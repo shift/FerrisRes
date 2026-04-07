@@ -20,7 +20,7 @@ var<workgroup> shared_max: array<f32, WG_SIZE>;
 var<workgroup> shared_sum: array<f32, WG_SIZE>;
 
 @compute @workgroup_size(WG_SIZE)
-fn softmax_main(@builtin(global_invocation_id) gid: vec3u) {
+fn softmax_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let row_idx = gid.x;
     if (row_idx >= p.rows) {
         return;
