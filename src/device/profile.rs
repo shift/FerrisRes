@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use super::capability::GpuKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceProfile {
@@ -9,6 +10,22 @@ pub enum DeviceProfile {
 }
 
 impl DeviceProfile {
+    pub fn from_vram_and_kind(vram_mb: u64, gpu_kind: GpuKind) -> Self {
+        match gpu_kind {
+            GpuKind::Integrated => DeviceProfile::Integrated,
+            GpuKind::Other => DeviceProfile::Integrated,
+            GpuKind::Discrete => {
+                if vram_mb < 4000 {
+                    DeviceProfile::LowEnd
+                } else if vram_mb < 8000 {
+                    DeviceProfile::MidRange
+                } else {
+                    DeviceProfile::HighEnd
+                }
+            }
+        }
+    }
+
     pub fn from_vram_mb(vram_mb: u64) -> Self {
         if vram_mb < 4000 {
             DeviceProfile::Integrated

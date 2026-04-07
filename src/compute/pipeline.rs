@@ -1,9 +1,11 @@
-use wgpu::{Device, Queue, ShaderModule, ComputePipeline};
+use wgpu::{Adapter, Device, Queue, ShaderModule, ComputePipeline};
 use crate::error::{FerrisResError, Result};
+use crate::device::{DeviceProfile, Capability};
 
 pub struct WgpuCompute {
     device: Device,
     queue: Queue,
+    adapter: Adapter,
     pipeline: Option<ComputePipeline>,
 }
 
@@ -11,6 +13,10 @@ impl WgpuCompute {
     pub async fn new() -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12,
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            display: None,
         });
 
         let adapter = instance
@@ -20,7 +26,7 @@ impl WgpuCompute {
                 compatible_surface: None,
             })
             .await
-            .ok_or_else(|| FerrisResError::Device("No GPU adapter found".into()))?;
+            .map_err(|e| FerrisResError::Device(format!("Failed to find adapter: {}", e)))?;
 
         let (device, queue) = adapter
             .request_device(
@@ -29,10 +35,9 @@ impl WgpuCompute {
                     required_features: wgpu::Features::empty(),
                     required_limits: wgpu::Limits::downlevel_defaults(),
                     memory_hints: wgpu::MemoryHints::default(),
-                    trace: None,
-                    experimental_features: None,
+                    trace: wgpu::Trace::Off,
+                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 },
-                None,
             )
             .await
             .map_err(|e| FerrisResError::Device(format!("Failed to request device: {}", e)))?;
@@ -40,6 +45,7 @@ impl WgpuCompute {
         Ok(Self {
             device,
             queue,
+            adapter,
             pipeline: None,
         })
     }
@@ -50,6 +56,30 @@ impl WgpuCompute {
 
     pub fn queue(&self) -> &Queue {
         &self.queue
+    }
+
+    pub fn adapter(&self) -> &Adapter {
+        &self.adapter
+    }
+
+    pub fn adapter_info(&self) -> wgpu::AdapterInfo {
+        self.adapter.get_info()
+    }
+
+    pub fn adapter_limits(&self) -> wgpu::Limits {
+        self.adapter.limits()
+    }
+
+    pub fn detect_capability(&self) -> Capability {
+        let limits = self.adapter_limits();
+        let info = self.adapter_info();
+        Capability::detect()
+            .with_adapter_limits(&limits, &info)
+    }
+
+    pub fn detect_profile(&self) -> DeviceProfile {
+        let cap = self.detect_capability();
+        DeviceProfile::from_vram_and_kind(cap.vram_mb, cap.gpu_kind)
     }
 
     pub fn create_shader_module(&self, wgsl: &str) -> Result<ShaderModule> {

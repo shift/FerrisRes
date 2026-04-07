@@ -1,3 +1,7 @@
+pub mod gpu_tensor;
+
+pub use gpu_tensor::GpuTensor;
+
 use std::fmt::Debug;
 use serde::{Deserialize, Serialize};
 
