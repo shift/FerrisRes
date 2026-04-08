@@ -145,45 +145,81 @@ struct GatherParams {
 @group(0) @binding(4) var<storage, read> expert_down_weights: array<f32>;
 @group(0) @binding(5) var<storage, read_write> output: array<f32>;
 @group(0) @binding(6) var<uniform> params: GatherParams;
+@group(0) @binding(7) var<storage, read_write> scratch: array<f32>;
 
 @compute @workgroup_size(256)
-fn moe_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let token_idx = gid.x;
-    if (token_idx >= params.batch_size) { return; }
+fn moe_up_proj(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let flat = gid.x;
+    let total = params.batch_size * params.top_k;
+    if (flat >= total) { return; }
+
+    let token_idx = flat / params.top_k;
+    let k = flat % params.top_k;
+    let expert_id = selected_experts[token_idx * params.top_k + k];
+    let weight = expert_weights[token_idx * params.top_k + k];
+    if (weight == 0.0) { return; }
 
     let input_offset = token_idx * params.hidden_dim;
-    var output_accum = array<f32, 4096>();
+    let up_offset = expert_id * params.intermediate_dim * params.hidden_dim;
+    let scratch_base = flat * params.intermediate_dim;
 
-    for (var k: u32; k < params.top_k; k = k + 1u) {
-        let expert_id = selected_experts[token_idx * params.top_k + k];
-        let weight = expert_weights[token_idx * params.top_k + k];
-        if (weight == 0.0) { continue; }
-
-        let up_offset = expert_id * params.intermediate_dim * params.hidden_dim;
-        let down_offset = expert_id * params.hidden_dim * params.intermediate_dim;
-
-        var intermediate = array<f32, 4096>();
-        for (var i: u32; i < params.intermediate_dim; i = i + 1u) {
-            var sum = 0.0;
-            for (var j: u32; j < params.hidden_dim; j = j + 1u) {
-                sum = sum + input[input_offset + j] * expert_up_weights[up_offset + i * params.hidden_dim + j];
-            }
-            intermediate[i] = max(0.0, sum);
+    var ii: u32 = 0u;
+    while (ii < params.intermediate_dim) {
+        var dot = 0.0;
+        var jj: u32 = 0u;
+        while (jj < params.hidden_dim) {
+            dot = dot + input[input_offset + jj] * expert_up_weights[up_offset + ii * params.hidden_dim + jj];
+            jj = jj + 1u;
         }
+        scratch[scratch_base + ii] = max(0.0, dot);
+        ii = ii + 1u;
+    }
+}
 
-        for (var i: u32; i < params.hidden_dim; i = i + 1u) {
-            var sum = 0.0;
-            for (var j: u32; j < params.intermediate_dim; j = j + 1u) {
-                sum = sum + intermediate[j] * expert_down_weights[down_offset + i * params.intermediate_dim + j];
-            }
-            output_accum[i] = output_accum[i] + sum * weight;
+@compute @workgroup_size(256)
+fn moe_down_proj(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let flat = gid.x;
+    let total = params.batch_size * params.top_k;
+    if (flat >= total) { return; }
+
+    let token_idx = flat / params.top_k;
+    let k = flat % params.top_k;
+    let expert_id = selected_experts[token_idx * params.top_k + k];
+    let weight = expert_weights[token_idx * params.top_k + k];
+    if (weight == 0.0) { return; }
+
+    let up_scratch_base = flat * params.intermediate_dim;
+    let down_offset = expert_id * params.hidden_dim * params.intermediate_dim;
+    let output_offset = flat * params.hidden_dim;
+
+    var ii: u32 = 0u;
+    while (ii < params.hidden_dim) {
+        var dot = 0.0;
+        var jj: u32 = 0u;
+        while (jj < params.intermediate_dim) {
+            dot = dot + scratch[up_scratch_base + jj] * expert_down_weights[down_offset + ii * params.intermediate_dim + jj];
+            jj = jj + 1u;
         }
+        output[output_offset + ii] = dot * weight;
+        ii = ii + 1u;
     }
+}
 
-    let output_offset = token_idx * params.hidden_dim;
-    for (var i: u32; i < params.hidden_dim; i = i + 1u) {
-        output[output_offset + i] = output_accum[i];
+@compute @workgroup_size(256)
+fn moe_accumulate(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let flat = gid.x;
+    let token_idx = flat / params.hidden_dim;
+    let dim_idx = flat % params.hidden_dim;
+    if (token_idx >= params.batch_size) { return; }
+
+    var sum = 0.0;
+    var kk: u32 = 0u;
+    while (kk < params.top_k) {
+        let expert_flat = token_idx * params.top_k + kk;
+        sum = sum + output[expert_flat * params.hidden_dim + dim_idx];
+        kk = kk + 1u;
     }
+    output[token_idx * params.hidden_dim + dim_idx] = sum;
 }
 "#;
 
@@ -368,7 +404,9 @@ impl MoEGatingOp {
 
 pub struct MoEExpertOp {
     dispatch_pipeline: wgpu::ComputePipeline,
-    gather_pipeline: wgpu::ComputePipeline,
+    up_proj_pipeline: wgpu::ComputePipeline,
+    down_proj_pipeline: wgpu::ComputePipeline,
+    accumulate_pipeline: wgpu::ComputePipeline,
     dispatch_bgl: wgpu::BindGroupLayout,
     gather_bgl: wgpu::BindGroupLayout,
     device: Arc<Device>,
@@ -406,21 +444,30 @@ impl MoEExpertOp {
                 BindGroupLayoutEntry { binding: 4, visibility: ShaderStages::COMPUTE, ty: BindingType::Buffer { ty: BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 BindGroupLayoutEntry { binding: 5, visibility: ShaderStages::COMPUTE, ty: BindingType::Buffer { ty: BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 BindGroupLayoutEntry { binding: 6, visibility: ShaderStages::COMPUTE, ty: BindingType::Buffer { ty: BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                BindGroupLayoutEntry { binding: 7, visibility: ShaderStages::COMPUTE, ty: BindingType::Buffer { ty: BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
             ],
         });
 
         let dispatch_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("MoE Dispatch PL"), bind_group_layouts: &[Some(&dispatch_bgl)], immediate_size: 0 });
-        let gather_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("MoE Gather PL"), bind_group_layouts: &[Some(&gather_bgl)], immediate_size: 0 });
+        let gather_pipeline = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("MoE Gather PL"), bind_group_layouts: &[Some(&gather_bgl)], immediate_size: 0 });
 
         let dispatch_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("MoE Dispatch Pipeline"), layout: Some(&dispatch_pl), module: &dispatch_shader, entry_point: Some("compute_top_k_indices"), cache: None, compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
-        let gather_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("MoE Gather Pipeline"), layout: Some(&gather_pl), module: &gather_shader, entry_point: Some("moe_forward"), cache: None, compilation_options: wgpu::PipelineCompilationOptions::default(),
+        let up_proj_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("MoE Up-Proj Pipeline"), layout: Some(&gather_pipeline), module: &gather_shader, entry_point: Some("moe_up_proj"), cache: None, compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
-        Ok(Self { dispatch_pipeline, gather_pipeline, dispatch_bgl, gather_bgl, device: Arc::clone(device) })
+        let down_proj_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("MoE Down-Proj Pipeline"), layout: Some(&gather_pipeline), module: &gather_shader, entry_point: Some("moe_down_proj"), cache: None, compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+
+        let accumulate_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("MoE Accumulate Pipeline"), layout: Some(&gather_pipeline), module: &gather_shader, entry_point: Some("moe_accumulate"), cache: None, compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+
+        Ok(Self { dispatch_pipeline, up_proj_pipeline, down_proj_pipeline, accumulate_pipeline, dispatch_bgl, gather_bgl, device: Arc::clone(device) })
     }
 
     pub fn dispatch_top_k(
@@ -453,7 +500,7 @@ impl MoEExpertOp {
     pub fn gather_expert_outputs(
         &self, encoder: &mut wgpu::CommandEncoder,
         input: &GpuBuffer, selected_experts: &GpuBuffer, expert_weights: &GpuBuffer,
-        expert_up: &GpuBuffer, expert_down: &GpuBuffer, output: &GpuBuffer,
+        expert_up: &GpuBuffer, expert_down: &GpuBuffer, output: &GpuBuffer, scratch: &GpuBuffer,
         batch_size: u32, num_experts: u32, top_k: u32, hidden_dim: u32, intermediate_dim: u32,
     ) -> Result<()> {
         let params: [u32; 5] = [num_experts, top_k, batch_size, hidden_dim, intermediate_dim];
@@ -471,13 +518,26 @@ impl MoEExpertOp {
                 wgpu::BindGroupEntry { binding: 4, resource: expert_down.buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: output.buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: scratch.buffer().as_entire_binding() },
             ],
         });
 
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("MoE Gather Pass"), timestamp_writes: None });
-        pass.set_pipeline(&self.gather_pipeline);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("MoE Gather Up Pass"), timestamp_writes: None });
+        pass.set_pipeline(&self.up_proj_pipeline);
         pass.set_bind_group(0, &bg, &[]);
-        pass.dispatch_workgroups(batch_size, 1, 1);
+        pass.dispatch_workgroups((batch_size * top_k + 255) / 256, 1, 1);
+        drop(pass);
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("MoE Gather Down Pass"), timestamp_writes: None });
+        pass.set_pipeline(&self.down_proj_pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups((batch_size * top_k + 255) / 256, 1, 1);
+        drop(pass);
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("MoE Accumulate Pass"), timestamp_writes: None });
+        pass.set_pipeline(&self.accumulate_pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups((batch_size * hidden_dim + 255) / 256, 1, 1);
         drop(pass);
         Ok(())
     }

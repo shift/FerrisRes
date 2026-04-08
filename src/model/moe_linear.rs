@@ -15,6 +15,7 @@ pub struct MoELinear {
     selected_experts_buf: Option<GpuBuffer>,
     expert_weights_buf: Option<GpuBuffer>,
     output_buf: Option<GpuBuffer>,
+    scratch_buf: Option<GpuBuffer>,
     hidden_dim: usize,
     intermediate_dim: usize,
     num_experts: usize,
@@ -57,6 +58,7 @@ impl MoELinear {
             selected_experts_buf: None,
             expert_weights_buf: None,
             output_buf: None,
+            scratch_buf: None,
             hidden_dim,
             intermediate_dim,
             num_experts,
@@ -77,7 +79,8 @@ impl MoELinear {
         let gate_logits_bytes = batch_size * self.num_experts * f32_size;
         let selected_experts_bytes = batch_size * self.top_k * u32_size;
         let expert_weights_bytes = batch_size * self.top_k * f32_size;
-        let output_bytes = batch_size * self.hidden_dim * f32_size;
+        let output_bytes = batch_size * self.top_k * self.hidden_dim * f32_size;
+        let scratch_bytes = batch_size * self.top_k * self.intermediate_dim * f32_size;
 
         if self.gate_logits_buf.as_ref().map_or(true, |b| b.size() < gate_logits_bytes) {
             self.gate_logits_buf = Some(GpuBuffer::zeros(&self.device, gate_logits_bytes, Some("MoE Gate Logits"))?);
@@ -91,11 +94,15 @@ impl MoELinear {
         if self.output_buf.as_ref().map_or(true, |b| b.size() < output_bytes) {
             self.output_buf = Some(GpuBuffer::zeros(&self.device, output_bytes, Some("MoE Output"))?);
         }
+        if self.scratch_buf.as_ref().map_or(true, |b| b.size() < scratch_bytes) {
+            self.scratch_buf = Some(GpuBuffer::zeros(&self.device, scratch_bytes, Some("MoE Scratch"))?);
+        }
 
         let gate_logits = self.gate_logits_buf.as_ref().unwrap();
         let selected_experts = self.selected_experts_buf.as_ref().unwrap();
         let expert_weights = self.expert_weights_buf.as_ref().unwrap();
         let output = self.output_buf.as_ref().unwrap();
+        let scratch = self.scratch_buf.as_ref().unwrap();
 
         let bs = batch_size as u32;
         let ne = self.num_experts as u32;
@@ -121,6 +128,7 @@ impl MoELinear {
             &self.expert_up_weights,
             &self.expert_down_weights,
             output,
+            scratch,
             bs, ne, tk, hd, id,
         )?;
 

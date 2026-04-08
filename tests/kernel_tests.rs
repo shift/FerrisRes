@@ -432,6 +432,7 @@ async fn test_moe_expert_gather() {
             wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
             wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
             wgpu::BindGroupLayoutEntry { binding: 6, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            wgpu::BindGroupLayoutEntry { binding: 7, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
         ],
     });
 
@@ -445,7 +446,7 @@ async fn test_moe_expert_gather() {
         label: Some("MoE Gather Pipeline"),
         layout: Some(&pl),
         module: &shader,
-        entry_point: Some("moe_forward"),
+        entry_point: Some("moe_up_proj"),
         cache: None,
         compilation_options: wgpu::PipelineCompilationOptions::default(),
     });
@@ -464,7 +465,8 @@ async fn test_moe_expert_gather() {
 
     let selected_buf = create_output_buffer(&device, (batch_size * top_k) as usize * std::mem::size_of::<u32>());
     let weights_buf = create_output_buffer(&device, (batch_size * top_k) as usize * std::mem::size_of::<f32>());
-    let output_buf = create_output_buffer(&device, (batch_size * hidden_dim) as usize * std::mem::size_of::<f32>());
+    let output_buf = create_output_buffer(&device, (batch_size * top_k * hidden_dim) as usize * std::mem::size_of::<f32>());
+    let scratch_buf = create_output_buffer(&device, (batch_size * top_k * intermediate_dim) as usize * std::mem::size_of::<f32>());
 
     let expert_up: &[f32] = &[
         1.0, 0.0, 0.0, 1.0,
@@ -549,6 +551,7 @@ async fn test_moe_expert_gather() {
             wgpu::BindGroupEntry { binding: 4, resource: down_buf.buffer().as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: output_buf.buffer().as_entire_binding() },
             wgpu::BindGroupEntry { binding: 6, resource: gather_params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: scratch_buf.buffer().as_entire_binding() },
         ],
     });
 
@@ -566,12 +569,48 @@ async fn test_moe_expert_gather() {
     drop(pass);
 
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("MoE Gather Pass"),
+        label: Some("MoE Gather Up Pass"),
         timestamp_writes: None,
     });
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &gather_bg, &[]);
-    pass.dispatch_workgroups(batch_size, 1, 1);
+    pass.dispatch_workgroups((batch_size * top_k + 255) / 256, 1, 1);
+    drop(pass);
+
+    let down_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("MoE Down Pipeline"),
+        layout: Some(&pl),
+        module: &shader,
+        entry_point: Some("moe_down_proj"),
+        cache: None,
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+    });
+
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("MoE Gather Down Pass"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&down_pipeline);
+    pass.set_bind_group(0, &gather_bg, &[]);
+    pass.dispatch_workgroups((batch_size * top_k + 255) / 256, 1, 1);
+    drop(pass);
+
+    let accumulate_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("MoE Accumulate Pipeline"),
+        layout: Some(&pl),
+        module: &shader,
+        entry_point: Some("moe_accumulate"),
+        cache: None,
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+    });
+
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("MoE Accumulate Pass"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&accumulate_pipeline);
+    pass.set_bind_group(0, &gather_bg, &[]);
+    pass.dispatch_workgroups((batch_size * hidden_dim + 255) / 256, 1, 1);
     drop(pass);
 
     queue.submit(std::iter::once(encoder.finish()));
