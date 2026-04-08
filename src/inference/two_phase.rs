@@ -208,6 +208,8 @@ impl TwoPhaseInference {
                 &scratch,
                 &partial_sum,
                 batch_size,
+                crate::training::CheckpointGranularity::None,
+                None,
             )?;
         }
 

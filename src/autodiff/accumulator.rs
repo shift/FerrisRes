@@ -11,6 +11,10 @@ pub struct GradientAccumulator {
     counts: HashMap<NodeId, u32>,
     elementwise: ElementWiseOp,
     device: Arc<Device>,
+    /// How many micro-batches have been accumulated since the last optimizer step.
+    pub micro_batch_count: u32,
+    /// How many micro-batches to accumulate before an optimizer step.
+    pub accumulation_steps: u32,
 }
 
 impl GradientAccumulator {
@@ -22,7 +26,52 @@ impl GradientAccumulator {
             counts: HashMap::new(),
             elementwise,
             device,
+            micro_batch_count: 0,
+            accumulation_steps: 1,
         }
+    }
+
+    /// Create a GradientAccumulator with a specific number of accumulation steps.
+    pub fn with_accumulation_steps(device: Arc<Device>, accumulation_steps: u32) -> Self {
+        assert!(accumulation_steps >= 1, "accumulation_steps must be >= 1");
+        tracing::info!("Creating GradientAccumulator with {} accumulation steps", accumulation_steps);
+        let elementwise = ElementWiseOp::new(&device);
+        Self {
+            accumulators: HashMap::new(),
+            counts: HashMap::new(),
+            elementwise,
+            device,
+            micro_batch_count: 0,
+            accumulation_steps,
+        }
+    }
+
+    /// Returns true when enough micro-batches have been accumulated to trigger an optimizer step.
+    /// Specifically returns true when `micro_batch_count % accumulation_steps == 0` and
+    /// `micro_batch_count > 0`.
+    pub fn should_step(&self) -> bool {
+        self.micro_batch_count > 0 && self.micro_batch_count % self.accumulation_steps == 0
+    }
+
+    /// Divides all accumulated gradient buffers by `accumulation_steps` in-place using GPU dispatch.
+    /// Must be called before the optimizer step to correctly average gradients across micro-batches.
+    pub fn normalize(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<()> {
+        if self.accumulation_steps <= 1 {
+            return Ok(());
+        }
+        let scale = 1.0 / self.accumulation_steps as f32;
+        for (id, accum) in &self.accumulators {
+            let numel = accum.size() as u32 / std::mem::size_of::<f32>() as u32;
+            self.elementwise.dispatch_scale(encoder, accum, accum, scale, numel)?;
+            tracing::debug!(
+                "GradientAccumulator::normalize: scaled {:?} by {:.6} (accumulation_steps={})",
+                id, scale, self.accumulation_steps
+            );
+        }
+        Ok(())
     }
 
     pub fn register(&mut self, id: NodeId, size: usize) -> Result<()> {
@@ -53,6 +102,17 @@ impl GradientAccumulator {
         Ok(())
     }
 
+    /// Increment the micro-batch counter. Call once per micro-batch (after all
+    /// parameter gradients have been accumulated for that micro-batch).
+    pub fn increment_micro_batch(&mut self) {
+        self.micro_batch_count += 1;
+        tracing::debug!(
+            "GradientAccumulator: micro_batch_count={} accumulation_steps={}",
+            self.micro_batch_count,
+            self.accumulation_steps
+        );
+    }
+
     pub fn averaged(&self, id: NodeId) -> Option<(&GpuBuffer, u32)> {
         let accum = self.accumulators.get(&id)?;
         let count = *self.counts.get(&id)?;
@@ -66,6 +126,7 @@ impl GradientAccumulator {
             self.elementwise.dispatch_copy(encoder, &zero, accum, numel)?;
             self.counts.insert(*id, 0);
         }
+        self.micro_batch_count = 0;
         tracing::debug!("GradientAccumulator: reset all accumulators");
         Ok(())
     }

@@ -35,6 +35,36 @@ impl BlockCache {
         })
     }
 
+    /// Reconstruct a `BlockCache` from an existing [`GpuBuffer`].
+    ///
+    /// Used by [`BorrowedBufferPool::transition_to_inference`] to restore
+    /// the KV cache after gradient buffers are returned.  The buffer **must**
+    /// be large enough to hold `cache_capacity * hidden_dim * sizeof(f32)` bytes;
+    /// the cache state (head / count) is reset to zero.
+    pub fn from_buffer(
+        device: Arc<Device>,
+        buffer: GpuBuffer,
+        hidden_dim: usize,
+        cache_capacity: usize,
+    ) -> Self {
+        Self {
+            buffer,
+            cache_capacity,
+            hidden_dim,
+            head: AtomicUsize::new(0),
+            count: AtomicUsize::new(0),
+            device,
+        }
+    }
+
+    /// Consume the cache and return the underlying [`GpuBuffer`].
+    ///
+    /// Used by [`BorrowedBufferPool::transition_to_training`] to extract the
+    /// backing memory for reuse as gradient scratch space.
+    pub fn into_buffer(self) -> GpuBuffer {
+        self.buffer
+    }
+
     pub fn push(
         &self,
         encoder: &mut CommandEncoder,

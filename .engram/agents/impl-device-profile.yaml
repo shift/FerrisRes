@@ -1,0 +1,25 @@
+name: impl-device-profile
+agent_type: coder
+specialization: DeviceProfile auto-selection hardware detection Rust
+email: null
+created_at: 2026-04-08
+version: 1.0.0
+capabilities:
+- memory_storage
+- task_management
+- context_tracking
+- reasoning_chains
+- knowledge_graph
+- team_collaboration
+commands:
+- engram task create --title "Task Title" --agent impl-device-profile
+- engram context create --source "documentation" --agent impl-device-profile
+- engram reasoning create --task-id "task-123" --agent impl-device-profile
+- engram sync --agents "agent1,agent2" --strategy "merge_with_conflict_resolution"
+workspace_access:
+  repositories:
+  - ./
+  tools:
+  - git
+  - rust
+  - cargo

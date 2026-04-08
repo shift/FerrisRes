@@ -98,7 +98,9 @@ async fn main() -> anyhow::Result<()> {
 async fn cmd_info() -> anyhow::Result<()> {
     let compute = WgpuCompute::new().await?;
     let capability = compute.detect_capability();
-    let profile = DeviceProfile::from_vram_and_kind(capability.vram_mb, capability.gpu_kind);
+    // Priority 1: env var override; Priority 2: hardware detection; Priority 3: Integrated fallback.
+    let profile = DeviceProfile::from_env()
+        .unwrap_or_else(|| DeviceProfile::from_vram_and_kind(capability.vram_mb, capability.gpu_kind));
 
     info!("Adapter: {} ({})", capability.adapter_name, capability.backend);
     info!("GPU kind: {:?}", capability.gpu_kind);
@@ -109,7 +111,7 @@ async fn cmd_info() -> anyhow::Result<()> {
     info!("Device profile: {:?}", profile);
     info!("Compute mode: {:?}", profile.compute_mode());
     info!("Recommended batch size: {}", profile.recommended_batch_size());
-    info!("Cache size: {} blocks", profile.cache_size());
+    info!("Cache size: {} MB", profile.cache_size() / (1024 * 1024));
 
     info!("Max workgroup size: {}", capability.max_compute_workgroup_size);
     info!("Max invocations/workgroup: {}", capability.max_compute_invocations_per_workgroup);

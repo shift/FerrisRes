@@ -32,6 +32,8 @@ vulkan = ["wgpu/vulkan"]
 metal = ["wgpu/metal"]
 dx12 = ["wgpu/dx12"]
 webgpu = ["wgpu/webgpu"]
+integrated_gpu_profile = []
+high_end_profile = []
 
 [build-dependencies]
 naga = "29"

@@ -13,7 +13,7 @@ pub struct Tensor<T: Clone + Debug> {
 
 impl<T: Clone + Debug + Default> Tensor<T> {
     pub fn zeros(shape: Vec<usize>) -> Self {
-        let size: usize = shape.iter().product();
+        let size: usize = shape.iter().product::<usize>();
         Self {
             shape,
             data: vec![T::default(); size],
@@ -27,13 +27,13 @@ impl<T: Clone + Debug> Tensor<T> {
     }
 
     pub fn size(&self) -> usize {
-        self.shape.iter().product()
+        self.shape.iter().product::<usize>()
     }
 
     pub fn reshape(&self, shape: Vec<usize>) -> Self {
         assert_eq!(
             self.size(),
-            shape.iter().product(),
+            shape.iter().product::<usize>(),
             "Cannot reshape from {:?} to {:?}",
             self.shape,
             shape

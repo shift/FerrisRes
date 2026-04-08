@@ -5,9 +5,151 @@ use std::sync::{Arc, Mutex};
 use wgpu::Device;
 
 use crate::compute::buffer::GpuBuffer;
-use crate::device::capability::Capability;
+use crate::compute::cache::BlockCache;
+use crate::device::capability::{Capability, GpuKind};
 use crate::device::profile::{ComputeMode, DeviceProfile};
 use crate::error::{FerrisResError, Result};
+
+/// Maximum tile size in bytes for integrated / non-discrete GPUs.
+/// This caps the tile budget so that a single tile does not consume all available VRAM,
+/// leaving room for model parameters, optimizer state, and activations.
+/// Derived from ADR research (41e79f09): 4 tiles of 512 MB = 2 GB coverage with
+/// ~1.5 GB headroom for a 125M-parameter model on DDR4-2666 iGPU.
+const INTEGRATED_MAX_TILE_BYTES: u64 = 512 * 1024 * 1024;
+
+// ─── DeviceMemoryPhase ────────────────────────────────────────────────────────
+
+/// Tracks whether the runtime is currently in inference or training mode.
+/// Used by [`BorrowedBufferPool`] to gate KV-cache buffer reuse for gradients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceMemoryPhase {
+    /// Normal inference: KV-cache buffers are owned by [`BlockCache`].
+    Inference,
+    /// Backward-pass / optimizer step: KV-cache buffers are available for
+    /// gradient accumulation, returned when training completes.
+    Training,
+}
+
+// ─── BorrowedBufferPool ───────────────────────────────────────────────────────
+
+/// Buffer-borrow strategy for integrated GPU profiles.
+///
+/// On integrated GPUs, CPU and GPU share DRAM, so we can reuse KV-cache
+/// buffers as gradient scratch space during the training phase instead of
+/// allocating a second set of equally-sized buffers.  Only enabled when
+/// [`DeviceProfile::Integrated`] is in use.
+///
+/// # Lifecycle
+/// ```text
+/// inference  ──transition_to_training()──▶  training
+///                (kv buffers extracted)      (kv buffers used as grad bufs)
+/// training   ──transition_to_inference()──▶  inference
+///                (grad bufs returned)         (kv cache restored)
+/// ```
+pub struct BorrowedBufferPool {
+    phase: DeviceMemoryPhase,
+    /// KV-cache buffers borrowed for gradient use during training.
+    borrowed_kv_buffers: Vec<GpuBuffer>,
+    /// Whether this pool is active (only for Integrated profile).
+    enabled: bool,
+}
+
+impl BorrowedBufferPool {
+    /// Create a new pool.  Pass `enabled = true` only for
+    /// [`DeviceProfile::Integrated`].
+    pub fn new(profile: &DeviceProfile) -> Self {
+        Self {
+            phase: DeviceMemoryPhase::Inference,
+            borrowed_kv_buffers: Vec::new(),
+            enabled: *profile == DeviceProfile::Integrated,
+        }
+    }
+
+    /// Returns `true` if the borrowed-buffer strategy is active.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Returns the current memory phase.
+    pub fn phase(&self) -> DeviceMemoryPhase {
+        self.phase
+    }
+
+    /// Transition from inference to training.
+    ///
+    /// Extracts the underlying [`GpuBuffer`] from the KV cache so it can be
+    /// reused as gradient scratch space.  After calling this function the
+    /// [`BlockCache`] is consumed; the caller must not use it until
+    /// [`transition_to_inference`] restores it.
+    ///
+    /// If the pool is disabled (non-integrated profile) this is a no-op and
+    /// returns an empty `Vec`.
+    ///
+    /// # Panics
+    /// Panics if called while already in [`DeviceMemoryPhase::Training`].
+    pub fn transition_to_training(&mut self, kv_cache: BlockCache) -> Vec<GpuBuffer> {
+        assert_eq!(
+            self.phase,
+            DeviceMemoryPhase::Inference,
+            "BorrowedBufferPool: already in Training phase"
+        );
+        self.phase = DeviceMemoryPhase::Training;
+
+        if !self.enabled {
+            // Return the backing buffer without consuming the cache so callers
+            // can still treat the result as "no borrowed buffers".
+            drop(kv_cache);
+            return Vec::new();
+        }
+
+        // Extract the backing GPU buffer from the cache and hand it to the
+        // gradient accumulator.
+        let buf = kv_cache.into_buffer();
+        self.borrowed_kv_buffers.push(buf);
+        self.borrowed_kv_buffers.drain(..).collect()
+    }
+
+    /// Transition from training back to inference.
+    ///
+    /// Restores gradient buffers to KV-cache use by reconstructing a
+    /// [`BlockCache`] from the returned buffers.
+    ///
+    /// If the pool is disabled this reconstructs a fresh cache from the
+    /// provided parameters.
+    ///
+    /// # Panics
+    /// Panics if called while already in [`DeviceMemoryPhase::Inference`].
+    pub fn transition_to_inference(
+        &mut self,
+        gradient_bufs: Vec<GpuBuffer>,
+        device: Arc<Device>,
+        hidden_dim: usize,
+        cache_capacity: usize,
+    ) -> Result<BlockCache> {
+        assert_eq!(
+            self.phase,
+            DeviceMemoryPhase::Training,
+            "BorrowedBufferPool: already in Inference phase"
+        );
+        self.phase = DeviceMemoryPhase::Inference;
+
+        if self.enabled && !gradient_bufs.is_empty() {
+            // Reconstruct the BlockCache by handing back the first buffer.
+            // Remaining buffers (if any) are dropped — the cache only needs one.
+            let mut bufs = gradient_bufs;
+            let backing = bufs.remove(0);
+            Ok(BlockCache::from_buffer(
+                device,
+                backing,
+                hidden_dim,
+                cache_capacity,
+            ))
+        } else {
+            // Disabled path or no buffers returned: allocate a fresh cache.
+            BlockCache::new(device, hidden_dim, cache_capacity)
+        }
+    }
+}
 
 pub struct MemoryBudget {
     total_vram_bytes: u64,
@@ -156,7 +298,18 @@ pub struct TiledCompute {
 impl TiledCompute {
     pub fn new(capability: &Capability) -> Self {
         let effective_vram = capability.effective_vram_mb() * 1024 * 1024;
-        let tile_size_bytes = effective_vram / 4;
+        let raw_tile = effective_vram / 4;
+
+        // Bug fix (ADR-013 / task b2965655): for integrated / non-discrete GPUs
+        // `effective_vram` reflects shared system RAM (e.g. 8 GB), so the
+        // uncapped formula produces a 2 GB tile that consumes the entire compute
+        // budget.  Cap at 512 MB for non-discrete devices so that at least four
+        // tiles fit simultaneously alongside model parameters and optimizer state.
+        let tile_size_bytes = match capability.gpu_kind {
+            GpuKind::Discrete => raw_tile,
+            _ => raw_tile.min(INTEGRATED_MAX_TILE_BYTES),
+        };
+
         let max_tiles = 64;
         Self {
             tile_size_bytes: tile_size_bytes.max(1),

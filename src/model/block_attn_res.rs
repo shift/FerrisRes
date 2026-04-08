@@ -7,6 +7,7 @@ use crate::compute::kernels::softmax::SoftmaxOp;
 use crate::compute::kernels::elementwise::ElementWiseOp;
 use crate::model::config::BlockAttnResConfig;
 use crate::model::linear::Linear;
+use crate::training::{CheckpointGranularity, CheckpointStore};
 use crate::error::Result;
 
 const HEAD_WEIGHT_MUL_WGSL: &str = r#"
@@ -272,11 +273,32 @@ impl BlockAttnResLayer {
         output: &GpuBuffer,
         partial_sum: &GpuBuffer,
         batch_size: u32,
+        checkpoint_granularity: CheckpointGranularity,
+        checkpoint_store: Option<&mut CheckpointStore>,
     ) -> Result<()> {
         tracing::debug!(
             "BlockAttnResLayer::forward_intra_block layer={} batch={} heads={}",
             self.layer_number, batch_size, self.num_heads
         );
+
+        // When PerBlock checkpointing is enabled, save the hidden_states input
+        // at the start of this block so the backward pass can recompute
+        // intermediate activations from this saved state instead of keeping
+        // them all live in VRAM.
+        //
+        // TODO(ADR-010): backward recomputation pass is not yet implemented.
+        //                The store is populated here; the recompute_block()
+        //                method on CheckpointStore will consume it during
+        //                backward.
+        if checkpoint_granularity == CheckpointGranularity::PerBlock {
+            if let Some(store) = checkpoint_store {
+                store.save(encoder, self.layer_number, "hidden_states_input", hidden_states)?;
+                tracing::debug!(
+                    "CheckpointStore: saved PerBlock checkpoint for layer={}",
+                    self.layer_number
+                );
+            }
+        }
 
         let hidden_dim = self.hidden_dim as u32;
         let intermediate_dim = self.ff_up.out_features() as u32;

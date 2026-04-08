@@ -452,13 +452,15 @@ impl BackwardPass {
             loss_node.buf.size() as u32 / std::mem::size_of::<f32>() as u32,
         )?;
 
+        // Walk the full tape in reverse topological order.
+        // The tape is recorded in forward (topological) order, so reversing it
+        // gives the correct gradient accumulation order for backprop.
         let tape_snapshot: Vec<(NodeId, NodeKind, Vec<NodeId>)> = graph.tape()
             .iter()
-            .filter(|e| e.output_id() == loss_id)
             .map(|e| (e.output_id(), e.op().clone(), e.inputs().to_vec()))
             .collect();
 
-        for (output_id, op, inputs) in tape_snapshot.iter() {
+        for (output_id, op, inputs) in tape_snapshot.iter().rev() {
             self.backward_entry(graph, encoder, *output_id, op, inputs)?;
         }
 

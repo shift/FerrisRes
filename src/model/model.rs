@@ -151,6 +151,8 @@ impl BlockAttnResModel {
                         &self.scratch_a,
                         &self.partial_sum,
                         batch_size,
+                        crate::training::CheckpointGranularity::None,
+                        None,
                     )?;
                     current_hidden = self.scratch_a.buffer();
                 } else {
@@ -160,6 +162,8 @@ impl BlockAttnResModel {
                         &self.scratch_a,
                         &self.partial_sum,
                         batch_size,
+                        crate::training::CheckpointGranularity::None,
+                        None,
                     )?;
                     current_hidden = self.scratch_a.buffer();
                 }

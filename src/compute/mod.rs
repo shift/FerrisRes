@@ -6,7 +6,7 @@ pub mod cache;
 
 pub use pipeline::WgpuCompute;
 pub use buffer::GpuBuffer;
-pub use memory::{MemoryBudget, MemoryPool, TiledCompute, ComputeDispatcher};
+pub use memory::{MemoryBudget, MemoryPool, TiledCompute, ComputeDispatcher, DeviceMemoryPhase, BorrowedBufferPool};
 pub use cache::{BlockCache, PipelineStage, PipelineScheduler};
 pub use kernels::softmax::SoftmaxOp;
 pub use kernels::rmsnorm::RmsNormOp;

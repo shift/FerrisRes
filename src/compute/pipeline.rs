@@ -84,8 +84,29 @@ impl WgpuCompute {
     }
 
     pub fn detect_profile(&self) -> DeviceProfile {
+        // Priority 1: FERRIS_DEVICE_PROFILE env var override.
+        if let Some(profile) = DeviceProfile::from_env() {
+            return profile;
+        }
+
+        // Priority 2: Vulkan/ash capability detection.
         let cap = self.detect_capability();
-        DeviceProfile::from_vram_and_kind(cap.vram_mb, cap.gpu_kind)
+        let profile = DeviceProfile::from_vram_and_kind(cap.vram_mb, cap.gpu_kind);
+
+        // Priority 3 (implicit): DeviceProfile::Integrated is the fallback inside
+        // from_vram_and_kind when no discrete GPU is found.
+
+        // Emit startup summary log.
+        let adapter_info = self.adapter_info();
+        tracing::info!("=== FerrisRes Device Profile ===");
+        tracing::info!("  GPU: {}", adapter_info.name);
+        tracing::info!("  Profile: {:?}", profile);
+        tracing::info!("  Compute mode: {:?}", profile.compute_mode());
+        tracing::info!("  Batch size: {}", profile.recommended_batch_size());
+        tracing::info!("  Cache size: {} MB", profile.cache_size() / (1024 * 1024));
+        tracing::info!("================================");
+
+        profile
     }
 
     pub fn create_shader_module(&self, wgsl: &str) -> Result<ShaderModule> {
