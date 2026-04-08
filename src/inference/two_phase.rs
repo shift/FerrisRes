@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use wgpu::{Device, Queue};
 
@@ -5,7 +6,9 @@ use crate::compute::cache::BlockCache;
 use crate::compute::buffer::GpuBuffer;
 use crate::compute::kernels::elementwise::ElementWiseOp;
 use crate::model::config::BlockAttnResConfig;
+use crate::model::embedding::TokenEmbedding;
 use crate::model::model::BlockAttnResModel;
+use crate::model::tokenizer::SimpleTokenizer;
 use crate::error::Result;
 
 #[derive(Debug, Clone)]
@@ -256,70 +259,376 @@ impl TwoPhaseInference {
     }
 }
 
-pub struct AutoregressiveGenerator {
-    inference: TwoPhaseInference,
+pub struct KVCache {
+    key_cache: GpuBuffer,
+    value_cache: GpuBuffer,
+    max_seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    current_len: AtomicUsize,
     #[allow(dead_code)]
-    kv_cache: GpuBuffer,
-    generated_tokens: usize,
-    max_tokens: usize,
+    device: Arc<Device>,
+}
+
+impl KVCache {
+    pub fn new(
+        device: Arc<Device>,
+        num_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> Result<Self> {
+        let layer_size = max_seq_len * num_heads * head_dim * std::mem::size_of::<f32>();
+        let key_cache = GpuBuffer::zeros(&device, layer_size, Some("KVCache Keys"))?;
+        let value_cache = GpuBuffer::zeros(&device, layer_size, Some("KVCache Values"))?;
+
+        Ok(Self {
+            key_cache,
+            value_cache,
+            max_seq_len,
+            num_heads,
+            head_dim,
+            current_len: AtomicUsize::new(0),
+            device,
+        })
+    }
+
+    pub fn update(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        _layer_idx: usize,
+        keys: &GpuBuffer,
+        values: &GpuBuffer,
+        seq_len: u32,
+    ) {
+        let pos = seq_len as usize;
+        if pos >= self.max_seq_len {
+            return;
+        }
+
+        let per_head_dim = self.head_dim * std::mem::size_of::<f32>();
+        let per_pos_size = self.num_heads * per_head_dim;
+        let dst_offset = pos * per_pos_size;
+
+        let copy_size = (keys.size() as u64).min(per_pos_size as u64);
+
+        encoder.copy_buffer_to_buffer(
+            keys.buffer(),
+            0,
+            self.key_cache.buffer(),
+            dst_offset as u64,
+            Some(copy_size),
+        );
+
+        encoder.copy_buffer_to_buffer(
+            values.buffer(),
+            0,
+            self.value_cache.buffer(),
+            dst_offset as u64,
+            Some(copy_size),
+        );
+    }
+
+    pub fn get(&self, _layer_idx: usize, seq_len: u32) -> (u64, u64) {
+        let per_pos_size = self.num_heads * self.head_dim * std::mem::size_of::<f32>();
+        let key_offset = (seq_len as usize) * per_pos_size;
+        let value_offset = key_offset;
+        (key_offset as u64, value_offset as u64)
+    }
+
+    pub fn current_len(&self) -> usize {
+        self.current_len.load(Ordering::Relaxed)
+    }
+
+    pub fn advance(&self) {
+        self.current_len.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn key_cache(&self) -> &GpuBuffer {
+        &self.key_cache
+    }
+
+    pub fn value_cache(&self) -> &GpuBuffer {
+        &self.value_cache
+    }
+
+    pub fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+}
+
+pub struct Sampler {
+    temperature: f32,
+    #[allow(dead_code)]
+    top_k: Option<usize>,
+    #[allow(dead_code)]
+    top_p: Option<f32>,
+}
+
+impl Sampler {
+    pub fn new(temperature: f32, top_k: Option<usize>, top_p: Option<f32>) -> Self {
+        Self {
+            temperature: if temperature > 0.0 { temperature } else { 1.0 },
+            top_k,
+            top_p,
+        }
+    }
+
+    pub fn sample(&self, logits: &[f32]) -> usize {
+        if logits.is_empty() {
+            return 0;
+        }
+
+        if self.temperature != 1.0 {
+            let scaled: Vec<f32> = logits.iter().map(|&l| l / self.temperature).collect();
+            return greedy_decode(&scaled);
+        }
+
+        greedy_decode(logits)
+    }
+}
+
+fn greedy_decode(logits: &[f32]) -> usize {
+    let mut best_idx = 0;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &val) in logits.iter().enumerate() {
+        if val > best_val {
+            best_val = val;
+            best_idx = i;
+        }
+    }
+    best_idx
+}
+
+pub struct GenerationState {
+    pub token_ids: Vec<u32>,
+    pub finished: bool,
+    pub finish_reason: String,
+}
+
+fn readback_buffer(device: &Device, queue: &Queue, buffer: &GpuBuffer) -> Vec<f32> {
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("generation_readback"),
+        size: buffer.size() as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Readback Encoder"),
+    });
+    encoder.copy_buffer_to_buffer(
+        buffer.buffer(),
+        0,
+        &staging,
+        0,
+        Some(buffer.size() as u64),
+    );
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    let _ = device.poll(wgpu::PollType::Poll);
+    let _ = rx.recv().unwrap();
+
+    let data = slice.get_mapped_range();
+    let floats: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+    drop(data);
+    staging.unmap();
+    floats
+}
+
+pub struct AutoregressiveGenerator {
+    model: BlockAttnResModel,
+    embedding: TokenEmbedding,
+    tokenizer: SimpleTokenizer,
+    kv_cache: KVCache,
+    sampler: Sampler,
+    #[allow(dead_code)]
+    device: Arc<Device>,
+    #[allow(dead_code)]
+    queue: Arc<Queue>,
+    #[allow(dead_code)]
+    elementwise: ElementWiseOp,
 }
 
 impl AutoregressiveGenerator {
-    pub fn new(inference: TwoPhaseInference, max_tokens: usize) -> Self {
-        let model_config = inference.model().config();
-        let hidden_dim = model_config.hidden_dim;
-        let cache_size = max_tokens * hidden_dim * std::mem::size_of::<f32>();
+    pub fn new(
+        device: Arc<Device>,
+        queue: Arc<Queue>,
+        model_config: BlockAttnResConfig,
+        vocab_size: usize,
+    ) -> Result<Self> {
+        tracing::info!(
+            "Creating AutoregressiveGenerator: hidden_dim={} vocab_size={}",
+            model_config.hidden_dim,
+            vocab_size,
+        );
 
-        let kv_cache = GpuBuffer::new(
-            inference.device(),
-            cache_size,
-            Some("Autoregressive KV Cache"),
-        ).expect("failed to allocate KV cache");
+        let model = BlockAttnResModel::new(
+            Arc::clone(&device),
+            Arc::clone(&queue),
+            model_config.clone(),
+            vocab_size,
+        )?;
 
-        Self {
-            inference,
+        let embedding = TokenEmbedding::new(
+            Arc::clone(&device),
+            Arc::clone(&queue),
+            vocab_size,
+            model_config.hidden_dim,
+        )?;
+
+        let tokenizer = SimpleTokenizer::new();
+
+        let num_heads = model_config.attention_heads;
+        let head_dim = model_config.hidden_dim / num_heads;
+        let max_seq_len = 2048;
+
+        let kv_cache = KVCache::new(
+            Arc::clone(&device),
+            num_heads,
+            head_dim,
+            max_seq_len,
+        )?;
+
+        let sampler = Sampler::new(1.0, None, None);
+
+        let elementwise = ElementWiseOp::new(&device);
+
+        tracing::info!("AutoregressiveGenerator created successfully");
+
+        Ok(Self {
+            model,
+            embedding,
+            tokenizer,
             kv_cache,
-            generated_tokens: 0,
-            max_tokens,
-        }
+            sampler,
+            device,
+            queue,
+            elementwise,
+        })
     }
 
     pub fn generate(
         &mut self,
-        _prompt: &GpuBuffer,
+        prompt: &str,
         max_new_tokens: usize,
-    ) -> Result<GpuBuffer> {
+    ) -> Result<GenerationState> {
         tracing::info!(
-            "AutoregressiveGenerator::generate max_new_tokens={} (stub)",
+            "AutoregressiveGenerator::generate prompt_len={} max_new_tokens={}",
+            prompt.len(),
             max_new_tokens,
         );
 
-        let model_config = self.inference.model().config();
-        let hidden_dim = model_config.hidden_dim;
-        let output_bytes = hidden_dim * std::mem::size_of::<f32>();
+        let hidden_dim = self.model.config().hidden_dim;
+        let eos_id = self.tokenizer.eos_id();
+        let mut token_ids = self.tokenizer.encode(prompt);
 
-        let output = GpuBuffer::zeros(
-            self.inference.device(),
-            output_bytes,
-            Some("Generator Output (stub)"),
+        if token_ids.is_empty() {
+            return Ok(GenerationState {
+                token_ids: vec![],
+                finished: true,
+                finish_reason: "empty_prompt".to_string(),
+            });
+        }
+
+        let embed_bytes = hidden_dim * std::mem::size_of::<f32>();
+        let input_ids_buf = GpuBuffer::new(
+            &self.device,
+            std::mem::size_of::<u32>(),
+            Some("gen_input_ids"),
+        )?;
+        let embed_out_buf = GpuBuffer::new(
+            &self.device,
+            embed_bytes,
+            Some("gen_embed_out"),
+        )?;
+        let model_out_buf = GpuBuffer::new(
+            &self.device,
+            embed_bytes,
+            Some("gen_model_out"),
         )?;
 
-        self.generated_tokens += max_new_tokens;
+        let mut finished = false;
+        let mut finish_reason = String::from("max_tokens");
 
-        tracing::warn!("AutoregressiveGenerator::generate is a stub - returns zeroed buffer");
+        for _step in 0..max_new_tokens {
+            let last_token = *token_ids.last().unwrap();
 
-        Ok(output)
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("gen_step"),
+            });
+
+            {
+                let mut id_mapped = input_ids_buf.buffer().slice(..).get_mapped_range_mut();
+                id_mapped.copy_from_slice(&last_token.to_le_bytes());
+                drop(id_mapped);
+            }
+
+            self.embedding.forward(&mut encoder, &input_ids_buf, &embed_out_buf, 1)?;
+
+            self.model.forward(&embed_out_buf, &model_out_buf, 1)?;
+
+            self.kv_cache.advance();
+
+            self.queue.submit(std::iter::once(encoder.finish()));
+
+            let output_data = readback_buffer(&self.device, &self.queue, &model_out_buf);
+
+            let logits = &output_data[..hidden_dim.min(output_data.len())];
+            let next_token = self.sampler.sample(logits) as u32;
+
+            token_ids.push(next_token);
+
+            if next_token == eos_id {
+                finished = true;
+                finish_reason = "eos".to_string();
+                break;
+            }
+        }
+
+        tracing::info!(
+            "AutoregressiveGenerator::generate complete: {} tokens, finished={}, reason={}",
+            token_ids.len(),
+            finished,
+            finish_reason,
+        );
+
+        Ok(GenerationState {
+            token_ids,
+            finished,
+            finish_reason,
+        })
     }
 
-    pub fn generated_tokens(&self) -> usize {
-        self.generated_tokens
+    pub fn model(&self) -> &BlockAttnResModel {
+        &self.model
     }
 
-    pub fn max_tokens(&self) -> usize {
-        self.max_tokens
+    pub fn embedding(&self) -> &TokenEmbedding {
+        &self.embedding
     }
 
-    pub fn inference(&self) -> &TwoPhaseInference {
-        &self.inference
+    pub fn tokenizer(&self) -> &SimpleTokenizer {
+        &self.tokenizer
+    }
+
+    pub fn kv_cache(&self) -> &KVCache {
+        &self.kv_cache
+    }
+
+    pub fn sampler(&self) -> &Sampler {
+        &self.sampler
+    }
+
+    pub fn device(&self) -> &Arc<Device> {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &Arc<Queue> {
+        &self.queue
     }
 }

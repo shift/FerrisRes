@@ -15,48 +15,46 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
 @group(0) @binding(2) var<uniform> params: Params;
 
-var<workgroup> shared_sum_sq: array<f32, 1024>;
+var<workgroup> wg_data: array<f32, 256>;
 
-@compute @workgroup_size(1024)
-fn rmsnorm_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let row = gid.x;
+@compute @workgroup_size(256)
+fn rmsnorm_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+    let row = wid.x;
     let col = lid.x;
     let hidden_dim = params.hidden_dim;
-    let warp_size = 32u;
 
-    var sum_sq = 0.0;
-    if (col < hidden_dim) {
-        let val = input[row * hidden_dim + col];
-        sum_sq = val * val;
+    var partial = 0.0;
+    for (var c = col; c < hidden_dim; c = c + 256u) {
+        let v = input[row * hidden_dim + c];
+        partial = partial + v * v;
     }
 
-    shared_sum_sq[col] = sum_sq;
+    wg_data[col] = partial;
     workgroupBarrier();
 
-    var lane = col % warp_size;
-    var wid = col / warp_size;
-
-    for (var offset = warp_size / 2u; offset > 0u; offset = offset / 2u) {
-        if (lane < offset) {
-            shared_sum_sq[wid * warp_size + lane] += shared_sum_sq[wid * warp_size + lane + offset];
+    var stride = 128u;
+    while (stride > 0u) {
+        if (col < stride) {
+            let a = wg_data[col];
+            let b = wg_data[col + stride];
+            wg_data[col] = a + b;
         }
         workgroupBarrier();
+        stride = stride / 2u;
     }
 
-    if (wid == 0u) {
-        var warp_sum = 0.0;
-        let num_warps = (hidden_dim + warp_size - 1u) / warp_size;
-        for (var i = 0u; i < num_warps; i++) {
-            warp_sum += shared_sum_sq[i * warp_size];
-        }
-        let inv_rms = inverseSqrt(warp_sum / f32(hidden_dim) + 1e-5);
-        shared_sum_sq[0u] = inv_rms;
+    var inv_rms = 1.0;
+    if (col == 0u) {
+        let ss = wg_data[0u];
+        inv_rms = inverseSqrt(ss / f32(hidden_dim) + 1e-5);
+        wg_data[0u] = inv_rms;
     }
     workgroupBarrier();
+    inv_rms = wg_data[0u];
 
-    if (col < hidden_dim) {
-        let val = input[row * hidden_dim + col];
-        output[row * hidden_dim + col] = val * shared_sum_sq[0u];
+    for (var c = col; c < hidden_dim; c = c + 256u) {
+        let v = input[row * hidden_dim + c];
+        output[row * hidden_dim + c] = v * inv_rms;
     }
 }
 "#;
@@ -147,9 +145,9 @@ impl RmsNormOp {
             hidden_dim
         );
 
-        if hidden_dim > 1024 {
+        if hidden_dim > 256 {
             return Err(FerrisResError::Unsupported(format!(
-                "RmsNorm hidden_dim {} exceeds max workgroup size 1024",
+                "RmsNorm hidden_dim {} exceeds max workgroup size 256",
                 hidden_dim
             )));
         }

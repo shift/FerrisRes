@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 #[tokio::test]
 async fn test_block_attn_res_forward() {
-    let _ = tracing_subscriber::fmt().with_env_filter("debug").try_init();
+    let _ = tracing_subscriber::fmt().try_init();
 
     let compute = WgpuCompute::new().await.expect("Failed to create WgpuCompute");
 
@@ -29,6 +29,7 @@ async fn test_block_attn_res_forward() {
     let batch_size: u32 = 1;
     let input_bytes = batch_size as usize * hidden_dim * std::mem::size_of::<f32>();
 
+    let input_data: Vec<f32> = (0..hidden_dim).map(|i| (i as f32) * 0.01 + 1.0).collect();
     let input_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Test Input"),
         size: input_bytes as u64,
@@ -37,15 +38,11 @@ async fn test_block_attn_res_forward() {
             | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: true,
     });
-    {
-        let mut mapped = input_buffer.slice(..).get_mapped_range_mut();
-        let data = bytemuck::cast_slice_mut::<u8, f32>(&mut mapped);
-        for (i, v) in data.iter_mut().enumerate() {
-            *v = (i as f32) * 0.01 + 1.0;
-        }
-        drop(mapped);
-        input_buffer.unmap();
-    }
+    input_buffer
+        .slice(..)
+        .get_mapped_range_mut()
+        .copy_from_slice(bytemuck::cast_slice(&input_data));
+    input_buffer.unmap();
     let input = GpuBuffer::from_existing(input_buffer, input_bytes);
 
     let output_bytes = input_bytes;
@@ -78,10 +75,10 @@ async fn test_block_attn_res_forward() {
 
     let slice = staging.slice(..);
     slice.map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
 
     let mapped = slice.get_mapped_range();
-    let result: &[f32] = bytemuck::cast_slice(&mapped);
+    let result: &[f32] = bytemuck::cast_slice::<u8, f32>(&mapped);
 
     let all_zero = result.iter().all(|&v| v == 0.0);
     assert!(!all_zero, "Output should not be all zeros");

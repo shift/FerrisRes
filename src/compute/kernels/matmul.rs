@@ -1,11 +1,9 @@
 use std::sync::Arc;
-use wgpu::Device;
+use wgpu::{Device, BufferDescriptor, BufferUsages, BindGroupLayoutEntry, ShaderStages, BindingType, BufferBindingType};
 use crate::compute::GpuBuffer;
 use crate::error::Result;
 
 const SHADER: &str = r#"
-override TILE_SIZE: u32 = 64u;
-
 struct Params {
     M: u32,
     K: u32,
@@ -15,45 +13,45 @@ struct Params {
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read> b: array<f32>;
 @group(0) @binding(2) var<storage, read_write> c: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
 
-var<private> params: Params;
+var<workgroup> tile_a: array<f32, 16 * 16>;
+var<workgroup> tile_b: array<f32, 16 * 16>;
 
-var<workgroup> tile_a: array<f32, 64 * 64>;
-var<workgroup> tile_b: array<f32, 64 * 64>;
-
-@compute @workgroup_size(TILE_SIZE, TILE_SIZE)
-fn matmul(@builtin(global_invocation_id) gid: vec3<u32>) {
+@compute @workgroup_size(16, 16)
+fn matmul(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let row = gid.x;
     let col = gid.y;
-    let local_row = local_invocation_id.x;
-    let local_col = local_invocation_id.y;
+    let local_row = lid.x;
+    let local_col = lid.y;
+    let tile_size = 16u;
 
     var acc: f32 = 0.0;
-    let num_tiles = (params.K + TILE_SIZE - 1u) / TILE_SIZE;
+    let num_tiles = (params.K + tile_size - 1u) / tile_size;
 
     for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {
-        let a_col = t * TILE_SIZE + local_col;
-        let b_row = t * TILE_SIZE + local_row;
+        let a_col = t * tile_size + local_col;
+        let b_row = t * tile_size + local_row;
 
         let a_valid = row < params.M && a_col < params.K;
         let b_valid = b_row < params.K && col < params.N;
 
         if (a_valid) {
-            tile_a[local_row * TILE_SIZE + local_col] = a[row * params.K + a_col];
+            tile_a[local_row * tile_size + local_col] = a[row * params.K + a_col];
         } else {
-            tile_a[local_row * TILE_SIZE + local_col] = 0.0;
+            tile_a[local_row * tile_size + local_col] = 0.0;
         }
 
         if (b_valid) {
-            tile_b[local_row * TILE_SIZE + local_col] = b[b_row * params.N + col];
+            tile_b[local_row * tile_size + local_col] = b[b_row * params.N + col];
         } else {
-            tile_b[local_row * TILE_SIZE + local_col] = 0.0;
+            tile_b[local_row * tile_size + local_col] = 0.0;
         }
 
         workgroupBarrier();
 
-        for (var i: u32 = 0u; i < TILE_SIZE; i = i + 1u) {
-            acc = acc + tile_a[local_row * TILE_SIZE + i] * tile_b[i * TILE_SIZE + local_col];
+        for (var i: u32 = 0u; i < tile_size; i = i + 1u) {
+            acc = acc + tile_a[local_row * tile_size + i] * tile_b[i * tile_size + local_col];
         }
 
         workgroupBarrier();
@@ -83,31 +81,41 @@ impl MatMulOp {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("MatMul Bind Group Layout"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
+                BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
+                BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
+                BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -119,7 +127,7 @@ impl MatMulOp {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("MatMul Pipeline Layout"),
             bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 12,
+            immediate_size: 0,
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -149,18 +157,27 @@ impl MatMulOp {
         k: u32,
         n: u32,
     ) -> Result<()> {
-        let tile_size = 64u32;
+        let tile_size = 16u32;
         let workgroup_count_x = (m + tile_size - 1) / tile_size;
         let workgroup_count_y = (n + tile_size - 1) / tile_size;
 
         tracing::debug!(
             "MatMulOp dispatch: M={} K={} N={} workgroups=({},{},1)",
-            m,
-            k,
-            n,
-            workgroup_count_x,
-            workgroup_count_y
+            m, k, n, workgroup_count_x, workgroup_count_y
         );
+
+        let params_data: [u32; 3] = [m, k, n];
+        let params_buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("MatMul Params"),
+            size: 12,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        params_buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .copy_from_slice(bytemuck::cast_slice(&params_data));
+        params_buffer.unmap();
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("MatMul Bind Group"),
@@ -178,6 +195,10 @@ impl MatMulOp {
                     binding: 2,
                     resource: c.buffer().as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -188,7 +209,6 @@ impl MatMulOp {
 
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.set_immediates(0, &[m.to_le_bytes(), k.to_le_bytes(), n.to_le_bytes()].concat());
         pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1);
 
         drop(pass);

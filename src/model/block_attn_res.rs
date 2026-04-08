@@ -9,21 +9,126 @@ use crate::model::config::BlockAttnResConfig;
 use crate::model::linear::Linear;
 use crate::error::Result;
 
+const HEAD_WEIGHT_MUL_WGSL: &str = r#"
+    struct Params {
+        batch_size: u32,
+        num_heads: u32,
+        head_dim: u32,
+    }
+
+    @group(0) @binding(0) var<storage, read> weights: array<f32>;
+    @group(0) @binding(1) var<storage, read> values: array<f32>;
+    @group(0) @binding(2) var<storage, read_write> output: array<f32>;
+    @group(0) @binding(3) var<uniform> p: Params;
+
+    @compute @workgroup_size(256)
+    fn head_weight_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
+        let idx = gid.x;
+        let total = p.batch_size * p.num_heads * p.head_dim;
+        if (idx >= total) {
+            return;
+        }
+
+        let b = idx / (p.num_heads * p.head_dim);
+        let remainder = idx % (p.num_heads * p.head_dim);
+        let h = remainder / p.head_dim;
+
+        let w = weights[b * p.num_heads + h];
+        output[idx] = w * values[idx];
+    }
+    "#;
+
+struct HeadWeightMulOp {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl HeadWeightMulOp {
+    fn new(device: &Device) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Head Weight Mul Shader"),
+            source: wgpu::ShaderSource::Wgsl(HEAD_WEIGHT_MUL_WGSL.into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Head Weight Mul BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Head Weight Mul Pipeline Layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Head Weight Mul Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("head_weight_mul"),
+            cache: None,
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+
+        Self { pipeline, bind_group_layout }
+    }
+}
+
 pub struct BlockAttnResLayer {
     layer_number: usize,
+    hidden_dim: usize,
+    num_heads: usize,
+    head_dim: usize,
 
-    #[allow(dead_code)]
     attn_norm: RmsNormOp,
-    #[allow(dead_code)]
-    attn_qkv: Linear,
-    #[allow(dead_code)]
-    attn_out: Linear,
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    out_proj: Linear,
 
-    #[allow(dead_code)]
     ff_norm: RmsNormOp,
-    #[allow(dead_code)]
     ff_up: Linear,
-    #[allow(dead_code)]
     ff_down: Linear,
 
     #[allow(dead_code)]
@@ -34,15 +139,14 @@ pub struct BlockAttnResLayer {
     attn_res_norm: RmsNormOp,
 
     elementwise: ElementWiseOp,
+    matmul: MatMulOp,
+    head_weight_mul: HeadWeightMulOp,
     #[allow(dead_code)]
     softmax: SoftmaxOp,
-    #[allow(dead_code)]
-    matmul: MatMulOp,
 
     device: Arc<Device>,
     #[allow(dead_code)]
     queue: Arc<Queue>,
-    hidden_dim: usize,
 }
 
 impl BlockAttnResLayer {
@@ -53,24 +157,44 @@ impl BlockAttnResLayer {
         layer_number: usize,
     ) -> Result<Self> {
         tracing::info!(
-            "Creating BlockAttnResLayer {}: hidden_dim={} intermediate_dim={}",
-            layer_number, config.hidden_dim, config.intermediate_dim
+            "Creating BlockAttnResLayer {}: hidden_dim={} intermediate_dim={} num_heads={}",
+            layer_number, config.hidden_dim, config.intermediate_dim, config.attention_heads
+        );
+
+        let num_heads = config.attention_heads;
+        let head_dim = config.hidden_dim / num_heads;
+        assert_eq!(
+            config.hidden_dim % num_heads,
+            0,
+            "hidden_dim must be divisible by num_heads"
         );
 
         let attn_norm = RmsNormOp::new(&device)?;
         let ff_norm = RmsNormOp::new(&device)?;
         let attn_res_norm = RmsNormOp::new(&device)?;
 
-        let _head_dim = config.hidden_dim / config.attention_heads;
-        let qkv_total = 3 * config.hidden_dim;
-        let attn_qkv = Linear::new(
+        let q_proj = Linear::new(
             Arc::clone(&device),
             Arc::clone(&queue),
             config.hidden_dim,
-            qkv_total,
+            config.hidden_dim,
             false,
         )?;
-        let attn_out = Linear::new(
+        let k_proj = Linear::new(
+            Arc::clone(&device),
+            Arc::clone(&queue),
+            config.hidden_dim,
+            config.hidden_dim,
+            false,
+        )?;
+        let v_proj = Linear::new(
+            Arc::clone(&device),
+            Arc::clone(&queue),
+            config.hidden_dim,
+            config.hidden_dim,
+            false,
+        )?;
+        let out_proj = Linear::new(
             Arc::clone(&device),
             Arc::clone(&queue),
             config.hidden_dim,
@@ -107,16 +231,25 @@ impl BlockAttnResLayer {
         let elementwise = ElementWiseOp::new(&device);
         let softmax = SoftmaxOp::new(&device)?;
         let matmul = MatMulOp::new(&device);
+        let head_weight_mul = HeadWeightMulOp::new(&device);
 
         let hidden_dim = config.hidden_dim;
 
-        tracing::info!("BlockAttnResLayer {} created successfully", layer_number);
+        tracing::info!(
+            "BlockAttnResLayer {} created: heads={} head_dim={}",
+            layer_number, num_heads, head_dim
+        );
 
         Ok(Self {
             layer_number,
+            hidden_dim,
+            num_heads,
+            head_dim,
             attn_norm,
-            attn_qkv,
-            attn_out,
+            q_proj,
+            k_proj,
+            v_proj,
+            out_proj,
             ff_norm,
             ff_up,
             ff_down,
@@ -124,11 +257,11 @@ impl BlockAttnResLayer {
             attn_res_proj,
             attn_res_norm,
             elementwise,
-            softmax,
             matmul,
+            head_weight_mul,
+            softmax,
             device,
             queue,
-            hidden_dim,
         })
     }
 
@@ -141,20 +274,22 @@ impl BlockAttnResLayer {
         batch_size: u32,
     ) -> Result<()> {
         tracing::debug!(
-            "BlockAttnResLayer::forward_intra_block layer={} batch={}",
-            self.layer_number, batch_size
+            "BlockAttnResLayer::forward_intra_block layer={} batch={} heads={}",
+            self.layer_number, batch_size, self.num_heads
         );
 
         let hidden_dim = self.hidden_dim as u32;
         let intermediate_dim = self.ff_up.out_features() as u32;
         let numel = batch_size * hidden_dim;
 
+        // --- Self-Attention ---
+
+        // 1. Pre-norm
         let normed = GpuBuffer::new(
             &self.device,
             batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
             Some("intra_normed"),
         )?;
-
         self.attn_norm.dispatch(
             &self.device,
             encoder,
@@ -164,22 +299,102 @@ impl BlockAttnResLayer {
             hidden_dim,
         )?;
 
-        let qkv_buf = GpuBuffer::new(
-            &self.device,
-            batch_size as usize * 3 * self.hidden_dim * std::mem::size_of::<f32>(),
-            Some("intra_qkv"),
-        )?;
-        self.attn_qkv.forward(encoder, &normed, &qkv_buf, batch_size)?;
-
-        let attn_intermediate = GpuBuffer::new(
+        // 2-4. Q, K, V projections
+        let q_buf = GpuBuffer::new(
             &self.device,
             batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
-            Some("intra_attn_intermediate"),
+            Some("intra_q"),
         )?;
-        self.attn_out.forward(encoder, &qkv_buf, &attn_intermediate, batch_size)?;
+        let k_buf = GpuBuffer::new(
+            &self.device,
+            batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
+            Some("intra_k"),
+        )?;
+        let v_buf = GpuBuffer::new(
+            &self.device,
+            batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
+            Some("intra_v"),
+        )?;
+        self.q_proj.forward(encoder, &normed, &q_buf, batch_size)?;
+        self.k_proj.forward(encoder, &normed, &k_buf, batch_size)?;
+        self.v_proj.forward(encoder, &normed, &v_buf, batch_size)?;
 
-        self.elementwise.dispatch_add(encoder, hidden_states, &attn_intermediate, output, numel)?;
+        // 5-6. Scaled dot-product attention (seq_len=1)
+        // Per-head dot product: scores[b, h] = dot(Q_h, K_h) / sqrt(head_dim)
+        // View Q,K as [batch*num_heads, head_dim], compute per-row dot product via matmul
 
+        let head_dim = self.head_dim as u32;
+        let num_heads = self.num_heads as u32;
+
+        let scores = GpuBuffer::new(
+            &self.device,
+            batch_size as usize * self.num_heads * std::mem::size_of::<f32>(),
+            Some("intra_attn_scores"),
+        )?;
+
+        self.matmul.dispatch(
+            encoder,
+            &q_buf,
+            &k_buf,
+            &scores,
+            batch_size * num_heads,
+            head_dim,
+            1u32,
+        )?;
+
+        let scale_factor = 1.0f32 / (self.head_dim as f32).sqrt();
+        self.elementwise.dispatch_scale(
+            encoder,
+            &scores,
+            &scores,
+            scale_factor,
+            batch_size * num_heads,
+        )?;
+
+        let attn_weights = GpuBuffer::new(
+            &self.device,
+            batch_size as usize * self.num_heads * std::mem::size_of::<f32>(),
+            Some("intra_attn_weights"),
+        )?;
+        self.softmax.dispatch(
+            encoder,
+            &scores,
+            &attn_weights,
+            batch_size,
+            num_heads,
+        )?;
+
+        // Weighted V: attn_out[b, h*d+j] = attn_weights[b, h] * V[b, h*d+j]
+        let attn_out = GpuBuffer::new(
+            &self.device,
+            batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
+            Some("intra_attn_out"),
+        )?;
+
+        self.dispatch_head_weight_mul(
+            encoder,
+            &attn_weights,
+            &v_buf,
+            &attn_out,
+            batch_size,
+            num_heads,
+            head_dim,
+        )?;
+
+        // 8. Output projection
+        let proj_out = GpuBuffer::new(
+            &self.device,
+            batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
+            Some("intra_proj_out"),
+        )?;
+        self.out_proj.forward(encoder, &attn_out, &proj_out, batch_size)?;
+
+        // 9. Residual connection
+        self.elementwise.dispatch_add(encoder, hidden_states, &proj_out, output, numel)?;
+
+        // --- Feed-Forward Network ---
+
+        // 10. Pre-norm
         let ff_normed = GpuBuffer::new(
             &self.device,
             batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
@@ -194,6 +409,7 @@ impl BlockAttnResLayer {
             hidden_dim,
         )?;
 
+        // 11. FFN up projection + ReLU
         let ff_hidden = GpuBuffer::new(
             &self.device,
             batch_size as usize * self.ff_up.out_features() * std::mem::size_of::<f32>(),
@@ -201,14 +417,14 @@ impl BlockAttnResLayer {
         )?;
         self.ff_up.forward(encoder, &ff_normed, &ff_hidden, batch_size)?;
 
-        self.elementwise.dispatch_scale(
+        self.elementwise.dispatch_relu(
             encoder,
             &ff_hidden,
             &ff_hidden,
-            0.5f32,
             batch_size * intermediate_dim,
         )?;
 
+        // FFN down projection
         let ff_out = GpuBuffer::new(
             &self.device,
             batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
@@ -217,12 +433,76 @@ impl BlockAttnResLayer {
         self.ff_down.forward(encoder, &ff_hidden, &ff_out, batch_size)?;
 
         self.elementwise.dispatch_add(encoder, output, &ff_out, output, numel)?;
+
         self.elementwise.dispatch_add(encoder, partial_sum, output, partial_sum, numel)?;
 
         tracing::debug!(
             "BlockAttnResLayer::forward_intra_block layer={} complete",
             self.layer_number
         );
+
+        Ok(())
+    }
+
+    fn dispatch_head_weight_mul(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        weights: &GpuBuffer,
+        values: &GpuBuffer,
+        output: &GpuBuffer,
+        batch_size: u32,
+        num_heads: u32,
+        head_dim: u32,
+    ) -> Result<()> {
+        let params_data: [u32; 3] = [batch_size, num_heads, head_dim];
+        let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Head Weight Mul Params"),
+            size: 12,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        params_buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .copy_from_slice(bytemuck::cast_slice(&params_data));
+        params_buffer.unmap();
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Head Weight Mul Bind Group"),
+            layout: &self.head_weight_mul.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: weights.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: values.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: output.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let total_elements = batch_size * num_heads * head_dim;
+        let workgroup_count = (total_elements + 255) / 256;
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Head Weight Mul Compute Pass"),
+            timestamp_writes: None,
+        });
+
+        pass.set_pipeline(&self.head_weight_mul.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(workgroup_count, 1, 1);
+
+        drop(pass);
 
         Ok(())
     }

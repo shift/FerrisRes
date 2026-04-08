@@ -28,11 +28,17 @@ impl WgpuCompute {
             .await
             .map_err(|e| FerrisResError::Device(format!("Failed to find adapter: {}", e)))?;
 
+        let required_features = if adapter.features().contains(wgpu::Features::IMMEDIATES) {
+            wgpu::Features::IMMEDIATES
+        } else {
+            wgpu::Features::empty()
+        };
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("FerrisRes Device"),
-                    required_features: wgpu::Features::empty(),
+                    required_features,
                     required_limits: wgpu::Limits::downlevel_defaults(),
                     memory_hints: wgpu::MemoryHints::default(),
                     trace: wgpu::Trace::Off,
