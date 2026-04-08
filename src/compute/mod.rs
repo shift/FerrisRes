@@ -12,3 +12,4 @@ pub use kernels::softmax::SoftmaxOp;
 pub use kernels::rmsnorm::RmsNormOp;
 pub use kernels::elementwise::ElementWiseOp;
 pub use kernels::matmul::MatMulOp;
+pub use kernels::moe::{MoEGatingOp, MoEExpertOp};

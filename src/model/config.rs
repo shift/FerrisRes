@@ -9,6 +9,9 @@ pub struct BlockAttnResConfig {
     pub include_embedding: bool,
     pub attention_heads: usize,
     pub intermediate_dim: usize,
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub use_moe: bool,
 }
 
 impl BlockAttnResConfig {
@@ -23,6 +26,9 @@ impl BlockAttnResConfig {
             include_embedding: true,
             attention_heads: 8,
             intermediate_dim: 4 * hidden_dim,
+            num_experts: 8,
+            top_k: 2,
+            use_moe: false,
         }
     }
 

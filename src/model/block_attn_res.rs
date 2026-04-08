@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::sync::Arc;
 use wgpu::{Device, Queue};
 use crate::compute::GpuBuffer;
@@ -7,6 +8,7 @@ use crate::compute::kernels::softmax::SoftmaxOp;
 use crate::compute::kernels::elementwise::ElementWiseOp;
 use crate::model::config::BlockAttnResConfig;
 use crate::model::linear::Linear;
+use crate::model::moe_linear::MoELinear;
 use crate::training::{CheckpointGranularity, CheckpointStore};
 use crate::error::Result;
 
@@ -121,6 +123,8 @@ pub struct BlockAttnResLayer {
     hidden_dim: usize,
     num_heads: usize,
     head_dim: usize,
+    #[allow(dead_code)]
+    intermediate_dim: usize,
 
     attn_norm: RmsNormOp,
     q_proj: Linear,
@@ -129,8 +133,9 @@ pub struct BlockAttnResLayer {
     out_proj: Linear,
 
     ff_norm: RmsNormOp,
-    ff_up: Linear,
-    ff_down: Linear,
+    ff_up: Option<Linear>,
+    ff_down: Option<Linear>,
+    moe_linear: Option<RefCell<MoELinear>>,
 
     #[allow(dead_code)]
     pseudo_query: GpuBuffer,
@@ -203,20 +208,33 @@ impl BlockAttnResLayer {
             false,
         )?;
 
-        let ff_up = Linear::new(
-            Arc::clone(&device),
-            Arc::clone(&queue),
-            config.hidden_dim,
-            config.intermediate_dim,
-            false,
-        )?;
-        let ff_down = Linear::new(
-            Arc::clone(&device),
-            Arc::clone(&queue),
-            config.intermediate_dim,
-            config.hidden_dim,
-            false,
-        )?;
+        let (ff_up, ff_down, moe_linear) = if config.use_moe {
+            let moe = MoELinear::new(
+                &device,
+                &queue,
+                config.hidden_dim,
+                config.intermediate_dim,
+                config.num_experts,
+                config.top_k,
+            )?;
+            (None, None, Some(RefCell::new(moe)))
+        } else {
+            let up = Linear::new(
+                Arc::clone(&device),
+                Arc::clone(&queue),
+                config.hidden_dim,
+                config.intermediate_dim,
+                false,
+            )?;
+            let down = Linear::new(
+                Arc::clone(&device),
+                Arc::clone(&queue),
+                config.intermediate_dim,
+                config.hidden_dim,
+                false,
+            )?;
+            (Some(up), Some(down), None)
+        };
 
         let pseudo_query_bytes = config.hidden_dim * std::mem::size_of::<f32>();
         let pseudo_query = GpuBuffer::zeros(&device, pseudo_query_bytes, Some("Pseudo Query"))?;
@@ -233,7 +251,7 @@ impl BlockAttnResLayer {
         let softmax = SoftmaxOp::new(&device)?;
         let matmul = MatMulOp::new(&device);
         let head_weight_mul = HeadWeightMulOp::new(&device);
-
+        
         let hidden_dim = config.hidden_dim;
 
         tracing::info!(
@@ -246,6 +264,7 @@ impl BlockAttnResLayer {
             hidden_dim,
             num_heads,
             head_dim,
+            intermediate_dim: config.intermediate_dim,
             attn_norm,
             q_proj,
             k_proj,
@@ -254,6 +273,7 @@ impl BlockAttnResLayer {
             ff_norm,
             ff_up,
             ff_down,
+            moe_linear,
             pseudo_query,
             attn_res_proj,
             attn_res_norm,
@@ -301,7 +321,7 @@ impl BlockAttnResLayer {
         }
 
         let hidden_dim = self.hidden_dim as u32;
-        let intermediate_dim = self.ff_up.out_features() as u32;
+        let intermediate_dim = self.intermediate_dim as u32;
         let numel = batch_size * hidden_dim;
 
         // --- Self-Attention ---
@@ -431,30 +451,35 @@ impl BlockAttnResLayer {
             hidden_dim,
         )?;
 
-        // 11. FFN up projection + ReLU
-        let ff_hidden = GpuBuffer::new(
-            &self.device,
-            batch_size as usize * self.ff_up.out_features() * std::mem::size_of::<f32>(),
-            Some("intra_ff_hidden"),
-        )?;
-        self.ff_up.forward(encoder, &ff_normed, &ff_hidden, batch_size)?;
+        // 11. FFN up projection + ReLU / MoE
+        if let Some(ref moe) = self.moe_linear {
+            let mut moe_ref = moe.borrow_mut();
+            let ff_out = moe_ref.forward(encoder, &ff_normed, batch_size as usize)?;
+            self.elementwise.dispatch_add(encoder, output, ff_out, output, numel)?;
+        } else {
+            let ff_hidden = GpuBuffer::new(
+                &self.device,
+                batch_size as usize * self.intermediate_dim * std::mem::size_of::<f32>(),
+                Some("intra_ff_hidden"),
+            )?;
+            self.ff_up.as_ref().unwrap().forward(encoder, &ff_normed, &ff_hidden, batch_size)?;
 
-        self.elementwise.dispatch_relu(
-            encoder,
-            &ff_hidden,
-            &ff_hidden,
-            batch_size * intermediate_dim,
-        )?;
+            self.elementwise.dispatch_relu(
+                encoder,
+                &ff_hidden,
+                &ff_hidden,
+                batch_size * intermediate_dim,
+            )?;
 
-        // FFN down projection
-        let ff_out = GpuBuffer::new(
-            &self.device,
-            batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
-            Some("intra_ff_out"),
-        )?;
-        self.ff_down.forward(encoder, &ff_hidden, &ff_out, batch_size)?;
+            let ff_out = GpuBuffer::new(
+                &self.device,
+                batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
+                Some("intra_ff_out"),
+            )?;
+            self.ff_down.as_ref().unwrap().forward(encoder, &ff_hidden, &ff_out, batch_size)?;
 
-        self.elementwise.dispatch_add(encoder, output, &ff_out, output, numel)?;
+            self.elementwise.dispatch_add(encoder, output, &ff_out, output, numel)?;
+        }
 
         self.elementwise.dispatch_add(encoder, partial_sum, output, partial_sum, numel)?;
 

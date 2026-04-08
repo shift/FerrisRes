@@ -3,7 +3,7 @@ use wgpu::{Device, BufferDescriptor, BufferUsages, BindGroupLayoutEntry, ShaderS
 use crate::compute::GpuBuffer;
 use crate::error::Result;
 
-const MOE_GATING_WGSL: &str = r#"
+pub const MOE_GATING_WGSL: &str = r#"
 struct MoEParams {
     num_experts: u32,
     top_k: u32,
@@ -24,7 +24,7 @@ fn top_k_gate(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let offset = token_idx * params.num_experts;
-    let mut expert_weights_arr = array<f32, 128>();
+    var expert_weights_arr: array<f32, 128>;
     let max_k = min(params.top_k, params.num_experts);
 
     for (var i: u32; i < params.num_experts; i = i + 1u) {
@@ -63,7 +63,7 @@ fn compute_gate_softmax(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let offset = token_idx * params.num_experts;
-    var max_val = -1e9;
+    var max_val: f32 = -1e9;
     for (var i: u32; i < params.num_experts; i = i + 1u) {
         max_val = max(max_val, gate_logits[offset + i]);
     }
@@ -81,7 +81,7 @@ fn compute_gate_softmax(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-const MOE_DISPATCH_WGSL: &str = r#"
+pub const MOE_DISPATCH_WGSL: &str = r#"
 struct DispatchParams {
     num_experts: u32,
     top_k: u32,
@@ -129,7 +129,7 @@ fn compute_top_k_indices(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-const MOE_GATHER_WGSL: &str = r#"
+pub const MOE_GATHER_WGSL: &str = r#"
 struct GatherParams {
     num_experts: u32,
     top_k: u32,
