@@ -234,7 +234,7 @@ impl AdamOptimizer {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Adam Pipeline Layout"),
             bind_group_layouts: &[Some(&adam_bind_group_layout)],
-            immediate_size: std::mem::size_of::<AdamParams>() as u32,
+            immediate_size: 0,
         });
 
         let adam_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -423,7 +423,7 @@ impl CrossEntropyLoss {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Cross Entropy Loss Pipeline Layout"),
             bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: std::mem::size_of::<LossParams>() as u32,
+            immediate_size: 0,
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
