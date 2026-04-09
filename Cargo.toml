@@ -27,6 +27,7 @@ rand = "0.8"
 [dev-dependencies]
 assert_matches = "1"
 criterion = { version = "0.5", features = ["async_tokio"] }
+proptest = "1"
 
 [features]
 default = ["vulkan"]
