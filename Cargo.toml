@@ -3,7 +3,6 @@ name = "ferrisres"
 version = "0.1.0"
 edition = "2021"
 description = "Block AttnRes runtime for distributed SLM/LLM training and inference"
-license = "MIT OR Apache-2.0"
 authors = ["FerrisRes Team"]
 repository = "https://github.com/shift/FerrisRes"
 rust-version = "1.75"
