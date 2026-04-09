@@ -29,7 +29,7 @@ fn rope_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let pos = start_pos + flat_idx / (num_heads * head_dim);
+    let pos = params.start_pos + flat_idx / (num_heads * head_dim);
     let head_offset = flat_idx % (num_heads * head_dim);
     let head_idx = head_offset / head_dim;
     let dim_idx = head_offset % head_dim;

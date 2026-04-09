@@ -3,6 +3,7 @@ use ferrisres::compute::{
     GpuBuffer, WgpuCompute, MatMulOp, RmsNormOp, SoftmaxOp, ElementWiseOp, MoEGatingOp,
 };
 use ferrisres::compute::kernels::moe::{MOE_DISPATCH_WGSL, MOE_GATHER_WGSL};
+use ferrisres::model::{BlockAttnResConfig, BlockAttnResLayer};
 
 async fn create_test_compute() -> (WgpuCompute, Arc<wgpu::Device>, Arc<wgpu::Queue>) {
     let compute = WgpuCompute::new().await.unwrap();
@@ -625,5 +626,26 @@ async fn test_moe_expert_gather() {
         (result[1] - 1.8).abs() < 1e-2,
         "moe gather[1]: got {}, want 1.8",
         result[1]
+    );
+}
+
+/// Verify that BlockAttnResLayer constructs without panic when use_moe=true.
+/// This test checks that MoELinear is wired in via the config flag.
+#[tokio::test]
+async fn test_moe_block_attn_res_layer_construction() {
+    let (_compute, device, queue) = create_test_compute().await;
+
+    let mut config = BlockAttnResConfig::new(64);
+    config.use_moe = true;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.attention_heads = 4;
+    config.intermediate_dim = 128;
+
+    let layer = BlockAttnResLayer::new(Arc::clone(&device), Arc::clone(&queue), &config, 0);
+    assert!(
+        layer.is_ok(),
+        "BlockAttnResLayer::new with use_moe=true should succeed, got: {:?}",
+        layer.err()
     );
 }
