@@ -300,4 +300,21 @@ The project is not yet open for external contributions while core development is
 
 ## License
 
-A license has not been selected yet. All rights are reserved until a license is published.
+FerrisRes is dual-licensed:
+
+**AGPL-3.0-or-later** for free and open-source use. If you use FerrisRes in a
+product or service you must publish the complete corresponding source code of
+that product or service under the AGPL-3.0. See [`LICENSE`](LICENSE) for the
+full terms.
+
+**Commercial license** for use in proprietary or commercial products and
+services that do not comply with the AGPL-3.0. To obtain a commercial license,
+contact: shift+licensing@someone.section.me
+
+### Contributor License Agreement
+
+Because FerrisRes is dual-licensed, any external code contribution must be
+accompanied by a signed Contributor License Agreement (CLA) that grants the
+project owner the right to distribute your contribution under both the AGPL-3.0
+and a commercial license. A CLA will be published alongside the contribution
+guide at the time of the public release.
