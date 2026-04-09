@@ -90,6 +90,45 @@ impl LayerKVCache {
         &self.value_cache
     }
 
+    pub fn update_batch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        new_k: &GpuBuffer,
+        new_v: &GpuBuffer,
+        num_tokens: u32,
+    ) -> Result<u32> {
+        let pos = self.current_len.load(Ordering::Relaxed);
+        if pos + num_tokens > self.max_seq_len {
+            return Err(crate::error::FerrisResError::Shape(format!(
+                "KVCache overflow: current_len {} + num_tokens {} > max_seq_len {}",
+                pos, num_tokens, self.max_seq_len
+            )));
+        }
+
+        let per_pos_size = self.num_heads as u64 * self.head_dim as u64 * std::mem::size_of::<f32>() as u64;
+        let dst_offset = pos as u64 * per_pos_size;
+        let copy_size = num_tokens as u64 * per_pos_size;
+
+        encoder.copy_buffer_to_buffer(
+            new_k.buffer(),
+            0,
+            self.key_cache.buffer(),
+            dst_offset,
+            Some(copy_size),
+        );
+
+        encoder.copy_buffer_to_buffer(
+            new_v.buffer(),
+            0,
+            self.value_cache.buffer(),
+            dst_offset,
+            Some(copy_size),
+        );
+
+        self.current_len.fetch_add(num_tokens, Ordering::Relaxed);
+        Ok(self.current_len.load(Ordering::Relaxed))
+    }
+
     pub fn reset(&self) {
         self.current_len.store(0, Ordering::Relaxed);
     }

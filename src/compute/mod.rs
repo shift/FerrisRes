@@ -16,3 +16,4 @@ pub use kernels::moe::{MoEGatingOp, MoEExpertOp};
 pub use kernels::rope::RopeOp;
 pub use kernels::im2col::Im2ColOp;
 pub use kernels::flash_decode::FlashDecodeOp;
+pub use kernels::causal_mask::CausalMaskOp;

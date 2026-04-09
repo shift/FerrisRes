@@ -6,3 +6,4 @@ pub mod moe;
 pub mod rope;
 pub mod im2col;
 pub mod flash_decode;
+pub mod causal_mask;

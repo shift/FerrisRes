@@ -1,0 +1,276 @@
+use std::sync::Arc;
+use std::sync::mpsc;
+
+use wgpu::{Device, Queue};
+
+use crate::compute::buffer::GpuBuffer;
+use crate::inference::kv_cache::ModelKVCache;
+use crate::inference::sampling;
+use crate::model::embedding::TokenEmbedding;
+use crate::model::lm_head::LMHead;
+use crate::model::model::BlockAttnResModel;
+use crate::error::Result;
+
+pub struct GenerateConfig {
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub max_tokens: usize,
+    pub eos_token: Option<u32>,
+}
+
+impl Default for GenerateConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            max_tokens: 128,
+            eos_token: None,
+        }
+    }
+}
+
+pub struct TokenGenerator {
+    model: Arc<BlockAttnResModel>,
+    lm_head: Arc<LMHead>,
+    embedding: Arc<TokenEmbedding>,
+    kv_cache: ModelKVCache,
+    device: Arc<Device>,
+    queue: Arc<Queue>,
+    #[allow(dead_code)]
+    max_seq_len: u32,
+}
+
+fn readback_buffer(device: &Device, queue: &Queue, buffer: &GpuBuffer) -> Vec<f32> {
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("generator_readback"),
+        size: buffer.size() as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Generator Readback"),
+    });
+    encoder.copy_buffer_to_buffer(
+        buffer.buffer(),
+        0,
+        &staging,
+        0,
+        Some(buffer.size() as u64),
+    );
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    let _ = device.poll(wgpu::PollType::Poll);
+    let _ = rx.recv().unwrap();
+
+    let data = slice.get_mapped_range();
+    let floats: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+    drop(data);
+    staging.unmap();
+    floats
+}
+
+fn sample_token(logits: &[f32], config: &GenerateConfig) -> usize {
+    let mut logits = logits.to_vec();
+    if config.top_p < 1.0 {
+        return sampling::sample_top_p(&mut logits, config.top_p);
+    }
+    if config.top_k > 0 {
+        return sampling::sample_top_k(&mut logits, config.top_k);
+    }
+    if config.temperature != 1.0 {
+        return sampling::sample_temperature(&mut logits, config.temperature);
+    }
+    sampling::sample_argmax(&logits)
+}
+
+impl TokenGenerator {
+    pub fn new(
+        model: Arc<BlockAttnResModel>,
+        lm_head: LMHead,
+        embedding: TokenEmbedding,
+        device: Arc<Device>,
+        queue: Arc<Queue>,
+        max_seq_len: u32,
+    ) -> Result<Self> {
+        let config = model.config();
+        let num_heads = config.attention_heads as u32;
+        let head_dim = (config.hidden_dim / config.attention_heads) as u32;
+        let total_layers = config.total_layers() as u32;
+
+        let kv_cache = ModelKVCache::new(
+            Arc::clone(&device),
+            total_layers,
+            max_seq_len,
+            num_heads,
+            head_dim,
+        )?;
+
+        Ok(Self {
+            model,
+            lm_head: Arc::new(lm_head),
+            embedding: Arc::new(embedding),
+            kv_cache,
+            device,
+            queue,
+            max_seq_len,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn make_kv_cache(&self) -> Result<ModelKVCache> {
+        let config = self.model.config();
+        let num_heads = config.attention_heads as u32;
+        let head_dim = (config.hidden_dim / config.attention_heads) as u32;
+        let total_layers = config.total_layers() as u32;
+        ModelKVCache::new(
+            Arc::clone(&self.device),
+            total_layers,
+            self.max_seq_len,
+            num_heads,
+            head_dim,
+        )
+    }
+
+    pub fn generate(&self, prompt_tokens: &[u32], config: &GenerateConfig) -> Result<Vec<u32>> {
+        let hidden_dim = self.model.config().hidden_dim;
+        let f32_size = std::mem::size_of::<f32>();
+        let seq_len = prompt_tokens.len() as u32;
+
+        if seq_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        self.kv_cache.reset_all();
+
+        let mut output_tokens = Vec::new();
+
+        let hidden_bytes = seq_len as usize * hidden_dim * f32_size;
+        let hidden_states = GpuBuffer::new(&self.device, hidden_bytes, Some("prefill_hidden"))?;
+
+        let token_ids_bytes = prompt_tokens.len() * std::mem::size_of::<u32>();
+        let token_ids_buf = GpuBuffer::new(&self.device, token_ids_bytes, Some("prefill_token_ids"))?;
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Prefill Phase"),
+        });
+
+        {
+            let mut mapped = token_ids_buf.buffer().slice(..).get_mapped_range_mut();
+            mapped.copy_from_slice(bytemuck::cast_slice(prompt_tokens));
+            drop(mapped);
+        }
+
+        self.embedding.forward(&mut encoder, &token_ids_buf, &hidden_states, seq_len)?;
+
+        let mut current_hidden = hidden_states;
+        for (i, layer) in self.model.layers().iter().enumerate() {
+            let kv = self.kv_cache.layer(i);
+            current_hidden = layer.forward_prefill(&mut encoder, &current_hidden, kv, seq_len)?;
+        }
+
+        let last_hidden_bytes = hidden_dim * f32_size;
+        let last_hidden = GpuBuffer::new(&self.device, last_hidden_bytes, Some("prefill_last_hidden"))?;
+        let last_offset = ((seq_len - 1) as u64) * (hidden_dim as u64) * (f32_size as u64);
+        encoder.copy_buffer_to_buffer(
+            current_hidden.buffer(),
+            last_offset,
+            last_hidden.buffer(),
+            0,
+            Some(last_hidden_bytes as u64),
+        );
+
+        let vocab_size = self.lm_head.vocab_size();
+        let logits_bytes = vocab_size * f32_size;
+        let logits_buf = GpuBuffer::new(&self.device, logits_bytes, Some("prefill_logits"))?;
+        self.lm_head.forward(&mut encoder, &last_hidden, &logits_buf, 1)?;
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let logits = readback_buffer(&self.device, &self.queue, &logits_buf);
+        let mut next_token = sample_token(&logits, config) as u32;
+        output_tokens.push(next_token);
+
+        if config.eos_token == Some(next_token) || output_tokens.len() >= config.max_tokens {
+            return Ok(output_tokens);
+        }
+
+        for _ in 0..config.max_tokens.saturating_sub(1) {
+            let token_buf = GpuBuffer::new(
+                &self.device,
+                std::mem::size_of::<u32>(),
+                Some("decode_token_id"),
+            )?;
+            let embed_buf = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_embed"))?;
+
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Decode Step"),
+            });
+
+            {
+                let mut mapped = token_buf.buffer().slice(..).get_mapped_range_mut();
+                mapped.copy_from_slice(&next_token.to_le_bytes());
+                drop(mapped);
+            }
+
+            self.embedding.forward(&mut encoder, &token_buf, &embed_buf, 1)?;
+
+            let mut current = embed_buf;
+            for (i, layer) in self.model.layers().iter().enumerate() {
+                let kv = self.kv_cache.layer(i);
+                current = layer.forward_decode_token(&mut encoder, &current, kv)?;
+            }
+
+            let logits_buf = GpuBuffer::new(&self.device, logits_bytes, Some("decode_logits"))?;
+            self.lm_head.forward(&mut encoder, &current, &logits_buf, 1)?;
+
+            self.queue.submit(std::iter::once(encoder.finish()));
+
+            let logits = readback_buffer(&self.device, &self.queue, &logits_buf);
+            let next = sample_token(&logits, config) as u32;
+            output_tokens.push(next);
+            next_token = next;
+
+            if config.eos_token == Some(next) {
+                break;
+            }
+        }
+
+        Ok(output_tokens)
+    }
+
+    pub fn generate_stream(&self, prompt_tokens: Vec<u32>, config: GenerateConfig) -> mpsc::Receiver<u32> {
+        let (tx, rx) = mpsc::channel();
+
+        let tokens = self.generate(&prompt_tokens, &config).unwrap_or_default();
+
+        std::thread::spawn(move || {
+            for token in tokens {
+                if tx.send(token).is_err() {
+                    return;
+                }
+            }
+        });
+
+        rx
+    }
+
+    pub fn kv_cache(&self) -> &ModelKVCache {
+        &self.kv_cache
+    }
+
+    pub fn device(&self) -> &Arc<Device> {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &Arc<Queue> {
+        &self.queue
+    }
+}
