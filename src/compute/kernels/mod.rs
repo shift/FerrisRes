@@ -3,3 +3,6 @@ pub mod softmax;
 pub mod elementwise;
 pub mod rmsnorm;
 pub mod moe;
+pub mod rope;
+pub mod im2col;
+pub mod flash_decode;

@@ -21,6 +21,8 @@ anyhow = "1"
 ash = "0.38"
 clap = { version = "4", features = ["derive"] }
 sysinfo = "0.33"
+image = "0.25"
+rand = "0.8"
 
 [dev-dependencies]
 assert_matches = "1"

@@ -12,4 +12,4 @@ pub use device::{DeviceProfile, Capability};
 pub use tensor::{GpuTensor, Tensor};
 pub use compute::{GpuBuffer, WgpuCompute, MemoryBudget, MemoryPool, TiledCompute, ComputeDispatcher};
 pub use model::{ModelShard, ShardManager, QuantizedBuffer, QuantDtype, TokenEmbedding, SimpleTokenizer, BlockAttnResConfig, BlockAttnResModel};
-pub use inference::{TwoPhaseConfig, TwoPhaseInference, AutoregressiveGenerator, KVCache, Sampler, GenerationState};
+pub use inference::{TwoPhaseConfig, TwoPhaseInference, AutoregressiveGenerator, KVCache, Sampler, GenerationState, LayerKVCache, ModelKVCache};
