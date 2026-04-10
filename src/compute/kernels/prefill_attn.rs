@@ -1,46 +1,64 @@
 use std::sync::Arc;
 use wgpu::{
     BufferDescriptor, BufferUsages, BindGroupLayoutEntry, BindingType, BufferBindingType,
-    Device, Queue, ShaderStages,
+    Device, ShaderStages,
 };
 use crate::compute::GpuBuffer;
 use crate::error::Result;
 
-const FLASH_DECODE_WGSL: &str = r#"
+/// Prefill multi-head self-attention kernel.
+///
+/// Inputs Q, K, V all have layout `[seq_len, num_heads, head_dim]` (token-major).
+/// Output has the same layout `[seq_len, num_heads, head_dim]`.
+///
+/// Each invocation handles one (query_pos, head) pair.
+/// The kernel applies causal masking (positions after the query get -inf),
+/// online softmax (numerically stable), and produces the weighted V sum.
+const PREFILL_ATTN_WGSL: &str = r#"
     struct Params {
-        seq_len: u32,
+        seq_len:  u32,
         num_heads: u32,
-        head_dim: u32,
-        _pad: u32,
+        head_dim:  u32,
+        _pad:      u32,
     }
 
-    @group(0) @binding(0) var<storage, read> query: array<f32>;
-    @group(0) @binding(1) var<storage, read> key_cache: array<f32>;
-    @group(0) @binding(2) var<storage, read> value_cache: array<f32>;
+    @group(0) @binding(0) var<storage, read>       q:      array<f32>;
+    @group(0) @binding(1) var<storage, read>       k:      array<f32>;
+    @group(0) @binding(2) var<storage, read>       v:      array<f32>;
     @group(0) @binding(3) var<storage, read_write> output: array<f32>;
-    @group(0) @binding(4) var<uniform> params: Params;
+    @group(0) @binding(4) var<uniform>             params: Params;
 
-    @compute @workgroup_size(256)
-    fn flash_decode_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-        let h = gid.x;
+    // Each thread handles one (query_pos, head) pair.
+    // gid.x = q_pos, gid.y = head index
+    @compute @workgroup_size(16, 16)
+    fn prefill_attn_main(
+        @builtin(global_invocation_id) gid: vec3<u32>,
+    ) {
+        let q_pos     = gid.x;
+        let h         = gid.y;
+        let seq_len   = params.seq_len;
         let num_heads = params.num_heads;
-        let head_dim = params.head_dim;
-        let seq_len = params.seq_len;
+        let head_dim  = params.head_dim;
 
-        if (h >= num_heads) {
+        if (q_pos >= seq_len || h >= num_heads) {
             return;
         }
 
         let scale = 1.0 / sqrt(f32(head_dim));
 
+        // Base offset of Q[q_pos, h, :]
+        let q_base = q_pos * num_heads * head_dim + h * head_dim;
+
+        // --- Online softmax: one pass for max, one pass for weighted sum ---
+
         var max_score: f32 = -3.402823466e+38;
 
-        for (var s: u32 = 0u; s < seq_len; s = s + 1u) {
+        for (var k_pos: u32 = 0u; k_pos <= q_pos; k_pos = k_pos + 1u) {
+            // K[k_pos, h, :]
+            let k_base = k_pos * num_heads * head_dim + h * head_dim;
             var dot: f32 = 0.0;
-            let q_base = h * head_dim;
-            let k_base = s * num_heads * head_dim + h * head_dim;
             for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
-                dot += query[q_base + d] * key_cache[k_base + d];
+                dot += q[q_base + d] * k[k_base + d];
             }
             let score = dot * scale;
             if (score > max_score) {
@@ -49,49 +67,51 @@ const FLASH_DECODE_WGSL: &str = r#"
         }
 
         var sum_exp: f32 = 0.0;
+
+        // Initialise output slice to zero
+        let out_base = q_pos * num_heads * head_dim + h * head_dim;
         for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
-            output[h * head_dim + d] = 0.0;
+            output[out_base + d] = 0.0;
         }
 
-        for (var s: u32 = 0u; s < seq_len; s = s + 1u) {
+        for (var k_pos: u32 = 0u; k_pos <= q_pos; k_pos = k_pos + 1u) {
+            let k_base = k_pos * num_heads * head_dim + h * head_dim;
             var dot: f32 = 0.0;
-            let q_base = h * head_dim;
-            let k_base = s * num_heads * head_dim + h * head_dim;
             for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
-                dot += query[q_base + d] * key_cache[k_base + d];
+                dot += q[q_base + d] * k[k_base + d];
             }
             let weight = exp(dot * scale - max_score);
             sum_exp += weight;
 
-            let v_base = s * num_heads * head_dim + h * head_dim;
+            // V[k_pos, h, :]
+            let v_base = k_pos * num_heads * head_dim + h * head_dim;
             for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
-                output[h * head_dim + d] += weight * value_cache[v_base + d];
+                output[out_base + d] += weight * v[v_base + d];
             }
         }
 
         let inv_sum = 1.0 / sum_exp;
         for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
-            output[h * head_dim + d] *= inv_sum;
+            output[out_base + d] *= inv_sum;
         }
     }
 "#;
 
-pub struct FlashDecodeOp {
+pub struct PrefillAttnOp {
     pipeline: wgpu::ComputePipeline,
     bgl: wgpu::BindGroupLayout,
     device: Arc<Device>,
-    queue: Arc<Queue>,
 }
 
-impl FlashDecodeOp {
-    pub fn new(device: &Arc<Device>, queue: &Arc<Queue>) -> Result<Self> {
+impl PrefillAttnOp {
+    pub fn new(device: &Arc<Device>) -> Result<Self> {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Flash Decode Shader"),
-            source: wgpu::ShaderSource::Wgsl(FLASH_DECODE_WGSL.into()),
+            label: Some("Prefill Attn Shader"),
+            source: wgpu::ShaderSource::Wgsl(PREFILL_ATTN_WGSL.into()),
         });
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Flash Decode BGL"),
+            label: Some("Prefill Attn BGL"),
             entries: &[
                 BindGroupLayoutEntry {
                     binding: 0,
@@ -147,16 +167,16 @@ impl FlashDecodeOp {
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Flash Decode Pipeline Layout"),
+            label: Some("Prefill Attn Pipeline Layout"),
             bind_group_layouts: &[Some(&bgl)],
             immediate_size: 0,
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Flash Decode Pipeline"),
+            label: Some("Prefill Attn Pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader,
-            entry_point: Some("flash_decode_main"),
+            entry_point: Some("prefill_attn_main"),
             cache: None,
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
@@ -165,16 +185,20 @@ impl FlashDecodeOp {
             pipeline,
             bgl,
             device: Arc::clone(device),
-            queue: Arc::clone(queue),
         })
     }
 
+    /// Dispatch prefill attention for a full sequence.
+    ///
+    /// `q`, `k`, `v` all have layout `[seq_len, num_heads, head_dim]`.
+    /// `output` has the same layout and must be pre-allocated with
+    /// `seq_len * num_heads * head_dim * sizeof(f32)` bytes.
     pub fn dispatch(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        query: &GpuBuffer,
-        key_cache: &GpuBuffer,
-        value_cache: &GpuBuffer,
+        q: &GpuBuffer,
+        k: &GpuBuffer,
+        v: &GpuBuffer,
         output: &GpuBuffer,
         seq_len: u32,
         num_heads: u32,
@@ -186,28 +210,32 @@ impl FlashDecodeOp {
 
         let params_data: [u32; 4] = [seq_len, num_heads, head_dim, 0];
         let params_buffer = self.device.create_buffer(&BufferDescriptor {
-            label: Some("Flash Decode Params"),
+            label: Some("Prefill Attn Params"),
             size: 16,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+            mapped_at_creation: true,
         });
-        self.queue.write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params_data));
+        params_buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .copy_from_slice(bytemuck::cast_slice(&params_data));
+        params_buffer.unmap();
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Flash Decode Bind Group"),
+            label: Some("Prefill Attn Bind Group"),
             layout: &self.bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: query.buffer().as_entire_binding(),
+                    resource: q.buffer().as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: key_cache.buffer().as_entire_binding(),
+                    resource: k.buffer().as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: value_cache.buffer().as_entire_binding(),
+                    resource: v.buffer().as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -220,40 +248,26 @@ impl FlashDecodeOp {
             ],
         });
 
-        let wg_count = (num_heads + 255) / 256;
+        // Workgroup size is (16, 16); dispatch covers (seq_len, num_heads).
+        let wg_x = (seq_len  + 15) / 16;
+        let wg_y = (num_heads + 15) / 16;
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("Flash Decode Compute Pass"),
+            label: Some("Prefill Attn Compute Pass"),
             timestamp_writes: None,
         });
 
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(wg_count, 1, 1);
+        pass.dispatch_workgroups(wg_x, wg_y, 1);
 
         drop(pass);
 
         tracing::debug!(
-            "FlashDecodeOp dispatched: seq_len={} num_heads={} head_dim={}",
+            "PrefillAttnOp dispatched: seq_len={} num_heads={} head_dim={}",
             seq_len, num_heads, head_dim
         );
 
         Ok(())
     }
-}
-
-pub fn dispatch_flash_decode(
-    device: &Arc<Device>,
-    queue: &Arc<Queue>,
-    encoder: &mut wgpu::CommandEncoder,
-    query: &GpuBuffer,
-    key_cache: &GpuBuffer,
-    value_cache: &GpuBuffer,
-    output: &GpuBuffer,
-    seq_len: u32,
-    num_heads: u32,
-    head_dim: u32,
-) -> Result<()> {
-    let op = FlashDecodeOp::new(device, queue)?;
-    op.dispatch(encoder, query, key_cache, value_cache, output, seq_len, num_heads, head_dim)
 }

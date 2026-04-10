@@ -47,10 +47,10 @@ impl BlockAttnResModel {
         let num_blocks = config.num_blocks;
 
         let embedding_bytes = hidden_dim * std::mem::size_of::<f32>();
-        let embedding = GpuBuffer::zeros(&device, embedding_bytes, Some("Token Embedding"))?;
+        let embedding = GpuBuffer::zeros(&device, &queue, embedding_bytes, Some("Token Embedding"))?;
 
         let block_reps_bytes = (num_blocks + 1) * hidden_dim * std::mem::size_of::<f32>();
-        let block_reps = GpuBuffer::zeros(&device, block_reps_bytes, Some("Block Representations"))?;
+        let block_reps = GpuBuffer::zeros(&device, &queue, block_reps_bytes, Some("Block Representations"))?;
 
         let partial_sum_bytes = hidden_dim * std::mem::size_of::<f32>();
         let partial_sum = GpuBuffer::new(
@@ -79,7 +79,7 @@ impl BlockAttnResModel {
             Some("Scratch Buffer A"),
         )?;
 
-        let elementwise = ElementWiseOp::new(&device);
+        let elementwise = ElementWiseOp::new(&device, &queue);
 
         tracing::info!("BlockAttnResModel created with {} layers", total_layers);
 

@@ -25,17 +25,19 @@ impl GpuBuffer {
         &self.buffer
     }
 
-    pub fn zeros(device: &wgpu::Device, size: usize, label: Option<&str>) -> Result<Self> {
+    pub fn zeros(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        size: usize,
+        label: Option<&str>,
+    ) -> Result<Self> {
         let buffer = device.create_buffer(&BufferDescriptor {
             label,
             size: size as u64,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+            mapped_at_creation: false,
         });
-        let mut mapped = buffer.slice(..).get_mapped_range_mut();
-        mapped.copy_from_slice(&vec![0u8; size]);
-        drop(mapped);
-        buffer.unmap();
+        queue.write_buffer(&buffer, 0, &vec![0u8; size]);
         Ok(Self { buffer, size })
     }
 

@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use wgpu::Device;
+use wgpu::{Device, Queue};
 
 use crate::compute::buffer::GpuBuffer;
 use crate::error::Result;
@@ -19,14 +19,15 @@ pub struct LayerKVCache {
 impl LayerKVCache {
     pub fn new(
         device: Arc<Device>,
+        queue: Arc<Queue>,
         max_seq_len: u32,
         num_heads: u32,
         head_dim: u32,
     ) -> Result<Self> {
         let elem_count = max_seq_len as usize * num_heads as usize * head_dim as usize;
         let byte_size = elem_count * std::mem::size_of::<f32>();
-        let key_cache = GpuBuffer::zeros(&device, byte_size, Some("KVCache Layer Keys"))?;
-        let value_cache = GpuBuffer::zeros(&device, byte_size, Some("KVCache Layer Values"))?;
+        let key_cache = GpuBuffer::zeros(&device, &queue, byte_size, Some("KVCache Layer Keys"))?;
+        let value_cache = GpuBuffer::zeros(&device, &queue, byte_size, Some("KVCache Layer Values"))?;
 
         Ok(Self {
             key_cache,
@@ -157,6 +158,7 @@ pub struct ModelKVCache {
 impl ModelKVCache {
     pub fn new(
         device: Arc<Device>,
+        queue: Arc<Queue>,
         num_layers: u32,
         max_seq_len: u32,
         num_heads: u32,
@@ -166,6 +168,7 @@ impl ModelKVCache {
         for i in 0..num_layers {
             layers.push(LayerKVCache::new(
                 Arc::clone(&device),
+                Arc::clone(&queue),
                 max_seq_len,
                 num_heads,
                 head_dim,

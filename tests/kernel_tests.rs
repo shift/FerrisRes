@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use ferrisres::compute::{
-    GpuBuffer, WgpuCompute, MatMulOp, RmsNormOp, SoftmaxOp, ElementWiseOp, MoEGatingOp,
+    GpuBuffer, WgpuCompute, MatMulOp, RmsNormOp, SoftmaxOp, ElementWiseOp, MoEGatingOp, MoEExpertOp,
 };
 use ferrisres::compute::kernels::moe::{MOE_DISPATCH_WGSL, MOE_GATHER_WGSL};
 use ferrisres::model::{BlockAttnResConfig, BlockAttnResLayer};
@@ -105,7 +105,7 @@ fn read_buffer_u32(
 #[tokio::test]
 async fn test_matmul_2x2() {
     let (_compute, device, queue) = create_test_compute().await;
-    let matmul = MatMulOp::new(&device);
+    let matmul = MatMulOp::new(&device, &queue);
 
     let a: &[f32] = &[1.0, 2.0, 3.0, 4.0];
     let b: &[f32] = &[5.0, 6.0, 7.0, 8.0];
@@ -134,7 +134,7 @@ async fn test_matmul_2x2() {
 #[tokio::test]
 async fn test_matmul_non_square() {
     let (_compute, device, queue) = create_test_compute().await;
-    let matmul = MatMulOp::new(&device);
+    let matmul = MatMulOp::new(&device, &queue);
 
     let a: &[f32] = &[2.0, 3.0];
     let b: &[f32] = &[4.0, 5.0];
@@ -159,7 +159,7 @@ async fn test_matmul_non_square() {
 #[tokio::test]
 async fn test_elementwise_add() {
     let (_compute, device, queue) = create_test_compute().await;
-    let ew = ElementWiseOp::new(&device);
+    let ew = ElementWiseOp::new(&device, &queue);
 
     let a: &[f32] = &[1.0, 2.0, 3.0];
     let b: &[f32] = &[4.0, 5.0, 6.0];
@@ -188,7 +188,7 @@ async fn test_elementwise_add() {
 #[tokio::test]
 async fn test_elementwise_scale() {
     let (_compute, device, queue) = create_test_compute().await;
-    let ew = ElementWiseOp::new(&device);
+    let ew = ElementWiseOp::new(&device, &queue);
 
     let a: &[f32] = &[2.0, 4.0, 6.0];
     let a_buf = create_filled_buffer(&device, a);
@@ -224,7 +224,7 @@ async fn test_rmsnorm() {
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("rmsnorm"),
     });
-    rmsnorm.dispatch(&device, &mut encoder, &in_buf, &out_buf, 1, 2).unwrap();
+    rmsnorm.dispatch(&device, &queue, &mut encoder, &in_buf, &out_buf, 1, 2).unwrap();
     queue.submit(std::iter::once(encoder.finish()));
 
     let result = read_buffer(&device, &queue, &out_buf);
@@ -250,7 +250,7 @@ async fn test_rmsnorm() {
 #[tokio::test]
 async fn test_softmax() {
     let (_compute, device, queue) = create_test_compute().await;
-    let softmax = SoftmaxOp::new(&device).unwrap();
+    let softmax = SoftmaxOp::new(&device, &queue).unwrap();
 
     let input: &[f32] = &[1.0, 2.0, 3.0];
     let in_buf = create_filled_buffer(&device, input);
@@ -402,15 +402,23 @@ async fn test_moe_dispatch_top_k() {
     assert_eq!(experts[1], 1, "moe dispatch: expected expert 1, got {}", experts[1]);
 
     let weights = read_buffer(&device, &queue, &weights_buf);
+    // After softmax over K=2 selected logits [0.9, 0.5]:
+    // sum_exp = exp(0.9) + exp(0.5) ≈ 2.4596 + 1.6487 = 4.1083
+    // weight[0] = exp(0.9)/sum_exp ≈ 0.5985, weight[1] = exp(0.5)/sum_exp ≈ 0.4015
+    let exp09 = 0.9f32.exp();
+    let exp05 = 0.5f32.exp();
+    let sum_exp = exp09 + exp05;
+    let expected_w0 = exp09 / sum_exp;
+    let expected_w1 = exp05 / sum_exp;
     assert!(
-        (weights[0] - 0.9).abs() < 1e-3,
-        "moe dispatch weight[0]: got {}, want 0.9",
-        weights[0]
+        (weights[0] - expected_w0).abs() < 1e-3,
+        "moe dispatch weight[0]: got {}, want {} (softmax-normalised)",
+        weights[0], expected_w0,
     );
     assert!(
-        (weights[1] - 0.5).abs() < 1e-3,
-        "moe dispatch weight[1]: got {}, want 0.5",
-        weights[1]
+        (weights[1] - expected_w1).abs() < 1e-3,
+        "moe dispatch weight[1]: got {}, want {} (softmax-normalised)",
+        weights[1], expected_w1,
     );
 }
 
@@ -617,15 +625,110 @@ async fn test_moe_expert_gather() {
     queue.submit(std::iter::once(encoder.finish()));
 
     let result = read_buffer(&device, &queue, &output_buf);
+    // With top_k=1, softmax over a single logit = 1.0 (identity).
+    // Expert up-proj (identity) on input [1.0, 2.0] → [1.0, 2.0] after ReLU.
+    // Expert down-proj (identity) → [1.0, 2.0] * weight(1.0) = [1.0, 2.0].
     assert!(
-        (result[0] - 0.9).abs() < 1e-2,
-        "moe gather[0]: got {}, want 0.9",
+        (result[0] - 1.0).abs() < 1e-2,
+        "moe gather[0]: got {}, want 1.0",
         result[0]
     );
     assert!(
-        (result[1] - 1.8).abs() < 1e-2,
-        "moe gather[1]: got {}, want 1.8",
+        (result[1] - 2.0).abs() < 1e-2,
+        "moe gather[1]: got {}, want 2.0",
         result[1]
+    );
+}
+
+/// Validates that MoEExpertOp (MOE_DISPATCH_WGSL) correctly selects top-2 expert indices
+/// and produces softmax-normalised weights when num_experts=4 (well below the 32-cap).
+/// This exercises the register-spill cap path: n_experts = min(4, 32) = 4.
+/// See ADR-003: expert_weights_arr / logits_with_idx capped at 32 to prevent iGPU register spill.
+#[tokio::test]
+async fn test_moe_small_num_experts() {
+    let (_compute, device, queue) = create_test_compute().await;
+
+    // num_experts=4, top_k=2 — deliberately smaller than the 32-cap to validate the min() guard.
+    let num_experts: u32 = 4;
+    let top_k: u32 = 2;
+    let batch_size: u32 = 1;
+    let hidden_dim: u32 = 0;
+
+    // Gate logits: [0.1, 0.9, 0.3, 0.5]
+    // Top-2 by value: 0.9 (idx 1), 0.5 (idx 3)
+    let gate_logits: &[f32] = &[0.1, 0.9, 0.3, 0.5];
+
+    let logits_buf = create_filled_buffer(&device, gate_logits);
+    let selected_buf = create_output_buffer(
+        &device,
+        (batch_size * top_k) as usize * std::mem::size_of::<u32>(),
+    );
+    let weights_buf = create_output_buffer(
+        &device,
+        (batch_size * top_k) as usize * std::mem::size_of::<f32>(),
+    );
+
+    let moe_expert_op = MoEExpertOp::new(&device)
+        .expect("MoEExpertOp::new should succeed");
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("moe small num_experts"),
+    });
+    moe_expert_op
+        .dispatch_top_k(
+            &mut encoder,
+            &logits_buf,
+            &selected_buf,
+            &weights_buf,
+            batch_size,
+            num_experts,
+            top_k,
+            hidden_dim,
+        )
+        .expect("dispatch_top_k should succeed for num_experts < 32");
+    queue.submit(std::iter::once(encoder.finish()));
+
+    // Verify selected expert indices are [1, 3] (descending by logit: 0.9, 0.5)
+    let experts = read_buffer_u32(&device, &queue, &selected_buf);
+    assert_eq!(
+        experts[0], 1,
+        "test_moe_small_num_experts: expected expert index 1 (logit 0.9), got {}",
+        experts[0]
+    );
+    assert_eq!(
+        experts[1], 3,
+        "test_moe_small_num_experts: expected expert index 3 (logit 0.5), got {}",
+        experts[1]
+    );
+
+    // Verify weights are softmax-normalised over the top-2 selected logits [0.9, 0.5].
+    // softmax: w[k] = exp(logit[k]) / (exp(0.9) + exp(0.5))
+    let weights = read_buffer(&device, &queue, &weights_buf);
+    let exp_09 = 0.9f32.exp();
+    let exp_05 = 0.5f32.exp();
+    let sum_exp = exp_09 + exp_05;
+    let expected_w0 = exp_09 / sum_exp;
+    let expected_w1 = exp_05 / sum_exp;
+
+    assert!(
+        (weights[0] - expected_w0).abs() < 1e-5,
+        "test_moe_small_num_experts weight[0]: got {}, want {} (softmax of logit 0.9)",
+        weights[0],
+        expected_w0
+    );
+    assert!(
+        (weights[1] - expected_w1).abs() < 1e-5,
+        "test_moe_small_num_experts weight[1]: got {}, want {} (softmax of logit 0.5)",
+        weights[1],
+        expected_w1
+    );
+
+    // Verify weights sum to 1.0 (softmax invariant), tolerance 1e-5
+    let weight_sum: f32 = weights.iter().sum();
+    assert!(
+        (weight_sum - 1.0).abs() < 1e-5,
+        "test_moe_small_num_experts: weights must sum to 1.0, got {}",
+        weight_sum
     );
 }
 

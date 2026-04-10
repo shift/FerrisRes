@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use wgpu::Device;
+use wgpu::{Device, Queue};
 use crate::compute::buffer::GpuBuffer;
 use crate::compute::kernels::elementwise::ElementWiseOp;
 use crate::autodiff::graph::{ComputationGraph, NodeId, NodeKind};
@@ -191,6 +191,8 @@ fn loss_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 pub struct BackwardPass {
     device: Arc<Device>,
+    #[allow(dead_code)]
+    queue: Arc<Queue>,
     elementwise: ElementWiseOp,
     matmul_grad_a_pipeline: wgpu::ComputePipeline,
     matmul_grad_a_layout: wgpu::BindGroupLayout,
@@ -207,10 +209,10 @@ pub struct BackwardPass {
 }
 
 impl BackwardPass {
-    pub fn new(device: Arc<Device>) -> Self {
+    pub fn new(device: Arc<Device>, queue: Arc<Queue>) -> Self {
         tracing::info!("Creating BackwardPass gradient pipelines");
 
-        let elementwise = ElementWiseOp::new(&device);
+        let elementwise = ElementWiseOp::new(&device, &queue);
 
         let matmul_grad_a_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("MatMul Grad A Shader"),
@@ -415,6 +417,7 @@ impl BackwardPass {
 
         Self {
             device,
+            queue,
             elementwise,
             matmul_grad_a_pipeline,
             matmul_grad_a_layout,

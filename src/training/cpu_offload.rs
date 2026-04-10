@@ -202,7 +202,7 @@ impl CpuGradientBuffer {
 
     /// Upload the CPU gradient data back to a new GPU buffer suitable for
     /// use as the `grad` argument to `AdamOptimizer::step`.
-    pub fn to_gpu_buffer(&self, device: &Arc<Device>) -> Result<GpuBuffer> {
+    pub fn to_gpu_buffer(&self, device: &Arc<Device>, queue: &wgpu::Queue) -> Result<GpuBuffer> {
         let bytes: &[u8] = bytemuck::cast_slice(&self.data);
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cpu_grad_upload"),
@@ -210,12 +210,9 @@ impl CpuGradientBuffer {
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+            mapped_at_creation: false,
         });
-        buf.slice(..)
-            .get_mapped_range_mut()
-            .copy_from_slice(bytes);
-        buf.unmap();
+        queue.write_buffer(&buf, 0, bytes);
         Ok(GpuBuffer::from_existing(buf, bytes.len()))
     }
 }

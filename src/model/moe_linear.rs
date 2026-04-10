@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use wgpu::Device;
+use wgpu::{Device, Queue};
 use crate::compute::kernels::moe::{MoEGatingOp, MoEExpertOp};
 use crate::compute::GpuBuffer;
 use crate::error::Result;
@@ -21,6 +21,7 @@ pub struct MoELinear {
     num_experts: usize,
     top_k: usize,
     device: Arc<Device>,
+    queue: Arc<Queue>,
 }
 
 impl MoELinear {
@@ -42,8 +43,8 @@ impl MoELinear {
 
         let up_bytes = num_experts * intermediate_dim * hidden_dim * std::mem::size_of::<f32>();
         let down_bytes = num_experts * hidden_dim * intermediate_dim * std::mem::size_of::<f32>();
-        let expert_up_weights = GpuBuffer::zeros(device, up_bytes, Some("MoE Expert Up Weights"))?;
-        let expert_down_weights = GpuBuffer::zeros(device, down_bytes, Some("MoE Expert Down Weights"))?;
+        let expert_up_weights = GpuBuffer::zeros(device, queue, up_bytes, Some("MoE Expert Up Weights"))?;
+        let expert_down_weights = GpuBuffer::zeros(device, queue, down_bytes, Some("MoE Expert Down Weights"))?;
 
         let moe_gating_op = MoEGatingOp::new(device)?;
         let moe_expert_op = MoEExpertOp::new(device)?;
@@ -64,6 +65,7 @@ impl MoELinear {
             num_experts,
             top_k,
             device: Arc::clone(device),
+            queue: Arc::clone(queue),
         })
     }
 
@@ -83,19 +85,19 @@ impl MoELinear {
         let scratch_bytes = batch_size * self.top_k * self.intermediate_dim * f32_size;
 
         if self.gate_logits_buf.as_ref().map_or(true, |b| b.size() < gate_logits_bytes) {
-            self.gate_logits_buf = Some(GpuBuffer::zeros(&self.device, gate_logits_bytes, Some("MoE Gate Logits"))?);
+            self.gate_logits_buf = Some(GpuBuffer::zeros(&self.device, &self.queue, gate_logits_bytes, Some("MoE Gate Logits"))?);
         }
         if self.selected_experts_buf.as_ref().map_or(true, |b| b.size() < selected_experts_bytes) {
-            self.selected_experts_buf = Some(GpuBuffer::zeros(&self.device, selected_experts_bytes, Some("MoE Selected Experts"))?);
+            self.selected_experts_buf = Some(GpuBuffer::zeros(&self.device, &self.queue, selected_experts_bytes, Some("MoE Selected Experts"))?);
         }
         if self.expert_weights_buf.as_ref().map_or(true, |b| b.size() < expert_weights_bytes) {
-            self.expert_weights_buf = Some(GpuBuffer::zeros(&self.device, expert_weights_bytes, Some("MoE Expert Weights"))?);
+            self.expert_weights_buf = Some(GpuBuffer::zeros(&self.device, &self.queue, expert_weights_bytes, Some("MoE Expert Weights"))?);
         }
         if self.output_buf.as_ref().map_or(true, |b| b.size() < output_bytes) {
-            self.output_buf = Some(GpuBuffer::zeros(&self.device, output_bytes, Some("MoE Output"))?);
+            self.output_buf = Some(GpuBuffer::zeros(&self.device, &self.queue, output_bytes, Some("MoE Output"))?);
         }
         if self.scratch_buf.as_ref().map_or(true, |b| b.size() < scratch_bytes) {
-            self.scratch_buf = Some(GpuBuffer::zeros(&self.device, scratch_bytes, Some("MoE Scratch"))?);
+            self.scratch_buf = Some(GpuBuffer::zeros(&self.device, &self.queue, scratch_bytes, Some("MoE Scratch"))?);
         }
 
         let gate_logits = self.gate_logits_buf.as_ref().unwrap();

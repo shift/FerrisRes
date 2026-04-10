@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use wgpu::Device;
+use wgpu::{Device, Queue};
 use crate::compute::buffer::GpuBuffer;
 use crate::compute::kernels::elementwise::ElementWiseOp;
 use crate::autodiff::graph::NodeId;
@@ -11,6 +11,7 @@ pub struct GradientAccumulator {
     counts: HashMap<NodeId, u32>,
     elementwise: ElementWiseOp,
     device: Arc<Device>,
+    queue: Arc<Queue>,
     /// How many micro-batches have been accumulated since the last optimizer step.
     pub micro_batch_count: u32,
     /// How many micro-batches to accumulate before an optimizer step.
@@ -18,29 +19,31 @@ pub struct GradientAccumulator {
 }
 
 impl GradientAccumulator {
-    pub fn new(device: Arc<Device>) -> Self {
+    pub fn new(device: Arc<Device>, queue: Arc<Queue>) -> Self {
         tracing::info!("Creating GradientAccumulator");
-        let elementwise = ElementWiseOp::new(&device);
+        let elementwise = ElementWiseOp::new(&device, &queue);
         Self {
             accumulators: HashMap::new(),
             counts: HashMap::new(),
             elementwise,
             device,
+            queue,
             micro_batch_count: 0,
             accumulation_steps: 1,
         }
     }
 
     /// Create a GradientAccumulator with a specific number of accumulation steps.
-    pub fn with_accumulation_steps(device: Arc<Device>, accumulation_steps: u32) -> Self {
+    pub fn with_accumulation_steps(device: Arc<Device>, queue: Arc<Queue>, accumulation_steps: u32) -> Self {
         assert!(accumulation_steps >= 1, "accumulation_steps must be >= 1");
         tracing::info!("Creating GradientAccumulator with {} accumulation steps", accumulation_steps);
-        let elementwise = ElementWiseOp::new(&device);
+        let elementwise = ElementWiseOp::new(&device, &queue);
         Self {
             accumulators: HashMap::new(),
             counts: HashMap::new(),
             elementwise,
             device,
+            queue,
             micro_batch_count: 0,
             accumulation_steps,
         }
@@ -75,7 +78,7 @@ impl GradientAccumulator {
     }
 
     pub fn register(&mut self, id: NodeId, size: usize) -> Result<()> {
-        let buf = GpuBuffer::zeros(&self.device, size, Some(&format!("grad_accum_{:?}", id)))?;
+        let buf = GpuBuffer::zeros(&self.device, &self.queue, size, Some(&format!("grad_accum_{:?}", id)))?;
         self.accumulators.insert(id, buf);
         self.counts.insert(id, 0);
         tracing::debug!("GradientAccumulator: registered {:?} size={}", id, size);
@@ -122,7 +125,7 @@ impl GradientAccumulator {
     pub fn reset(&mut self, encoder: &mut wgpu::CommandEncoder) -> Result<()> {
         for (id, accum) in &self.accumulators {
             let numel = accum.size() as u32 / std::mem::size_of::<f32>() as u32;
-            let zero = GpuBuffer::zeros(&self.device, accum.size(), Some("grad_accum_zero"))?;
+            let zero = GpuBuffer::zeros(&self.device, &self.queue, accum.size(), Some("grad_accum_zero"))?;
             self.elementwise.dispatch_copy(encoder, &zero, accum, numel)?;
             self.counts.insert(*id, 0);
         }

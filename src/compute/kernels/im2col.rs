@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use wgpu::{Device, BufferDescriptor, BufferUsages, BindGroupLayoutEntry, ShaderStages, BindingType, BufferBindingType};
+use wgpu::{Device, Queue, BufferDescriptor, BufferUsages, BindGroupLayoutEntry, ShaderStages, BindingType, BufferBindingType};
 use crate::compute::GpuBuffer;
 use crate::error::Result;
 
@@ -43,10 +43,11 @@ pub struct Im2ColOp {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     device: Arc<Device>,
+    queue: Arc<Queue>,
 }
 
 impl Im2ColOp {
-    pub fn new(device: &Arc<Device>) -> Self {
+    pub fn new(device: &Arc<Device>, queue: &Arc<Queue>) -> Self {
         tracing::debug!("Creating Im2ColOp compute pipeline");
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -113,6 +114,7 @@ impl Im2ColOp {
             pipeline,
             bind_group_layout,
             device: Arc::clone(device),
+            queue: Arc::clone(queue),
         }
     }
 
@@ -147,13 +149,9 @@ impl Im2ColOp {
             label: Some("Im2Col Params"),
             size: 16,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+            mapped_at_creation: false,
         });
-        params_buffer
-            .slice(..)
-            .get_mapped_range_mut()
-            .copy_from_slice(&params_data);
-        params_buffer.unmap();
+        self.queue.write_buffer(&params_buffer, 0, &params_data);
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Im2Col Bind Group"),

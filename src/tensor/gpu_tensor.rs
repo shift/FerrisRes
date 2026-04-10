@@ -44,14 +44,10 @@ impl<T: Pod + Zeroable> GpuTensor<T> {
             label: Some("GpuTensor"),
             size: byte_size,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+            mapped_at_creation: false,
         });
 
-        buffer
-            .slice(..)
-            .get_mapped_range_mut()
-            .copy_from_slice(cast_slice(data));
-        buffer.unmap();
+        queue.write_buffer(&buffer, 0, cast_slice(data));
 
         Ok(Self {
             buffer,
@@ -78,13 +74,10 @@ impl<T: Pod + Zeroable> GpuTensor<T> {
             label: Some("GpuTensor(zeros)"),
             size: byte_size,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+            mapped_at_creation: false,
         });
 
-        let mut mapped = buffer.slice(..).get_mapped_range_mut();
-        mapped.copy_from_slice(bytemuck::cast_slice(&vec![T::zeroed(); numel]));
-        drop(mapped);
-        buffer.unmap();
+        queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&vec![T::zeroed(); numel]));
 
         Ok(Self {
             buffer,

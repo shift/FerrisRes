@@ -17,7 +17,7 @@ pub struct Linear {
 impl Linear {
     pub fn new(
         device: Arc<Device>,
-        _queue: Arc<Queue>,
+        queue: Arc<Queue>,
         in_features: usize,
         out_features: usize,
         use_bias: bool,
@@ -28,17 +28,17 @@ impl Linear {
         );
 
         let weight_bytes = out_features * in_features * std::mem::size_of::<f32>();
-        let weight = GpuBuffer::zeros(&device, weight_bytes, Some("Linear Weight"))?;
+        let weight = GpuBuffer::zeros(&device, &queue, weight_bytes, Some("Linear Weight"))?;
 
         let bias = if use_bias {
             let bias_bytes = out_features * std::mem::size_of::<f32>();
-            Some(GpuBuffer::zeros(&device, bias_bytes, Some("Linear Bias"))?)
+            Some(GpuBuffer::zeros(&device, &queue, bias_bytes, Some("Linear Bias"))?)
         } else {
             None
         };
 
-        let matmul_op = MatMulOp::new(&device);
-        let elementwise_op = ElementWiseOp::new(&device);
+        let matmul_op = MatMulOp::new(&device, &queue);
+        let elementwise_op = ElementWiseOp::new(&device, &queue);
 
         Ok(Self {
             weight,

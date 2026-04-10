@@ -105,7 +105,7 @@ pub struct SgdOptimizer {
 impl SgdOptimizer {
     pub fn new(device: Arc<Device>, queue: Arc<Queue>, learning_rate: f32) -> Self {
         tracing::info!("Creating SGD optimizer with lr={}", learning_rate);
-        let elementwise = ElementWiseOp::new(&device);
+        let elementwise = ElementWiseOp::new(&device, &queue);
         Self {
             learning_rate,
             device,
@@ -175,7 +175,7 @@ impl AdamOptimizer {
             learning_rate, beta1, beta2, epsilon
         );
 
-        let elementwise = ElementWiseOp::new(&device);
+        let elementwise = ElementWiseOp::new(&device, &queue);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Adam Optimizer Shader"),
@@ -264,8 +264,8 @@ impl AdamOptimizer {
 
     pub fn register_param(&mut self, name: &str, shape: usize) -> Result<()> {
         let bytes = shape * std::mem::size_of::<f32>();
-        let m_buf = GpuBuffer::zeros(&self.device, bytes, Some(&format!("adam_m_{}", name)))?;
-        let v_buf = GpuBuffer::zeros(&self.device, bytes, Some(&format!("adam_v_{}", name)))?;
+        let m_buf = GpuBuffer::zeros(&self.device, &self.queue, bytes, Some(&format!("adam_m_{}", name)))?;
+        let v_buf = GpuBuffer::zeros(&self.device, &self.queue, bytes, Some(&format!("adam_v_{}", name)))?;
         self.m_buffers.insert(name.to_string(), m_buf);
         self.v_buffers.insert(name.to_string(), v_buf);
         tracing::debug!("Adam registered param '{}' with {} elements", name, shape);

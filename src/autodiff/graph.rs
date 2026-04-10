@@ -128,7 +128,7 @@ impl ComputationGraph {
     pub fn add_parameter(&mut self, name: &str, buf: GpuBuffer) -> Result<NodeId> {
         let numel = buf.size() / std::mem::size_of::<f32>();
         let id = self.alloc_id();
-        let grad = GpuBuffer::zeros(&self.device, buf.size(), Some(&format!("grad_param_{}", name)))?;
+        let grad = GpuBuffer::zeros(&self.device, &self.queue, buf.size(), Some(&format!("grad_param_{}", name)))?;
 
         let kind = NodeKind::Parameter {
             name: name.to_string(),
@@ -152,7 +152,7 @@ impl ComputationGraph {
     pub fn add_input(&mut self, name: &str, buf: GpuBuffer) -> Result<NodeId> {
         let numel = buf.size() / std::mem::size_of::<f32>();
         let id = self.alloc_id();
-        let grad = GpuBuffer::zeros(&self.device, buf.size(), Some(&format!("grad_input_{}", name)))?;
+        let grad = GpuBuffer::zeros(&self.device, &self.queue, buf.size(), Some(&format!("grad_input_{}", name)))?;
 
         let kind = NodeKind::Input {
             name: name.to_string(),
@@ -183,7 +183,7 @@ impl ComputationGraph {
         n: u32,
     ) -> Result<NodeId> {
         let id = self.alloc_id();
-        let grad = GpuBuffer::zeros(&self.device, output_buf.size(), Some("grad_matmul"))?;
+        let grad = GpuBuffer::zeros(&self.device, &self.queue, output_buf.size(), Some("grad_matmul"))?;
 
         let op = NodeKind::MatMul { m, k, n };
         tracing::debug!("Graph: record matmul id={:?} M={} K={} N={}", id, m, k, n);
@@ -214,7 +214,7 @@ impl ComputationGraph {
         numel: u32,
     ) -> Result<NodeId> {
         let id = self.alloc_id();
-        let grad = GpuBuffer::zeros(&self.device, output_buf.size(), Some("grad_add"))?;
+        let grad = GpuBuffer::zeros(&self.device, &self.queue, output_buf.size(), Some("grad_add"))?;
 
         let op = NodeKind::Add { numel };
         tracing::debug!("Graph: record add id={:?} numel={}", id, numel);
@@ -245,7 +245,7 @@ impl ComputationGraph {
         numel: u32,
     ) -> Result<NodeId> {
         let id = self.alloc_id();
-        let grad = GpuBuffer::zeros(&self.device, output_buf.size(), Some("grad_scale"))?;
+        let grad = GpuBuffer::zeros(&self.device, &self.queue, output_buf.size(), Some("grad_scale"))?;
 
         let op = NodeKind::Scale { scale, numel };
         tracing::debug!("Graph: record scale id={:?} scale={} numel={}", id, scale, numel);
@@ -275,7 +275,7 @@ impl ComputationGraph {
         numel: u32,
     ) -> Result<NodeId> {
         let id = self.alloc_id();
-        let grad = GpuBuffer::zeros(&self.device, output_buf.size(), Some("grad_relu"))?;
+        let grad = GpuBuffer::zeros(&self.device, &self.queue, output_buf.size(), Some("grad_relu"))?;
 
         let op = NodeKind::ReLU { numel };
         tracing::debug!("Graph: record relu id={:?} numel={}", id, numel);
@@ -306,7 +306,7 @@ impl ComputationGraph {
         eps: f32,
     ) -> Result<NodeId> {
         let id = self.alloc_id();
-        let grad = GpuBuffer::zeros(&self.device, output_buf.size(), Some("grad_rmsnorm"))?;
+        let grad = GpuBuffer::zeros(&self.device, &self.queue, output_buf.size(), Some("grad_rmsnorm"))?;
 
         let op = NodeKind::RmsNorm { hidden_dim, eps };
         tracing::debug!("Graph: record rmsnorm id={:?} hidden_dim={} eps={}", id, hidden_dim, eps);
@@ -337,7 +337,7 @@ impl ComputationGraph {
         cols: u32,
     ) -> Result<NodeId> {
         let id = self.alloc_id();
-        let grad = GpuBuffer::zeros(&self.device, output_buf.size(), Some("grad_softmax"))?;
+        let grad = GpuBuffer::zeros(&self.device, &self.queue, output_buf.size(), Some("grad_softmax"))?;
 
         let op = NodeKind::Softmax { rows, cols };
         tracing::debug!("Graph: record softmax id={:?} rows={} cols={}", id, rows, cols);
@@ -370,7 +370,7 @@ impl ComputationGraph {
         out_features: u32,
     ) -> Result<NodeId> {
         let id = self.alloc_id();
-        let grad = GpuBuffer::zeros(&self.device, output_buf.size(), Some("grad_linear"))?;
+        let grad = GpuBuffer::zeros(&self.device, &self.queue, output_buf.size(), Some("grad_linear"))?;
 
         let mut inputs = vec![input_id, weight_id];
         if let Some(bid) = bias_id {
@@ -407,7 +407,7 @@ impl ComputationGraph {
         hidden_dim: u32,
     ) -> Result<NodeId> {
         let id = self.alloc_id();
-        let grad = GpuBuffer::zeros(&self.device, output_buf.size(), Some("grad_embedding"))?;
+        let grad = GpuBuffer::zeros(&self.device, &self.queue, output_buf.size(), Some("grad_embedding"))?;
 
         let op = NodeKind::Embedding { vocab_size, hidden_dim };
         tracing::debug!("Graph: record embedding id={:?} vocab={} dim={}", id, vocab_size, hidden_dim);
@@ -439,7 +439,7 @@ impl ComputationGraph {
         vocab_size: u32,
     ) -> Result<NodeId> {
         let id = self.alloc_id();
-        let grad = GpuBuffer::zeros(&self.device, output_buf.size(), Some("grad_loss"))?;
+        let grad = GpuBuffer::zeros(&self.device, &self.queue, output_buf.size(), Some("grad_loss"))?;
 
         let op = NodeKind::Loss { batch_size, vocab_size };
         tracing::debug!("Graph: record loss id={:?} batch={} vocab={}", id, batch_size, vocab_size);
@@ -499,7 +499,7 @@ impl ComputationGraph {
     }
 
     fn zero_buffer(&self, encoder: &mut wgpu::CommandEncoder, buf: &GpuBuffer) -> Result<()> {
-        let zero_buf = GpuBuffer::zeros(&self.device, buf.size(), Some("zero_temp"))?;
+        let zero_buf = GpuBuffer::zeros(&self.device, &self.queue, buf.size(), Some("zero_temp"))?;
         encoder.copy_buffer_to_buffer(zero_buf.buffer(), 0, buf.buffer(), 0, buf.size() as u64);
         Ok(())
     }

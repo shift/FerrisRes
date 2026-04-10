@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use wgpu::{Device, BufferDescriptor, BufferUsages, BindGroupLayoutEntry, ShaderStages, BindingType, BufferBindingType};
+use wgpu::{Device, Queue, BufferDescriptor, BufferUsages, BindGroupLayoutEntry, ShaderStages, BindingType, BufferBindingType};
 use crate::compute::GpuBuffer;
 use crate::error::Result;
 
@@ -67,10 +67,11 @@ pub struct MatMulOp {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     device: Arc<Device>,
+    queue: Arc<Queue>,
 }
 
 impl MatMulOp {
-    pub fn new(device: &Arc<Device>) -> Self {
+    pub fn new(device: &Arc<Device>, queue: &Arc<Queue>) -> Self {
         tracing::debug!("Creating MatMulOp compute pipeline");
 
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -144,6 +145,7 @@ impl MatMulOp {
             pipeline,
             bind_group_layout,
             device: Arc::clone(device),
+            queue: Arc::clone(queue),
         }
     }
 
@@ -171,13 +173,9 @@ impl MatMulOp {
             label: Some("MatMul Params"),
             size: 12,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+            mapped_at_creation: false,
         });
-        params_buffer
-            .slice(..)
-            .get_mapped_range_mut()
-            .copy_from_slice(bytemuck::cast_slice(&params_data));
-        params_buffer.unmap();
+        self.queue.write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params_data));
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("MatMul Bind Group"),

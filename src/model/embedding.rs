@@ -51,7 +51,7 @@ impl TokenEmbedding {
         );
 
         let weight_bytes = vocab_size * hidden_dim * std::mem::size_of::<f32>();
-        let weight = GpuBuffer::zeros(&device, weight_bytes, Some("TokenEmbedding Weight"))?;
+        let weight = GpuBuffer::zeros(&device, &queue, weight_bytes, Some("TokenEmbedding Weight"))?;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("TokenEmbedding Shader"),

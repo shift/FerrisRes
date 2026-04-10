@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use wgpu::{Device, BufferDescriptor, BufferUsages, BindGroupLayoutEntry, ShaderStages, BindingType, BufferBindingType};
+use wgpu::{Device, Queue, BufferDescriptor, BufferUsages, BindGroupLayoutEntry, ShaderStages, BindingType, BufferBindingType};
 use crate::compute::GpuBuffer;
 use crate::error::Result;
 
@@ -48,10 +48,11 @@ pub struct ElementWiseOp {
     relu_pipeline: wgpu::ComputePipeline,
     relu_bind_group_layout: wgpu::BindGroupLayout,
     device: Arc<Device>,
+    queue: Arc<Queue>,
 }
 
 impl ElementWiseOp {
-    pub fn new(device: &Arc<Device>) -> Self {
+    pub fn new(device: &Arc<Device>, queue: &Arc<Queue>) -> Self {
         tracing::debug!("Creating ElementWiseOp compute pipelines");
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -195,6 +196,7 @@ impl ElementWiseOp {
             relu_pipeline,
             relu_bind_group_layout,
             device: Arc::clone(device),
+            queue: Arc::clone(queue),
         }
     }
 
@@ -266,13 +268,9 @@ impl ElementWiseOp {
             label: Some("ElementWise Add Params"),
             size: 4,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+            mapped_at_creation: false,
         });
-        params_buffer
-            .slice(..)
-            .get_mapped_range_mut()
-            .copy_from_slice(&stride.to_le_bytes());
-        params_buffer.unmap();
+        self.queue.write_buffer(&params_buffer, 0, &stride.to_le_bytes());
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ElementWise Add Bind Group"),
@@ -367,13 +365,9 @@ impl ElementWiseOp {
             label: Some("ElementWise Scale Params"),
             size: 4,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+            mapped_at_creation: false,
         });
-        params_buffer
-            .slice(..)
-            .get_mapped_range_mut()
-            .copy_from_slice(&scale.to_le_bytes());
-        params_buffer.unmap();
+        self.queue.write_buffer(&params_buffer, 0, &scale.to_le_bytes());
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ElementWise Scale Bind Group"),

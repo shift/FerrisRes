@@ -73,9 +73,9 @@ impl TwoPhaseInference {
         )?;
 
         let lse_bytes = model_config.hidden_dim * std::mem::size_of::<f32>();
-        let lse_buffer = GpuBuffer::zeros(&device, lse_bytes, Some("LSE Buffer"))?;
+        let lse_buffer = GpuBuffer::zeros(&device, &queue, lse_bytes, Some("LSE Buffer"))?;
 
-        let elementwise = ElementWiseOp::new(&device);
+        let elementwise = ElementWiseOp::new(&device, &queue);
 
         tracing::info!("TwoPhaseInference created successfully");
 
@@ -181,6 +181,7 @@ impl TwoPhaseInference {
 
         let partial_sum = GpuBuffer::zeros(
             &self.device,
+            &self.queue,
             hidden_dim * std::mem::size_of::<f32>(),
             Some("block_partial_sum"),
         )?;
@@ -275,13 +276,14 @@ pub struct KVCache {
 impl KVCache {
     pub fn new(
         device: Arc<Device>,
+        queue: Arc<Queue>,
         num_heads: usize,
         head_dim: usize,
         max_seq_len: usize,
     ) -> Result<Self> {
         let layer_size = max_seq_len * num_heads * head_dim * std::mem::size_of::<f32>();
-        let key_cache = GpuBuffer::zeros(&device, layer_size, Some("KVCache Keys"))?;
-        let value_cache = GpuBuffer::zeros(&device, layer_size, Some("KVCache Values"))?;
+        let key_cache = GpuBuffer::zeros(&device, &queue, layer_size, Some("KVCache Keys"))?;
+        let value_cache = GpuBuffer::zeros(&device, &queue, layer_size, Some("KVCache Values"))?;
 
         Ok(Self {
             key_cache,
@@ -491,6 +493,7 @@ impl AutoregressiveGenerator {
 
         let kv_cache = KVCache::new(
             Arc::clone(&device),
+            Arc::clone(&queue),
             num_heads,
             head_dim,
             max_seq_len,
@@ -498,7 +501,7 @@ impl AutoregressiveGenerator {
 
         let sampler = Sampler::new(1.0, None, None);
 
-        let elementwise = ElementWiseOp::new(&device);
+        let elementwise = ElementWiseOp::new(&device, &queue);
 
         tracing::info!("AutoregressiveGenerator created successfully");
 
@@ -564,11 +567,7 @@ impl AutoregressiveGenerator {
                 label: Some("gen_step"),
             });
 
-            {
-                let mut id_mapped = input_ids_buf.buffer().slice(..).get_mapped_range_mut();
-                id_mapped.copy_from_slice(&last_token.to_le_bytes());
-                drop(id_mapped);
-            }
+            self.queue.write_buffer(input_ids_buf.buffer(), 0, &last_token.to_le_bytes());
 
             self.embedding.forward(&mut encoder, &input_ids_buf, &embed_out_buf, 1)?;
 

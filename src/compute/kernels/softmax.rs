@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use wgpu::{Device, BufferDescriptor, BufferUsages, BindGroupLayoutEntry, ShaderStages, BindingType, BufferBindingType};
+use wgpu::{Device, Queue, BufferDescriptor, BufferUsages, BindGroupLayoutEntry, ShaderStages, BindingType, BufferBindingType};
 use crate::compute::GpuBuffer;
 use crate::error::Result;
 
@@ -84,10 +84,11 @@ pub struct SoftmaxOp {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     device: Arc<Device>,
+    queue: Arc<Queue>,
 }
 
 impl SoftmaxOp {
-    pub fn new(device: &Arc<Device>) -> Result<Self> {
+    pub fn new(device: &Arc<Device>, queue: &Arc<Queue>) -> Result<Self> {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Softmax Shader"),
             source: wgpu::ShaderSource::Wgsl(SOFTMAX_WGSL.into()),
@@ -150,6 +151,7 @@ impl SoftmaxOp {
             pipeline,
             bind_group_layout,
             device: Arc::clone(device),
+            queue: Arc::clone(queue),
         })
     }
 
@@ -170,13 +172,9 @@ impl SoftmaxOp {
             label: Some("Softmax Params"),
             size: 4,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+            mapped_at_creation: false,
         });
-        params_buffer
-            .slice(..)
-            .get_mapped_range_mut()
-            .copy_from_slice(bytemuck::cast_slice(&params_data));
-        params_buffer.unmap();
+        self.queue.write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params_data));
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Softmax Bind Group"),

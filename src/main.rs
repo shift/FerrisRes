@@ -208,7 +208,7 @@ async fn cmd_infer(
     info!("Encoded tokens ({}): {:?}", tokens.len(), tokens);
 
     let input_bytes = config.hidden_dim * std::mem::size_of::<f32>();
-    let input = GpuBuffer::zeros(&device, input_bytes, Some("Infer Input"))?;
+    let input = GpuBuffer::zeros(&device, &queue, input_bytes, Some("Infer Input"))?;
     let output = GpuBuffer::new(&device, input_bytes, Some("Infer Output"))?;
 
     model.forward(&input, &output, 1)?;
@@ -235,10 +235,10 @@ async fn cmd_benchmark(
     let device = Arc::new(compute.device().clone());
     let queue = Arc::new(compute.queue().clone());
 
-    let matmul_op = MatMulOp::new(&device);
+    let matmul_op = MatMulOp::new(&device, &queue);
     let rmsnorm_op = RmsNormOp::new(&device)?;
-    let softmax_op = SoftmaxOp::new(&device)?;
-    let ew_op = ElementWiseOp::new(&device);
+    let softmax_op = SoftmaxOp::new(&device, &queue)?;
+    let ew_op = ElementWiseOp::new(&device, &queue);
 
     info!("");
     info!("=== Benchmark Results ===");
@@ -279,7 +279,7 @@ async fn cmd_benchmark(
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("bench_rmsnorm"),
             });
-            rmsnorm_op.dispatch(&device, &mut encoder, &input, &output, rows, hd)?;
+            rmsnorm_op.dispatch(&device, &queue, &mut encoder, &input, &output, rows, hd)?;
             queue.submit(std::iter::once(encoder.finish()));
         }
         device.poll(wgpu::PollType::wait_indefinitely())?;

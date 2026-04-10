@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::mpsc;
 
 use wgpu::{Device, Queue};
 
@@ -41,6 +40,13 @@ pub struct TokenGenerator {
     #[allow(dead_code)]
     max_seq_len: u32,
 }
+
+// SAFETY: TokenGenerator is moved into exactly one OS thread at a time via Arc<Self>.
+// The Arc ensures exclusive ownership — no concurrent access from multiple threads.
+// The non-Sync field (RefCell<MoELinear> inside BlockAttnResLayer) is only accessed
+// from within the single OS thread that owns the Arc, never concurrently.
+unsafe impl Send for TokenGenerator {}
+unsafe impl Sync for TokenGenerator {}
 
 fn readback_buffer(device: &Device, queue: &Queue, buffer: &GpuBuffer) -> Vec<f32> {
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
@@ -107,6 +113,7 @@ impl TokenGenerator {
 
         let kv_cache = ModelKVCache::new(
             Arc::clone(&device),
+            Arc::clone(&queue),
             total_layers,
             max_seq_len,
             num_heads,
@@ -132,6 +139,7 @@ impl TokenGenerator {
         let total_layers = config.total_layers() as u32;
         ModelKVCache::new(
             Arc::clone(&self.device),
+            Arc::clone(&self.queue),
             total_layers,
             self.max_seq_len,
             num_heads,
@@ -162,11 +170,7 @@ impl TokenGenerator {
             label: Some("Prefill Phase"),
         });
 
-        {
-            let mut mapped = token_ids_buf.buffer().slice(..).get_mapped_range_mut();
-            mapped.copy_from_slice(bytemuck::cast_slice(prompt_tokens));
-            drop(mapped);
-        }
+        self.queue.write_buffer(token_ids_buf.buffer(), 0, bytemuck::cast_slice(prompt_tokens));
 
         self.embedding.forward(&mut encoder, &token_ids_buf, &hidden_states, seq_len)?;
 
@@ -214,11 +218,7 @@ impl TokenGenerator {
                 label: Some("Decode Step"),
             });
 
-            {
-                let mut mapped = token_buf.buffer().slice(..).get_mapped_range_mut();
-                mapped.copy_from_slice(&next_token.to_le_bytes());
-                drop(mapped);
-            }
+            self.queue.write_buffer(token_buf.buffer(), 0, &next_token.to_le_bytes());
 
             self.embedding.forward(&mut encoder, &token_buf, &embed_buf, 1)?;
 
@@ -246,15 +246,166 @@ impl TokenGenerator {
         Ok(output_tokens)
     }
 
-    pub fn generate_stream(&self, prompt_tokens: Vec<u32>, config: GenerateConfig) -> mpsc::Receiver<u32> {
-        let (tx, rx) = mpsc::channel();
-
-        let tokens = self.generate(&prompt_tokens, &config).unwrap_or_default();
+    /// True streaming generation: runs the full decode loop in a dedicated OS thread
+    /// (not a tokio blocking thread pool thread), sending each token as it is produced.
+    ///
+    /// The returned `Receiver` is bounded (capacity 16), providing backpressure so the GPU
+    /// poll loop cannot run ahead of the consumer by more than 16 tokens.
+    ///
+    /// Cancellation: when the `Receiver` is dropped, `blocking_send` returns `Err` and
+    /// the OS thread exits cleanly without any explicit cancellation signal.
+    pub fn generate_stream(
+        self: Arc<Self>,
+        prompt_tokens: Vec<u32>,
+        max_new_tokens: usize,
+    ) -> tokio::sync::mpsc::Receiver<u32> {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
 
         std::thread::spawn(move || {
-            for token in tokens {
-                if tx.send(token).is_err() {
+            let config = GenerateConfig {
+                max_tokens: max_new_tokens,
+                ..GenerateConfig::default()
+            };
+            let hidden_dim = self.model.config().hidden_dim;
+            let f32_size = std::mem::size_of::<f32>();
+            let seq_len = prompt_tokens.len() as u32;
+
+            if seq_len == 0 {
+                return;
+            }
+
+            self.kv_cache.reset_all();
+
+            // --- Prefill phase ---
+            let hidden_bytes = seq_len as usize * hidden_dim * f32_size;
+            let hidden_states = match GpuBuffer::new(&self.device, hidden_bytes, Some("stream_prefill_hidden")) {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+
+            let token_ids_bytes = prompt_tokens.len() * std::mem::size_of::<u32>();
+            let token_ids_buf = match GpuBuffer::new(&self.device, token_ids_bytes, Some("stream_prefill_token_ids")) {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Stream Prefill Phase"),
+            });
+
+            self.queue.write_buffer(token_ids_buf.buffer(), 0, bytemuck::cast_slice(&prompt_tokens));
+
+            if self.embedding.forward(&mut encoder, &token_ids_buf, &hidden_states, seq_len).is_err() {
+                return;
+            }
+
+            let mut current_hidden = hidden_states;
+            for (i, layer) in self.model.layers().iter().enumerate() {
+                let kv = self.kv_cache.layer(i);
+                current_hidden = match layer.forward_prefill(&mut encoder, &current_hidden, kv, seq_len) {
+                    Ok(h) => h,
+                    Err(_) => return,
+                };
+            }
+
+            let last_hidden_bytes = hidden_dim * f32_size;
+            let last_hidden = match GpuBuffer::new(&self.device, last_hidden_bytes, Some("stream_prefill_last_hidden")) {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+            let last_offset = ((seq_len - 1) as u64) * (hidden_dim as u64) * (f32_size as u64);
+            encoder.copy_buffer_to_buffer(
+                current_hidden.buffer(),
+                last_offset,
+                last_hidden.buffer(),
+                0,
+                Some(last_hidden_bytes as u64),
+            );
+
+            let vocab_size = self.lm_head.vocab_size();
+            let logits_bytes = vocab_size * f32_size;
+            let logits_buf = match GpuBuffer::new(&self.device, logits_bytes, Some("stream_prefill_logits")) {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+            if self.lm_head.forward(&mut encoder, &last_hidden, &logits_buf, 1).is_err() {
+                return;
+            }
+
+            self.queue.submit(std::iter::once(encoder.finish()));
+
+            let logits = readback_buffer(&self.device, &self.queue, &logits_buf);
+            let mut next_token = sample_token(&logits, &config) as u32;
+
+            // Send first token; exit if receiver dropped (cancellation)
+            if tx.blocking_send(next_token).is_err() {
+                return;
+            }
+
+            if config.eos_token == Some(next_token) {
+                return;
+            }
+
+            // --- Decode loop: one token per step ---
+            for _ in 0..config.max_tokens.saturating_sub(1) {
+                let token_buf = match GpuBuffer::new(
+                    &self.device,
+                    std::mem::size_of::<u32>(),
+                    Some("stream_decode_token_id"),
+                ) {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                let embed_buf = match GpuBuffer::new(
+                    &self.device,
+                    hidden_dim * f32_size,
+                    Some("stream_decode_embed"),
+                ) {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+
+                let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Stream Decode Step"),
+                });
+
+                self.queue.write_buffer(token_buf.buffer(), 0, &next_token.to_le_bytes());
+
+                if self.embedding.forward(&mut encoder, &token_buf, &embed_buf, 1).is_err() {
                     return;
+                }
+
+                let mut current = embed_buf;
+                for (i, layer) in self.model.layers().iter().enumerate() {
+                    let kv = self.kv_cache.layer(i);
+                    current = match layer.forward_decode_token(&mut encoder, &current, kv) {
+                        Ok(h) => h,
+                        Err(_) => return,
+                    };
+                }
+
+                let logits_buf = match GpuBuffer::new(&self.device, logits_bytes, Some("stream_decode_logits")) {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                if self.lm_head.forward(&mut encoder, &current, &logits_buf, 1).is_err() {
+                    return;
+                }
+
+                self.queue.submit(std::iter::once(encoder.finish()));
+
+                let logits = readback_buffer(&self.device, &self.queue, &logits_buf);
+                let token = sample_token(&logits, &config) as u32;
+
+                // blocking_send applies backpressure; Err means receiver dropped → cancel
+                if tx.blocking_send(token).is_err() {
+                    return;
+                }
+
+                next_token = token;
+
+                if config.eos_token == Some(token) {
+                    break;
                 }
             }
         });

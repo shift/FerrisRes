@@ -114,6 +114,7 @@ impl CausalMaskOp {
     pub fn dispatch_causal_mask(
         &self,
         device: &Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         scores: &GpuBuffer,
         output: &GpuBuffer,
@@ -128,13 +129,9 @@ impl CausalMaskOp {
             label: Some("CausalMask Params"),
             size: 16,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+            mapped_at_creation: false,
         });
-        params_buffer
-            .slice(..)
-            .get_mapped_range_mut()
-            .copy_from_slice(bytemuck::cast_slice(&params_data));
-        params_buffer.unmap();
+        queue.write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params_data));
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("CausalMask Bind Group"),

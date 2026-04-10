@@ -9,6 +9,7 @@ use crate::compute::kernels::elementwise::ElementWiseOp;
 use crate::compute::kernels::rope::RopeOp;
 use crate::compute::kernels::flash_decode::FlashDecodeOp;
 use crate::compute::kernels::causal_mask::CausalMaskOp;
+use crate::compute::kernels::prefill_attn::PrefillAttnOp;
 use crate::model::config::BlockAttnResConfig;
 use crate::model::linear::Linear;
 use crate::model::moe_linear::MoELinear;
@@ -154,8 +155,10 @@ pub struct BlockAttnResLayer {
     #[allow(dead_code)]
     softmax: SoftmaxOp,
     rope: RopeOp,
+    #[allow(dead_code)]
     causal_mask: CausalMaskOp,
     flash_decode: FlashDecodeOp,
+    prefill_attn: PrefillAttnOp,
 
     device: Arc<Device>,
     #[allow(dead_code)]
@@ -244,7 +247,7 @@ impl BlockAttnResLayer {
         };
 
         let pseudo_query_bytes = config.hidden_dim * std::mem::size_of::<f32>();
-        let pseudo_query = GpuBuffer::zeros(&device, pseudo_query_bytes, Some("Pseudo Query"))?;
+        let pseudo_query = GpuBuffer::zeros(&device, &queue, pseudo_query_bytes, Some("Pseudo Query"))?;
 
         let attn_res_proj = Linear::new(
             Arc::clone(&device),
@@ -254,13 +257,14 @@ impl BlockAttnResLayer {
             false,
         )?;
 
-        let elementwise = ElementWiseOp::new(&device);
-        let softmax = SoftmaxOp::new(&device)?;
-        let matmul = MatMulOp::new(&device);
+        let elementwise = ElementWiseOp::new(&device, &queue);
+        let softmax = SoftmaxOp::new(&device, &queue)?;
+        let matmul = MatMulOp::new(&device, &queue);
         let head_weight_mul = HeadWeightMulOp::new(&device);
         let rope = RopeOp::new(&device)?;
         let causal_mask = CausalMaskOp::new(&device)?;
-        let flash_decode = FlashDecodeOp::new(&device)?;
+        let flash_decode = FlashDecodeOp::new(&device, &queue)?;
+        let prefill_attn = PrefillAttnOp::new(&device)?;
         
         let hidden_dim = config.hidden_dim;
 
@@ -294,6 +298,7 @@ impl BlockAttnResLayer {
             rope,
             causal_mask,
             flash_decode,
+            prefill_attn,
             device,
             queue,
         })
@@ -347,6 +352,7 @@ impl BlockAttnResLayer {
         )?;
         self.attn_norm.dispatch(
             &self.device,
+            &self.queue,
             encoder,
             hidden_states,
             &normed,
@@ -457,6 +463,7 @@ impl BlockAttnResLayer {
         )?;
         self.ff_norm.dispatch(
             &self.device,
+            &self.queue,
             encoder,
             output,
             &ff_normed,
@@ -523,6 +530,7 @@ impl BlockAttnResLayer {
         )?;
         self.attn_norm.dispatch(
             &self.device,
+            &self.queue,
             encoder,
             hidden_states,
             &normed,
@@ -567,6 +575,7 @@ impl BlockAttnResLayer {
         let ff_normed = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_ff_normed"))?;
         self.ff_norm.dispatch(
             &self.device,
+            &self.queue,
             encoder,
             &residual1,
             &ff_normed,
@@ -625,6 +634,7 @@ impl BlockAttnResLayer {
         )?;
         self.attn_norm.dispatch(
             &self.device,
+            &self.queue,
             encoder,
             hidden_states,
             &normed,
@@ -648,74 +658,25 @@ impl BlockAttnResLayer {
 
         let _new_len = kv_cache.update_batch(encoder, &rope_k, &v_buf, seq_len)?;
 
-        let attn_scores = GpuBuffer::new(
-            &self.device,
-            seq_len as usize * seq_len as usize * num_heads as usize * f32_size,
-            Some("prefill_attn_scores"),
-        )?;
-        self.matmul.dispatch(
-            encoder,
-            &rope_q,
-            &rope_k,
-            &attn_scores,
-            seq_len * num_heads,
-            head_dim,
-            seq_len,
-        )?;
-
-        let masked_scores = GpuBuffer::new(
-            &self.device,
-            seq_len as usize * seq_len as usize * num_heads as usize * f32_size,
-            Some("prefill_masked_scores"),
-        )?;
-        self.causal_mask.dispatch_causal_mask(
-            &self.device,
-            encoder,
-            &attn_scores,
-            &masked_scores,
-            seq_len * num_heads,
-            seq_len,
-        )?;
-
-        let scale_factor = 1.0f32 / (self.head_dim as f32).sqrt();
-        let scaled_scores = GpuBuffer::new(
-            &self.device,
-            seq_len as usize * seq_len as usize * num_heads as usize * f32_size,
-            Some("prefill_scaled_scores"),
-        )?;
-        self.elementwise.dispatch_scale(
-            encoder,
-            &masked_scores,
-            &scaled_scores,
-            scale_factor,
-            seq_len * seq_len * num_heads,
-        )?;
-
-        let attn_weights = GpuBuffer::new(
-            &self.device,
-            seq_len as usize * seq_len as usize * num_heads as usize * f32_size,
-            Some("prefill_attn_weights"),
-        )?;
-        self.softmax.dispatch(
-            encoder,
-            &scaled_scores,
-            &attn_weights,
-            seq_len * num_heads,
-            seq_len,
-        )?;
-
         let attn_out = GpuBuffer::new(
             &self.device,
             seq_len as usize * hidden_dim * f32_size,
             Some("prefill_attn_out"),
         )?;
-        self.matmul.dispatch(
+        // rope_q and rope_k are both [seq_len, num_heads, head_dim].
+        // v_buf is [seq_len, num_heads, head_dim].
+        // PrefillAttnOp correctly handles this layout: each thread owns
+        // one (query_pos, head) pair, indexes k/v as
+        //   s * num_heads * head_dim + h * head_dim + d
+        // and applies causal masking + online softmax internally.
+        self.prefill_attn.dispatch(
             encoder,
-            &attn_weights,
+            &rope_q,
+            &rope_k,
             &v_buf,
             &attn_out,
-            seq_len * num_heads,
             seq_len,
+            num_heads,
             head_dim,
         )?;
 
@@ -728,6 +689,7 @@ impl BlockAttnResLayer {
         let ff_normed = GpuBuffer::new(&self.device, seq_len as usize * hidden_dim * f32_size, Some("prefill_ff_normed"))?;
         self.ff_norm.dispatch(
             &self.device,
+            &self.queue,
             encoder,
             &residual1,
             &ff_normed,
@@ -852,6 +814,7 @@ impl BlockAttnResLayer {
         )?;
         self.attn_res_norm.dispatch(
             &self.device,
+            &self.queue,
             encoder,
             block_reps,
             &normed_keys,

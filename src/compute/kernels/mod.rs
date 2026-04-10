@@ -7,3 +7,4 @@ pub mod rope;
 pub mod im2col;
 pub mod flash_decode;
 pub mod causal_mask;
+pub mod prefill_attn;

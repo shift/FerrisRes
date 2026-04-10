@@ -133,6 +133,7 @@ impl RmsNormOp {
     pub fn dispatch(
         &self,
         device: &Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         input: &GpuBuffer,
         output: &GpuBuffer,
@@ -158,13 +159,9 @@ impl RmsNormOp {
             label: Some("RmsNorm Params"),
             size: 8,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+            mapped_at_creation: false,
         });
-        params_buffer
-            .slice(..)
-            .get_mapped_range_mut()
-            .copy_from_slice(bytemuck::cast_slice(&params_data));
-        params_buffer.unmap();
+        queue.write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params_data));
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("RmsNorm Bind Group"),

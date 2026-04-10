@@ -31,7 +31,6 @@ fn rope_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let pos = params.start_pos + flat_idx / (num_heads * head_dim);
     let head_offset = flat_idx % (num_heads * head_dim);
-    let head_idx = head_offset / head_dim;
     let dim_idx = head_offset % head_dim;
 
     if (dim_idx % 2u != 0u) {
@@ -46,12 +45,13 @@ fn rope_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cos_t = cos(theta);
     let sin_t = sin(theta);
 
-    let base_idx = pos * num_heads * head_dim + head_idx * head_dim + dim_idx;
-    let x0 = input[base_idx];
-    let x1 = input[base_idx + 1u];
+    // Buffer index is always local — input/output sized for current batch only.
+    // pos is used only for angle (theta) computation above; flat_idx addresses the buffer.
+    let x0 = input[flat_idx];
+    let x1 = input[flat_idx + 1u];
 
-    output[base_idx] = x0 * cos_t - x1 * sin_t;
-    output[base_idx + 1u] = x0 * sin_t + x1 * cos_t;
+    output[flat_idx] = x0 * cos_t - x1 * sin_t;
+    output[flat_idx + 1u] = x0 * sin_t + x1 * cos_t;
 }
 "#;
 

@@ -24,16 +24,17 @@ fn top_k_gate(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let offset = token_idx * params.num_experts;
-    var expert_weights_arr: array<f32, 128>;
+    var expert_weights_arr: array<f32, 32>; // capped to 32 to prevent register spill on iGPUs
     let max_k = min(params.top_k, params.num_experts);
+    let n_experts = min(params.num_experts, 32u);
 
-    for (var i: u32; i < params.num_experts; i = i + 1u) {
+    for (var i: u32; i < n_experts; i = i + 1u) {
         expert_weights_arr[i] = gate_logits[offset + i];
     }
 
-    for (var j: u32 = 0u; j < 64u; j = j + 1u) {
+    for (var j: u32 = 0u; j < n_experts; j = j + 1u) {
         var swapped = false;
-        for (var k: u32 = 0u; k < 63u - j; k = k + 1u) {
+        for (var k: u32 = 0u; k < n_experts - 1u - j; k = k + 1u) {
             if (expert_weights_arr[k] < expert_weights_arr[k + 1u]) {
                 let temp = expert_weights_arr[k];
                 expert_weights_arr[k] = expert_weights_arr[k + 1u];
@@ -102,15 +103,16 @@ fn compute_top_k_indices(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let offset = token_idx * params.num_experts;
-    var logits_with_idx = array<vec2<f32>, 128>();
-    
-    for (var i: u32; i < params.num_experts; i = i + 1u) {
+    var logits_with_idx = array<vec2<f32>, 32>(); // capped to 32 to prevent register spill on iGPUs
+    let n_experts = min(params.num_experts, 32u);
+
+    for (var i: u32; i < n_experts; i = i + 1u) {
         logits_with_idx[i] = vec2<f32>(gate_logits[offset + i], f32(i));
     }
 
-    for (var j: u32 = 0u; j < 64u; j = j + 1u) {
+    for (var j: u32 = 0u; j < n_experts; j = j + 1u) {
         var swapped = false;
-        for (var k: u32 = 0u; k < 63u - j; k = k + 1u) {
+        for (var k: u32 = 0u; k < n_experts - 1u - j; k = k + 1u) {
             if (logits_with_idx[k].x < logits_with_idx[k + 1u].x) {
                 let temp = logits_with_idx[k];
                 logits_with_idx[k] = logits_with_idx[k + 1u];
@@ -122,9 +124,17 @@ fn compute_top_k_indices(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let sel_offset = token_idx * params.top_k;
+
+    // Softmax over K selected logits (numerically stable: subtract max before exp).
+    // logits_with_idx is sorted descending, so index 0 is the maximum.
+    let max_logit: f32 = logits_with_idx[0].x;
+    var sum_exp: f32 = 0.0;
+    for (var k: u32 = 0u; k < params.top_k; k = k + 1u) {
+        sum_exp = sum_exp + exp(logits_with_idx[k].x - max_logit);
+    }
     for (var k: u32 = 0u; k < params.top_k; k = k + 1u) {
         selected_experts[sel_offset + k] = u32(logits_with_idx[k].y);
-        expert_weights[sel_offset + k] = logits_with_idx[k].x;
+        expert_weights[sel_offset + k] = exp(logits_with_idx[k].x - max_logit) / sum_exp;
     }
 }
 "#;
