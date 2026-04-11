@@ -8,11 +8,42 @@ pub enum GpuKind {
     Other,
 }
 
+/// GPU vendor identification
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GpuVendor {
+    Nvidia,
+    Amd,
+    Intel,
+    Apple,
+    Qualcomm,
+    Unknown,
+}
+
+impl GpuVendor {
+    pub fn from_adapter_name(name: &str) -> Self {
+        let name_lower = name.to_lowercase();
+        if name_lower.contains("nvidia") || name_lower.contains("geforce") || name_lower.contains("rtx") {
+            GpuVendor::Nvidia
+        } else if name_lower.contains("amd") || name_lower.contains("radeon") {
+            GpuVendor::Amd
+        } else if name_lower.contains("intel") || name_lower.contains("uhd") {
+            GpuVendor::Intel
+        } else if name_lower.contains("apple") || name_lower.contains("metal") {
+            GpuVendor::Apple
+        } else if name_lower.contains("qualcomm") || name_lower.contains("adreno") {
+            GpuVendor::Qualcomm
+        } else {
+            GpuVendor::Unknown
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capability {
     pub vram_mb: u64,
     pub shared_ram_mb: u64,
     pub gpu_kind: GpuKind,
+    pub vendor: GpuVendor,
     pub max_compute_workgroup_size: u32,
     pub max_compute_invocations_per_workgroup: u32,
     pub max_storage_buffer_range: u64,
@@ -28,6 +59,7 @@ impl Capability {
             vram_mb: 0,
             shared_ram_mb: 0,
             gpu_kind: GpuKind::Other,
+            vendor: GpuVendor::Unknown,
             max_compute_workgroup_size: 0,
             max_compute_invocations_per_workgroup: 0,
             max_storage_buffer_range: 0,
@@ -40,17 +72,19 @@ impl Capability {
         match detect_vram_ash() {
             Some((vram, name, kind)) => {
                 cap.vram_mb = vram;
-                cap.adapter_name = name;
+                cap.adapter_name = name.clone();
                 cap.gpu_kind = kind;
-                info!(vram_mb = vram, kind = ?kind, method = "ash", "Detected GPU via Vulkan");
+                cap.vendor = GpuVendor::from_adapter_name(&name);
+                info!(vram_mb = vram, kind = ?kind, vendor = ?cap.vendor, method = "ash", "Detected GPU via Vulkan");
             }
             None => {
                 warn!("ash VRAM detection failed, trying sysfs fallback");
                 match detect_vram_sysfs() {
                     Some((vram, name)) => {
                         cap.vram_mb = vram;
-                        cap.adapter_name = name;
-                        info!(vram_mb = vram, method = "sysfs", "Detected GPU VRAM via sysfs");
+                        cap.adapter_name = name.clone();
+                        cap.vendor = GpuVendor::from_adapter_name(&name);
+                        info!(vram_mb = vram, vendor = ?cap.vendor, method = "sysfs", "Detected GPU VRAM via sysfs");
                     }
                     None => {
                         warn!("No GPU VRAM detected via any method");
@@ -85,6 +119,75 @@ impl Capability {
         match self.gpu_kind {
             GpuKind::Discrete if self.vram_mb > 0 => self.vram_mb,
             _ => self.shared_ram_mb,
+        }
+    }
+    
+    /// Get vendor-specific compute tuning hints
+    pub fn vendor_tuning(&self) -> VendorTuning {
+        match self.vendor {
+            GpuVendor::Nvidia => VendorTuning {
+                prefer_warps: true,
+                warp_size: 32,
+                align_to_warp: true,
+                prefer_fp32_atomic: false,
+                l2_benefits_from_padding: true,
+            },
+            GpuVendor::Amd => VendorTuning {
+                prefer_warps: true,
+                warp_size: 32,
+                align_to_warp: true,
+                prefer_fp32_atomic: true,
+                l2_benefits_from_padding: false,
+            },
+            GpuVendor::Intel => VendorTuning {
+                prefer_warps: false,
+                warp_size: 32,
+                align_to_warp: false,
+                prefer_fp32_atomic: false,
+                l2_benefits_from_padding: true,
+            },
+            GpuVendor::Apple => VendorTuning {
+                prefer_warps: true,
+                warp_size: 32,
+                align_to_warp: true,
+                prefer_fp32_atomic: false,
+                l2_benefits_from_padding: true,
+            },
+            GpuVendor::Qualcomm => VendorTuning {
+                prefer_warps: true,
+                warp_size: 32,
+                align_to_warp: true,
+                prefer_fp32_atomic: false,
+                l2_benefits_from_padding: false,
+            },
+            GpuVendor::Unknown => VendorTuning::default(),
+        }
+    }
+}
+
+/// Vendor-specific GPU tuning parameters
+#[derive(Debug, Clone)]
+pub struct VendorTuning {
+    /// Whether the GPU benefits from warp-aligned access patterns
+    pub prefer_warps: bool,
+    /// Hardware warp size
+    pub warp_size: u32,
+    /// Whether to align memory accesses to warp boundaries
+    pub align_to_warp: bool,
+    /// Whether to prefer FP32 atomics (AMD performs better with these)
+    pub prefer_fp32_atomic: bool,
+    /// Whether L2 cache benefits from memory padding
+    pub l2_benefits_from_padding: bool,
+}
+
+impl Default for VendorTuning {
+    fn default() -> Self {
+        Self {
+            prefer_warps: false,
+            warp_size: 32,
+            align_to_warp: false,
+            prefer_fp32_atomic: false,
+            l2_benefits_from_padding: false,
         }
     }
 }

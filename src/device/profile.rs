@@ -110,3 +110,60 @@ pub enum ComputeMode {
     Tiled,
     CpuOffload,
 }
+
+impl DeviceProfile {
+    /// Get recommended workgroup size for compute shaders
+    /// Based on GPU capability and profile
+    pub fn recommended_workgroup_size(&self, max_invocations: u32) -> u32 {
+        // Use a power of 2 that fits within hardware limits
+        // Smaller workgroups = more flexibility for different GPU architectures
+        match self {
+            DeviceProfile::Integrated => {
+                // Integrated GPUs benefit from smaller workgroups
+                64.min(max_invocations)
+            }
+            DeviceProfile::LowEnd => {
+                64.min(max_invocations)
+            }
+            DeviceProfile::MidRange => {
+                // Mid-range GPUs can handle larger workgroups efficiently
+                128.min(max_invocations)
+            }
+            DeviceProfile::HighEnd => {
+                // High-end GPUs benefit from maximum utilization
+                256.min(max_invocations)
+            }
+        }
+    }
+    
+    /// Get recommended tile size for tiled matrix multiplication
+    pub fn recommended_tile_size(&self) -> (u32, u32) {
+        match self {
+            DeviceProfile::Integrated => (8, 8),
+            DeviceProfile::LowEnd => (16, 16),
+            DeviceProfile::MidRange => (32, 32),
+            DeviceProfile::HighEnd => (64, 64),
+        }
+    }
+    
+    /// Get memory transfer optimization hints
+    pub fn memory_transfer_hint(&self) -> MemoryTransferHint {
+        match self {
+            DeviceProfile::Integrated => MemoryTransferHint::PreferCoalesced,
+            DeviceProfile::LowEnd => MemoryTransferHint::PreferCoalesced,
+            DeviceProfile::MidRange => MemoryTransferHint::Balanced,
+            DeviceProfile::HighEnd => MemoryTransferHint::PreferAligned,
+        }
+    }
+}
+
+/// Memory transfer optimization hints
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryTransferHint {
+    /// Prioritize memory coalescing over alignment
+    PreferCoalesced,
+    /// Balanced between coalescing and alignment
+    Balanced,
+    /// Prioritize memory alignment for bandwidth
+    PreferAligned,
+}

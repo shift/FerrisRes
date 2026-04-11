@@ -2,6 +2,30 @@ use wgpu::{Adapter, Device, Queue, ShaderModule, ComputePipeline};
 use crate::error::{FerrisResError, Result};
 use crate::device::{DeviceProfile, Capability};
 
+/// Runtime compute parameters optimized for detected hardware
+#[derive(Debug, Clone)]
+pub struct ComputeParams {
+    /// Recommended workgroup size for compute shaders
+    pub workgroup_size: u32,
+    /// Recommended tile size for matrix operations (height, width)
+    pub tile_size: (u32, u32),
+    /// Recommended batch size for inference
+    pub batch_size: u32,
+    /// Whether to use async compute pipelines
+    pub use_async: bool,
+}
+
+impl Default for ComputeParams {
+    fn default() -> Self {
+        Self {
+            workgroup_size: 64,
+            tile_size: (16, 16),
+            batch_size: 1,
+            use_async: false,
+        }
+    }
+}
+
 pub struct WgpuCompute {
     device: Device,
     queue: Queue,
@@ -81,6 +105,24 @@ impl WgpuCompute {
         let info = self.adapter_info();
         Capability::detect()
             .with_adapter_limits(&limits, &info)
+    }
+    
+    /// Get optimized compute parameters based on detected hardware
+    pub fn get_optimal_params(&self) -> ComputeParams {
+        let capability = self.detect_capability();
+        let profile = DeviceProfile::from_vram_and_kind(
+            capability.vram_mb, 
+            capability.gpu_kind
+        );
+        
+        ComputeParams {
+            workgroup_size: profile.recommended_workgroup_size(
+                capability.max_compute_invocations_per_workgroup
+            ),
+            tile_size: profile.recommended_tile_size(),
+            batch_size: profile.recommended_batch_size(),
+            use_async: matches!(profile, DeviceProfile::HighEnd | DeviceProfile::MidRange),
+        }
     }
 
     pub fn detect_profile(&self) -> DeviceProfile {

@@ -10,6 +10,52 @@ use crate::device::capability::{Capability, GpuKind};
 use crate::device::profile::{ComputeMode, DeviceProfile};
 use crate::error::{FerrisResError, Result};
 
+/// Memory coalescing configuration based on GPU type
+#[derive(Debug, Clone)]
+pub struct MemoryCoalescingConfig {
+    /// Preferred alignment in bytes for memory transfers
+    pub alignment_bytes: u32,
+    /// Whether to prefer sequential access patterns
+    pub prefer_sequential: bool,
+    /// Whether to use double buffering
+    pub use_double_buffering: bool,
+    /// Chunk size for batched transfers
+    pub chunk_size: u32,
+}
+
+impl MemoryCoalescingConfig {
+    /// Create config based on GPU kind
+    pub fn for_gpu_kind(kind: GpuKind) -> Self {
+        match kind {
+            GpuKind::Discrete => Self {
+                alignment_bytes: 256,
+                prefer_sequential: true,
+                use_double_buffering: true,
+                chunk_size: 4096,
+            },
+            GpuKind::Integrated => Self {
+                // Integrated GPUs benefit from simpler access patterns
+                alignment_bytes: 64,
+                prefer_sequential: true,
+                use_double_buffering: false,
+                chunk_size: 1024,
+            },
+            GpuKind::Other => Self::default(),
+        }
+    }
+}
+
+impl Default for MemoryCoalescingConfig {
+    fn default() -> Self {
+        Self {
+            alignment_bytes: 64,
+            prefer_sequential: true,
+            use_double_buffering: false,
+            chunk_size: 1024,
+        }
+    }
+}
+
 /// Maximum tile size in bytes for integrated / non-discrete GPUs.
 /// This caps the tile budget so that a single tile does not consume all available VRAM,
 /// leaving room for model parameters, optimizer state, and activations.

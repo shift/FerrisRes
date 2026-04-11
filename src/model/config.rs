@@ -1,5 +1,92 @@
 use serde::{Deserialize, Serialize};
 
+/// Configuration for entropy-based adaptive patching
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptivePatchingConfig {
+    /// Use entropy-based adaptive patch sizes (vs fixed block_size)
+    pub enabled: bool,
+    /// Minimum patch size in tokens
+    pub min_patch_size: usize,
+    /// Maximum patch size in tokens
+    pub max_patch_size: usize,
+    /// Entropy threshold - start new patch when entropy > threshold
+    pub entropy_threshold: f32,
+    /// Entropy history smoothing factor
+    pub smoothing_factor: f32,
+}
+
+impl Default for AdaptivePatchingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_patch_size: 2,
+            max_patch_size: 16,
+            entropy_threshold: 2.0,
+            smoothing_factor: 0.9,
+        }
+    }
+}
+
+/// Entropy-based patch boundary predictor
+pub struct EntropyPredictor {
+    config: AdaptivePatchingConfig,
+    running_entropy: f32,
+    patch_boundaries: Vec<usize>,
+}
+
+impl EntropyPredictor {
+    pub fn new(config: AdaptivePatchingConfig) -> Self {
+        Self {
+            config,
+            running_entropy: 0.0,
+            patch_boundaries: vec![0],
+        }
+    }
+    
+    /// Compute Shannon entropy of a probability distribution
+    pub fn compute_entropy(&self, probabilities: &[f32]) -> f32 {
+        probabilities.iter()
+            .filter(|&&p| p > 0.0)
+            .map(|&p| -p * p.log2())
+            .sum()
+    }
+    
+    /// Predict next patch boundary based on entropy
+    pub fn predict_boundary(&mut self, token_probs: &[f32], current_pos: usize) -> usize {
+        let entropy = self.compute_entropy(token_probs);
+        
+        // Update running average
+        self.running_entropy = self.config.smoothing_factor * self.running_entropy 
+            + (1.0 - self.config.smoothing_factor) * entropy;
+        
+        // Start new patch if entropy crosses threshold
+        if self.running_entropy > self.config.entropy_threshold 
+            && current_pos - *self.patch_boundaries.last().unwrap() >= self.config.min_patch_size {
+            self.patch_boundaries.push(current_pos);
+        }
+        
+        // Cap at max patch size
+        let patch_size = current_pos - self.patch_boundaries.last().unwrap();
+        if patch_size >= self.config.max_patch_size {
+            self.patch_boundaries.push(current_pos);
+        }
+        
+        self.patch_boundaries.last().copied().unwrap_or(0)
+    }
+    
+    /// Reset predictor state
+    pub fn reset(&mut self) {
+        self.running_entropy = 0.0;
+        self.patch_boundaries.clear();
+        self.patch_boundaries.push(0);
+    }
+    
+    /// Get computed patch boundaries
+    pub fn boundaries(&self) -> &[usize] {
+        &self.patch_boundaries
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockAttnResConfig {
     pub hidden_dim: usize,

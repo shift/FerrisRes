@@ -2,11 +2,13 @@ pub mod optimizer;
 pub mod checkpointing;
 pub mod cpu_offload;
 pub mod async_offload;
+pub mod lora;
 
 pub use optimizer::{SgdOptimizer, AdamOptimizer, CrossEntropyLoss};
 pub use checkpointing::CheckpointStore;
 pub use cpu_offload::CpuGradientBuffer;
 pub use async_offload::AsyncGradientOffload;
+pub use lora::{LoraConfig, LoraLayer, LoraManager};
 use std::fmt;
 use std::sync::Arc;
 use wgpu::Device;

@@ -5,6 +5,7 @@ use wgpu::{Device, Queue};
 use crate::compute::cache::BlockCache;
 use crate::compute::buffer::GpuBuffer;
 use crate::compute::kernels::elementwise::ElementWiseOp;
+use crate::compute::turboquant::{TurboQuantConfig, OutlierChannelSplitter};
 use crate::model::config::BlockAttnResConfig;
 use crate::model::embedding::TokenEmbedding;
 use crate::model::model::BlockAttnResModel;
@@ -16,6 +17,10 @@ pub struct TwoPhaseConfig {
     pub max_batch_inference: u32,
     pub cache_block_reps: bool,
     pub use_online_softmax: bool,
+    // TurboQuant KV cache compression settings
+    pub use_turboquant: bool,
+    pub compression_bit_width: Option<u32>,  // 2, 2.5, 3, or 4 bits
+    pub use_outlier_splitting: bool,  // For fractional bit precision
 }
 
 impl Default for TwoPhaseConfig {
@@ -24,16 +29,65 @@ impl Default for TwoPhaseConfig {
             max_batch_inference: 1,
             cache_block_reps: true,
             use_online_softmax: true,
+            // Default: no TurboQuant compression (can be enabled via settings)
+            use_turboquant: false,
+            compression_bit_width: None,
+            use_outlier_splitting: false,
         }
     }
 }
 
+impl TwoPhaseConfig {
+    /// Enable TurboQuant compression with specified bit width
+    pub fn with_turboquant(mut self, bit_width: u32) -> Self {
+        self.use_turboquant = true;
+        self.compression_bit_width = Some(bit_width);
+        self
+    }
+    
+    /// Enable 2-bit compression (16x memory reduction)
+    pub fn with_2bit_compression(self) -> Self {
+        self.with_turboquant(2)
+    }
+    
+    /// Enable 2.5-bit compression (12.8x memory reduction)
+    pub fn with_2_5bit_compression(self) -> Self {
+        let mut config = self.with_turboquant(2);
+        config.use_outlier_splitting = true;
+        config
+    }
+    
+    /// Enable 3-bit compression (10.7x memory reduction)
+    pub fn with_3bit_compression(self) -> Self {
+        self.with_turboquant(3)
+    }
+    
+    /// Calculate compression ratio based on settings
+    pub fn compression_ratio(&self) -> f32 {
+        if !self.use_turboquant {
+            return 1.0;  // No compression
+        }
+        
+        match self.compression_bit_width {
+            Some(2) if self.use_outlier_splitting => 12.8,
+            Some(2) => 16.0,
+            Some(3) => 10.7,
+            Some(4) => 8.0,
+            _ => 1.0,
+        }
+    }
+}
+
+#[allow(dead_code)]
 pub struct TwoPhaseInference {
     config: TwoPhaseConfig,
     model: BlockAttnResModel,
     block_cache: BlockCache,
     lse_buffer: GpuBuffer,
     elementwise: ElementWiseOp,
+    // TurboQuant compression state
+    turboquant_config: Option<TurboQuantConfig>,
+    outlier_splitter: Option<OutlierChannelSplitter>,
     device: Arc<Device>,
     queue: Arc<Queue>,
 }
@@ -77,6 +131,36 @@ impl TwoPhaseInference {
 
         let elementwise = ElementWiseOp::new(&device, &queue);
 
+        // Initialize TurboQuant configuration if enabled
+        let (turboquant_config, outlier_splitter) = if inference_config.use_turboquant {
+            let bit_width = inference_config.compression_bit_width.unwrap_or(2);
+            let tq_config = TurboQuantConfig::new(
+                bit_width,
+                model_config.hidden_dim as u32,
+                true,  // enable QJL
+            );
+            
+            let splitter = if inference_config.use_outlier_splitting {
+                Some(OutlierChannelSplitter::new(
+                    model_config.hidden_dim as u32,
+                    2.5,  // 2.5-bit average
+                ))
+            } else {
+                None
+            };
+            
+            tracing::info!(
+                "TurboQuant compression enabled: {}bit, outlier_splitting={}, compression={:.1}x",
+                bit_width,
+                inference_config.use_outlier_splitting,
+                inference_config.compression_ratio()
+            );
+            
+            (Some(tq_config), splitter)
+        } else {
+            (None, None)
+        };
+
         tracing::info!("TwoPhaseInference created successfully");
 
         Ok(Self {
@@ -85,6 +169,8 @@ impl TwoPhaseInference {
             block_cache,
             lse_buffer,
             elementwise,
+            turboquant_config,
+            outlier_splitter,
             device,
             queue,
         })

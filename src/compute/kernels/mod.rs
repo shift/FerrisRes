@@ -8,3 +8,4 @@ pub mod im2col;
 pub mod flash_decode;
 pub mod causal_mask;
 pub mod prefill_attn;
+pub mod turboquant_kernels;

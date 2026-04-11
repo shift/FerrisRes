@@ -199,6 +199,7 @@ pub struct QuantizedBuffer {
 }
 
 impl QuantizedBuffer {
+    /// Create new f32 buffer
     pub fn new_f32(device: &Device, size: usize) -> Result<Self> {
         let buffer = GpuBuffer::new(device, size, Some("quant_f32"))?;
         let scale = GpuBuffer::new(device, size, Some("quant_f32_scale"))?;
@@ -208,6 +209,59 @@ impl QuantizedBuffer {
             scale,
             zero_point,
             dtype: QuantDtype::F32,
+        })
+    }
+    
+    /// Create new int8 buffer (with scale for dequantization)
+    pub fn new_int8(device: &Device, size: usize) -> Result<Self> {
+        // Int8 uses 1 byte per element vs 4 for f32
+        let buffer_size = size * std::mem::size_of::<i8>();
+        let scale_size = size * std::mem::size_of::<f32>();
+        
+        let buffer = GpuBuffer::new(device, buffer_size, Some("quant_i8"))?;
+        let scale = GpuBuffer::new(device, scale_size, Some("quant_i8_scale"))?;
+        let zero_point = GpuBuffer::new(device, scale_size, Some("quant_i8_zp"))?;
+        
+        Ok(Self {
+            buffer,
+            scale,
+            zero_point,
+            dtype: QuantDtype::Int8,
+        })
+    }
+    
+    /// Create new int4 buffer (4-bit, packed)
+    pub fn new_int4(device: &Device, size: usize) -> Result<Self> {
+        // Int4 packs 2 values per byte
+        let buffer_size = (size + 1) / 2;
+        let scale_size = size * std::mem::size_of::<f32>();
+        
+        let buffer = GpuBuffer::new(device, buffer_size, Some("quant_i4"))?;
+        let scale = GpuBuffer::new(device, scale_size, Some("quant_i4_scale"))?;
+        let zero_point = GpuBuffer::new(device, scale_size, Some("quant_i4_zp"))?;
+        
+        Ok(Self {
+            buffer,
+            scale,
+            zero_point,
+            dtype: QuantDtype::Int4,
+        })
+    }
+    
+    /// Create new fp16 buffer
+    pub fn new_f16(device: &Device, size: usize) -> Result<Self> {
+        let buffer_size = size * std::mem::size_of::<u16>(); // f16 as u16 repr
+        let scale_size = size * std::mem::size_of::<f32>(); // scale for upcast
+        
+        let buffer = GpuBuffer::new(device, buffer_size, Some("quant_f16"))?;
+        let scale = GpuBuffer::new(device, scale_size, Some("quant_f16_scale"))?;
+        let zero_point = GpuBuffer::new(device, scale_size, Some("quant_f16_zp"))?;
+        
+        Ok(Self {
+            buffer,
+            scale,
+            zero_point,
+            dtype: QuantDtype::F16,
         })
     }
 
@@ -223,5 +277,17 @@ impl QuantizedBuffer {
         Err(FerrisResError::Unsupported(
             "Quantization not yet implemented".into(),
         ))
+    }
+    
+    /// Get compression ratio vs f32
+    /// Get compression ratio vs f32
+    #[allow(dead_code)]
+    pub fn compression_ratio(&self) -> f32 {
+        match self.dtype {
+            QuantDtype::F32 => 1.0,
+            QuantDtype::F16 => 2.0,
+            QuantDtype::Int8 => 4.0,
+            QuantDtype::Int4 => 8.0,
+        }
     }
 }
