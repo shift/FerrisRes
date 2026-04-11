@@ -9,3 +9,5 @@ pub mod flash_decode;
 pub mod causal_mask;
 pub mod prefill_attn;
 pub mod turboquant_kernels;
+
+pub use turboquant_kernels::TURBOQUANT_WGSL;

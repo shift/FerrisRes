@@ -253,6 +253,16 @@ impl TurboQuantEngine {
     pub fn compression_ratio(&self) -> f32 {
         32.0 / self.config.bit_width as f32
     }
+
+    /// Get the WGSL compute shader source for GPU-accelerated quantization.
+    /// The returned source contains kernels: kernel_rotation, kernel_quantize,
+    /// kernel_dequantize, kernel_qjl_project, kernel_qjl_reconstruct,
+    /// kernel_inverse_rotation.
+    ///
+    /// Use with wgpu::Device::create_shader_module() to build a compute pipeline.
+    pub fn wgsl_source() -> &'static str {
+        crate::compute::kernels::TURBOQUANT_WGSL
+    }
 }
 
 /// Outlier Channel Splitting for non-integer bit precision
