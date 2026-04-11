@@ -1,0 +1,25 @@
+name: benchmark-turboquant
+agent_type: coder
+specialization: TurboQuant performance analysis and benchmarking
+email: null
+created_at: 2026-04-11
+version: 1.0.0
+capabilities:
+- memory_storage
+- task_management
+- context_tracking
+- reasoning_chains
+- knowledge_graph
+- team_collaboration
+commands:
+- engram task create --title "Task Title" --agent benchmark-turboquant
+- engram context create --source "documentation" --agent benchmark-turboquant
+- engram reasoning create --task-id "task-123" --agent benchmark-turboquant
+- engram sync --agents "agent1,agent2" --strategy "merge_with_conflict_resolution"
+workspace_access:
+  repositories:
+  - ./
+  tools:
+  - git
+  - rust
+  - cargo
