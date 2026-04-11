@@ -4,7 +4,7 @@ use wgpu::{Device, Queue};
 
 use crate::compute::buffer::GpuBuffer;
 use crate::inference::kv_cache::ModelKVCache;
-use crate::inference::sampling;
+use crate::inference::logit_processors::{LogitProcessor, LogitProcessorConfig};
 use crate::model::embedding::TokenEmbedding;
 use crate::model::lm_head::LMHead;
 use crate::model::model::BlockAttnResModel;
@@ -16,6 +16,14 @@ pub struct GenerateConfig {
     pub top_p: f32,
     pub max_tokens: usize,
     pub eos_token: Option<u32>,
+    /// Repetition penalty (1.0 = disabled).
+    pub repetition_penalty: f32,
+    /// Frequency penalty (0.0 = disabled).
+    pub frequency_penalty: f32,
+    /// Presence penalty (0.0 = disabled).
+    pub presence_penalty: f32,
+    /// Number of recent tokens for repetition window (0 = full history).
+    pub repetition_window: usize,
 }
 
 impl Default for GenerateConfig {
@@ -26,6 +34,25 @@ impl Default for GenerateConfig {
             top_p: 1.0,
             max_tokens: 128,
             eos_token: None,
+            repetition_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            repetition_window: 0,
+        }
+    }
+}
+
+impl GenerateConfig {
+    /// Build a LogitProcessorConfig from this GenerateConfig.
+    pub fn to_logit_config(&self) -> LogitProcessorConfig {
+        LogitProcessorConfig {
+            temperature: self.temperature,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            repetition_penalty: self.repetition_penalty,
+            frequency_penalty: self.frequency_penalty,
+            presence_penalty: self.presence_penalty,
+            repetition_window: self.repetition_window,
         }
     }
 }
@@ -83,18 +110,9 @@ fn readback_buffer(device: &Device, queue: &Queue, buffer: &GpuBuffer) -> Vec<f3
     floats
 }
 
-fn sample_token(logits: &[f32], config: &GenerateConfig) -> usize {
+fn sample_token(processor: &mut LogitProcessor, logits: &[f32]) -> usize {
     let mut logits = logits.to_vec();
-    if config.top_p < 1.0 {
-        return sampling::sample_top_p(&mut logits, config.top_p);
-    }
-    if config.top_k > 0 {
-        return sampling::sample_top_k(&mut logits, config.top_k);
-    }
-    if config.temperature != 1.0 {
-        return sampling::sample_temperature(&mut logits, config.temperature);
-    }
-    sampling::sample_argmax(&logits)
+    processor.process_and_sample(&mut logits)
 }
 
 impl TokenGenerator {
@@ -163,6 +181,10 @@ impl TokenGenerator {
         let hidden_bytes = seq_len as usize * hidden_dim * f32_size;
         let hidden_states = GpuBuffer::new(&self.device, hidden_bytes, Some("prefill_hidden"))?;
 
+        // Create logit processor from config and seed with prompt tokens
+        let mut logit_processor = LogitProcessor::new(config.to_logit_config());
+        logit_processor.record_prompt(prompt_tokens);
+
         let token_ids_bytes = prompt_tokens.len() * std::mem::size_of::<u32>();
         let token_ids_buf = GpuBuffer::new(&self.device, token_ids_bytes, Some("prefill_token_ids"))?;
 
@@ -199,7 +221,8 @@ impl TokenGenerator {
         self.queue.submit(std::iter::once(encoder.finish()));
 
         let logits = readback_buffer(&self.device, &self.queue, &logits_buf);
-        let mut next_token = sample_token(&logits, config) as u32;
+        let mut next_token = sample_token(&mut logit_processor, &logits) as u32;
+        logit_processor.record_token(next_token);
         output_tokens.push(next_token);
 
         if config.eos_token == Some(next_token) || output_tokens.len() >= config.max_tokens {
@@ -234,7 +257,8 @@ impl TokenGenerator {
             self.queue.submit(std::iter::once(encoder.finish()));
 
             let logits = readback_buffer(&self.device, &self.queue, &logits_buf);
-            let next = sample_token(&logits, config) as u32;
+            let next = sample_token(&mut logit_processor, &logits) as u32;
+            logit_processor.record_token(next);
             output_tokens.push(next);
             next_token = next;
 
@@ -266,6 +290,8 @@ impl TokenGenerator {
                 max_tokens: max_new_tokens,
                 ..GenerateConfig::default()
             };
+            let mut logit_processor = LogitProcessor::new(config.to_logit_config());
+            logit_processor.record_prompt(&prompt_tokens);
             let hidden_dim = self.model.config().hidden_dim;
             let f32_size = std::mem::size_of::<f32>();
             let seq_len = prompt_tokens.len() as u32;
@@ -335,7 +361,8 @@ impl TokenGenerator {
             self.queue.submit(std::iter::once(encoder.finish()));
 
             let logits = readback_buffer(&self.device, &self.queue, &logits_buf);
-            let mut next_token = sample_token(&logits, &config) as u32;
+            let mut next_token = sample_token(&mut logit_processor, &logits) as u32;
+            logit_processor.record_token(next_token);
 
             // Send first token; exit if receiver dropped (cancellation)
             if tx.blocking_send(next_token).is_err() {
@@ -395,7 +422,8 @@ impl TokenGenerator {
                 self.queue.submit(std::iter::once(encoder.finish()));
 
                 let logits = readback_buffer(&self.device, &self.queue, &logits_buf);
-                let token = sample_token(&logits, &config) as u32;
+                let token = sample_token(&mut logit_processor, &logits) as u32;
+                logit_processor.record_token(token);
 
                 // blocking_send applies backpressure; Err means receiver dropped → cancel
                 if tx.blocking_send(token).is_err() {
