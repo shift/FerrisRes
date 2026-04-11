@@ -5,3 +5,10 @@ Cargo.lock
 *.swp
 *.swo
 *~
+
+# Internal AI agent tooling
+.engram/
+skills/
+
+# Raw paper PDFs (large binary files)
+papers_research/raw/*.pdf
