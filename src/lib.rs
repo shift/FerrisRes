@@ -15,3 +15,4 @@ pub use model::{ModelShard, ShardManager, QuantizedBuffer, QuantDtype, TokenEmbe
 pub use inference::{TwoPhaseConfig, TwoPhaseInference, AutoregressiveGenerator, KVCache, Sampler, GenerationState, LayerKVCache, ModelKVCache, TokenGenerator, PromptTemplateRegistry, TemplateFormat, LogitProcessor, LogitProcessorConfig};
 pub use compute::turboquant::{TurboQuantConfig, TurboQuantEngine, TurboQuantError, OutlierChannelSplitter};
 pub use training::{CrossEntropyLoss, AdamOptimizer, SgdOptimizer};
+pub use training::lora::{LoraConfig, LoraLayer, LoraManager};

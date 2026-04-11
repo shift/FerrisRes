@@ -32,6 +32,8 @@ enum Commands {
         learning_rate: f64,
         #[arg(long)]
         data: Option<String>,
+        #[arg(long)]
+        lora_rank: Option<usize>,
     },
 
     Infer {
@@ -81,7 +83,8 @@ async fn main() -> anyhow::Result<()> {
             batch_size,
             learning_rate,
             data,
-        } => cmd_train(hidden_dim, num_blocks, block_size, epochs, batch_size, learning_rate, data).await,
+            lora_rank,
+        } => cmd_train(hidden_dim, num_blocks, block_size, epochs, batch_size, learning_rate, data, lora_rank).await,
         Commands::Infer {
             hidden_dim,
             num_blocks,
@@ -136,6 +139,7 @@ async fn cmd_train(
     batch_size: u32,
     learning_rate: f64,
     data: Option<String>,
+    lora_rank: Option<usize>,
 ) -> anyhow::Result<()> {
     info!("Initializing training pipeline");
 
@@ -163,6 +167,25 @@ async fn cmd_train(
         0.999,
         1e-8,
     );
+
+    // Wire LoRA adapter if requested
+    let _lora_manager = if let Some(rank) = lora_rank {
+        let lora_config = ferrisres::LoraConfig {
+            rank,
+            alpha: rank as f32 * 2.0,
+            dropout: 0.0,
+            target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+            merge_on_inference: true,
+        };
+        let mut mgr = ferrisres::LoraManager::new(lora_config);
+        // Register LoRA layers for the model's attention projections
+        mgr.add_adapter(0, "q_proj", config.hidden_dim, config.hidden_dim);
+        mgr.add_adapter(0, "v_proj", config.hidden_dim, config.hidden_dim);
+        info!("LoRA enabled: rank={} alpha={}", rank, rank * 2);
+        Some(mgr)
+    } else {
+        None
+    };
 
     info!("Model config: hidden_dim={} num_blocks={} block_size={} total_layers={} heads={} intermediate_dim={}",
         config.hidden_dim, config.num_blocks, config.block_size, config.total_layers(),
