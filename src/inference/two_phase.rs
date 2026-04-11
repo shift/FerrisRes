@@ -530,6 +530,10 @@ fn readback_buffer(device: &Device, queue: &Queue, buffer: &GpuBuffer) -> Vec<f3
     floats
 }
 
+#[deprecated(
+    since = "0.2.0",
+    note = "Use TokenGenerator from inference::generator instead — it supports logit processors, RAG, context extension, and tool calling"
+)]
 pub struct AutoregressiveGenerator {
     model: BlockAttnResModel,
     embedding: TokenEmbedding,
@@ -544,6 +548,7 @@ pub struct AutoregressiveGenerator {
     elementwise: ElementWiseOp,
 }
 
+#[allow(deprecated)]
 impl AutoregressiveGenerator {
     pub fn new(
         device: Arc<Device>,

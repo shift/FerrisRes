@@ -12,6 +12,7 @@ pub mod hull_kv_cache;
 pub mod llm_computer;
 
 pub use kv_cache::{LayerKVCache, ModelKVCache};
+#[allow(deprecated)]
 pub use two_phase::{TwoPhaseConfig, TwoPhaseInference, AutoregressiveGenerator, KVCache, Sampler, GenerationState};
 pub use generator::{TokenGenerator, GenerateConfig};
 pub use logit_processors::{LogitProcessor, LogitProcessorConfig, TokenHistory};

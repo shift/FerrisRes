@@ -12,7 +12,8 @@ pub use device::{DeviceProfile, Capability};
 pub use tensor::{GpuTensor, Tensor};
 pub use compute::{GpuBuffer, WgpuCompute, MemoryBudget, MemoryPool, TiledCompute, ComputeDispatcher};
 pub use model::{ModelShard, ShardManager, QuantizedBuffer, QuantDtype, TokenEmbedding, LMHead, SimpleTokenizer, BlockAttnResConfig, BlockAttnResModel, ImagePreprocessor};
-pub use inference::{TwoPhaseConfig, TwoPhaseInference, AutoregressiveGenerator, KVCache, Sampler, GenerationState, LayerKVCache, ModelKVCache, TokenGenerator, PromptTemplateRegistry, TemplateFormat, LogitProcessor, LogitProcessorConfig};
+#[allow(deprecated)]
+pub use inference::{TwoPhaseConfig, TwoPhaseInference, AutoregressiveGenerator, KVCache, Sampler, GenerationState, LayerKVCache, ModelKVCache, TokenGenerator, GenerateConfig, PromptTemplateRegistry, TemplateFormat, LogitProcessor, LogitProcessorConfig};
 pub use compute::turboquant::{TurboQuantConfig, TurboQuantEngine, TurboQuantError, OutlierChannelSplitter};
 pub use training::{CrossEntropyLoss, AdamOptimizer, SgdOptimizer};
 pub use training::lora::{LoraConfig, LoraLayer, LoraManager};
