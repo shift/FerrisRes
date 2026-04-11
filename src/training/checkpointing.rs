@@ -149,7 +149,71 @@ impl CheckpointStore {
         tracing::debug!("CheckpointStore: cleared all checkpoints");
     }
 
-    // TODO(ADR-010): implement recompute_block() that re-runs forward for a
-    // single block using the saved hidden_states input, restoring intermediate
-    // activations needed for gradient computation.
+    /// Recompute block activations by re-running the forward pass from
+    /// saved input hidden states.
+    ///
+    /// Takes a closure `forward_fn` that accepts (encoder, input_buffer, block_idx) -> output_buffer.
+    /// Returns the recomputed output buffer.
+    ///
+    /// This implements ADR-010 gradient checkpointing: during backward,
+    /// saved input activations are used to re-run the forward pass and
+    /// regenerate intermediate activations needed for gradient computation.
+    pub fn recompute_block<F>(
+        &mut self,
+        block_idx: usize,
+        encoder: &mut wgpu::CommandEncoder,
+        forward_fn: F,
+    ) -> Result<GpuBuffer>
+    where
+        F: FnOnce(&mut wgpu::CommandEncoder, &GpuBuffer, usize) -> Result<GpuBuffer>,
+    {
+        // Retrieve the saved input for this block
+        let input = self.take(block_idx, "hidden_input")
+            .ok_or_else(|| crate::error::FerrisResError::Device(
+                format!("No saved checkpoint for block {} - was save() called during forward?", block_idx)
+            ))?;
+
+        tracing::debug!("CheckpointStore: recomputing block {} from saved input", block_idx);
+
+        // Re-run forward pass to regenerate activations
+        let output = forward_fn(encoder, &input, block_idx)?;
+
+        // Re-save the input so it's available for the next backward layer
+        let input_copy = GpuBuffer::new(&self.device, input.size(), Some(&format!("ckpt_b{}_hidden_input", block_idx)))?;
+        encoder.copy_buffer_to_buffer(input.buffer(), 0, input_copy.buffer(), 0, input.size() as u64);
+        self.saved.insert((block_idx, "hidden_input"), input_copy);
+
+        Ok(output)
+    }
+
+    /// Recompute at finer granularity: PerLayer or PerAttention.
+    /// Takes sub-block index in addition to block index.
+    pub fn recompute_sublayer<F>(
+        &mut self,
+        block_idx: usize,
+        sublayer_idx: usize,
+        encoder: &mut wgpu::CommandEncoder,
+        forward_fn: F,
+    ) -> Result<GpuBuffer>
+    where
+        F: FnOnce(&mut wgpu::CommandEncoder, &GpuBuffer, usize, usize) -> Result<GpuBuffer>,
+    {
+        let label = format!("sublayer_{}_input", sublayer_idx);
+        let input = self.saved.remove(&(block_idx, Box::leak(label.clone().into_boxed_str())))
+            .ok_or_else(|| crate::error::FerrisResError::Device(
+                format!("No saved checkpoint for block {}/{}", block_idx, sublayer_idx)
+            ))?;
+
+        tracing::debug!("CheckpointStore: recomputing block {}/{}", block_idx, sublayer_idx);
+
+        let output = forward_fn(encoder, &input, block_idx, sublayer_idx)?;
+
+        // Re-save input
+        let label_ref: &'static str = Box::leak(label.clone().into_boxed_str());
+        let input_copy = GpuBuffer::new(&self.device, input.size(), Some(&format!("ckpt_b{}_sl{}_input", block_idx, sublayer_idx)))?;
+        encoder.copy_buffer_to_buffer(input.buffer(), 0, input_copy.buffer(), 0, input.size() as u64);
+        self.saved.insert((block_idx, label_ref), input_copy);
+
+        Ok(output)
+    }
 }
