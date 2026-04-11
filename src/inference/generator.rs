@@ -32,6 +32,9 @@ pub struct GenerateConfig {
     pub context_extension: Option<crate::inference::context_extension::ContextExtensionConfig>,
     /// Optional RAG config: if set, retrieval-augmented documents are prepended.
     pub rag_config: Option<crate::inference::rag::RagConfig>,
+    /// Optional tool registry: if set, enables agentic tool-calling during generation.
+    #[allow(dead_code)]
+    pub tool_registry: Option<crate::inference::tool_search::ToolRegistry>,
 }
 
 impl Default for GenerateConfig {
@@ -49,6 +52,7 @@ impl Default for GenerateConfig {
             template_format: None,
             context_extension: None,
             rag_config: None,
+            tool_registry: None,
         }
     }
 }
