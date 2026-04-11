@@ -5,6 +5,7 @@ use wgpu::{Device, Queue};
 use crate::compute::buffer::GpuBuffer;
 use crate::inference::kv_cache::ModelKVCache;
 use crate::inference::logit_processors::{LogitProcessor, LogitProcessorConfig};
+use crate::inference::prompt_templates::{PromptTemplateRegistry, TemplateFormat};
 use crate::model::embedding::TokenEmbedding;
 use crate::model::lm_head::LMHead;
 use crate::model::model::BlockAttnResModel;
@@ -24,6 +25,9 @@ pub struct GenerateConfig {
     pub presence_penalty: f32,
     /// Number of recent tokens for repetition window (0 = full history).
     pub repetition_window: usize,
+    /// Optional chat template format. When set, the prompt is wrapped in the
+    /// template before tokenization.
+    pub template_format: Option<TemplateFormat>,
 }
 
 impl Default for GenerateConfig {
@@ -38,6 +42,7 @@ impl Default for GenerateConfig {
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             repetition_window: 0,
+            template_format: None,
         }
     }
 }
@@ -53,6 +58,17 @@ impl GenerateConfig {
             frequency_penalty: self.frequency_penalty,
             presence_penalty: self.presence_penalty,
             repetition_window: self.repetition_window,
+        }
+    }
+
+    /// Apply chat template to a raw prompt string.
+    /// If no template format is set, returns the prompt unchanged.
+    pub fn apply_template(&self, prompt: &str) -> String {
+        if let Some(format) = self.template_format {
+            let registry = PromptTemplateRegistry::new(format);
+            registry.apply_single(prompt)
+        } else {
+            prompt.to_string()
         }
     }
 }

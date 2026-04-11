@@ -47,6 +47,8 @@ enum Commands {
         max_tokens: usize,
         #[arg(long, default_value_t = 0.7)]
         temperature: f64,
+        #[arg(long)]
+        template: Option<String>,
     },
 
     Benchmark {
@@ -85,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
             prompt,
             max_tokens,
             temperature,
-        } => cmd_infer(hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature).await,
+        } => cmd_infer(hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template).await,
         Commands::Benchmark {
             hidden_dim,
             num_blocks,
@@ -185,6 +187,7 @@ async fn cmd_infer(
     prompt: String,
     max_tokens: usize,
     temperature: f64,
+    template: Option<String>,
 ) -> anyhow::Result<()> {
     info!("Initializing inference pipeline");
 
@@ -201,10 +204,28 @@ async fn cmd_infer(
     let device = Arc::new(compute.device().clone());
     let queue = Arc::new(compute.queue().clone());
 
+    // Apply chat template if specified
+    let formatted_prompt = if let Some(ref template_name) = template {
+        match ferrisres::TemplateFormat::from_name(template_name) {
+            Some(fmt) => {
+                let registry = ferrisres::PromptTemplateRegistry::new(fmt);
+                let result = registry.apply_single(&prompt);
+                info!("Applied {} template: {} chars → {} chars", template_name, prompt.len(), result.len());
+                result
+            }
+            None => {
+                info!("Unknown template '{}', using raw prompt", template_name);
+                prompt.clone()
+            }
+        }
+    } else {
+        prompt.clone()
+    };
+
     let tokenizer = SimpleTokenizer::new();
     let model = BlockAttnResModel::new(Arc::clone(&device), Arc::clone(&queue), config.clone(), tokenizer.vocab_size())?;
 
-    let tokens = tokenizer.encode(&prompt);
+    let tokens = tokenizer.encode(&formatted_prompt);
     info!("Encoded tokens ({}): {:?}", tokens.len(), tokens);
 
     let input_bytes = config.hidden_dim * std::mem::size_of::<f32>();
