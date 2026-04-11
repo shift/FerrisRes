@@ -6,6 +6,7 @@ pub mod model;
 pub mod shard;
 pub mod embedding;
 pub mod tokenizer;
+pub mod qa_tokenizer;
 pub mod image_preprocessor;
 pub mod lm_head;
 
@@ -17,4 +18,5 @@ pub use model::BlockAttnResModel;
 pub use shard::{ModelShard, ShardManager, QuantizedBuffer, QuantDtype};
 pub use embedding::TokenEmbedding;
 pub use tokenizer::SimpleTokenizer;
+pub use qa_tokenizer::{QaTokenizer, QaTokenConfig, QualityScore, QualitySegment};
 pub use image_preprocessor::ImagePreprocessor;
