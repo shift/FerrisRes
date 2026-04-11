@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 use clap::{Parser, Subcommand};
+use tracing::{info, warn};
 use ferrisres::{WgpuCompute, DeviceProfile, BlockAttnResConfig, BlockAttnResModel, SimpleTokenizer};
 use ferrisres::compute::{GpuBuffer, MatMulOp, RmsNormOp, SoftmaxOp, ElementWiseOp};
 use ferrisres::training::AdamOptimizer;
-use tracing::info;
 
 #[derive(Parser)]
 #[command(name = "ferrisres", about = "Block AttnRes runtime for SLM/LLM training and inference")]
@@ -53,6 +53,8 @@ enum Commands {
         template: Option<String>,
         #[arg(long)]
         yarn_scale: Option<f32>,
+        #[arg(long)]
+        image: Option<String>,
     },
 
     Benchmark {
@@ -94,7 +96,8 @@ async fn main() -> anyhow::Result<()> {
             temperature,
             template,
             yarn_scale,
-        } => cmd_infer(hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale).await,
+            image,
+        } => cmd_infer(hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale, image).await,
         Commands::Benchmark {
             hidden_dim,
             num_blocks,
@@ -288,6 +291,7 @@ async fn cmd_infer(
     temperature: f64,
     template: Option<String>,
     yarn_scale: Option<f32>,
+    image: Option<String>,
 ) -> anyhow::Result<()> {
     info!("Initializing inference pipeline");
 
@@ -327,6 +331,20 @@ async fn cmd_infer(
 
     let tokens = tokenizer.encode(&formatted_prompt);
     info!("Encoded tokens ({}): {:?}", tokens.len(), tokens);
+
+    // Wire image preprocessing if specified
+    if let Some(ref image_path) = image {
+        let preprocessor = ferrisres::ImagePreprocessor::new(224, 224, true);
+        match std::fs::read(image_path) {
+            Ok(image_data) => {
+                match preprocessor.preprocess(&image_data) {
+                    Ok(patches) => info!("Image preprocessed: {} patches from {}", patches.len(), image_path),
+                    Err(e) => warn!("Image preprocessing failed: {}", e),
+                }
+            }
+            Err(e) => warn!("Failed to read image {}: {}", image_path, e),
+        }
+    }
 
     // Build the full inference pipeline
     use ferrisres::{TokenEmbedding, LMHead};
