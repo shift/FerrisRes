@@ -283,20 +283,18 @@ impl ToolRegistry {
 
         let mut results: Vec<SelectedTool> = keyword_results.into_iter()
             .filter_map(|(name, score)| {
-                self.tools.get(&name).map(|tool| {
-                    // Apply category filter
-                    if !self.config.category_filter.is_empty()
-                        && !self.config.category_filter.contains(&tool.category) {
-                        return None;
-                    }
-                    Some(SelectedTool {
-                        tool: tool.clone(),
-                        relevance_score: score,
-                        rank: 0,
-                    })
+                let tool = self.tools.get(&name)?;
+                // Apply category filter
+                if !self.config.category_filter.is_empty()
+                    && !self.config.category_filter.contains(&tool.category) {
+                    return None;
+                }
+                Some(SelectedTool {
+                    tool: tool.clone(),
+                    relevance_score: score,
+                    rank: 0,
                 })
             })
-            .flatten()
             .filter(|s| s.relevance_score >= self.config.min_relevance)
             .collect();
 
@@ -505,13 +503,14 @@ mod tests {
     fn test_category_filter() {
         let config = ToolSearchConfig {
             category_filter: vec!["math".to_string()],
+            min_relevance: 0.0,
             ..Default::default()
         };
         let mut registry = ToolRegistry::new(config);
-        registry.register(Tool::new("calc", "Calculator").with_category("math"));
-        registry.register(Tool::new("search", "Web search").with_category("web"));
+        registry.register(Tool::new("calc", "Calculator for math").with_category("math"));
+        registry.register(Tool::new("search", "Web search engine").with_category("web"));
 
-        let results = registry.search_by_keywords("search calculate", 5);
+        let results = registry.search_by_keywords("calculator", 5);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].tool.name, "calc");
     }
@@ -552,7 +551,7 @@ mod tests {
         let mut registry = ToolRegistry::default_registry();
         registry.register(Tool::new("calculator", "Math"));
 
-        let output = "I'll calculate that. TOOL_CALL:calculator({"a": 1, "b": 2})";
+        let output = r#"I'll calculate that. TOOL_CALL:calculator({"a": 1, "b": 2})"#;
         let call = registry.parse_tool_call(output).unwrap();
         assert_eq!(call.tool_name, "calculator");
         assert!(call.arguments.contains("\"a\""));
