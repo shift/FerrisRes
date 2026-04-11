@@ -49,6 +49,8 @@ enum Commands {
         temperature: f64,
         #[arg(long)]
         template: Option<String>,
+        #[arg(long)]
+        yarn_scale: Option<f32>,
     },
 
     Benchmark {
@@ -88,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
             max_tokens,
             temperature,
             template,
-        } => cmd_infer(hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template).await,
+        } => cmd_infer(hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale).await,
         Commands::Benchmark {
             hidden_dim,
             num_blocks,
@@ -189,6 +191,7 @@ async fn cmd_infer(
     max_tokens: usize,
     temperature: f64,
     template: Option<String>,
+    yarn_scale: Option<f32>,
 ) -> anyhow::Result<()> {
     info!("Initializing inference pipeline");
 
@@ -257,6 +260,9 @@ async fn cmd_infer(
     let gen_config = ferrisres::inference::generator::GenerateConfig {
         temperature: temperature as f32,
         max_tokens,
+        context_extension: yarn_scale.map(|scale| {
+            ferrisres::ContextExtensionConfig::yarn(4096, (4096.0 * scale) as usize)
+        }),
         ..Default::default()
     };
     

@@ -28,6 +28,8 @@ pub struct GenerateConfig {
     /// Optional chat template format. When set, the prompt is wrapped in the
     /// template before tokenization.
     pub template_format: Option<TemplateFormat>,
+    /// Optional context extension config (YaRN/StreamingLLM).
+    pub context_extension: Option<crate::inference::context_extension::ContextExtensionConfig>,
 }
 
 impl Default for GenerateConfig {
@@ -43,6 +45,7 @@ impl Default for GenerateConfig {
             presence_penalty: 0.0,
             repetition_window: 0,
             template_format: None,
+            context_extension: None,
         }
     }
 }
@@ -70,6 +73,12 @@ impl GenerateConfig {
         } else {
             prompt.to_string()
         }
+    }
+
+    /// Check if context extension (YaRN/StreamingLLM) is active.
+    #[allow(dead_code)]
+    pub fn has_context_extension(&self) -> bool {
+        self.context_extension.as_ref().map_or(false, |c: &crate::inference::context_extension::ContextExtensionConfig| c.is_active())
     }
 }
 
