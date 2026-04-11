@@ -30,6 +30,8 @@ pub struct GenerateConfig {
     pub template_format: Option<TemplateFormat>,
     /// Optional context extension config (YaRN/StreamingLLM).
     pub context_extension: Option<crate::inference::context_extension::ContextExtensionConfig>,
+    /// Optional RAG config: if set, retrieval-augmented documents are prepended.
+    pub rag_config: Option<crate::inference::rag::RagConfig>,
 }
 
 impl Default for GenerateConfig {
@@ -46,6 +48,7 @@ impl Default for GenerateConfig {
             repetition_window: 0,
             template_format: None,
             context_extension: None,
+            rag_config: None,
         }
     }
 }
@@ -79,6 +82,12 @@ impl GenerateConfig {
     #[allow(dead_code)]
     pub fn has_context_extension(&self) -> bool {
         self.context_extension.as_ref().map_or(false, |c: &crate::inference::context_extension::ContextExtensionConfig| c.is_active())
+    }
+
+    /// Check if RAG is configured.
+    #[allow(dead_code)]
+    pub fn has_rag(&self) -> bool {
+        self.rag_config.is_some()
     }
 }
 
