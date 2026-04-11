@@ -17,6 +17,7 @@ pub use block_attn_res::BlockAttnResLayer;
 pub use model::BlockAttnResModel;
 pub use shard::{ModelShard, ShardManager, QuantizedBuffer, QuantDtype};
 pub use embedding::TokenEmbedding;
+pub use lm_head::LMHead;
 pub use tokenizer::SimpleTokenizer;
 pub use qa_tokenizer::{QaTokenizer, QaTokenConfig, QualityScore, QualitySegment};
 pub use image_preprocessor::ImagePreprocessor;

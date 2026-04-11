@@ -87,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
             prompt,
             max_tokens,
             temperature,
+            template,
         } => cmd_infer(hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template).await,
         Commands::Benchmark {
             hidden_dim,
@@ -228,15 +229,43 @@ async fn cmd_infer(
     let tokens = tokenizer.encode(&formatted_prompt);
     info!("Encoded tokens ({}): {:?}", tokens.len(), tokens);
 
-    let input_bytes = config.hidden_dim * std::mem::size_of::<f32>();
-    let input = GpuBuffer::zeros(&device, &queue, input_bytes, Some("Infer Input"))?;
-    let output = GpuBuffer::new(&device, input_bytes, Some("Infer Output"))?;
-
-    model.forward(&input, &output, 1)?;
-
-    info!("Forward pass complete");
-    info!("Config: max_tokens={} temperature={}", max_tokens, temperature);
-    info!("Generated {} tokens (stub: autoregressive generation not yet wired)", max_tokens);
+    // Build the full inference pipeline
+    use ferrisres::{TokenEmbedding, LMHead};
+    use ferrisres::inference::generator::TokenGenerator;
+    
+    let embedding = TokenEmbedding::new(
+        Arc::clone(&device),
+        Arc::clone(&queue),
+        config.hidden_dim,
+        tokenizer.vocab_size(),
+    )?;
+    let lm_head = LMHead::new(
+        Arc::clone(&device),
+        Arc::clone(&queue),
+        config.hidden_dim,
+        tokenizer.vocab_size(),
+    )?;
+    let generator = TokenGenerator::new(
+        Arc::new(model),
+        lm_head,
+        embedding,
+        Arc::clone(&device),
+        Arc::clone(&queue),
+        2048, // max_seq_len
+    )?;
+    
+    let gen_config = ferrisres::inference::generator::GenerateConfig {
+        temperature: temperature as f32,
+        max_tokens,
+        ..Default::default()
+    };
+    
+    let output_tokens = generator.generate(&tokens, &gen_config)?;
+    
+    // Decode and print
+    let decoded = tokenizer.decode(&output_tokens);
+    info!("Generated {} tokens", output_tokens.len());
+    println!("{}", decoded);
 
     Ok(())
 }

@@ -13,6 +13,7 @@ pub mod llm_computer;
 
 pub use kv_cache::{LayerKVCache, ModelKVCache};
 pub use two_phase::{TwoPhaseConfig, TwoPhaseInference, AutoregressiveGenerator, KVCache, Sampler, GenerationState};
+pub use generator::{TokenGenerator, GenerateConfig};
 pub use logit_processors::{LogitProcessor, LogitProcessorConfig, TokenHistory};
 pub use prompt_templates::{PromptTemplateRegistry, TemplateFormat, ChatMessage, Role};
 pub use context_extension::{ContextExtensionConfig, ContextExtensionEngine, ExtensionMethod, YarnParams, AttentionSinkManager};
