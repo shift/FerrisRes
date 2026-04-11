@@ -2,7 +2,7 @@
 
 FerrisRes is a Rust-native AI inference and training engine built around **Block AttnRes** — a novel linear-time transformer architecture that replaces the quadratic attention bottleneck of standard transformers. It runs on any GPU or iGPU via [wgpu](https://github.com/gfx-rs/wgpu) (Vulkan, Metal, DX12, WebGPU), adapts automatically to the hardware it finds, and is written entirely in safe Rust with no Python dependency.
 
-> **Status:** Active development. The architecture and core APIs are stabilising but not yet 1.0. Expect breaking changes between minor versions until the 1.0 release.
+> ⚠️ **Research project — work in progress.** FerrisRes is an active research project exploring novel transformer architectures and heterogeneous GPU runtimes. It is **not production-ready**. APIs are unstable, core components are still being implemented, and breaking changes should be expected. It is shared publicly for transparency and to invite early feedback.
 
 ---
 
