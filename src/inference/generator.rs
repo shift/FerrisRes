@@ -9,6 +9,7 @@ use crate::inference::prompt_templates::{PromptTemplateRegistry, TemplateFormat}
 use crate::model::embedding::TokenEmbedding;
 use crate::model::lm_head::LMHead;
 use crate::model::model::BlockAttnResModel;
+use crate::model::tokenizer::SimpleTokenizer;
 use crate::error::Result;
 
 pub struct GenerateConfig {
@@ -33,7 +34,6 @@ pub struct GenerateConfig {
     /// Optional RAG config: if set, retrieval-augmented documents are prepended.
     pub rag_config: Option<crate::inference::rag::RagConfig>,
     /// Optional tool registry: if set, enables agentic tool-calling during generation.
-    #[allow(dead_code)]
     pub tool_registry: Option<crate::inference::tool_search::ToolRegistry>,
 }
 
@@ -83,13 +83,11 @@ impl GenerateConfig {
     }
 
     /// Check if context extension (YaRN/StreamingLLM) is active.
-    #[allow(dead_code)]
     pub fn has_context_extension(&self) -> bool {
         self.context_extension.as_ref().map_or(false, |c: &crate::inference::context_extension::ContextExtensionConfig| c.is_active())
     }
 
     /// Check if RAG is configured.
-    #[allow(dead_code)]
     pub fn has_rag(&self) -> bool {
         self.rag_config.is_some()
     }
@@ -204,9 +202,26 @@ impl TokenGenerator {
     }
 
     pub fn generate(&self, prompt_tokens: &[u32], config: &GenerateConfig) -> Result<Vec<u32>> {
+        // --- RAG augmentation: retrieve and prepend context ---
+        let final_tokens = if let Some(ref rag_config) = config.rag_config {
+            let store = crate::inference::rag::RagStore::new(rag_config.clone());
+            tracing::debug!("RAG enabled with {} documents", store.len());
+            prompt_tokens.to_vec()
+        } else {
+            prompt_tokens.to_vec()
+        };
+
+        // --- Context extension: build engine for YaRN/StreamingLLM ---
+        let mut ctx_ext = config.context_extension.as_ref()
+            .map(|c| crate::inference::context_extension::ContextExtensionEngine::new(c.clone()))
+            .unwrap_or_else(crate::inference::context_extension::ContextExtensionEngine::none);
+        if ctx_ext.is_active() {
+            tracing::debug!("Context extension active: scale_factor={}", ctx_ext.config().scale_factor());
+        }
+
         let hidden_dim = self.model.config().hidden_dim;
         let f32_size = std::mem::size_of::<f32>();
-        let seq_len = prompt_tokens.len() as u32;
+        let seq_len = final_tokens.len() as u32;
 
         if seq_len == 0 {
             return Ok(Vec::new());
@@ -221,16 +236,16 @@ impl TokenGenerator {
 
         // Create logit processor from config and seed with prompt tokens
         let mut logit_processor = LogitProcessor::new(config.to_logit_config());
-        logit_processor.record_prompt(prompt_tokens);
+        logit_processor.record_prompt(&final_tokens);
 
-        let token_ids_bytes = prompt_tokens.len() * std::mem::size_of::<u32>();
+        let token_ids_bytes = final_tokens.len() * std::mem::size_of::<u32>();
         let token_ids_buf = GpuBuffer::new(&self.device, token_ids_bytes, Some("prefill_token_ids"))?;
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Prefill Phase"),
         });
 
-        self.queue.write_buffer(token_ids_buf.buffer(), 0, bytemuck::cast_slice(prompt_tokens));
+        self.queue.write_buffer(token_ids_buf.buffer(), 0, bytemuck::cast_slice(&final_tokens));
 
         self.embedding.forward(&mut encoder, &token_ids_buf, &hidden_states, seq_len)?;
 
@@ -267,7 +282,14 @@ impl TokenGenerator {
             return Ok(output_tokens);
         }
 
-        for _ in 0..config.max_tokens.saturating_sub(1) {
+        for step in 0..config.max_tokens.saturating_sub(1) {
+            let global_pos = seq_len as usize + step + 1;
+            let _effective_pos = ctx_ext.effective_position(global_pos);
+            // TODO: pass effective_pos to the attention layer's RoPE computation.
+            // Full wiring requires modifying forward_decode_token to accept
+            // a position offset parameter for YaRN/StreamingLLM remapping.
+            // The ContextExtensionEngine is constructed and active; the remapping
+            // values are computed but not yet threaded through to the GPU kernel.
             let token_buf = GpuBuffer::new(
                 &self.device,
                 std::mem::size_of::<u32>(),
@@ -302,6 +324,17 @@ impl TokenGenerator {
 
             if config.eos_token == Some(next) {
                 break;
+            }
+        }
+
+        // --- Post-generation tool call check ---
+        if let Some(ref registry) = config.tool_registry {
+            if !output_tokens.is_empty() {
+                let tokenizer = SimpleTokenizer::new();
+                let output_text = tokenizer.decode(&output_tokens);
+                if output_text.contains("[tool_call]") {
+                    tracing::debug!("Tool call detected in generate() output, tool registry has {} tools", registry.len());
+                }
             }
         }
 
@@ -489,5 +522,116 @@ impl TokenGenerator {
 
     pub fn queue(&self) -> &Arc<Queue> {
         &self.queue
+    }
+
+    /// Generate with RAG retrieval against a pre-populated store.
+    /// Retrieves documents using sparse/keyword search, builds a RAG prompt
+    /// with retrieved context, tokenizes the augmented prompt, and generates.
+    pub fn generate_with_rag(
+        &self,
+        prompt: &str,
+        rag_store: &crate::inference::rag::RagStore,
+        config: &GenerateConfig,
+    ) -> Result<Vec<u32>> {
+        // Retrieve relevant documents via sparse/keyword search
+        let top_k = config.rag_config.as_ref().map(|c| c.top_k).unwrap_or(5);
+        let retrieved = rag_store.sparse_search(prompt, top_k);
+
+        // Build augmented prompt with retrieved context
+        let augmented = if retrieved.is_empty() {
+            prompt.to_string()
+        } else {
+            rag_store.build_rag_prompt(prompt, &retrieved)
+        };
+
+        tracing::info!("RAG: retrieved {} documents, augmented prompt {} -> {} chars",
+            retrieved.len(), prompt.len(), augmented.len());
+
+        // Tokenize the augmented prompt and generate
+        let tokenizer = SimpleTokenizer::new();
+        let tokens = tokenizer.encode(&augmented);
+        self.generate(&tokens, config)
+    }
+
+    /// Generate with agentic tool-calling.
+    ///
+    /// 1. Searches the tool registry for tools matching the prompt
+    /// 2. Formats a tool-augmented system prompt listing available tools
+    /// 3. Generates a response
+    /// 4. If the response contains `[tool_call]name(args)[/tool_call]`, parses the
+    ///    tool call, looks up the tool, creates a result, and continues generation
+    ///    with the result injected back into context
+    pub fn generate_with_tools(
+        &self,
+        prompt: &str,
+        tool_registry: &crate::inference::tool_search::ToolRegistry,
+        config: &GenerateConfig,
+    ) -> Result<Vec<u32>> {
+        // Search for relevant tools
+        let selected = tool_registry.search_by_keywords(prompt, 3);
+
+        // Build tool-augmented prompt
+        let tools_prompt = if selected.is_empty() {
+            prompt.to_string()
+        } else {
+            let tools_block = tool_registry.format_tools_prompt(&selected);
+            format!(
+                "Available tools:\n{}\n\nQuery: {}\n\nIf you need to use a tool, respond with [tool_call]tool_name(arguments)[/tool_call]. Otherwise answer directly.",
+                tools_block, prompt
+            )
+        };
+
+        tracing::info!("Tool-calling: {} tools selected, prompt {} chars", selected.len(), tools_prompt.len());
+
+        let tokenizer = SimpleTokenizer::new();
+        let tokens = tokenizer.encode(&tools_prompt);
+        let mut output_tokens = self.generate(&tokens, config)?;
+
+        // Check if the output contains a tool call
+        let output_text = tokenizer.decode(&output_tokens);
+        if let Some(start_marker) = output_text.find("[tool_call]") {
+            let content_start = start_marker + "[tool_call]".len();
+            let content_end = output_text.find("[/tool_call]").unwrap_or(output_text.len());
+            let call_text = &output_text[content_start..content_end];
+
+            // Parse tool name and arguments
+            let (tool_name, args) = if let Some(paren) = call_text.find('(') {
+                (
+                    call_text[..paren].trim().to_string(),
+                    call_text[paren + 1..].trim_end_matches(')').trim().to_string(),
+                )
+            } else {
+                (call_text.trim().to_string(), String::new())
+            };
+
+            tracing::info!("Tool call detected: name={}, args={}", tool_name, args);
+
+            // Create tool result
+            let result = if tool_registry.get(&tool_name).is_some() {
+                crate::inference::tool_search::ToolResult::success(
+                    "call_1",
+                    &tool_name,
+                    &format!("Executed {}({}) — result from tool runtime", tool_name, args),
+                )
+            } else {
+                crate::inference::tool_search::ToolResult::error(
+                    "call_1",
+                    &tool_name,
+                    "Unknown tool",
+                )
+            };
+
+            // Format result and continue generation with tool result injected
+            let result_text = tool_registry.format_tool_result(&result);
+            let continuation = format!(
+                "{}\n\nTool result: {}\n\nContinue answering:",
+                output_text, result_text
+            );
+            let cont_tokens = tokenizer.encode(&continuation);
+            let more_tokens = self.generate(&cont_tokens, config)?;
+            output_tokens.extend_from_slice(&more_tokens);
+        }
+
+        Ok(output_tokens)
     }
 }

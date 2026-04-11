@@ -325,7 +325,7 @@ Phase 3: Inference Engine & Two-Phase Compute    ██████████�
 Phase 4: End-to-End Trainable System             ████████████ DONE
 Phase 5: Advanced Inference Features             ████████████ DONE
 Phase 6: Architecture Extensions                 ██████░░░░░░ IN PROGRESS
-Phase 7: Multimodal Tokenization                 ██░░░░░░░░░░ RESEARCHED
+Phase 7: Multimodal Tokenization                 ████░░░░░░░░ RESEARCHED + NEW TASKS
 Phase 8: Distributed Training                    ██░░░░░░░░░░ RESEARCHED
 Phase 9: Model Format Loading                    ██░░░░░░░░░░ RESEARCHED
 ```
@@ -334,13 +334,19 @@ Phase 9: Model Format Loading                    ██░░░░░░░░�
 
 Remaining implementation tasks:
 
-| Task | Description | Status |
-|---|---|---|
-| Tool Search Registry | Dynamic tool discovery for agentic workflows | 📝 Todo |
-| DECS Token Optimizer | Reasoning token reduction via redundancy detection | 📝 Todo |
-| QA-Token | Quality-aware tokenization for noisy domains | 📝 Todo |
-| 2D Attention + HullKVCache | O(log n) exact lookups | 📝 Todo |
-| LLM-Computer | WASM interpreter in transformer weights | 📝 Todo |
+| Task | ID | Description | Status |
+|---|---|---|---|
+| Tool Search Registry | `2c6aacbf` | Dynamic tool discovery for agentic workflows | 📝 Todo |
+| DECS Token Optimizer | `72fb66b3` | Reasoning token reduction via redundancy detection | 📝 Todo |
+| QA-Token | `882b4c58` | Quality-aware tokenization for noisy domains | 📝 Todo |
+| 2D Attention + HullKVCache | `9059364b` | O(log n) exact lookups | 📝 Todo |
+| LLM-Computer | `a1965c61` | WASM interpreter in transformer weights | 📝 Todo |
+
+### Cross-Cutting: WGSL Kernel Efficiency
+
+| Task | ID | Description | Status |
+|---|---|---|---|
+| FlashAttention-3 Async Principles for WGSL | `f4c0a839` | Double-buffer tile loops; pipelined TurboQuant dequant+decode on 800 MHz shared bus | 📝 Todo |
 
 ### Phase 7: Multimodal Tokenization
 
@@ -350,11 +356,23 @@ Research complete for:
 - Unified multimodal embedding space
 - Cross-modal attention
 
+New research tasks added (see `papers_research/`):
+
+| Task | Description | Status |
+|---|---|---|
+| Implicit GEMM / Fused Patching | Eliminate `im2col` buffer via fused WGSL patch-embed kernel; ~59 MB VRAM saving at 224×224 on Integrated GPU | 📝 Todo |
+| Token Merging (ToMe) | Training-free visual token reduction (bipartite matching on key vectors); up to 2× throughput, no retraining | 📝 Todo |
+| Matryoshka Embeddings | Nested embedding dimensions for elastic RAG/Engram lookups; dim=64 on Integrated, dim=768 on HighEnd | 📝 Todo |
+| Patch-to-Cluster Attention (PaCa) | Learned spatial clustering of patches; O(N×K) vs O(N²) attention; architectural complement to HullKVCache | 📝 Todo |
+
 Implementation requires:
 - `MultimodalTokenizer` combining text/vision/audio tokenizers
-- `VisionEncoder` with patch embedding
+- `VisionEncoder` with patch embedding (choose: explicit `im2col` or fused Implicit GEMM)
 - `AudioEncoder` with spectral features
 - Cross-modal attention layers
+- `ToMeMerger` for training-free visual token reduction
+- `ElasticRagStore` for Matryoshka-aware RAG
+- `PaCaLayer` for spatial cluster attention (after HullKVCache design is settled)
 
 ### Phase 8: Distributed Training
 

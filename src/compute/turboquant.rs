@@ -263,6 +263,120 @@ impl TurboQuantEngine {
     pub fn wgsl_source() -> &'static str {
         crate::compute::kernels::TURBOQUANT_WGSL
     }
+
+    /// Create GPU compute pipelines for quantization and dequantization.
+    /// Returns a TurboQuantPipelines struct with bind group layout and pipelines.
+    pub fn create_pipelines(
+        device: &wgpu::Device,
+    ) -> Result<TurboQuantPipelines> {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("turboquant"),
+            source: wgpu::ShaderSource::Wgsl(Self::wgsl_source().into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("turboquant_bind_layout"),
+            entries: &[
+                // @group(0) @binding(0) — input buffer
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // @group(0) @binding(1) — centroids/rotation buffer
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // @group(0) @binding(2) — output buffer
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // @group(0) @binding(3) — uniform config
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("turboquant_layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let quantize_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("turboquant_quantize"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("kernel_quantize"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        let dequantize_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("turboquant_dequantize"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("kernel_dequantize"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        let rotation_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("turboquant_rotation"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("kernel_rotation"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        Ok(TurboQuantPipelines {
+            bind_group_layout,
+            quantize_pipeline,
+            dequantize_pipeline,
+            rotation_pipeline,
+        })
+    }
+}
+
+/// GPU compute pipelines for TurboQuant operations.
+/// Created via TurboQuantEngine::create_pipelines().
+pub struct TurboQuantPipelines {
+    /// Bind group layout for turboquant kernels
+    pub bind_group_layout: wgpu::BindGroupLayout,
+    /// Quantization pipeline (kernel_quantize)
+    pub quantize_pipeline: wgpu::ComputePipeline,
+    /// Dequantization pipeline (kernel_dequantize)
+    pub dequantize_pipeline: wgpu::ComputePipeline,
+    /// Rotation pipeline (kernel_rotation)
+    pub rotation_pipeline: wgpu::ComputePipeline,
 }
 
 /// Outlier Channel Splitting for non-integer bit precision
