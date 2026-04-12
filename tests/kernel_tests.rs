@@ -1067,8 +1067,10 @@ fn test_elastic_rag_empty_search() {
 // FlashDecodeTiledOp tests (task f4c0a839 — tiled KV attention)
 // =============================================================================
 
-use ferrisres::compute::kernels::flash_decode::FlashDecodeTiledOp;
 use ferrisres::compute::kernels::tome_merge::bipartite_match;
+
+/// CPU reference: single-query attention with causal mask (all positions visible).
+fn flash_decode_ref(
     query:     &[f32],   // [num_heads, head_dim]
     key_cache: &[f32],   // [seq_len, num_heads, head_dim]
     value_cache:&[f32],  // [seq_len, num_heads, head_dim]
@@ -1195,7 +1197,6 @@ async fn test_flash_decode_tiled_vs_original() {
 // ToMe bipartite matching tests (task c9e2d541)
 // =============================================================================
 
-use ferrisres::compute::kernels::tome_merge::bipartite_match;
 
 #[test]
 fn test_bipartite_match_merge_count() {

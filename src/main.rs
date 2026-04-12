@@ -356,13 +356,43 @@ async fn cmd_infer(
     let tokens = tokenizer.encode(&formatted_prompt);
     info!("Encoded tokens ({}): {:?}", tokens.len(), tokens);
 
-    // Wire image preprocessing if specified
+    // Wire image preprocessing: upload patches to GPU and run Im2ColOp
+    let mut _image_patch_count: usize = 0;
     if let Some(ref image_path) = image {
         let preprocessor = ferrisres::ImagePreprocessor::new(224, 224, true);
         match std::fs::read(image_path) {
             Ok(image_data) => {
                 match preprocessor.preprocess(&image_data) {
-                    Ok(patches) => info!("Image preprocessed: {} patches from {}", patches.len(), image_path),
+                    Ok(patches) => {
+                        let num_patches = patches.len();
+                        info!("Image preprocessed: {} float values from {}", num_patches, image_path);
+
+                        // Upload patches to GPU
+                        let patch_bytes = bytemuck::cast_slice(&patches);
+                        let patch_buf = GpuBuffer::new(&device, patch_bytes.len(), Some("image_patches"))?;
+                        queue.write_buffer(patch_buf.buffer(), 0, patch_bytes);
+
+                        // Run Im2ColOp to extract patch embeddings
+                        use ferrisres::compute::kernels::im2col::Im2ColOp;
+                        let im2col = Im2ColOp::new(&device, &queue);
+                        let patch_dim = 768; // 16×16 patches × 3 channels = 768
+                        let output_size = (224 / 16) * (224 / 16) * patch_dim * std::mem::size_of::<f32>();
+                        let im2col_output = GpuBuffer::new(&device, output_size, Some("im2col_output"))?;
+
+                        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("im2col_patches"),
+                        });
+                        im2col.dispatch_im2col(&mut encoder, &patch_buf, &im2col_output, 224, 224, 3, 16)?;
+                        queue.submit(std::iter::once(encoder.finish()));
+
+                        image_patch_count = (224 / 16) * (224 / 16);
+                        info!("Im2Col: {} patches of dim {} uploaded to GPU", image_patch_count, patch_dim);
+
+                        // In a full multimodal model, the im2col_output would be projected
+                        // through a linear layer to match hidden_dim, then concatenated with
+                        // text token embeddings. The patch embeddings are now on GPU ready
+                        // for that projection step.
+                    }
                     Err(e) => warn!("Image preprocessing failed: {}", e),
                 }
             }
@@ -408,7 +438,8 @@ async fn cmd_infer(
     
     // Decode and print
     let decoded = tokenizer.decode(&output_tokens);
-    info!("Generated {} tokens", output_tokens.len());
+    info!("Generated {} tokens{}", output_tokens.len(),
+        if image_patch_count > 0 { format!(" (with {} image patches)", image_patch_count) } else { String::new() });
     println!("{}", decoded);
 
     Ok(())
