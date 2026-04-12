@@ -284,12 +284,7 @@ impl TokenGenerator {
 
         for step in 0..config.max_tokens.saturating_sub(1) {
             let global_pos = seq_len as usize + step + 1;
-            let _effective_pos = ctx_ext.effective_position(global_pos);
-            // TODO: pass effective_pos to the attention layer's RoPE computation.
-            // Full wiring requires modifying forward_decode_token to accept
-            // a position offset parameter for YaRN/StreamingLLM remapping.
-            // The ContextExtensionEngine is constructed and active; the remapping
-            // values are computed but not yet threaded through to the GPU kernel.
+            let effective_pos = ctx_ext.effective_position(global_pos);
             let token_buf = GpuBuffer::new(
                 &self.device,
                 std::mem::size_of::<u32>(),
@@ -308,7 +303,7 @@ impl TokenGenerator {
             let mut current = embed_buf;
             for (i, layer) in self.model.layers().iter().enumerate() {
                 let kv = self.kv_cache.layer(i);
-                current = layer.forward_decode_token(&mut encoder, &current, kv)?;
+                current = layer.forward_decode_token_with_pos(&mut encoder, &current, kv, Some(effective_pos as u32))?;
             }
 
             let logits_buf = GpuBuffer::new(&self.device, logits_bytes, Some("decode_logits"))?;

@@ -516,6 +516,20 @@ impl BlockAttnResLayer {
         hidden_states: &GpuBuffer,
         kv_cache: &LayerKVCache,
     ) -> Result<GpuBuffer> {
+        self.forward_decode_token_with_pos(encoder, hidden_states, kv_cache, None)
+    }
+
+    /// Decode a single token with optional position override for YaRN/StreamingLLM.
+    /// When `effective_pos` is `Some(pos)`, uses that position for RoPE instead of
+    /// the KV cache length. This enables context extension methods to remap
+    /// positions without modifying the cache structure.
+    pub fn forward_decode_token_with_pos(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        hidden_states: &GpuBuffer,
+        kv_cache: &LayerKVCache,
+        effective_pos: Option<u32>,
+    ) -> Result<GpuBuffer> {
         let hidden_dim = self.hidden_dim;
         let num_heads = self.num_heads as u32;
         let head_dim = self.head_dim as u32;
@@ -544,7 +558,7 @@ impl BlockAttnResLayer {
         self.k_proj.forward(encoder, &normed, &k_buf, 1u32)?;
         self.v_proj.forward(encoder, &normed, &v_buf, 1u32)?;
 
-        let pos = kv_cache.current_len();
+        let pos = effective_pos.unwrap_or_else(|| kv_cache.current_len());
 
         let rope_q = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_rope_q"))?;
         let rope_k = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_rope_k"))?;

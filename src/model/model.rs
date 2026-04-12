@@ -303,25 +303,30 @@ impl BlockAttnResModel {
                 },
             );
 
+            let layer = &self.layers[layer_idx];
+            let dev = &self.device;
+            let que = &self.queue;
+
             // Recompute this layer's forward pass from saved checkpoint
             let _recomputed = checkpoint_store.recompute_block(
                 layer_idx,
                 &mut encoder,
-                |enc, input_buf, idx| {
-                    // Re-run this layer's forward to get intermediate activations
+                |enc, input_buf, _idx| {
                     let output = GpuBuffer::new(
-                        &self.device,
+                        dev,
                         input_buf.size(),
-                        Some(&format!("recompute_layer{}_output", idx)),
+                        Some(&format!("recompute_output")),
                     )?;
-                    // In a full implementation, we'd call the layer's forward here.
-                    // For now, copy input to output (identity) as a placeholder
-                    // until the layer forward accepts arbitrary GpuBuffer I/O.
-                    enc.copy_buffer_to_buffer(
-                        input_buf.buffer(), 0,
-                        output.buffer(), 0,
-                        input_buf.size() as u64,
-                    );
+                    let partial = GpuBuffer::zeros(dev, que, input_buf.size(), Some("recompute_partial"))?;
+                    layer.forward_intra_block(
+                        enc,
+                        input_buf,
+                        &output,
+                        &partial,
+                        1,
+                        crate::training::CheckpointGranularity::PerBlock,
+                        None,
+                    )?;
                     Ok(output)
                 },
             )?;

@@ -107,6 +107,30 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Read back a single f32 value from a GPU buffer.
+fn readback_f32(device: &Arc<wgpu::Device>, queue: &Arc<wgpu::Queue>, buffer: &GpuBuffer) -> f32 {
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("loss_readback"),
+        size: 4,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("loss_readback_enc") });
+    enc.copy_buffer_to_buffer(buffer.buffer(), 0, &staging, 0, 4);
+    queue.submit(std::iter::once(enc.finish()));
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let _ = rx.recv();
+    let data = slice.get_mapped_range();
+    let val: f32 = bytemuck::cast_slice(&data)[0];
+    drop(data);
+    staging.unmap();
+    val
+}
+
 async fn cmd_info() -> anyhow::Result<()> {
     let compute = WgpuCompute::new().await?;
     let capability = compute.detect_capability();
@@ -243,9 +267,12 @@ async fn cmd_train(
             let target_buf = GpuBuffer::zeros(&device, &queue, batch_size as usize * std::mem::size_of::<f32>(), Some("train_target"))?;
             let dummy_buf = GpuBuffer::zeros(&device, &queue, hidden_bytes, Some("train_dummy"))?;
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train_forward"), });
-            let _loss_buf = loss_fn.compute(&mut encoder, &loss_logits, &target_buf, 1, vocab_size as u32, &dummy_buf)?;
+            loss_fn.compute(&mut encoder, &loss_logits, &target_buf, 1, vocab_size as u32, &dummy_buf)?;
             queue.submit(std::iter::once(encoder.finish()));
-            epoch_loss += 0.5; // placeholder
+
+            // Read back the loss value from GPU
+            let loss_val = readback_f32(&device, &queue, &dummy_buf);
+            epoch_loss += loss_val;
             batches += 1;
         } else {
             let num_batches = (all_tokens.len() - 1) / batch_size as usize;
@@ -275,10 +302,12 @@ async fn cmd_train(
                 });
 
                 // Run forward through loss
-                let _loss = loss_fn.compute(&mut encoder, &loss_logits, &target_buf, 1, vocab_size as u32, &dummy_buf)?;
+                loss_fn.compute(&mut encoder, &loss_logits, &target_buf, 1, vocab_size as u32, &dummy_buf)?;
                 queue.submit(std::iter::once(encoder.finish()));
 
-                epoch_loss += 1.0 / (batch_idx as f32 + 1.0); // placeholder loss curve
+                // Read back the loss value from GPU
+                let loss_val = readback_f32(&device, &queue, &dummy_buf);
+                epoch_loss += loss_val;
                 batches += 1;
             }
         }
