@@ -349,15 +349,31 @@ impl TokenGenerator {
         prompt_tokens: Vec<u32>,
         max_new_tokens: usize,
     ) -> tokio::sync::mpsc::Receiver<u32> {
+        self.generate_stream_with_config(prompt_tokens, max_new_tokens, None)
+    }
+
+    /// Streaming generation with optional config for context extension and other settings.
+    pub fn generate_stream_with_config(
+        self: Arc<Self>,
+        prompt_tokens: Vec<u32>,
+        max_new_tokens: usize,
+        config_override: Option<GenerateConfig>,
+    ) -> tokio::sync::mpsc::Receiver<u32> {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
 
         std::thread::spawn(move || {
-            let config = GenerateConfig {
+            let config = config_override.unwrap_or_else(|| GenerateConfig {
                 max_tokens: max_new_tokens,
                 ..GenerateConfig::default()
-            };
+            });
             let mut logit_processor = LogitProcessor::new(config.to_logit_config());
             logit_processor.record_prompt(&prompt_tokens);
+
+            // Context extension engine for YaRN/StreamingLLM in streaming mode
+            let mut ctx_ext = config.context_extension.as_ref()
+                .map(|c: &crate::inference::context_extension::ContextExtensionConfig| crate::inference::context_extension::ContextExtensionEngine::new(c.clone()))
+                .unwrap_or_else(crate::inference::context_extension::ContextExtensionEngine::none);
+
             let hidden_dim = self.model.config().hidden_dim;
             let f32_size = std::mem::size_of::<f32>();
             let seq_len = prompt_tokens.len() as u32;
@@ -440,7 +456,10 @@ impl TokenGenerator {
             }
 
             // --- Decode loop: one token per step ---
-            for _ in 0..config.max_tokens.saturating_sub(1) {
+            for step in 0..config.max_tokens.saturating_sub(1) {
+                let global_pos = seq_len as usize + step + 1;
+                let effective_pos = ctx_ext.effective_position(global_pos);
+
                 let token_buf = match GpuBuffer::new(
                     &self.device,
                     std::mem::size_of::<u32>(),
@@ -471,7 +490,7 @@ impl TokenGenerator {
                 let mut current = embed_buf;
                 for (i, layer) in self.model.layers().iter().enumerate() {
                     let kv = self.kv_cache.layer(i);
-                    current = match layer.forward_decode_token(&mut encoder, &current, kv) {
+                    current = match layer.forward_decode_token_direct(&mut encoder, &current, kv, Some(effective_pos as u32)) {
                         Ok(h) => h,
                         Err(_) => return,
                     };
@@ -486,6 +505,20 @@ impl TokenGenerator {
                 }
 
                 self.queue.submit(std::iter::once(encoder.finish()));
+
+                // Check if StreamingLLM eviction needs compaction
+                if ctx_ext.needs_compaction(self.kv_cache.layer(0).current_len() as usize) {
+                    let indices = ctx_ext.kv_cache_window(
+                        self.kv_cache.layer(0).current_len() as usize
+                    );
+                    let mut compact_encoder = self.device.create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor { label: Some("kv_compact_stream") },
+                    );
+                    if self.kv_cache.compact_all(&mut compact_encoder, &indices).is_err() {
+                        return;
+                    }
+                    self.queue.submit(std::iter::once(compact_encoder.finish()));
+                }
 
                 let logits = readback_buffer(&self.device, &self.queue, &logits_buf);
                 let token = sample_token(&mut logit_processor, &logits) as u32;
