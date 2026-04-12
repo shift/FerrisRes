@@ -17,6 +17,7 @@ pub mod tool_search;
 pub mod speculative;
 pub mod paged_attention;
 pub mod cross_modal;
+pub mod circular_kv;
 
 pub use kv_cache::{LayerKVCache, ModelKVCache};
 pub use two_phase::{TwoPhaseConfig, TwoPhaseInference, KVCache, Sampler, GenerationState};
