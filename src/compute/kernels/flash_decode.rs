@@ -298,24 +298,28 @@ const FLASH_DECODE_TILED_WGSL: &str = r#"
     var<workgroup> tile_v: array<f32, 256>;
 
     @compute @workgroup_size(256)
-    fn flash_decode_tiled(@builtin(global_invocation_id) gid: vec3<u32>) {
-        let h         = gid.x;
+    fn flash_decode_tiled(
+        @builtin(global_invocation_id)  gid: vec3<u32>,
+        @builtin(local_invocation_id)  lid: vec3<u32>,
+        @builtin(workgroup_id)         wid: vec3<u32>,
+    ) {
+        let h         = wid.x;           // 1 workgroup per head
         let num_heads = params.num_heads;
         let head_dim  = params.head_dim;
         let seq_len   = params.seq_len;
         let tile_kv   = params.tile_kv;
-
-        if (h >= num_heads) { return; }
+        let is_active = h < num_heads;
+        let tid       = lid.x;           // local thread index (0..255)
 
         let scale   = 1.0 / sqrt(f32(head_dim));
         let q_base  = h * head_dim;
         let tile_el = tile_kv * head_dim;
         let n_tiles = (seq_len + tile_kv - 1u) / tile_kv;
 
-        // Online softmax accumulators
+        // Online softmax accumulators (only meaningful when active)
         var run_max: f32 = -3.402823466e+38;
         var run_sum: f32 = 0.0;
-        var acc:     array<f32, 64>;   // max head_dim = 64 for typical models
+        var acc:     array<f32, 64>;
         for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
             acc[d] = 0.0;
         }
@@ -324,10 +328,11 @@ const FLASH_DECODE_TILED_WGSL: &str = r#"
             let tile_start = t * tile_kv;
 
             // ---- Load K/V tile into shared memory ----
-            for (var idx = gid.x; idx < tile_el; idx = idx + num_heads) {
+            // ALL threads participate in loading (cooperative)
+            for (var idx = tid; idx < tile_el; idx = idx + 256u) {
                 let s = tile_start + (idx / head_dim);
                 let d = idx % head_dim;
-                if (s < seq_len) {
+                if (s < seq_len && is_active) {
                     tile_k[idx] = key_cache  [s * num_heads * head_dim + h * head_dim + d];
                     tile_v[idx] = value_cache[s * num_heads * head_dim + h * head_dim + d];
                 } else {
@@ -337,57 +342,61 @@ const FLASH_DECODE_TILED_WGSL: &str = r#"
             }
             workgroupBarrier();
 
-            let tile_len = min(tile_kv, seq_len - tile_start);
+            if (is_active) {
+                let tile_len = min(tile_kv, seq_len - tile_start);
 
-            // ---- Tile-local online softmax ----
-            var tile_max: f32 = -3.402823466e+38;
+                // ---- Tile-local online softmax ----
+                var tile_max: f32 = -3.402823466e+38;
 
-            // Pass 1: tile max
-            for (var s: u32 = 0u; s < tile_len; s = s + 1u) {
-                var dot: f32 = 0.0;
-                for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
-                    dot += query[q_base + d] * tile_k[s * head_dim + d];
+                // Pass 1: tile max
+                for (var s: u32 = 0u; s < tile_len; s = s + 1u) {
+                    var dot: f32 = 0.0;
+                    for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
+                        dot += query[q_base + d] * tile_k[s * head_dim + d];
+                    }
+                    let score = dot * scale;
+                    if (score > tile_max) { tile_max = score; }
                 }
-                let score = dot * scale;
-                if (score > tile_max) { tile_max = score; }
-            }
 
-            // Merge tile into running accumulators
-            let new_max = max(run_max, tile_max);
-            let old_correction = exp(run_max - new_max);
+                // Merge tile into running accumulators
+                let new_max = max(run_max, tile_max);
+                let old_correction = exp(run_max - new_max);
 
-            // Rescale running accumulators
-            run_sum *= old_correction;
-            for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
-                acc[d] *= old_correction;
-            }
-
-            // Pass 2: accumulate tile contributions (all using new_max)
-            for (var s: u32 = 0u; s < tile_len; s = s + 1u) {
-                var dot: f32 = 0.0;
+                // Rescale running accumulators
+                run_sum *= old_correction;
                 for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
-                    dot += query[q_base + d] * tile_k[s * head_dim + d];
+                    acc[d] *= old_correction;
                 }
-                let weight = exp(dot * scale - new_max);
-                run_sum += weight;
-                for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
-                    acc[d] += weight * tile_v[s * head_dim + d];
-                }
-            }
 
-            run_max = new_max;
+                // Pass 2: accumulate tile contributions (all using new_max)
+                for (var s: u32 = 0u; s < tile_len; s = s + 1u) {
+                    var dot: f32 = 0.0;
+                    for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
+                        dot += query[q_base + d] * tile_k[s * head_dim + d];
+                    }
+                    let weight = exp(dot * scale - new_max);
+                    run_sum += weight;
+                    for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
+                        acc[d] += weight * tile_v[s * head_dim + d];
+                    }
+                }
+
+                run_max = new_max;
+            }
             workgroupBarrier();
         }
 
         // Final normalisation
-        if (run_sum > 0.0) {
-            let inv_sum = 1.0 / run_sum;
-            for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
-                output[h * head_dim + d] = acc[d] * inv_sum;
-            }
-        } else {
-            for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
-                output[h * head_dim + d] = 0.0;
+        if (is_active) {
+            if (run_sum > 0.0) {
+                let inv_sum = 1.0 / run_sum;
+                for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
+                    output[h * head_dim + d] = acc[d] * inv_sum;
+                }
+            } else {
+                for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
+                    output[h * head_dim + d] = 0.0;
+                }
             }
         }
     }
@@ -525,7 +534,7 @@ impl FlashDecodeTiledOp {
             ],
         });
 
-        let wg_count = (num_heads + 255) / 256;
+        let wg_count = num_heads;  // 1 workgroup per head (each has its own shared memory)
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Flash Decode Tiled Pass"),
             timestamp_writes: None,
@@ -537,7 +546,7 @@ impl FlashDecodeTiledOp {
 
         tracing::debug!(
             "FlashDecodeTiledOp dispatched: seq_len={} num_heads={} head_dim={} tile_kv={} wg={}",
-            seq_len, num_heads, head_dim, tile_kv, wg_count
+            seq_len, num_heads, head_dim, tile_kv, num_heads
         );
 
         Ok(())

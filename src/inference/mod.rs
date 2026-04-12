@@ -10,6 +10,7 @@ pub mod tool_search;
 pub mod decs;
 pub mod hull_kv_cache;
 pub mod llm_computer;
+pub mod token_merging;
 
 pub use kv_cache::{LayerKVCache, ModelKVCache};
 #[allow(deprecated)]
