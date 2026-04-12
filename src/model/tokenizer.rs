@@ -297,10 +297,9 @@ impl DomainVocabulary {
         
         for &id in ids {
             if id >= self.domain_offset {
-                // Domain token
-                let domain_id = id - self.domain_offset;
+                // Domain token — match by absolute ID
                 for (token, &tid) in &self.domain_tokens {
-                    if tid == domain_id {
+                    if tid == id {
                         result.push_str(token);
                         break;
                     }
@@ -317,5 +316,78 @@ impl DomainVocabulary {
     /// Get total vocabulary size (base + domain)
     pub fn total_vocab_size(&self) -> usize {
         self.base_tokenizer.vocab_size() + self.domain_tokens.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_simple_tokenizer_encode_decode() {
+        let tok = SimpleTokenizer::new();
+        let tokens = tok.encode("hello world");
+        assert!(!tokens.is_empty());
+        let decoded = tok.decode(&tokens);
+        assert!(!decoded.is_empty());
+    }
+
+    #[test]
+    fn test_simple_tokenizer_vocab_size() {
+        let tok = SimpleTokenizer::new();
+        assert!(tok.vocab_size() > 0);
+    }
+
+    #[test]
+    fn test_simple_tokenizer_eos() {
+        let tok = SimpleTokenizer::new();
+        assert_eq!(tok.eos_id(), 1);
+    }
+
+    #[test]
+    fn test_simple_tokenizer_roundtrip() {
+        let tok = SimpleTokenizer::new();
+        let text = "test roundtrip";
+        let tokens = tok.encode(text);
+        let decoded = tok.decode(&tokens);
+        // Should contain the original words in some form
+        assert!(decoded.contains("test") || decoded.contains("roundtrip"));
+    }
+
+    #[test]
+    fn test_bpe_basic_train() {
+        let mut tok = BpeTokenizer::new(100);
+        tok.train("ab ab ab ab", 5);
+        assert!(tok.vocab_size() > 0);
+    }
+
+    #[test]
+    fn test_bpe_encode_decode() {
+        let tok = BpeTokenizer::default_vocab();
+        let tokens = tok.encode("hello");
+        assert!(!tokens.is_empty());
+        let decoded = tok.decode(&tokens);
+        assert!(!decoded.is_empty());
+    }
+
+    #[test]
+    fn test_domain_vocab_extend() {
+        let base = BpeTokenizer::default_vocab();
+        let mut dv = DomainVocabulary::new(base);
+        let initial = dv.total_vocab_size();
+        dv.extend(vec!["<CODE>".to_string(), "</CODE>".to_string()]);
+        assert!(dv.total_vocab_size() > initial);
+    }
+
+    #[test]
+    fn test_domain_vocab_encode_decode() {
+        let base = BpeTokenizer::default_vocab();
+        let mut dv = DomainVocabulary::new(base);
+        dv.extend(vec!["<RUST>".to_string()]);
+        let tokens = dv.encode("<RUST> fn");
+        assert!(!tokens.is_empty());
+        let decoded = dv.decode(&tokens);
+        // Domain token should decode to the original string
+        assert!(decoded.contains("<RUST>"));
     }
 }

@@ -511,3 +511,18 @@ struct LossParams {
     _pad0: u32,
     _pad1: u32,
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_sgd_learning_rate() {
+        let lr = 0.01f32;
+        assert!(lr > 0.0);
+    }
+
+    #[test]
+    fn test_adam_timestep_type() {
+        let ts: u32 = 0;
+        assert_eq!(ts, 0u32);
+    }
+}

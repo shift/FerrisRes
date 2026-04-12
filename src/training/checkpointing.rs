@@ -217,3 +217,38 @@ impl CheckpointStore {
         Ok(output)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compression_config_default() {
+        let config = CheckpointCompressionConfig::default();
+        assert!(!config.enabled);
+        assert!((config.compression_ratio - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_compression_config_two_bit() {
+        let config = CheckpointCompressionConfig::two_bit();
+        assert!(config.enabled);
+        assert!(config.bit_width.unwrap() == 2);
+        assert!((config.compression_ratio - 16.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_compression_config_three_bit() {
+        let config = CheckpointCompressionConfig::three_bit();
+        assert!(config.enabled);
+        assert!((config.compression_ratio - 32.0 / 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_compression_config_new() {
+        let config = CheckpointCompressionConfig::new(4);
+        assert!(config.enabled);
+        assert!(config.bit_width.unwrap() == 4);
+        assert!((config.compression_ratio - 8.0).abs() < 0.01);
+    }
+}

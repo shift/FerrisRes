@@ -635,3 +635,71 @@ impl TokenGenerator {
         Ok(output_tokens)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_config_default() {
+        let config = GenerateConfig::default();
+        assert!((config.temperature - 1.0).abs() < 0.01);
+        assert_eq!(config.max_tokens, 128);
+        assert_eq!(config.top_k, 0);
+        assert!((config.top_p - 1.0).abs() < 0.01);
+        assert!((config.repetition_penalty - 1.0).abs() < 0.01);
+        assert!(config.eos_token.is_none());
+        assert!(config.template_format.is_none());
+        assert!(config.context_extension.is_none());
+        assert!(config.rag_config.is_none());
+        assert!(config.tool_registry.is_none());
+    }
+
+    #[test]
+    fn test_generate_config_to_logit_config() {
+        let config = GenerateConfig {
+            temperature: 0.7,
+            top_k: 50,
+            top_p: 0.9,
+            repetition_penalty: 1.2,
+            frequency_penalty: 0.5,
+            presence_penalty: 0.3,
+            repetition_window: 64,
+            ..Default::default()
+        };
+        let lc = config.to_logit_config();
+        assert!((lc.temperature - 0.7).abs() < 0.01);
+        assert_eq!(lc.top_k, 50);
+        assert!((lc.top_p - 0.9).abs() < 0.01);
+        assert!((lc.repetition_penalty - 1.2).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_generate_config_apply_template_raw() {
+        let config = GenerateConfig::default();
+        let result = config.apply_template("hello");
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_generate_config_apply_template_chatml() {
+        let config = GenerateConfig {
+            template_format: Some(TemplateFormat::ChatML),
+            ..Default::default()
+        };
+        let result = config.apply_template("hello");
+        assert!(result.contains("hello"));
+    }
+
+    #[test]
+    fn test_has_context_extension_none() {
+        let config = GenerateConfig::default();
+        assert!(!config.has_context_extension());
+    }
+
+    #[test]
+    fn test_has_rag_none() {
+        let config = GenerateConfig::default();
+        assert!(!config.has_rag());
+    }
+}

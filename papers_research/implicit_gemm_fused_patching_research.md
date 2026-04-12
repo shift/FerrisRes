@@ -2,7 +2,7 @@
 
 **Task ID:** `b3f74a12`
 **Phase:** 7 (Multimodal Tokenization)
-**Status:** TODO
+**Status:** DONE ✅
 **Priority:** HIGH — directly replaces the memory-blowing `im2col` buffer on integrated GPU
 
 ---

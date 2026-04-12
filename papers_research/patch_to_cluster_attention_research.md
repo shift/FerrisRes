@@ -2,7 +2,7 @@
 
 **Task ID:** `e5b92f76`
 **Phase:** 7 (Multimodal Tokenization) — Vision encoder architecture
-**Status:** TODO
+**Status:** DONE ✅
 **Priority:** MEDIUM — architectural synergy with HullKVCache (Task `9059364b`); deferred until
 HullKVCache lands but research should precede it
 

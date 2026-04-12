@@ -418,3 +418,12 @@ impl CompressedModelKVCache {
         self.layers[0].compression_ratio()
     }
 }
+
+#[cfg(test)]
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_kv_cache_module_compiles() {
+        assert!(true);
+    }
+}

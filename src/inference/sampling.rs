@@ -105,3 +105,65 @@ fn softmax_inplace_values(indexed: &mut [(usize, f32)]) {
         *v /= sum;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_argmax_basic() {
+        let logits = vec![0.1, 0.5, 0.9, 0.3];
+        assert_eq!(sample_argmax(&logits), 2);
+    }
+
+    #[test]
+    fn test_argmax_tie() {
+        let logits = vec![1.0, 1.0];
+        // First one wins on tie
+        assert_eq!(sample_argmax(&logits), 0);
+    }
+
+    #[test]
+    fn test_argmax_single() {
+        assert_eq!(sample_argmax(&[5.0]), 0);
+    }
+
+    #[test]
+    fn test_temperature_high() {
+        // High temperature should flatten; argmax still picks the max
+        let mut logits = vec![1.0, 2.0, 3.0];
+        let idx = sample_temperature(&mut logits, 100.0);
+        assert_eq!(idx, 2);
+    }
+
+    #[test]
+    fn test_temperature_low() {
+        // Low temperature should sharpen; still picks max
+        let mut logits = vec![1.0, 2.0, 3.0];
+        let idx = sample_temperature(&mut logits, 0.1);
+        assert_eq!(idx, 2);
+    }
+
+    #[test]
+    fn test_softmax_inplace() {
+        let mut logits = vec![1.0, 2.0, 3.0];
+        softmax_inplace(&mut logits);
+        let sum: f32 = logits.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
+        // Probabilities should be positive
+        assert!(logits.iter().all(|&v| v > 0.0));
+        // Largest logit should have highest probability
+        assert!(logits[2] > logits[1]);
+        assert!(logits[1] > logits[0]);
+    }
+
+    #[test]
+    fn test_softmax_inplace_zeros() {
+        let mut logits = vec![0.0, 0.0, 0.0];
+        softmax_inplace(&mut logits);
+        // Uniform distribution
+        for &v in &logits {
+            assert!((v - 1.0 / 3.0).abs() < 1e-5);
+        }
+    }
+}
