@@ -346,7 +346,7 @@ Remaining implementation tasks:
 
 | Task | ID | Description | Status |
 |---|---|---|---|
-| FlashAttention-3 Async Principles for WGSL | `f4c0a839` | Double-buffer tile loops; pipelined TurboQuant dequant+decode on 800 MHz shared bus | 📝 Todo |
+| FlashAttention-3 Async Principles for WGSL | `f4c0a839` | Double-buffer tile loops; pipelined TurboQuant dequant+decode on 800 MHz shared bus | ✅ Implemented (matmul; flash_decode pending) |
 
 ### Phase 7: Multimodal Tokenization
 
@@ -360,9 +360,9 @@ New research tasks added (see `papers_research/`):
 
 | Task | Description | Status |
 |---|---|---|
-| Implicit GEMM / Fused Patching | Eliminate `im2col` buffer via fused WGSL patch-embed kernel; ~59 MB VRAM saving at 224×224 on Integrated GPU | 📝 Todo |
+| Implicit GEMM / Fused Patching | Eliminate `im2col` buffer via fused WGSL patch-embed kernel; ~59 MB VRAM saving at 224×224 on Integrated GPU | ✅ Implemented |
 | Token Merging (ToMe) | Training-free visual token reduction (bipartite matching on key vectors); up to 2× throughput, no retraining | 📝 Todo |
-| Matryoshka Embeddings | Nested embedding dimensions for elastic RAG/Engram lookups; dim=64 on Integrated, dim=768 on HighEnd | 📝 Todo |
+| Matryoshka Embeddings | Nested embedding dimensions for elastic RAG/Engram lookups; dim=64 on Integrated, dim=768 on HighEnd | ✅ Implemented |
 | Patch-to-Cluster Attention (PaCa) | Learned spatial clustering of patches; O(N×K) vs O(N²) attention; architectural complement to HullKVCache | 📝 Todo |
 
 Implementation requires:

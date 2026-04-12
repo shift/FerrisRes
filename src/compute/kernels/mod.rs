@@ -5,6 +5,7 @@ pub mod rmsnorm;
 pub mod moe;
 pub mod rope;
 pub mod im2col;
+pub mod fused_patch_embed;
 pub mod flash_decode;
 pub mod causal_mask;
 pub mod prefill_attn;

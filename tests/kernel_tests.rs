@@ -1,9 +1,11 @@
 use std::sync::Arc;
 use ferrisres::compute::{
-    GpuBuffer, WgpuCompute, MatMulOp, RmsNormOp, SoftmaxOp, ElementWiseOp, MoEGatingOp, MoEExpertOp,
+    GpuBuffer, WgpuCompute, MatMulOp, MatMulDoubleBufferOp, FusedPatchEmbedOp,
+    RmsNormOp, SoftmaxOp, ElementWiseOp, MoEGatingOp, MoEExpertOp,
 };
 use ferrisres::compute::kernels::moe::{MOE_DISPATCH_WGSL, MOE_GATHER_WGSL};
 use ferrisres::model::{BlockAttnResConfig, BlockAttnResLayer};
+use ferrisres::inference::rag::{Document, ElasticRagStore, EmbedProfile};
 
 async fn create_test_compute() -> (WgpuCompute, Arc<wgpu::Device>, Arc<wgpu::Queue>) {
     let compute = WgpuCompute::new().await.unwrap();
@@ -751,4 +753,311 @@ async fn test_moe_block_attn_res_layer_construction() {
         "BlockAttnResLayer::new with use_moe=true should succeed, got: {:?}",
         layer.err()
     );
+}
+
+// =============================================================================
+// Fused Patch Embedding tests (task b3f74a12)
+// =============================================================================
+
+/// Build a flat HWC f32 image filled with a constant value.
+#[allow(dead_code)]
+fn make_image(h: u32, w: u32, c: u32, val: f32) -> Vec<f32> {
+    vec![val; (h * w * c) as usize]
+}
+
+/// Explicit im2col + matmul reference (CPU, correct but slow).
+/// Returns the `[n_patches, embed_dim]` embedding.
+fn reference_patch_embed(
+    image: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    h: u32, w: u32, c: u32,
+    patch_size: u32,
+    embed_dim: u32,
+) -> Vec<f32> {
+    let ph = (h / patch_size) as usize;
+    let pw = (w / patch_size) as usize;
+    let n = ph * pw;
+    let k = (patch_size * patch_size * c) as usize;
+    let d = embed_dim as usize;
+
+    // im2col
+    let mut patches = vec![0.0f32; n * k];
+    for pi in 0..n {
+        let p_row = pi / pw;
+        let p_col = pi % pw;
+        for ki in 0..k {
+            let ch = ki % c as usize;
+            let loc_xy = ki / c as usize;
+            let ly = loc_xy / patch_size as usize;
+            let lx = loc_xy % patch_size as usize;
+            let iy = p_row * patch_size as usize + ly;
+            let ix = p_col * patch_size as usize + lx;
+            patches[pi * k + ki] = image[(iy * w as usize + ix) * c as usize + ch];
+        }
+    }
+
+    // matmul: [N, K] × [K, D] → [N, D]
+    let mut out = vec![0.0f32; n * d];
+    for ni in 0..n {
+        for di in 0..d {
+            let mut acc = 0.0f32;
+            for ki in 0..k {
+                acc += patches[ni * k + ki] * weight[ki * d + di];
+            }
+            if let Some(b) = bias {
+                acc += b[di];
+            }
+            out[ni * d + di] = acc;
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn test_fused_patch_embed_matches_reference_no_bias() {
+    let (_, device, queue) = create_test_compute().await;
+
+    // Small image: 8×8 RGB, patch_size=4, embed_dim=8
+    let (h, w, c, p, d) = (8u32, 8u32, 3u32, 4u32, 8u32);
+    let n_patches = (h / p) * (w / p);             // 2×2 = 4
+    let k_size    = (p * p * c) as usize;           // 4*4*3 = 48
+    let d_size    = d as usize;
+
+    // Deterministic image: pixel at (y,x,ch) = (y*w + x)*c + ch as f32 * 0.01
+    let mut image = vec![0.0f32; (h * w * c) as usize];
+    for i in 0..image.len() { image[i] = i as f32 * 0.01; }
+
+    // Random-ish weight: w[k,d] = (k*d_size + d) as f32 * 0.001
+    let mut weight = vec![0.0f32; k_size * d_size];
+    for i in 0..weight.len() { weight[i] = i as f32 * 0.001; }
+
+    let expected = reference_patch_embed(&image, &weight, None, h, w, c, p, d);
+
+    // GPU buffers
+    let img_buf = create_filled_buffer(&device, &image);
+    let w_buf   = create_filled_buffer(&device, &weight);
+    let out_buf = create_output_buffer(&device, (n_patches * d) as usize * 4);
+
+    let op = FusedPatchEmbedOp::new(&device, &queue);
+    let mut encoder = device.create_command_encoder(
+        &wgpu::CommandEncoderDescriptor { label: Some("fused_patch_test") }
+    );
+    op.dispatch(&mut encoder, &img_buf, &w_buf, None, &out_buf, h, w, c, p, d).unwrap();
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let actual = read_buffer(&device, &queue, &out_buf);
+
+    assert_eq!(actual.len(), expected.len());
+    for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (a - e).abs() < 1e-3,
+            "fused_patch_embed mismatch at index {}: got {} expected {}", i, a, e
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_fused_patch_embed_matches_reference_with_bias() {
+    let (_, device, queue) = create_test_compute().await;
+
+    let (h, w, c, p, d) = (8u32, 8u32, 1u32, 4u32, 4u32);
+    let n_patches = (h / p) * (w / p);
+    let k_size    = (p * p * c) as usize;
+    let d_size    = d as usize;
+
+    let image  = vec![1.0f32; (h * w * c) as usize];
+    let weight = vec![0.5f32; k_size * d_size];
+    let bias   = vec![0.25f32; d_size];
+
+    let expected = reference_patch_embed(&image, &weight, Some(&bias), h, w, c, p, d);
+
+    let img_buf  = create_filled_buffer(&device, &image);
+    let w_buf    = create_filled_buffer(&device, &weight);
+    let b_buf    = create_filled_buffer(&device, &bias);
+    let out_buf  = create_output_buffer(&device, (n_patches * d) as usize * 4);
+
+    let op = FusedPatchEmbedOp::new(&device, &queue);
+    let mut encoder = device.create_command_encoder(
+        &wgpu::CommandEncoderDescriptor { label: Some("fused_patch_bias_test") }
+    );
+    op.dispatch(&mut encoder, &img_buf, &w_buf, Some(&b_buf), &out_buf, h, w, c, p, d).unwrap();
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let actual = read_buffer(&device, &queue, &out_buf);
+    for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (a - e).abs() < 1e-3,
+            "fused_patch_embed(bias) mismatch at {}: got {} expected {}", i, a, e
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_fused_patch_embed_output_byte_size() {
+    // Static helper — no GPU needed.
+    assert_eq!(FusedPatchEmbedOp::output_byte_size(224, 224, 16, 768),
+               (14 * 14 * 768 * 4));   // 196 patches × 768 × 4 bytes
+    assert_eq!(FusedPatchEmbedOp::output_byte_size(8, 8, 4, 8),
+               (4 * 8 * 4));           // (2×2) patches × 8 dims × 4 bytes
+}
+
+// =============================================================================
+// MatMulDoubleBufferOp tests (task f4c0a839)
+// =============================================================================
+
+/// CPU reference multiply
+fn matmul_ref(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0f32;
+            for l in 0..k { acc += a[i * k + l] * b[l * n + j]; }
+            c[i * n + j] = acc;
+        }
+    }
+    c
+}
+
+#[tokio::test]
+async fn test_matmul_double_buf_2x2() {
+    let (_, device, queue) = create_test_compute().await;
+
+    let a = vec![1.0f32, 2.0, 3.0, 4.0];  // 2×2
+    let b = vec![5.0f32, 6.0, 7.0, 8.0];  // 2×2
+    let expected = matmul_ref(&a, &b, 2, 2, 2);
+
+    let a_buf = create_filled_buffer(&device, &a);
+    let b_buf = create_filled_buffer(&device, &b);
+    let c_buf = create_output_buffer(&device, 4 * 4);
+
+    let op = MatMulDoubleBufferOp::new(&device, &queue);
+    let mut enc = device.create_command_encoder(
+        &wgpu::CommandEncoderDescriptor { label: Some("mm_db_2x2") }
+    );
+    op.dispatch(&mut enc, &a_buf, &b_buf, &c_buf, 2, 2, 2).unwrap();
+    queue.submit(std::iter::once(enc.finish()));
+
+    let actual = read_buffer(&device, &queue, &c_buf);
+    for (i, (a, e)) in actual[..4].iter().zip(expected.iter()).enumerate() {
+        assert!((a - e).abs() < 1e-4, "mm_db[{}]: got {} expected {}", i, a, e);
+    }
+}
+
+#[tokio::test]
+async fn test_matmul_double_buf_matches_single_buf_32x64x32() {
+    // Larger matrix: ensure double-buffer and single-buffer agree numerically.
+    let (_, device, queue) = create_test_compute().await;
+
+    let (m, k, n) = (32usize, 64usize, 32usize);
+    let a: Vec<f32> = (0..m * k).map(|i| i as f32 * 0.001).collect();
+    let b: Vec<f32> = (0..k * n).map(|i| i as f32 * 0.001).collect();
+
+    let a_buf  = create_filled_buffer(&device, &a);
+    let b_buf  = create_filled_buffer(&device, &b);
+    let c1_buf = create_output_buffer(&device, m * n * 4);
+    let c2_buf = create_output_buffer(&device, m * n * 4);
+
+    let single = MatMulOp::new(&device, &queue);
+    let double = MatMulDoubleBufferOp::new(&device, &queue);
+
+    let mut enc = device.create_command_encoder(
+        &wgpu::CommandEncoderDescriptor { label: Some("mm_compare") }
+    );
+    single.dispatch(&mut enc, &a_buf, &b_buf, &c1_buf, m as u32, k as u32, n as u32).unwrap();
+    double.dispatch(&mut enc, &a_buf, &b_buf, &c2_buf, m as u32, k as u32, n as u32).unwrap();
+    queue.submit(std::iter::once(enc.finish()));
+
+    let r1 = read_buffer(&device, &queue, &c1_buf);
+    let r2 = read_buffer(&device, &queue, &c2_buf);
+
+    for (i, (a, b)) in r1.iter().zip(r2.iter()).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-3,
+            "mm_double_buf vs single_buf mismatch at [{}]: {} vs {}", i, a, b
+        );
+    }
+}
+
+// =============================================================================
+// ElasticRagStore tests (task d7a18c03)
+// =============================================================================
+
+fn embed(vals: &[f32]) -> Vec<f32> { vals.to_vec() }
+
+#[test]
+fn test_elastic_rag_profile_query_dims() {
+    assert_eq!(EmbedProfile::Integrated.query_dim(768), 64);
+    assert_eq!(EmbedProfile::LowEnd.query_dim(768),     128);
+    assert_eq!(EmbedProfile::MidRange.query_dim(768),   256);
+    assert_eq!(EmbedProfile::HighEnd.query_dim(768),    768);
+    // Clamp to d_max
+    assert_eq!(EmbedProfile::Integrated.query_dim(32),  32);
+}
+
+#[test]
+fn test_elastic_rag_search_top1() {
+    let mut store = ElasticRagStore::new(4, vec![2, 4], EmbedProfile::HighEnd);
+    store.add(Document::new("a", "doc a"), embed(&[1.0, 0.0, 0.0, 0.0]));
+    store.add(Document::new("b", "doc b"), embed(&[0.0, 1.0, 0.0, 0.0]));
+    store.add(Document::new("c", "doc c"), embed(&[0.0, 0.0, 1.0, 0.0]));
+
+    let query = vec![1.0f32, 0.0, 0.0, 0.0];
+    let results = store.search(&query, 1);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].document.id, "a");
+    assert!((results[0].score - 1.0).abs() < 1e-5);
+}
+
+#[test]
+fn test_elastic_rag_search_reduced_dim() {
+    // query_dim=2: only first 2 dims used → docs distinguishable by [1,0] prefix
+    let mut store = ElasticRagStore::new(4, vec![2, 4], EmbedProfile::Integrated);
+    // Integrated → query_dim = min(64, 4) = 4; override to 2 for this test
+    store.set_query_dim(2);
+
+    store.add(Document::new("a", "doc a"), embed(&[1.0, 0.0, 0.0, 0.0]));
+    store.add(Document::new("b", "doc b"), embed(&[0.0, 1.0, 0.0, 0.0]));
+    store.add(Document::new("c", "doc c"), embed(&[0.5, 0.5, 99.0, 99.0])); // noisy tail
+
+    // Query matches "c" on dim[:2] = [0.5, 0.5], but "a" = [1,0] is more aligned to [1,0.1]
+    let query = vec![1.0f32, 0.1, 0.0, 0.0];
+    let results = store.search(&query, 3);
+    assert_eq!(results.len(), 3);
+    // "a" should rank first (closest in first 2 dims)
+    assert_eq!(results[0].document.id, "a");
+}
+
+#[test]
+fn test_elastic_rag_coarse_then_fine() {
+    let mut store = ElasticRagStore::new(4, vec![2, 4], EmbedProfile::HighEnd);
+    // doc "a": [1, 0, 1, 0] — coarse [1,0] and fine [1,0,1,0]
+    // doc "b": [1, 0, 0, 1] — coarse [1,0] same; fine differs
+    // doc "c": [0, 1, 0, 0] — coarse different
+    store.add(Document::new("a", "doc a"), embed(&[1.0, 0.0, 1.0, 0.0]));
+    store.add(Document::new("b", "doc b"), embed(&[1.0, 0.0, 0.0, 1.0]));
+    store.add(Document::new("c", "doc c"), embed(&[0.0, 1.0, 0.0, 0.0]));
+
+    // Query: [1, 0, 1, 0] → perfect match with "a"
+    let q = vec![1.0f32, 0.0, 1.0, 0.0];
+    let results = store.search_coarse_then_fine(&q, 2, 2, 1);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].document.id, "a");
+}
+
+#[test]
+fn test_elastic_rag_apply_profile() {
+    let mut store = ElasticRagStore::new(768, vec![64, 128, 256, 768], EmbedProfile::HighEnd);
+    assert_eq!(store.query_dim(), 768);
+    store.apply_profile(EmbedProfile::Integrated);
+    assert_eq!(store.query_dim(), 64);
+    store.apply_profile(EmbedProfile::MidRange);
+    assert_eq!(store.query_dim(), 256);
+}
+
+#[test]
+fn test_elastic_rag_empty_search() {
+    let store = ElasticRagStore::new(4, vec![2, 4], EmbedProfile::HighEnd);
+    let results = store.search(&[1.0, 0.0, 0.0, 0.0], 5);
+    assert!(results.is_empty());
 }

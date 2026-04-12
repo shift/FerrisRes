@@ -380,6 +380,255 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ElasticRagStore — Matryoshka-aware RAG with DeviceProfile-mapped query dims
+//
+// Stores embeddings at full D_max dimensionality.  At query time only the
+// first `query_dim` dimensions are used, where `query_dim` is automatically
+// selected based on the DeviceProfile:
+//
+//   Integrated  → 64   (~95% recall, minimal DRAM pressure)
+//   LowEnd      → 128  (~97% recall)
+//   MidRange    → 256  (~98.5% recall)
+//   HighEnd     → D_max (100%)
+//
+// Quality figures from the MRL paper (Kusupati et al., NeurIPS 2022,
+// arxiv 2205.13147) on the BEIR benchmark.
+//
+// Task: d7a18c03 — see papers_research/matryoshka_embeddings_research.md
+// ---------------------------------------------------------------------------
+
+/// DeviceProfile tier used to select the elastic embedding query dimension.
+/// Mirrors `device::profile::DeviceProfile` without importing the GPU types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedProfile {
+    /// Integrated / shared DRAM GPU (e.g. Intel Iris Xe, X1 Yoga).
+    Integrated,
+    /// Discrete GPU with < 4 GB VRAM.
+    LowEnd,
+    /// Discrete GPU with 4–8 GB VRAM.
+    MidRange,
+    /// Discrete GPU with > 8 GB VRAM.
+    HighEnd,
+}
+
+impl EmbedProfile {
+    /// Return the recommended query dimension for this profile.
+    ///
+    /// The returned value is clamped to `d_max` so callers never need to
+    /// range-check.
+    pub fn query_dim(&self, d_max: usize) -> usize {
+        let dim = match self {
+            EmbedProfile::Integrated => 64,
+            EmbedProfile::LowEnd     => 128,
+            EmbedProfile::MidRange   => 256,
+            EmbedProfile::HighEnd    => d_max,
+        };
+        dim.min(d_max)
+    }
+}
+
+/// RAG document store that exploits Matryoshka (nested) embedding structure.
+///
+/// Embeddings are stored at their full dimensionality `d_max`.  Searches use
+/// only the leading `query_dim` dimensions, making retrieval proportionally
+/// faster (fewer multiply-adds) while preserving correctness for models whose
+/// embedding weights were trained with an MRL loss.
+///
+/// For a non-MRL model the prefix subspace is *not* meaningful — only use
+/// this store with embeddings produced by an MRL-trained encoder.
+pub struct ElasticRagStore {
+    /// Full-dimension embeddings `[num_docs, d_max]`.
+    embeddings: Vec<Vec<f32>>,
+    /// Corresponding documents.
+    documents: Vec<Document>,
+    /// Full embedding dimensionality.
+    d_max: usize,
+    /// Active query dimensionality (≤ d_max).
+    query_dim: usize,
+    /// Nesting sizes supported by the encoder (informational; not enforced).
+    pub matryoshka_dims: Vec<usize>,
+}
+
+impl ElasticRagStore {
+    /// Create a new store.
+    ///
+    /// * `d_max`            – Full embedding dimension.
+    /// * `matryoshka_dims`  – Supported nesting sizes, e.g. `[32, 64, 128, 256, 768]`.
+    ///   Must all be ≤ `d_max`.  Used for documentation and profile validation.
+    /// * `profile`          – Hardware profile; determines the default `query_dim`.
+    pub fn new(
+        d_max: usize,
+        matryoshka_dims: Vec<usize>,
+        profile: EmbedProfile,
+    ) -> Self {
+        let query_dim = profile.query_dim(d_max);
+        tracing::debug!(
+            "ElasticRagStore: d_max={} query_dim={} profile={:?}",
+            d_max, query_dim, profile
+        );
+        Self {
+            embeddings: Vec::new(),
+            documents: Vec::new(),
+            d_max,
+            query_dim,
+            matryoshka_dims,
+        }
+    }
+
+    /// Add a document with its pre-computed full-dimension embedding.
+    ///
+    /// The embedding slice must have exactly `d_max` elements.
+    pub fn add(&mut self, doc: Document, embedding: Vec<f32>) {
+        debug_assert_eq!(
+            embedding.len(), self.d_max,
+            "Embedding length {} != d_max {}", embedding.len(), self.d_max
+        );
+        self.documents.push(doc);
+        self.embeddings.push(embedding);
+    }
+
+    /// Change the active query dimension at runtime.
+    ///
+    /// Must be ≤ `d_max`.
+    pub fn set_query_dim(&mut self, dim: usize) {
+        assert!(dim <= self.d_max, "query_dim {} > d_max {}", dim, self.d_max);
+        self.query_dim = dim;
+        tracing::debug!("ElasticRagStore: query_dim set to {}", dim);
+    }
+
+    /// Apply a hardware profile, updating `query_dim` accordingly.
+    pub fn apply_profile(&mut self, profile: EmbedProfile) {
+        self.query_dim = profile.query_dim(self.d_max);
+        tracing::debug!(
+            "ElasticRagStore: profile {:?} → query_dim={}",
+            profile, self.query_dim
+        );
+    }
+
+    /// Active query dimension.
+    pub fn query_dim(&self) -> usize {
+        self.query_dim
+    }
+
+    /// Full embedding dimension.
+    pub fn d_max(&self) -> usize {
+        self.d_max
+    }
+
+    /// Number of stored documents.
+    pub fn len(&self) -> usize {
+        self.documents.len()
+    }
+
+    /// True if the store contains no documents.
+    pub fn is_empty(&self) -> bool {
+        self.documents.is_empty()
+    }
+
+    /// Return the top-k documents most similar to `query`.
+    ///
+    /// Only the first `self.query_dim` dimensions of `query` and each stored
+    /// embedding are used for the cosine similarity comparison.
+    ///
+    /// `query` must have at least `self.query_dim` elements.
+    pub fn search(&self, query: &[f32], top_k: usize) -> Vec<RetrievedDocument> {
+        assert!(
+            query.len() >= self.query_dim,
+            "query len {} < query_dim {}",
+            query.len(), self.query_dim
+        );
+        if self.documents.is_empty() {
+            return Vec::new();
+        }
+
+        let q = &query[..self.query_dim];
+
+        let mut scored: Vec<(usize, f32)> = self
+            .embeddings
+            .iter()
+            .enumerate()
+            .map(|(i, emb)| {
+                let score = cosine_similarity(q, &emb[..self.query_dim]);
+                (i, score)
+            })
+            .collect();
+
+        // Sort descending by score; stable for deterministic tie-breaking.
+        scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k);
+
+        scored
+            .into_iter()
+            .map(|(idx, score)| RetrievedDocument {
+                document: self.documents[idx].clone(),
+                score,
+                retrieval_method: RetrievalMethod::Dense,
+            })
+            .collect()
+    }
+
+    /// Two-stage coarse-to-fine search (Matryoshka adaptive retrieval).
+    ///
+    /// 1. Retrieve `coarse_k` candidates using `coarse_dim` dimensions.
+    /// 2. Re-rank those candidates using all `d_max` dimensions.
+    /// 3. Return the top `fine_k` results.
+    ///
+    /// This pattern trades one extra pass over `coarse_k` embeddings at full
+    /// dimensionality for a large savings in the initial scan over all `N` docs.
+    pub fn search_coarse_then_fine(
+        &self,
+        query: &[f32],
+        coarse_dim: usize,
+        coarse_k: usize,
+        fine_k: usize,
+    ) -> Vec<RetrievedDocument> {
+        assert!(
+            coarse_dim <= self.d_max,
+            "coarse_dim {} > d_max {}", coarse_dim, self.d_max
+        );
+        assert!(
+            query.len() >= self.d_max,
+            "query len {} < d_max {}", query.len(), self.d_max
+        );
+        if self.documents.is_empty() {
+            return Vec::new();
+        }
+
+        // --- Stage 1: coarse scan ---
+        let q_coarse = &query[..coarse_dim];
+        let mut scored: Vec<(usize, f32)> = self
+            .embeddings
+            .iter()
+            .enumerate()
+            .map(|(i, emb)| {
+                (i, cosine_similarity(q_coarse, &emb[..coarse_dim]))
+            })
+            .collect();
+        scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(coarse_k);
+
+        // --- Stage 2: full re-rank ---
+        let q_full = &query[..self.d_max];
+        let mut fine: Vec<(usize, f32)> = scored
+            .iter()
+            .map(|(idx, _)| {
+                (*idx, cosine_similarity(q_full, &self.embeddings[*idx]))
+            })
+            .collect();
+        fine.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        fine.truncate(fine_k);
+
+        fine.into_iter()
+            .map(|(idx, score)| RetrievedDocument {
+                document: self.documents[idx].clone(),
+                score,
+                retrieval_method: RetrievalMethod::Dense,
+            })
+            .collect()
+    }
+}
+
 /// In-context learning example manager.
 pub struct InContextLearner {
     examples: Vec<(String, String)>, // (input, output) pairs

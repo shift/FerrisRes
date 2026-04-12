@@ -1,0 +1,5 @@
+# GPU kernel tests share a single wgpu device context.  Running them in
+# parallel races on the GPU command queue and causes intermittent SIGSEGV.
+# Force single-thread execution for the integration test harness.
+[env]
+RUST_TEST_THREADS = "1"

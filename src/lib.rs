@@ -10,10 +10,11 @@ pub mod autodiff;
 pub use error::{FerrisResError, Result};
 pub use device::{DeviceProfile, Capability};
 pub use tensor::{GpuTensor, Tensor};
-pub use compute::{GpuBuffer, WgpuCompute, MemoryBudget, MemoryPool, TiledCompute, ComputeDispatcher};
+pub use compute::{GpuBuffer, WgpuCompute, MemoryBudget, MemoryPool, TiledCompute, ComputeDispatcher, MatMulDoubleBufferOp, FusedPatchEmbedOp};
 pub use model::{ModelShard, ShardManager, QuantizedBuffer, QuantDtype, TokenEmbedding, LMHead, SimpleTokenizer, BlockAttnResConfig, BlockAttnResModel, ImagePreprocessor};
 #[allow(deprecated)]
 pub use inference::{TwoPhaseConfig, TwoPhaseInference, AutoregressiveGenerator, KVCache, Sampler, GenerationState, LayerKVCache, ModelKVCache, TokenGenerator, GenerateConfig, PromptTemplateRegistry, TemplateFormat, LogitProcessor, LogitProcessorConfig};
+pub use inference::rag::{ElasticRagStore, EmbedProfile};
 pub use compute::turboquant::{TurboQuantConfig, TurboQuantEngine, TurboQuantError, OutlierChannelSplitter};
 pub use training::{CrossEntropyLoss, AdamOptimizer, SgdOptimizer};
 pub use training::lora::{LoraConfig, LoraLayer, LoraManager};
