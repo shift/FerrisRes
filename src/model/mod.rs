@@ -14,6 +14,7 @@ pub mod safetensors;
 pub mod gguf;
 pub mod standard_transformer;
 pub mod dispatcher;
+pub mod audio;
 
 pub use config::BlockAttnResConfig;
 pub use linear::Linear;
