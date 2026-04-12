@@ -12,6 +12,7 @@ pub mod hull_kv_cache;
 pub mod llm_computer;
 pub mod token_merging;
 pub mod matryoshka;
+pub mod paca;
 
 pub use kv_cache::{LayerKVCache, ModelKVCache};
 #[allow(deprecated)]

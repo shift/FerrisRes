@@ -4,6 +4,7 @@ pub mod memory;
 pub mod kernels;
 pub mod cache;
 pub mod turboquant;
+pub mod async_pipeline;
 
 pub use pipeline::WgpuCompute;
 pub use buffer::GpuBuffer;
