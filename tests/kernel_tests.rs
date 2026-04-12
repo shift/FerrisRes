@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use ferrisres::compute::{
     GpuBuffer, WgpuCompute, MatMulOp, MatMulDoubleBufferOp, FusedPatchEmbedOp,
+    FlashDecodeOp, FlashDecodeTiledOp,
     RmsNormOp, SoftmaxOp, ElementWiseOp, MoEGatingOp, MoEExpertOp,
 };
 use ferrisres::compute::kernels::moe::{MOE_DISPATCH_WGSL, MOE_GATHER_WGSL};
@@ -1060,4 +1061,193 @@ fn test_elastic_rag_empty_search() {
     let store = ElasticRagStore::new(4, vec![2, 4], EmbedProfile::HighEnd);
     let results = store.search(&[1.0, 0.0, 0.0, 0.0], 5);
     assert!(results.is_empty());
+}
+
+// =============================================================================
+// FlashDecodeTiledOp tests (task f4c0a839 — tiled KV attention)
+// =============================================================================
+
+use ferrisres::compute::kernels::flash_decode::FlashDecodeTiledOp;
+use ferrisres::compute::kernels::tome_merge::bipartite_match;
+    query:     &[f32],   // [num_heads, head_dim]
+    key_cache: &[f32],   // [seq_len, num_heads, head_dim]
+    value_cache:&[f32],  // [seq_len, num_heads, head_dim]
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {           // [num_heads, head_dim]
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut output = vec![0.0f32; num_heads * head_dim];
+
+    for h in 0..num_heads {
+        let q_base = h * head_dim;
+        // Pass 1: max score
+        let mut max_score = f32::NEG_INFINITY;
+        for s in 0..seq_len {
+            let k_base = s * num_heads * head_dim + h * head_dim;
+            let mut dot = 0.0f32;
+            for d in 0..head_dim { dot += query[q_base + d] * key_cache[k_base + d]; }
+            max_score = max_score.max(dot * scale);
+        }
+        // Pass 2: weighted sum
+        let mut sum_exp = 0.0f32;
+        let mut acc = vec![0.0f32; head_dim];
+        for s in 0..seq_len {
+            let k_base = s * num_heads * head_dim + h * head_dim;
+            let mut dot = 0.0f32;
+            for d in 0..head_dim { dot += query[q_base + d] * key_cache[k_base + d]; }
+            let weight = (dot * scale - max_score).exp();
+            sum_exp += weight;
+            let v_base = s * num_heads * head_dim + h * head_dim;
+            for d in 0..head_dim { acc[d] += weight * value_cache[v_base + d]; }
+        }
+        let inv = 1.0 / sum_exp;
+        for d in 0..head_dim { output[h * head_dim + d] = acc[d] * inv; }
+    }
+    output
+}
+
+#[tokio::test]
+async fn test_flash_decode_tiled_matches_reference() {
+    let (_, device, queue) = create_test_compute().await;
+
+    let seq_len = 8u32;
+    let num_heads = 2u32;
+    let head_dim = 4u32;
+
+    let mut query = vec![0.0f32; (num_heads * head_dim) as usize];
+    let mut kc = vec![0.0f32; (seq_len * num_heads * head_dim) as usize];
+    let mut vc = vec![0.0f32; (seq_len * num_heads * head_dim) as usize];
+    for i in 0..query.len()  { query[i] = (i as f32 * 0.1).sin(); }
+    for i in 0..kc.len()     { kc[i]    = (i as f32 * 0.05).cos(); }
+    for i in 0..vc.len()     { vc[i]    = (i as f32 * 0.07).sin(); }
+
+    let expected = flash_decode_ref(
+        &query, &kc, &vc,
+        seq_len as usize, num_heads as usize, head_dim as usize,
+    );
+
+    let q_buf = create_filled_buffer(&device, &query);
+    let k_buf = create_filled_buffer(&device, &kc);
+    let v_buf = create_filled_buffer(&device, &vc);
+    let o_buf = create_output_buffer(&device, (num_heads * head_dim) as usize * 4);
+
+    let op = FlashDecodeTiledOp::new(&device, &queue).unwrap();
+    let mut enc = device.create_command_encoder(
+        &wgpu::CommandEncoderDescriptor { label: Some("tiled_decode_test") }
+    );
+    op.dispatch(&mut enc, &q_buf, &k_buf, &v_buf, &o_buf, seq_len, num_heads, head_dim, 4).unwrap();
+    queue.submit(std::iter::once(enc.finish()));
+
+    let actual = read_buffer(&device, &queue, &o_buf);
+
+    for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (a - e).abs() < 1e-3,
+            "tiled_decode mismatch [{}]: got {} expected {}", i, a, e
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_flash_decode_tiled_vs_original() {
+    let (_, device, queue) = create_test_compute().await;
+
+    let seq_len = 16u32;
+    let num_heads = 4u32;
+    let head_dim = 8u32;
+
+    let mut query = vec![0.0f32; (num_heads * head_dim) as usize];
+    let mut kc = vec![0.0f32; (seq_len * num_heads * head_dim) as usize];
+    let mut vc = vec![0.0f32; (seq_len * num_heads * head_dim) as usize];
+    for i in 0..query.len()  { query[i] = (i as f32 * 0.11).sin(); }
+    for i in 0..kc.len()     { kc[i]    = (i as f32 * 0.03).cos(); }
+    for i in 0..vc.len()     { vc[i]    = (i as f32 * 0.09).sin(); }
+
+    let q_buf = create_filled_buffer(&device, &query);
+    let k_buf = create_filled_buffer(&device, &kc);
+    let v_buf = create_filled_buffer(&device, &vc);
+    let o1 = create_output_buffer(&device, (num_heads * head_dim) as usize * 4);
+    let o2 = create_output_buffer(&device, (num_heads * head_dim) as usize * 4);
+
+    let orig = FlashDecodeOp::new(&device, &queue).unwrap();
+    let tiled = FlashDecodeTiledOp::new(&device, &queue).unwrap();
+
+    let mut enc = device.create_command_encoder(
+        &wgpu::CommandEncoderDescriptor { label: Some("decode_compare") }
+    );
+    orig.dispatch(&mut enc, &q_buf, &k_buf, &v_buf, &o1, seq_len, num_heads, head_dim).unwrap();
+    tiled.dispatch(&mut enc, &q_buf, &k_buf, &v_buf, &o2, seq_len, num_heads, head_dim, 4).unwrap();
+    queue.submit(std::iter::once(enc.finish()));
+
+    let r1 = read_buffer(&device, &queue, &o1);
+    let r2 = read_buffer(&device, &queue, &o2);
+
+    for (i, (a, b)) in r1.iter().zip(r2.iter()).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-3,
+            "tiled vs original mismatch [{}]: {} vs {}", i, a, b
+        );
+    }
+}
+
+// =============================================================================
+// ToMe bipartite matching tests (task c9e2d541)
+// =============================================================================
+
+use ferrisres::compute::kernels::tome_merge::bipartite_match;
+
+#[test]
+fn test_bipartite_match_merge_count() {
+    // 8 tokens, merge top 2 pairs → 6 output tokens
+    let keys: Vec<f32> = vec![
+        1.0, 0.0,  // token 0
+        0.9, 0.1,  // token 1 (similar to 0)
+        0.0, 1.0,  // token 2
+        0.1, 0.9,  // token 3 (similar to 2)
+        1.0, 1.0,  // token 4
+        0.5, 0.5,  // token 5
+        -1.0, 0.0, // token 6
+        0.0, -1.0, // token 7
+    ];
+    let result = bipartite_match(&keys, 8, 2, 2);
+    assert_eq!(result.n_out, 6);
+    assert_eq!(result.pair_a.len(), 6);
+    assert_eq!(result.pair_b.len(), 6);
+}
+
+#[test]
+fn test_bipartite_match_no_merge() {
+    let keys = vec![1.0f32, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, -1.0];
+    let result = bipartite_match(&keys, 4, 2, 0);
+    assert_eq!(result.n_out, 4);
+    // All tokens should be copies (pair_a == pair_b)
+    for i in 0..4 {
+        assert_eq!(result.pair_a[i], result.pair_b[i], "token {} should be unmerged", i);
+    }
+}
+
+#[test]
+fn test_bipartite_match_similar_tokens_merged() {
+    // Two identical pairs: (0,1) and (2,3)
+    let keys: Vec<f32> = vec![
+        1.0, 0.0,
+        1.0, 0.0,
+        0.0, 1.0,
+        0.0, 1.0,
+    ];
+    let result = bipartite_match(&keys, 4, 2, 2);
+    assert_eq!(result.n_out, 2, "should merge 2 pairs from 4 tokens");
+    // Check that the merged pairs have different source indices
+    let merged_count = result.pair_a.iter().zip(result.pair_b.iter())
+        .filter(|(a, b)| a != b).count();
+    assert_eq!(merged_count, 2, "both outputs should be merged pairs");
+}
+
+#[test]
+fn test_bipartart_match_r_clamped() {
+    let keys = vec![1.0f32, 0.0, 0.0, 1.0];
+    // r=10 but only 2 tokens, should clamp to n_tokens/2 = 1
+    let result = bipartite_match(&keys, 2, 1, 10);
+    assert_eq!(result.n_out, 1);
 }
