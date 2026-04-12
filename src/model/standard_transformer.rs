@@ -17,6 +17,7 @@ use crate::compute::kernels::rope::RopeOp;
 use crate::compute::kernels::flash_decode::FlashDecodeOp;
 use crate::compute::kernels::rmsnorm::RmsNormOp;
 use crate::compute::kernels::elementwise::ElementWiseOp;
+use crate::compute::kernels::prefill_attn::PrefillAttnOp;
 use crate::error::Result;
 use crate::inference::kv_cache::LayerKVCache;
 use crate::model::linear::Linear;
@@ -117,6 +118,9 @@ pub struct StandardTransformerLayer {
     // Decode
     flash_decode: FlashDecodeOp,
 
+    // Prefill
+    prefill_attn: PrefillAttnOp,
+
     // FFN
     ff_gate: Linear,
     ff_up: Linear,
@@ -177,6 +181,7 @@ impl StandardTransformerLayer {
         let elementwise = ElementWiseOp::new(&device, &queue);
         let rope = RopeOp::new(&device)?;
         let flash_decode = FlashDecodeOp::new(&device, &queue)?;
+        let prefill_attn = PrefillAttnOp::new(&device)?;
 
         Ok(Self {
             hidden_dim,
@@ -190,6 +195,7 @@ impl StandardTransformerLayer {
             attn_norm,
             rope,
             flash_decode,
+            prefill_attn,
             ff_gate,
             ff_up,
             ff_down,
@@ -248,27 +254,27 @@ impl StandardTransformerLayer {
         self.rope.dispatch_with_offset(encoder, &k_buf, &rope_k, seq_len, num_heads, head_dim, 0)?;
 
         // Update KV cache with all prefill K/V
-        let new_len = kv_cache.update_batch(encoder, &rope_k, &v_buf, seq_len)?;
+        let _ = kv_cache.update_batch(encoder, &rope_k, &v_buf, seq_len)?;
 
         // Full O(n²) self-attention via prefill kernel
-        // The prefill_attn kernel computes: output = softmax(Q × K^T / sqrt(d)) × V
-        // with causal masking applied within the kernel.
+        // prefill_attn computes: output = softmax(Q × K^T / sqrt(d)) × V
+        // with causal masking (k_pos <= q_pos) built into the kernel.
         let attn_out = GpuBuffer::new(
             &self.device,
             seq_len as usize * hidden_dim * f32_size,
             Some("std_prefill_attn"),
         )?;
-        self.elementwise.dispatch_scale(encoder, &rope_q, &attn_out, 0.0, numel)?;
-
-        // For now, use a simplified attention: copy Q as attention output
-        // (placeholder for full batched attention kernel)
-        // In a real implementation, this would use prefill_attn dispatch.
-        // The flash_decode kernel handles single-query decode correctly below.
-        encoder.copy_buffer_to_buffer(
-            rope_q.buffer(), 0,
-            attn_out.buffer(), 0,
-            Some((seq_len as u64) * (hidden_dim as u64) * (f32_size as u64)),
-        );
+        // Read K/V from the KV cache (which now contains all prefill positions)
+        self.prefill_attn.dispatch(
+            encoder,
+            &rope_q,
+            kv_cache.key_buffer(),
+            kv_cache.value_buffer(),
+            &attn_out,
+            seq_len,
+            num_heads,
+            head_dim,
+        )?;
 
         // Output projection
         let proj_out = GpuBuffer::new(
@@ -334,7 +340,6 @@ impl StandardTransformerLayer {
         )?;
         self.elementwise.dispatch_add(encoder, &residual1, &ff_down, &output, numel)?;
 
-        let _ = new_len;
         Ok(output)
     }
 
