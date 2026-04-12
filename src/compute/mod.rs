@@ -18,5 +18,6 @@ pub use kernels::moe::{MoEGatingOp, MoEExpertOp};
 pub use kernels::rope::RopeOp;
 pub use kernels::im2col::Im2ColOp;
 pub use kernels::fused_patch_embed::FusedPatchEmbedOp;
+pub use kernels::tome_merge::TomeMergeOp;
 pub use kernels::flash_decode::FlashDecodeOp;
 pub use kernels::causal_mask::CausalMaskOp;

@@ -11,7 +11,7 @@ pub use error::{FerrisResError, Result};
 pub use device::{DeviceProfile, Capability};
 pub use tensor::{GpuTensor, Tensor};
 pub use compute::{GpuBuffer, WgpuCompute, MemoryBudget, MemoryPool, TiledCompute, ComputeDispatcher, MatMulDoubleBufferOp, FusedPatchEmbedOp};
-pub use model::{ModelShard, ShardManager, QuantizedBuffer, QuantDtype, TokenEmbedding, LMHead, SimpleTokenizer, BlockAttnResConfig, BlockAttnResModel, ImagePreprocessor};
+pub use model::{ModelShard, ShardManager, QuantizedBuffer, QuantDtype, TokenEmbedding, LMHead, SimpleTokenizer, BlockAttnResConfig, BlockAttnResModel, ImagePreprocessor, VisionConfig, VisionEncoder};
 #[allow(deprecated)]
 pub use inference::{TwoPhaseConfig, TwoPhaseInference, AutoregressiveGenerator, KVCache, Sampler, GenerationState, LayerKVCache, ModelKVCache, TokenGenerator, GenerateConfig, PromptTemplateRegistry, TemplateFormat, LogitProcessor, LogitProcessorConfig};
 pub use inference::rag::{ElasticRagStore, EmbedProfile};
