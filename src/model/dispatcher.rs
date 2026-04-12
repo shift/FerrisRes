@@ -337,7 +337,7 @@ impl AnyModel {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         hidden_states: &crate::compute::GpuBuffer,
-        kv_cache: &mut crate::inference::kv_cache::ModelKVCache,
+        kv_cache: &crate::inference::kv_cache::ModelKVCache,
         layer_idx: usize,
         effective_pos: Option<u32>,
     ) -> Result<crate::compute::GpuBuffer> {
@@ -360,7 +360,7 @@ impl AnyModel {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         hidden_states: &crate::compute::GpuBuffer,
-        kv_cache: &mut crate::inference::kv_cache::ModelKVCache,
+        kv_cache: &crate::inference::kv_cache::ModelKVCache,
         layer_idx: usize,
         seq_len: u32,
     ) -> Result<crate::compute::GpuBuffer> {

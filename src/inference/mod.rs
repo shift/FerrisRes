@@ -6,13 +6,14 @@ pub mod logit_processors;
 pub mod prompt_templates;
 pub mod context_extension;
 pub mod rag;
-pub mod tool_search;
+pub mod unified_generator;
 pub mod decs;
 pub mod hull_kv_cache;
 pub mod llm_computer;
 pub mod token_merging;
 pub mod matryoshka;
 pub mod paca;
+pub mod tool_search;
 
 pub use kv_cache::{LayerKVCache, ModelKVCache};
 #[allow(deprecated)]
