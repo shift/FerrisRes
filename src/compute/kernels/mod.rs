@@ -13,3 +13,4 @@ pub mod prefill_attn;
 pub mod turboquant_kernels;
 
 pub use turboquant_kernels::TURBOQUANT_WGSL;
+pub use fused_patch_embed::FusedPatchEmbedOp;
