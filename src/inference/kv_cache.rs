@@ -370,6 +370,8 @@ pub struct CompressedLayerKVCache {
     value_indices: Option<GpuBuffer>,
     /// TurboQuant engine for compression/decompression
     engine: TurboQuantEngine,
+    /// GPU pipelines for quantize/dequantize dispatch
+    pipelines: Option<crate::compute::turboquant::TurboQuantPipelines>,
     /// Current length
     current_len: AtomicU32,
     /// Maximum sequence length
@@ -380,6 +382,8 @@ pub struct CompressedLayerKVCache {
     head_dim: u32,
     /// Device reference
     device: Arc<Device>,
+    /// Queue reference for writing uniform params
+    queue: Arc<Queue>,
 }
 
 impl CompressedLayerKVCache {
@@ -400,6 +404,9 @@ impl CompressedLayerKVCache {
             .map_err(|e| crate::error::FerrisResError::Device(format!(
                 "Failed to create TurboQuant engine: {}", e
             )))?;
+
+        // Create GPU pipelines for quantize/dequantize
+        let pipelines = TurboQuantEngine::create_pipelines(&device).ok();
         
         // If using full precision storage (for now, until GPU kernels are ready)
         let key_cache = GpuBuffer::zeros(&device, &queue, byte_size, Some("Compressed KVCache Keys"))?;
@@ -411,11 +418,13 @@ impl CompressedLayerKVCache {
             key_indices: None,
             value_indices: None,
             engine,
+            pipelines,
             current_len: AtomicU32::new(0),
             max_seq_len,
             num_heads,
             head_dim,
             device,
+            queue,
         })
     }
     
@@ -438,12 +447,23 @@ impl CompressedLayerKVCache {
         let dst_offset = pos as u64 * per_pos_size as u64;
         let copy_size = (new_k.size() as u64).min(per_pos_size as u64);
         
-        // Copy to cache (compression will happen via GPU kernel in future)
+        // Copy to cache then dispatch quantize kernel
         if let Some(ref cache) = self.key_cache {
             encoder.copy_buffer_to_buffer(new_k.buffer(), 0, cache.buffer(), dst_offset, Some(copy_size));
         }
         if let Some(ref cache) = self.value_cache {
             encoder.copy_buffer_to_buffer(new_v.buffer(), 0, cache.buffer(), dst_offset, Some(copy_size));
+        }
+
+        // Dispatch TurboQuant quantize kernel on the newly written row
+        if let Some(ref pipelines) = self.pipelines {
+            if let Some(ref key_cache) = self.key_cache {
+                let _ = Self::dispatch_quantize(
+                    &self.device, &self.queue, pipelines,
+                    key_cache.buffer(), dst_offset, copy_size,
+                    encoder,
+                );
+            }
         }
         
         self.current_len.fetch_add(1, Ordering::Relaxed);
@@ -473,6 +493,95 @@ impl CompressedLayerKVCache {
     /// Get compression configuration
     pub fn compression_ratio(&self) -> f32 {
         self.engine.compression_ratio()
+    }
+
+    /// Dispatch the TurboQuant quantize kernel on a sub-region of a buffer.
+    fn dispatch_quantize(
+        device: &Arc<Device>,
+        _queue: &Arc<Queue>,
+        pipelines: &crate::compute::turboquant::TurboQuantPipelines,
+        buffer: &wgpu::Buffer,
+        offset: u64,
+        size: u64,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<()> {
+        // Bind the cache sub-region as a storage buffer
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tq_quantize_bg"),
+            layout: &pipelines.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer,
+                        offset,
+                        size: Some(std::num::NonZeroU64::new(size).unwrap_or(std::num::NonZeroU64::new(1).unwrap())),
+                    }),
+                },
+            ],
+        });
+
+        let workgroups = (size as u32 + 255) / 256;
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("tq_quantize"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipelines.quantize_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(workgroups, 1, 1);
+        drop(pass);
+        Ok(())
+    }
+
+    /// Dequantize a range of the key cache for attention computation.
+    /// Returns a temporary buffer with f32 data.
+    pub fn dequantize_keys(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        len: u32,
+    ) -> Result<Option<GpuBuffer>> {
+        let pipelines = match self.pipelines {
+            Some(ref p) => p,
+            None => return Ok(None),
+        };
+        let key_cache = match self.key_cache {
+            Some(ref c) => c,
+            None => return Ok(None),
+        };
+
+        let per_pos_bytes = self.num_heads as u64 * self.head_dim as u64 * std::mem::size_of::<f32>() as u64;
+        let total_bytes = len as u64 * per_pos_bytes;
+
+        // Allocate output buffer
+        let output = GpuBuffer::new(&self.device, total_bytes as usize, Some("tq_dequantized_keys"))?;
+
+        // Dispatch dequantize
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tq_dequantize_bg"),
+            layout: &pipelines.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: key_cache.buffer(),
+                        offset: 0,
+                        size: Some(std::num::NonZeroU64::new(total_bytes).unwrap_or(std::num::NonZeroU64::new(1).unwrap())),
+                    }),
+                },
+            ],
+        });
+
+        let workgroups = (total_bytes as u32 + 255) / 256;
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("tq_dequantize"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipelines.dequantize_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(workgroups, 1, 1);
+        drop(pass);
+
+        Ok(Some(output))
     }
 }
 
