@@ -19,8 +19,7 @@ pub mod paged_attention;
 pub mod cross_modal;
 
 pub use kv_cache::{LayerKVCache, ModelKVCache};
-#[allow(deprecated)]
-pub use two_phase::{TwoPhaseConfig, TwoPhaseInference, AutoregressiveGenerator, KVCache, Sampler, GenerationState};
+pub use two_phase::{TwoPhaseConfig, TwoPhaseInference, KVCache, Sampler, GenerationState};
 pub use generator::{TokenGenerator, GenerateConfig};
 pub use logit_processors::{LogitProcessor, LogitProcessorConfig, TokenHistory};
 pub use prompt_templates::{PromptTemplateRegistry, TemplateFormat, ChatMessage, Role};
