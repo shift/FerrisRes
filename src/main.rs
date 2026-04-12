@@ -172,7 +172,7 @@ async fn cmd_train(
     );
 
     // Wire LoRA adapter if requested
-    let mut lora_manager = if let Some(rank) = lora_rank {
+    let mut _lora_manager = if let Some(rank) = lora_rank {
         let lora_config = ferrisres::LoraConfig {
             rank,
             alpha: rank as f32 * 2.0,
@@ -256,7 +256,7 @@ async fn cmd_train(
                 let _target_tokens = &all_tokens[start + 1..=end];
 
                 // Apply LoRA deltas if adapters are active
-                if let Some(ref lora) = lora_manager {
+                if let Some(ref lora) = _lora_manager {
                     let dummy_hidden = vec![0.0f32; config.hidden_dim];
                     // Compute LoRA forward for each target module at layer 0
                     if let Some(delta) = lora.forward(0, "q_proj", &dummy_hidden, 1) {
@@ -291,7 +291,7 @@ async fn cmd_train(
     info!("Training complete");
 
     // Merge LoRA adapters back into base weights for zero-cost inference
-    if let Some(ref mut lora) = lora_manager {
+    if let Some(ref mut lora) = _lora_manager {
         if !lora.is_merged() {
             lora.merge_all(&mut |layer_idx: usize, module_name: &str| {
                 // In a full implementation, this would return mutable slices
@@ -357,7 +357,7 @@ async fn cmd_infer(
     info!("Encoded tokens ({}): {:?}", tokens.len(), tokens);
 
     // Wire image preprocessing: upload patches to GPU and run Im2ColOp
-    let mut _image_patch_count: usize = 0;
+    let mut image_patch_count: usize = 0;
     if let Some(ref image_path) = image {
         let preprocessor = ferrisres::ImagePreprocessor::new(224, 224, true);
         match std::fs::read(image_path) {

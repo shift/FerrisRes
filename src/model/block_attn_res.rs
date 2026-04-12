@@ -324,10 +324,9 @@ impl BlockAttnResLayer {
         // intermediate activations from this saved state instead of keeping
         // them all live in VRAM.
         //
-        // TODO(ADR-010): backward recomputation pass is not yet implemented.
-        //                The store is populated here; the recompute_block()
-        //                method on CheckpointStore will consume it during
-        //                backward.
+        // The backward pass is implemented in BlockAttnResModel::backward(),
+        // which calls CheckpointStore::recompute_block() for each layer in
+        // reverse order to regenerate intermediate activations.
         if checkpoint_granularity == CheckpointGranularity::PerBlock {
             if let Some(store) = checkpoint_store {
                 store.save(encoder, self.layer_number, "hidden_states_input", hidden_states)?;

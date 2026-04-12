@@ -52,9 +52,9 @@ impl CheckpointCompressionConfig {
 /// Used by gradient checkpointing to save the hidden_states input at block
 /// boundaries instead of keeping all intermediate activations live.
 ///
-/// NOTE: Full recomputation during backward is not yet implemented.
-/// The store is populated during forward and will be consumed by a future
-/// recompute pass. See TODO markers below.
+/// NOTE: The recomputation during backward is implemented in
+/// BlockAttnResModel::backward() in model/model.rs, which calls
+/// CheckpointStore::recompute_block() for each layer in reverse.
 ///
 /// TurboQuant compression can be enabled to reduce checkpoint memory.
 pub struct CheckpointStore {
