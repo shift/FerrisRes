@@ -12,6 +12,7 @@ pub mod lm_head;
 pub mod vision;
 pub mod safetensors;
 pub mod gguf;
+pub mod standard_transformer;
 
 pub use config::BlockAttnResConfig;
 pub use linear::Linear;
@@ -27,3 +28,4 @@ pub use image_preprocessor::ImagePreprocessor;
 pub use vision::{VisionConfig, VisionEncoder};
 pub use safetensors::{load_safetensors, LoadedWeights, LoadedTensor, SafetensorsHeader, TensorMeta, ModelArchitecture};
 pub use gguf::{load_gguf, GgufFile, GgmlType, GgufTensorInfo, LoadedGgufTensor};
+pub use standard_transformer::{StandardTransformerConfig, StandardTransformerLayer, StandardTransformerModel};
