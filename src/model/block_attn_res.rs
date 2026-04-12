@@ -626,6 +626,159 @@ impl BlockAttnResLayer {
         Ok(output)
     }
 
+    /// Optimized decode: project K directly into KV cache, apply RoPE in-place.
+    ///
+    /// Eliminates the per-step `copy_buffer_to_buffer` by writing the K
+    /// projection directly into the cache slot and applying RoPE in-place.
+    /// The V projection still uses the regular path since V doesn't need RoPE.
+    ///
+    /// Callers should prefer this over `forward_decode_token_with_pos` for
+    /// single-token decode steps.
+    pub fn forward_decode_token_direct(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        hidden_states: &GpuBuffer,
+        kv_cache: &LayerKVCache,
+        effective_pos: Option<u32>,
+    ) -> Result<GpuBuffer> {
+        let hidden_dim = self.hidden_dim;
+        let num_heads = self.num_heads as u32;
+        let head_dim = self.head_dim as u32;
+        let intermediate_dim = self.intermediate_dim as u32;
+        let f32_size = std::mem::size_of::<f32>();
+
+        // RMSNorm on input
+        let normed = GpuBuffer::new(
+            &self.device,
+            hidden_dim * f32_size,
+            Some("decode_direct_normed"),
+        )?;
+        self.attn_norm.dispatch(
+            &self.device,
+            &self.queue,
+            encoder,
+            hidden_states,
+            &normed,
+            1u32,
+            hidden_dim as u32,
+        )?;
+
+        // Q projection → temp buffer (Q is consumed by flash_decode, not cached)
+        let q_buf = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_q"))?;
+        self.q_proj.forward(encoder, &normed, &q_buf, 1u32)?;
+
+        // Compute the cache slot offset
+        let pos = effective_pos.unwrap_or_else(|| kv_cache.current_len());
+        let per_pos_bytes = num_heads as u64 * head_dim as u64 * f32_size as u64;
+        let slot_offset = kv_cache.current_len() as u64 * per_pos_bytes;
+        let row_bytes = hidden_dim as u64 * f32_size as u64;
+
+        // K projection → directly into KV cache slot
+        self.k_proj.forward_into_offset(
+            encoder,
+            &normed,
+            kv_cache.key_buffer().buffer(),
+            slot_offset,
+            row_bytes,
+            1u32,
+        )?;
+
+        // RoPE in-place on the cache slot we just wrote
+        self.rope.dispatch_inplace_at_offset(
+            encoder,
+            kv_cache.key_buffer().buffer(),
+            slot_offset,
+            row_bytes,
+            1u32,
+            num_heads,
+            head_dim,
+            pos,
+        )?;
+
+        // V projection → temp buffer (V is appended to cache via update)
+        let v_buf = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_v"))?;
+        self.v_proj.forward(encoder, &normed, &v_buf, 1u32)?;
+
+        // RoPE on Q (Q needs RoPE but goes to flash_decode, not cache)
+        let rope_q = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_rope_q"))?;
+        self.rope.dispatch_with_offset(encoder, &q_buf, &rope_q, 1u32, num_heads, head_dim, pos)?;
+
+        // V: copy into cache (no RoPE needed for V)
+        // K is already in-place via direct projection, so we only copy V
+        // and manually bump the counter.
+        let v_slot_offset = kv_cache.current_len() as u64 * per_pos_bytes;
+        let v_copy_size = (v_buf.size() as u64).min(per_pos_bytes);
+        encoder.copy_buffer_to_buffer(
+            v_buf.buffer(),
+            0,
+            kv_cache.value_buffer().buffer(),
+            v_slot_offset,
+            v_copy_size,
+        );
+        kv_cache.increment_len();
+        let new_len = kv_cache.current_len();
+
+        // Flash decode attention
+        let attn_out = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_attn_out"))?;
+        self.flash_decode.dispatch(
+            encoder,
+            &rope_q,
+            kv_cache.key_buffer(),
+            kv_cache.value_buffer(),
+            &attn_out,
+            new_len,
+            num_heads,
+            head_dim,
+        )?;
+
+        // Output projection + residual + FFN (same as regular decode)
+        let proj_out = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_proj"))?;
+        self.out_proj.forward(encoder, &attn_out, &proj_out, 1u32)?;
+
+        let residual1 = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_res1"))?;
+        self.elementwise.dispatch_add(encoder, hidden_states, &proj_out, &residual1, hidden_dim as u32)?;
+
+        let output = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_output"))?;
+
+        let ff_normed = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_ff_norm"))?;
+        self.ff_norm.dispatch(
+            &self.device,
+            &self.queue,
+            encoder,
+            &residual1,
+            &ff_normed,
+            1u32,
+            hidden_dim as u32,
+        )?;
+
+        if let Some(ref moe) = self.moe_linear {
+            let mut moe_ref = moe.borrow_mut();
+            let ff_out = moe_ref.forward(encoder, &ff_normed, 1)?;
+            self.elementwise.dispatch_add(encoder, &residual1, ff_out, &output, hidden_dim as u32)?;
+        } else {
+            let ff_hidden = GpuBuffer::new(
+                &self.device,
+                self.intermediate_dim * f32_size,
+                Some("decode_direct_ff_hidden"),
+            )?;
+            self.ff_up.as_ref().unwrap().forward(encoder, &ff_normed, &ff_hidden, 1u32)?;
+
+            let ff_relu = GpuBuffer::new(
+                &self.device,
+                self.intermediate_dim * f32_size,
+                Some("decode_direct_ff_relu"),
+            )?;
+            self.elementwise.dispatch_relu(encoder, &ff_hidden, &ff_relu, intermediate_dim)?;
+
+            let ff_out = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_ff_out"))?;
+            self.ff_down.as_ref().unwrap().forward(encoder, &ff_relu, &ff_out, 1u32)?;
+
+            self.elementwise.dispatch_add(encoder, &residual1, &ff_out, &output, hidden_dim as u32)?;
+        }
+
+        Ok(output)
+    }
+
     pub fn forward_prefill(
         &self,
         encoder: &mut wgpu::CommandEncoder,

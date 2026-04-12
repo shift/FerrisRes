@@ -213,7 +213,7 @@ impl TokenGenerator {
 
         // --- Context extension: build engine for YaRN/StreamingLLM ---
         let mut ctx_ext = config.context_extension.as_ref()
-            .map(|c| crate::inference::context_extension::ContextExtensionEngine::new(c.clone()))
+            .map(|c: &crate::inference::context_extension::ContextExtensionConfig| crate::inference::context_extension::ContextExtensionEngine::new(c.clone()))
             .unwrap_or_else(crate::inference::context_extension::ContextExtensionEngine::none);
         if ctx_ext.is_active() {
             tracing::debug!("Context extension active: scale_factor={}", ctx_ext.config().scale_factor());
@@ -303,7 +303,7 @@ impl TokenGenerator {
             let mut current = embed_buf;
             for (i, layer) in self.model.layers().iter().enumerate() {
                 let kv = self.kv_cache.layer(i);
-                current = layer.forward_decode_token_with_pos(&mut encoder, &current, kv, Some(effective_pos as u32))?;
+                current = layer.forward_decode_token_direct(&mut encoder, &current, kv, Some(effective_pos as u32))?;
             }
 
             let logits_buf = GpuBuffer::new(&self.device, logits_bytes, Some("decode_logits"))?;

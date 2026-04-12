@@ -301,6 +301,78 @@ impl MatMulOp {
 
         Ok(())
     }
+
+    /// Dispatch matmul with the output (C) buffer bound at a byte offset.
+    ///
+    /// This enables writing the result directly into a sub-region of a larger
+    /// buffer (e.g., a KV cache slot) without a separate copy_buffer_to_buffer.
+    /// The output buffer binding uses `BufferBinding { offset, size }` to
+    /// restrict the write range.
+    pub fn dispatch_at_output_offset(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        a: &GpuBuffer,
+        b: &GpuBuffer,
+        c_buffer: &wgpu::Buffer,
+        c_offset: u64,
+        c_size: u64,
+        m: u32,
+        k: u32,
+        n: u32,
+    ) -> Result<()> {
+        let tile_size = 16u32;
+        let workgroup_count_x = (m + tile_size - 1) / tile_size;
+        let workgroup_count_y = (n + tile_size - 1) / tile_size;
+
+        let params_data: [u32; 3] = [m, k, n];
+        let params_buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("MatMul Offset Params"),
+            size: 12,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params_data));
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MatMul Offset Bind Group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: b.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: c_buffer,
+                        offset: c_offset,
+                        size: Some(std::num::NonZeroU64::new(c_size).unwrap_or(std::num::NonZeroU64::new(1).unwrap())),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("MatMul Offset Compute Pass"),
+            timestamp_writes: None,
+        });
+
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1);
+
+        drop(pass);
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

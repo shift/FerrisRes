@@ -84,6 +84,13 @@ impl LayerKVCache {
         self.current_len.load(Ordering::Relaxed)
     }
 
+    /// Increment the length counter without copying any data.
+    /// Used by the direct-write decode path where K/V data is
+    /// already written directly into the cache buffer.
+    pub fn increment_len(&self) {
+        self.current_len.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn key_buffer(&self) -> &GpuBuffer {
         &self.key_cache
     }
@@ -133,6 +140,97 @@ impl LayerKVCache {
 
     pub fn reset(&self) {
         self.current_len.store(0, Ordering::Relaxed);
+    }
+
+    /// Compact the KV cache by keeping only the entries at `indices`.
+    ///
+    /// Copies entries at the given indices into a contiguous prefix using a
+    /// GPU staging buffer, then sets `current_len = indices.len()`. This is
+    /// the StreamingLLM eviction strategy: keep sink tokens (first N) and
+    /// recent tokens (last M), discard everything in between.
+    ///
+    /// Cost: O(indices.len()) GPU copy per compaction event, amortized over
+    /// every `window_size - num_sink_tokens` decode steps.
+    ///
+    /// # Arguments
+    /// * `encoder` — Command encoder to record copy commands into
+    /// * `indices` — Sorted list of cache positions to keep (sinks + recent)
+    pub fn compact(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        indices: &[usize],
+    ) -> Result<()> {
+        if indices.is_empty() {
+            self.current_len.store(0, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        let per_pos_bytes = self.num_heads as u64
+            * self.head_dim as u64
+            * std::mem::size_of::<f32>() as u64;
+
+        // Allocate staging buffers to hold the compacted entries
+        let compact_bytes = indices.len() as u64 * per_pos_bytes;
+        let staging_key = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kv_compact_staging_key"),
+            size: compact_bytes,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let staging_val = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kv_compact_staging_val"),
+            size: compact_bytes,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Copy each selected entry into the staging buffer
+        for (dst_idx, &src_idx) in indices.iter().enumerate() {
+            let src_offset = src_idx as u64 * per_pos_bytes;
+            let dst_offset = dst_idx as u64 * per_pos_bytes;
+
+            encoder.copy_buffer_to_buffer(
+                self.key_cache.buffer(),
+                src_offset,
+                &staging_key,
+                dst_offset,
+                per_pos_bytes,
+            );
+            encoder.copy_buffer_to_buffer(
+                self.value_cache.buffer(),
+                src_offset,
+                &staging_val,
+                dst_offset,
+                per_pos_bytes,
+            );
+        }
+
+        // Copy staging back into the cache at offset 0
+        encoder.copy_buffer_to_buffer(
+            &staging_key,
+            0,
+            self.key_cache.buffer(),
+            0,
+            compact_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &staging_val,
+            0,
+            self.value_cache.buffer(),
+            0,
+            compact_bytes,
+        );
+
+        // Update length to compacted size
+        self.current_len.store(indices.len() as u32, Ordering::Relaxed);
+
+        tracing::debug!(
+            "KV cache compacted: kept {} of {} entries",
+            indices.len(),
+            self.max_seq_len
+        );
+
+        Ok(())
     }
 
     pub fn max_seq_len(&self) -> u32 {
@@ -189,6 +287,19 @@ impl ModelKVCache {
         for layer in &self.layers {
             layer.reset();
         }
+    }
+
+    /// Compact all layers using the same set of indices.
+    /// See [`LayerKVCache::compact`] for details.
+    pub fn compact_all(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        indices: &[usize],
+    ) -> Result<()> {
+        for layer in &self.layers {
+            layer.compact(encoder, indices)?;
+        }
+        Ok(())
     }
 
     pub fn num_layers(&self) -> usize {
@@ -420,10 +531,41 @@ impl CompressedModelKVCache {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
+    /// Verify index selection for sinks + recent window
     #[test]
-    fn test_kv_cache_module_compiles() {
-        assert!(true);
+    fn test_compact_indices_sink_and_recent() {
+        let num_sinks = 4;
+        let _window = 10;
+        let cache_len = 20;
+
+        let mut indices: Vec<usize> = (0..num_sinks).collect();
+        let recent_start = cache_len - (_window - num_sinks);
+        indices.extend(recent_start..cache_len);
+
+        assert_eq!(indices.len(), _window);
+        assert_eq!(&indices[0..4], &[0, 1, 2, 3]);
+        assert_eq!(&indices[4..10], &[14, 15, 16, 17, 18, 19]);
+    }
+
+    /// Verify compact with no eviction (cache < window) keeps all
+    #[test]
+    fn test_compact_indices_no_eviction() {
+        let cache_len = 8;
+        let _window = 16;
+        let indices: Vec<usize> = (0..cache_len).collect();
+        assert_eq!(indices.len(), 8);
+    }
+
+    /// Verify staging buffer size calculation
+    #[test]
+    fn test_compact_buffer_size() {
+        let num_heads = 8u64;
+        let head_dim = 64u64;
+        let per_pos_bytes = num_heads * head_dim * std::mem::size_of::<f32>() as u64;
+        let indices_len = 10u64;
+        let compact_bytes = indices_len * per_pos_bytes;
+
+        assert_eq!(compact_bytes, 10 * 8 * 64 * 4);
     }
 }

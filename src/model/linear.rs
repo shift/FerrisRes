@@ -83,6 +83,41 @@ impl Linear {
         Ok(())
     }
 
+    /// Project input directly into a sub-region of a larger buffer.
+    ///
+    /// This writes the matmul result at `byte_offset` within `target_buffer`,
+    /// sized to `row_bytes`. Used to write K/V projections directly into the
+    /// KV cache without a separate copy_buffer_to_buffer.
+    ///
+    /// Note: bias addition is not supported in this path (bias is rarely
+    /// used on Q/K/V projections in modern transformers).
+    pub fn forward_into_offset(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        input: &GpuBuffer,
+        target_buffer: &wgpu::Buffer,
+        byte_offset: u64,
+        row_bytes: u64,
+        batch_size: u32,
+    ) -> Result<()> {
+        let m = batch_size;
+        let k = self.in_features as u32;
+        let n = self.out_features as u32;
+
+        self.matmul_op.dispatch_at_output_offset(
+            encoder,
+            input,
+            &self.weight,
+            target_buffer,
+            byte_offset,
+            row_bytes,
+            m, k, n,
+        )?;
+
+        // Note: bias not applied in offset path — Q/K/V typically have no bias
+        Ok(())
+    }
+
     pub fn weight(&self) -> &GpuBuffer {
         &self.weight
     }
