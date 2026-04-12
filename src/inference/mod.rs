@@ -15,6 +15,7 @@ pub mod matryoshka;
 pub mod paca;
 pub mod tool_search;
 pub mod speculative;
+pub mod paged_attention;
 
 pub use kv_cache::{LayerKVCache, ModelKVCache};
 #[allow(deprecated)]
