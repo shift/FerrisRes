@@ -26,3 +26,7 @@ pub use tool_search::{ToolRegistry, ToolSearchConfig, Tool, SelectedTool, ToolCa
 pub use decs::{DecsOptimizer, DecsConfig, ReasoningChain, ReasoningMetrics, StopReason};
 pub use hull_kv_cache::{HullKVCache, Point2D, Attention2D};
 pub use llm_computer::{LlmComputer, LlmComputerConfig, CalmInstruction, CalmOp, VmState};
+pub use sampling::{sample_argmax, sample_temperature, sample_top_k, sample_top_p};
+pub use token_merging::{ToMeMerger, ToMeConfig, TokenSizes, cosine_sim};
+pub use matryoshka::ElasticRagStore;
+pub use paca::{PacaEngine, PacaConfig, ClusterMethod, ClusterAssignment};

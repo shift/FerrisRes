@@ -13,8 +13,9 @@ pub use tensor::{GpuTensor, Tensor};
 pub use compute::{GpuBuffer, WgpuCompute, MemoryBudget, MemoryPool, TiledCompute, ComputeDispatcher, MatMulDoubleBufferOp, FusedPatchEmbedOp};
 pub use model::{ModelShard, ShardManager, QuantizedBuffer, QuantDtype, TokenEmbedding, LMHead, SimpleTokenizer, BlockAttnResConfig, BlockAttnResModel, ImagePreprocessor, VisionConfig, VisionEncoder};
 #[allow(deprecated)]
-pub use inference::{TwoPhaseConfig, TwoPhaseInference, AutoregressiveGenerator, KVCache, Sampler, GenerationState, LayerKVCache, ModelKVCache, TokenGenerator, GenerateConfig, PromptTemplateRegistry, TemplateFormat, LogitProcessor, LogitProcessorConfig};
+pub use inference::{TwoPhaseConfig, TwoPhaseInference, AutoregressiveGenerator, KVCache, Sampler, GenerationState, LayerKVCache, ModelKVCache, TokenGenerator, GenerateConfig, PromptTemplateRegistry, TemplateFormat, LogitProcessor, LogitProcessorConfig, ToMeMerger, ToMeConfig, PacaEngine, PacaConfig};
 pub use inference::rag::{ElasticRagStore, EmbedProfile};
+pub use inference::sampling::{sample_argmax, sample_temperature, sample_top_k, sample_top_p};
 pub use compute::turboquant::{TurboQuantConfig, TurboQuantEngine, TurboQuantError, OutlierChannelSplitter};
 pub use training::{CrossEntropyLoss, AdamOptimizer, SgdOptimizer};
 pub use training::lora::{LoraConfig, LoraLayer, LoraManager};

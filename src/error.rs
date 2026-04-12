@@ -21,4 +21,10 @@ pub enum FerrisResError {
     Unsupported(String),
 }
 
+impl From<std::io::Error> for FerrisResError {
+    fn from(e: std::io::Error) -> Self {
+        FerrisResError::Device(format!("IO error: {}", e))
+    }
+}
+
 pub type Result<T> = std::result::Result<T, FerrisResError>;
