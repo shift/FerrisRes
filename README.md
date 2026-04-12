@@ -2,7 +2,7 @@
 
 FerrisRes is a Rust-native AI inference and training engine built around **Block AttnRes** — a novel linear-time transformer architecture that replaces the quadratic attention bottleneck of standard transformers. It runs on any GPU or iGPU via [wgpu](https://github.com/gfx-rs/wgpu) (Vulkan, Metal, DX12, WebGPU), adapts automatically to the hardware it finds, and is written entirely in safe Rust with no Python dependency.
 
-> ⚠️ **Research project — work in progress.** FerrisRes is an active research project exploring novel transformer architectures and heterogeneous GPU runtimes. It is **not production-ready**. APIs are unstable, core components are still being implemented, and breaking changes should be expected. It is shared publicly for transparency and to invite early feedback.
+> ⚠️ **Research project — work in progress.** FerrisRes is an active research project exploring novel transformer architectures and heterogeneous GPU runtimes. It is **not production-ready**. APIs are unstable and breaking changes should be expected. It is shared publicly for transparency and to invite early feedback.
 
 ---
 
@@ -14,7 +14,8 @@ FerrisRes is a Rust-native AI inference and training engine built around **Block
 | Python-only ML ecosystem | Pure Rust — no Python runtime, no C extension chain |
 | Fixed hardware assumptions | `DeviceProfile` auto-tunes for integrated GPU through data-centre |
 | Training only on high-end GPUs | Gradient checkpointing + CPU offload for 8 GB iGPUs and below |
-| Monolithic model format | `ModelShard` + `ShardManager` for tensor-parallel split across devices |
+| KV cache memory blowout | TurboQuant 2-bit compression: 16× memory reduction |
+| Rigid inference pipeline | Composable: LoRA hot-swap, YaRN context extension, RAG, tool-calling |
 
 ---
 
@@ -26,106 +27,108 @@ Standard transformers apply full self-attention over every token, giving O(n²) 
 
 The token sequence is divided into fixed-size **blocks** (default: 8 tokens per block). Within each block, standard multi-head self-attention runs with RoPE positional encoding. This produces a per-block *partial sum* — a compressed representation of that block's content.
 
-```
-tokens: [t₀ t₁ … t₇] [t₈ t₉ … t₁₅] … [tₙ₋₈ … tₙ₋₁]
-                 ↓ intra-block attn
-block reps:   [b₀]          [b₁]      …       [bₖ]
-```
-
-Each block's partial sum is produced by accumulating the residual-connected attention outputs across every layer within the block (`forward_intra_block`). This can be parallelised across blocks.
-
 ### Inter-block attention
 
-Once all block representations are collected, a second attention pass attends *across* blocks. The current query (or the running hidden state in decode) attends over the sequence of block representations, selecting which blocks are relevant and blending their summaries. This is the `forward_inter_block` pass.
-
-Because there are only k = n / block_size blocks, this second pass is O(k) = O(n / block_size) — linear in the original sequence length.
+Once all block representations are collected, a second attention pass attends *across* blocks. The current query attends over the sequence of block representations, selecting which blocks are relevant. Because there are only k = n / block_size blocks, this second pass is O(k) = O(n / block_size) — linear in the original sequence length.
 
 ### Two-phase inference
 
-Generation follows the standard prefill → decode split:
+1. **Prefill** — process the entire prompt in parallel, populate per-layer KV cache, produce logits for the first output token.
+2. **Decode** — autoregressively generate one token per step. Each step appends new K/V to the per-layer cache and runs flash-decode attention via a dedicated WGSL kernel.
 
-1. **Prefill** — process the entire prompt in parallel, populate the per-layer KV cache (keys and values projected through RoPE), and produce logits for the first output token.
-2. **Decode** — autoregressively generate one token per step using `forward_decode_token`. Each step appends the new K/V to the per-layer cache and runs flash-decode attention (single query against full cache) via a dedicated WGSL kernel.
-
-The `TokenGenerator` orchestrates both phases and exposes a `generate_stream` channel for streaming token delivery.
+The `TokenGenerator` orchestrates both phases and exposes `generate_stream` for streaming delivery.
 
 ---
 
 ## Feature Overview
 
-### Compute kernels (WGSL)
+### Inference Pipeline
 
-All GPU computation is expressed in hand-written WGSL shaders compiled at runtime through naga:
-
-| Kernel | File | Purpose |
-|---|---|---|
-| Tiled matrix multiply | `compute/kernels/matmul.rs` | General matmul with workgroup tiling |
-| RMS normalisation | `compute/kernels/rmsnorm.rs` | Pre-norm before attention and FFN |
-| Softmax | `compute/kernels/softmax.rs` | Row-wise softmax for attention weights |
-| RoPE | `compute/kernels/rope.rs` | Rotary position embeddings on Q and K |
-| Flash decode | `compute/kernels/flash_decode.rs` | Single-query decode attention over KV cache |
-| Causal mask | `compute/kernels/causal_mask.rs` | Upper-triangular -inf masking for prefill |
-| Elementwise | `compute/kernels/elementwise.rs` | Add, scale, ReLU, copy |
-| im2col | `compute/kernels/im2col.rs` | Image-patch extraction for vision inputs |
-| MoE dispatch/gather | `compute/kernels/moe.rs` | Expert routing and result assembly |
-
-### Model components
-
-- `BlockAttnResLayer` — single layer: pre-norm → Q/K/V projection → RoPE → attention → output projection → residual → FFN (dense or MoE)
-- `BlockAttnResModel` — stack of layers organised into blocks; exposes `forward`, `forward_prefill`, `forward_decode_token`
-- `MoELinear` — Mixture-of-Experts feed-forward with top-k gating, GPU dispatch and gather
-- `TokenEmbedding` — learned token embeddings with GPU lookup
-- `LMHead` — linear projection to vocabulary logits
-- `ImagePreprocessor` — resize + normalise input images; im2col patch tokenisation for vision
-
-### Inference
-
-- `TwoPhaseInference` — block-level forward with optional block-representation caching
-- `TokenGenerator` — full prefill+decode pipeline with per-layer `ModelKVCache`
-- `KVCache` / `LayerKVCache` / `ModelKVCache` — GPU-resident key/value buffers with atomic position tracking
-- `Sampler` — argmax, temperature, top-k, top-p sampling on CPU from read-back logits
-- `generate_stream` — `mpsc::Receiver<u32>` channel for streaming tokens to the caller
+- **TokenGenerator** — full prefill+decode pipeline with `generate()`, `generate_stream()`, `generate_with_rag()`, `generate_with_tools()`
+- **Logit processors** — composable chain: repetition → frequency/presence penalty → temperature → top-k → top-p → sample
+- **Prompt templates** — ChatML, Llama 2, Mistral, Alpaca, Raw (CLI `--template` flag)
+- **Context extension** — YaRN (NTK-aware RoPE scaling) and StreamingLLM (attention sinks), effective position computed per decode step
+- **RAG pipeline** — dense (cosine similarity), sparse (TF-IDF), hybrid retrieval with in-context learning
+- **Tool search** — keyword/embedding/hybrid tool discovery, `[tool_call]` detection, result injection, continuation generation
+- **DECS** — reasoning token optimizer with plateau detection and quality-preserving early stopping
+- **Matryoshka elastic RAG** — adaptive embedding dimensions per device profile (32/64/128/256/768)
+- **Token merging (ToMe)** — CPU bipartite soft matching for training-free visual token reduction
+- **HullKVCache** — 2D convex hull attention with O(log n) lookups
+- **LLM-Computer** — CALM virtual machine: LookUp → Compute → BranchIf instruction set
 
 ### Training
 
-- `SgdOptimizer`, `AdamOptimizer` — GPU-side optimisers
-- `CrossEntropyLoss` — GPU loss computation
-- `CheckpointStore` — activation checkpointing at configurable granularity (`PerBlock`, `PerLayer`, `PerAttention`)
-- `AsyncGradientOffload` — multi-stage staging pool for async GPU→CPU gradient transfer
-- `CpuGradientBuffer` — CPU-side gradient accumulation for `CpuOffload` mode
-- `TrainingConfig::apply_device_profile` — auto-promotes checkpoint granularity and gradient accumulation steps for integrated-GPU devices
+- **Autodiff engine** — computation graph, reverse-mode backward pass, gradient accumulation
+- **SGD / Adam optimizers** — GPU-side parameter updates
+- **Cross-entropy loss** — GPU loss computation
+- **LoRA adapters** — low-rank fine-tuning with merge/unmerge, auto-populate, hot-swap, merge_all()
+- **Gradient checkpointing** — PerBlock/PerLayer/PerAttention with recompute_block() (ADR-010)
+- **CPU/Async gradient offload** — CPU-side accumulation and async GPU→CPU transfer for iGPUs
 
-### Hardware adaptation (`DeviceProfile`)
+### Model Components
 
-FerrisRes auto-detects VRAM and GPU kind at startup and selects one of four profiles:
+- **BlockAttnResModel** — stack of layers with forward() and backward() (ADR-010)
+- **MoELinear** — Mixture-of-Experts with top-k gating
+- **TokenEmbedding / LMHead** — embedding lookup and logit projection
+- **QuantizedBuffer** — F32, F16, Int8, Int4 storage with quantize_data()
+- **BPE tokenizer** — byte-pair encoding with DomainVocabulary for specialized tokens
+- **QA-Token** — quality-aware tokenization with confidence-weighted vocabulary
+- **VisionEncoder** — ViT-style with Implicit GEMM (0 MB intermediate) or legacy im2col + ToMe
 
-| Profile | VRAM | Compute mode | Default batch | KV cache |
-|---|---|---|---|---|
-| `Integrated` | shared / iGPU | `CpuOffload` | 1 | 2 GB |
-| `LowEnd` | < 4 GB | `Tiled` | 2 | 4 GB |
-| `MidRange` | 4–8 GB | `FullGpu` | 4 | 8 GB |
-| `HighEnd` | > 8 GB | `FullGpu` | 8 | 16 GB |
+### Compute Kernels (WGSL)
 
-Override via environment variable for testing:
+| Kernel | Purpose |
+|---|---|
+| Tiled MatMul | 16×16 workgroup tiling + double-buffer variant |
+| RMSNorm | Row-wise normalization |
+| Softmax | Numerically stable online softmax |
+| RoPE | Rotary position embeddings |
+| FlashDecode + Tiled | Single-query decode attention, tiled with online softmax |
+| CausalMask | Upper-triangular masking |
+| Elementwise | Add, scale, ReLU, copy |
+| im2col | Image patch extraction (legacy) |
+| FusedPatchEmbed | Implicit GEMM — fused patch extraction + projection, 0 MB intermediate |
+| MoE | Expert routing and gather |
+| TurboQuant | Rotation, quantize, dequantize, QJL projection |
+| ToMeMerge | Scatter-merge for token reduction |
+
+### Hardware Adaptation
+
+| Profile | VRAM | Default batch | KV cache |
+|---|---|---|---|
+| `Integrated` | shared / iGPU | 1 | 2 GB |
+| `LowEnd` | < 4 GB | 2 | 4 GB |
+| `MidRange` | 4–8 GB | 4 | 8 GB |
+| `HighEnd` | > 8 GB | 8 | 16 GB |
+
+Auto-detects at startup. Override via `FERRIS_DEVICE_PROFILE=integrated cargo run`.
+
+---
+
+## CLI
+
 ```
-FERRIS_DEVICE_PROFILE=integrated cargo run
-```
+# Inference
+cargo run -- infer --prompt "Explain transformers" --template chatml --max-tokens 128
 
-Compile-time feature flags also force a profile:
-```
-cargo build --features integrated_gpu_profile
-cargo build --features high_end_profile
-```
+# Multimodal
+cargo run -- infer --prompt "Describe this image" --image photo.jpg
 
-### Model sharding
+# Extended context
+cargo run -- infer --prompt "Long document..." --yarn-scale 4.0
 
-`ModelShard` and `ShardManager` split the layer stack across multiple devices for tensor-parallel inference and training. Each shard holds a contiguous range of layers and exposes the same `forward` interface.
+# Training with LoRA
+cargo run -- train --epochs 3 --lora-rank 8 --data training.txt
+
+# Benchmark
+cargo run -- benchmark --iterations 100 --hidden-dim 512
+```
 
 ---
 
 ## Getting Started
 
-> The API is not yet stable. The snippet below reflects the current state; method signatures may change before 1.0.
+> The API is not yet stable. Method signatures may change before 1.0.
 
 Add FerrisRes to your `Cargo.toml`:
 
@@ -138,20 +141,18 @@ ferrisres = { git = "https://github.com/shift/FerrisRes" }
 
 ```rust
 use ferrisres::{
-    BlockAttnResConfig, DeviceProfile, Capability,
-    inference::{TokenGenerator, GenerateConfig},
-    model::{BlockAttnResModel, TokenEmbedding, LMHead},
+    BlockAttnResConfig, TokenEmbedding, LMHead,
+    inference::generator::{TokenGenerator, GenerateConfig},
+    model::BlockAttnResModel,
 };
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialise wgpu device
     let instance = wgpu::Instance::default();
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions::default())
-        .await
-        .expect("no adapter");
+        .await?;
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor::default(), None)
         .await?;
@@ -159,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
     let queue = Arc::new(queue);
 
     let vocab_size = 32_000;
-    let config = BlockAttnResConfig::new(512); // hidden_dim=512
+    let config = BlockAttnResConfig::new(512);
 
     let model = Arc::new(BlockAttnResModel::new(
         Arc::clone(&device), Arc::clone(&queue),
@@ -177,10 +178,10 @@ async fn main() -> anyhow::Result<()> {
     let generator = TokenGenerator::new(
         model, lm_head, embedding,
         Arc::clone(&device), Arc::clone(&queue),
-        /*max_seq_len=*/ 2048,
+        2048,
     )?;
 
-    let prompt_tokens: Vec<u32> = vec![1, 42, 7]; // pre-tokenised
+    let prompt_tokens: Vec<u32> = vec![1, 42, 7];
     let output = generator.generate(
         &prompt_tokens,
         &GenerateConfig { max_tokens: 64, ..Default::default() },
@@ -194,23 +195,26 @@ async fn main() -> anyhow::Result<()> {
 ### Streaming generation
 
 ```rust
-let rx = generator.generate_stream(
-    prompt_tokens,
-    GenerateConfig { max_tokens: 128, temperature: 0.8, ..Default::default() },
+let rx = Arc::new(generator).generate_stream(
+    prompt_tokens, /*max_new_tokens=*/ 128,
 );
 for token_id in rx {
     print!("{token_id} ");
 }
 ```
 
-### Training
+### RAG-augmented generation
 
 ```rust
-use ferrisres::training::{TrainingConfig, TrainingState};
+use ferrisres::inference::rag::RagStore;
 
-let mut train_cfg = TrainingConfig::new(/*epochs=*/3, /*batch=*/4, /*lr=*/1e-3);
-train_cfg.apply_device_profile(DeviceProfile::Integrated); // auto-tunes for iGPU
-let mut state = TrainingState::with_profile(&DeviceProfile::Integrated, Some(Arc::clone(&device)));
+let rag_store = RagStore::default_store();
+// ... add documents ...
+let output = generator.generate_with_rag(
+    "What is attention?",
+    &rag_store,
+    &GenerateConfig::default(),
+)?;
 ```
 
 ---
@@ -222,16 +226,8 @@ FerrisRes requires a working Vulkan driver. On Linux the recommended path is thr
 ```bash
 nix develop          # enters the dev shell with Rust + Vulkan layers
 cargo build
-cargo test
+cargo test            # 191 tests
 cargo bench
-```
-
-Feature flags:
-```
---features vulkan      # default
---features metal       # macOS
---features dx12        # Windows
---features webgpu      # browser / WASM target
 ```
 
 ---
@@ -240,37 +236,37 @@ Feature flags:
 
 ```
 src/
-├── autodiff/        # Reverse-mode autodiff graph and gradient accumulator
+├── main.rs              # CLI (train/infer/benchmark/info)
+├── lib.rs               # Public API re-exports
+├── autodiff/             # Reverse-mode autodiff graph
 ├── compute/
-│   ├── kernels/     # WGSL compute shaders (matmul, RoPE, softmax, MoE, …)
-│   ├── buffer.rs    # GpuBuffer — typed wgpu buffer wrapper
-│   ├── cache.rs     # BlockCache for block representations
-│   ├── memory.rs    # MemoryBudget, MemoryPool, BorrowedBufferPool
-│   └── pipeline.rs  # ComputeDispatcher, TiledCompute
-├── device/
-│   ├── capability.rs # GPU kind detection (integrated / discrete)
-│   └── profile.rs    # DeviceProfile + ComputeMode
+│   ├── kernels/          # 13 WGSL compute shaders
+│   ├── buffer.rs         # GpuBuffer
+│   ├── turboquant.rs     # TurboQuant engine
+│   └── async_pipeline.rs # FA3 double-buffer dispatch
+├── device/               # GPU detection + DeviceProfile
 ├── inference/
-│   ├── generator.rs  # TokenGenerator — prefill + decode pipeline
-│   ├── kv_cache.rs   # LayerKVCache / ModelKVCache
-│   ├── sampling.rs   # argmax, temperature, top-k, top-p
-│   └── two_phase.rs  # TwoPhaseInference + legacy KVCache / Sampler
+│   ├── generator.rs      # TokenGenerator (generate/stream/rag/tools)
+│   ├── logit_processors.rs
+│   ├── prompt_templates.rs
+│   ├── context_extension.rs
+│   ├── rag.rs / matryoshka.rs / tool_search.rs
+│   ├── token_merging.rs / paca.rs
+│   ├── decs.rs / hull_kv_cache.rs / llm_computer.rs
+│   └── kv_cache.rs / sampling.rs
 ├── model/
-│   ├── block_attn_res.rs  # BlockAttnResLayer (intra/inter/decode/prefill)
-│   ├── config.rs          # BlockAttnResConfig
-│   ├── embedding.rs       # TokenEmbedding
-│   ├── image_preprocessor.rs  # Vision input pipeline
-│   ├── lm_head.rs         # LMHead linear projection
-│   ├── moe_linear.rs      # MoELinear with gating
-│   ├── shard.rs           # ModelShard / ShardManager
-│   └── tokenizer.rs       # SimpleTokenizer
-├── tensor/
-│   └── gpu_tensor.rs      # GpuTensor high-level wrapper
+│   ├── model.rs          # BlockAttnResModel (forward + backward)
+│   ├── block_attn_res.rs # BlockAttnResLayer
+│   ├── tokenizer.rs      # BPE + DomainVocabulary
+│   ├── qa_tokenizer.rs   # QA-Token
+│   ├── vision.rs         # VisionEncoder
+│   └── shard.rs          # ModelShard + QuantizedBuffer
+├── tensor/               # GpuTensor
 └── training/
-    ├── async_offload.rs   # AsyncGradientOffload staging pool
-    ├── checkpointing.rs   # CheckpointStore + CheckpointGranularity
-    ├── cpu_offload.rs     # CpuGradientBuffer
-    └── optimizer.rs       # SGD, Adam, CrossEntropyLoss
+    ├── optimizer.rs      # SGD, Adam, CrossEntropyLoss
+    ├── checkpointing.rs  # CheckpointStore (recompute_block)
+    ├── lora.rs           # LoRA adapter
+    └── cpu_offload.rs / async_offload.rs
 ```
 
 ---
@@ -279,22 +275,21 @@ src/
 
 | Phase | Status | Description |
 |---|---|---|
-| 1 | Done | wgpu foundation, device detection, GPU tensors, compute kernels |
-| 2–3 | Done | BlockAttnRes model, tiered compute, caching, batch inference |
-| 4 | Done | Autodiff, training, tokenizer, embedding, benches |
-| 4.1 | Done | Backward pass, async offload, gradient checkpointing, CPU offload |
-| 4.2 | Done | MoE gating, expert dispatch/gather kernels, MoELinear |
-| 5 | Done | Streaming inference (RoPE, per-layer KV cache, prefill, flash-decode) |
-| 6 | In progress | Test harness, integration tests, public API stabilisation |
-| 7 | Planned | Weight loading (safetensors / GGUF), real tokeniser integration |
-| 8 | Planned | Vision encoder (ViT + im2col), multimodal input pipeline |
-| 9 | Planned | Distributed / multi-GPU training, tensor parallelism |
+| 1–3 | ✅ Done | wgpu foundation, BlockAttnRes model, tiered compute, caching |
+| 4 | ✅ Done | Autodiff, training, tokenizer, embedding, benches |
+| 5 | ✅ Done | Streaming inference, RoPE, KV cache, flash-decode, logit processors |
+| 6 | ✅ Done | TurboQuant, LoRA, RAG, YaRN, templates, DECS, HullKVCache, LLM-Computer |
+| 7 | 🔧 Mostly done | Vision (Implicit GEMM, ToMe, PaCa), Matryoshka. Audio + cross-modal remain |
+| 8 | 📝 Planned | Distributed / multi-GPU training, tensor parallelism |
+| 9 | 📝 Planned | Weight loading (safetensors / GGUF) |
+
+See [ROADMAP.md](ROADMAP.md) for full technical details.
 
 ---
 
 ## Contributing
 
-The project is not yet open for external contributions while core development is ongoing. Watch this repository for updates — a contribution guide will be published alongside the public release.
+The project is not yet open for external contributions while core development is ongoing. Watch this repository for updates.
 
 ---
 
@@ -302,19 +297,6 @@ The project is not yet open for external contributions while core development is
 
 FerrisRes is dual-licensed:
 
-**AGPL-3.0-or-later** for free and open-source use. If you use FerrisRes in a
-product or service you must publish the complete corresponding source code of
-that product or service under the AGPL-3.0. See [`LICENSE`](LICENSE) for the
-full terms.
+**AGPL-3.0-or-later** for free and open-source use. See [`LICENSE`](LICENSE) for the full terms.
 
-**Commercial license** for use in proprietary or commercial products and
-services that do not comply with the AGPL-3.0. To obtain a commercial license,
-contact: shift+licensing@someone.section.me
-
-### Contributor License Agreement
-
-Because FerrisRes is dual-licensed, any external code contribution must be
-accompanied by a signed Contributor License Agreement (CLA) that grants the
-project owner the right to distribute your contribution under both the AGPL-3.0
-and a commercial license. A CLA will be published alongside the contribution
-guide at the time of the public release.
+**Commercial license** for use in proprietary or commercial products. Contact: shift+licensing@someone.section.me
