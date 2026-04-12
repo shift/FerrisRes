@@ -13,6 +13,7 @@ pub mod vision;
 pub mod safetensors;
 pub mod gguf;
 pub mod standard_transformer;
+pub mod dispatcher;
 
 pub use config::BlockAttnResConfig;
 pub use linear::Linear;
@@ -29,3 +30,6 @@ pub use vision::{VisionConfig, VisionEncoder};
 pub use safetensors::{load_safetensors, LoadedWeights, LoadedTensor, SafetensorsHeader, TensorMeta, ModelArchitecture};
 pub use gguf::{load_gguf, GgufFile, GgmlType, GgufTensorInfo, LoadedGgufTensor};
 pub use standard_transformer::{StandardTransformerConfig, StandardTransformerLayer, StandardTransformerModel};
+pub use dispatcher::{
+    AnyModel, AnyModelConfig, ArchitectureHint, ArchitectureDetector, DetectedArchitecture,
+};
