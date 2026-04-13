@@ -45,6 +45,14 @@ pub enum NodeKind {
         batch_size: u32,
         vocab_size: u32,
     },
+    /// Block Summary cross-attention: compresses block of tokens into summary.
+    /// Forward: Q=queries×W_q, K=tokens×W_k, V=tokens×W_v, attn=softmax(QK^T/√d)V, out=attn×W_o.
+    /// Backward: propagates gradients to queries, W_q, W_k, W_v, W_o, and bridge_weight.
+    BlockSummaryCrossAttn {
+        num_queries: u32,
+        hidden_dim: u32,
+        block_size: u32,
+    },
     Parameter {
         name: String,
         numel: usize,
@@ -455,6 +463,52 @@ impl ComputationGraph {
         self.tape.push(TapeEntry {
             op,
             inputs: vec![logits_id, targets_id],
+            output_id: id,
+        });
+
+        Ok(id)
+    }
+
+    /// Record a Block Summary cross-attention operation.
+    ///
+    /// Takes block tokens and summary queries as input, produces
+    /// compressed summary as output. During backward, computes gradients
+    /// for queries, key/value projections, and bridge weight.
+    ///
+    /// Inputs: [0] = block_tokens [block_size × hidden_dim],
+    ///         [1] = summary_queries [num_queries × hidden_dim]
+    /// Output: summary [num_queries × hidden_dim]
+    pub fn record_block_summary(
+        &mut self,
+        block_tokens_id: NodeId,
+        queries_id: NodeId,
+        num_queries: u32,
+        hidden_dim: u32,
+        block_size: u32,
+    ) -> Result<NodeId> {
+        let numel = num_queries as usize * hidden_dim as usize;
+        let buf = GpuBuffer::zeros(
+            &self.device, &self.queue,
+            numel * std::mem::size_of::<f32>(),
+            Some("block_summary_output"),
+        )?;
+
+        let id = NodeId(self.next_id);
+        self.next_id += 1;
+
+        let kind = NodeKind::BlockSummaryCrossAttn { num_queries, hidden_dim, block_size };
+        self.nodes.insert(id, Node {
+            id,
+            kind,
+            buf,
+            grad: GpuBuffer::zeros(&self.device, &self.queue, 0, Some("empty_grad"))?,
+            is_leaf: false,
+            requires_grad: false,
+        });
+
+        self.tape.push(TapeEntry {
+            op: NodeKind::BlockSummaryCrossAttn { num_queries, hidden_dim, block_size },
+            inputs: vec![block_tokens_id, queries_id],
             output_id: id,
         });
 

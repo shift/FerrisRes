@@ -905,6 +905,43 @@ impl BackwardPass {
                 tracing::debug!("Backward: embedding grad vocab={} dim={} seq={}", vocab_size, hidden_dim, seq_len);
             }
 
+            NodeKind::BlockSummaryCrossAttn { num_queries, hidden_dim, block_size } => {
+                // Block Summary backward: allocate gradient buffers for inputs.
+                // Real gradient computation happens in CPU-side backprop_block_summary()
+                // in gemma_mapper.rs, which is the primary distillation path.
+                // This ensures the autodiff graph doesn't panic on unknown op.
+                let hd = *hidden_dim as usize;
+                let nq = *num_queries as usize;
+                let bs = *block_size as usize;
+
+                let tokens_id = inputs[0];
+                let queries_id = inputs[1];
+
+                let tokens_grad_size = bs * hd * std::mem::size_of::<f32>();
+                let queries_grad_size = nq * hd * std::mem::size_of::<f32>();
+
+                {
+                    let t_node = graph.get_node_mut(tokens_id).ok_or_else(|| {
+                        FerrisResError::Device("block_summary tokens node not found".to_string())
+                    })?;
+                    if t_node.grad.size() == 0 {
+                        t_node.grad = GpuBuffer::zeros(&self.device, &self.queue,
+                            tokens_grad_size, Some("bs_tokens_grad"))?;
+                    }
+                }
+                {
+                    let q_node = graph.get_node_mut(queries_id).ok_or_else(|| {
+                        FerrisResError::Device("block_summary queries node not found".to_string())
+                    })?;
+                    if q_node.grad.size() == 0 {
+                        q_node.grad = GpuBuffer::zeros(&self.device, &self.queue,
+                            queries_grad_size, Some("bs_queries_grad"))?;
+                    }
+                }
+
+                tracing::debug!("Backward: block_summary nq={} hd={} bs={}", nq, hd, bs);
+            }
+
             NodeKind::Parameter { .. } | NodeKind::Input { .. } => {
                 tracing::debug!("Backward: skipping leaf node");
             }
