@@ -198,7 +198,7 @@ fn detect_vram_ash() -> Option<(u64, String, GpuKind)> {
     let mut app_info = ash::vk::ApplicationInfo::default();
     app_info.api_version = ash::vk::API_VERSION_1_0;
 
-    let extension_names: Vec<*const i8> = vec![ash::ext::debug_utils::NAME.as_ptr()];
+    let extension_names: Vec<*const std::os::raw::c_char> = vec![ash::ext::debug_utils::NAME.as_ptr()];
 
     let create_info = ash::vk::InstanceCreateInfo::default()
         .application_info(&app_info)

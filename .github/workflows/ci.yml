@@ -39,7 +39,7 @@ jobs:
         run: cargo clippy --no-default-features --features vulkan -- -D warnings
 
       - name: Tests
-        run: cargo test --lib --no-default-features --features vulkan -- -D warnings
+        run: cargo test --lib --no-default-features --features vulkan
 
       - name: Build release
         run: cargo build --release --no-default-features --features vulkan
