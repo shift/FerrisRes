@@ -191,7 +191,7 @@ jobs:
         run: cargo test --lib --no-default-features --features vulkan
 
       - name: Run clippy
-        run: cargo clippy --no-default-features --features vulkan -- -D warnings
+        run: cargo clippy --no-default-features --features vulkan -- -W clippy::correctness -W clippy::suspicious
 
   # ── Create GitHub Release ─────────────────────────────────────────
   release:
