@@ -484,6 +484,150 @@ impl std::fmt::Display for ModelArchitecture {
 }
 
 // ---------------------------------------------------------------------------
+// Safetensors Writer
+// ---------------------------------------------------------------------------
+
+/// A tensor to be written to a safetensors file.
+#[derive(Debug, Clone)]
+pub struct TensorToWrite {
+    pub name: String,
+    pub shape: Vec<usize>,
+    pub dtype: SafeDtype,
+    pub data_f32: Vec<f32>,
+}
+
+/// Supported output dtypes for safetensors writing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafeDtype {
+    F32,
+    F16,
+    BF16,
+}
+
+impl SafeDtype {
+    /// Dtype string as used in safetensors JSON header.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::F32 => "F32",
+            Self::F16 => "F16",
+            Self::BF16 => "BF16",
+        }
+    }
+
+    /// Bytes per element.
+    pub fn bytes_per_element(&self) -> usize {
+        match self {
+            Self::F32 => 4,
+            Self::F16 | Self::BF16 => 2,
+        }
+    }
+}
+
+/// Convert f32 data to raw bytes for the given dtype.
+fn f32_to_bytes(data: &[f32], dtype: SafeDtype) -> Vec<u8> {
+    match dtype {
+        SafeDtype::F32 => data.iter().flat_map(|f| f.to_le_bytes()).collect(),
+        SafeDtype::F16 => data.iter().map(|&f| f32_to_f16_bits(f)).flat_map(|h| h.to_le_bytes()).collect(),
+        SafeDtype::BF16 => data.iter().map(|&f| f32_to_bf16_bits(f)).flat_map(|h| h.to_le_bytes()).collect(),
+    }
+}
+
+/// Convert f32 to f16 bits (IEEE 754 half precision).
+fn f32_to_f16_bits(val: f32) -> u16 {
+    if val == 0.0 {
+        return if val.is_sign_negative() { 0x8000 } else { 0x0000 };
+    }
+    if val.is_nan() {
+        return if val.is_sign_negative() { 0xFFFF } else { 0x7FFF };
+    }
+    if val.is_infinite() {
+        return if val.is_sign_negative() { 0xFC00 } else { 0x7C00 };
+    }
+    let bits = val.to_bits();
+    let sign = (bits >> 31) & 1;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x7FFFFF;
+
+    let new_exp = exp - 127 + 15;
+    if new_exp <= 0 {
+        // Subnormal or zero
+        let shift = 1 - new_exp;
+        let new_mant = ((0x400000 + mant) >> (shift + 1)) & 0x3FF;
+        (sign as u16) << 15 | new_mant as u16
+    } else if new_exp >= 31 {
+        // Overflow → infinity
+        (sign as u16) << 15 | 0x7C00
+    } else {
+        (sign as u16) << 15 | (new_exp as u16) << 10 | ((mant >> 13) as u16)
+    }
+}
+
+/// Convert f32 to BF16 bits (bfloat16).
+fn f32_to_bf16_bits(val: f32) -> u16 {
+    // BF16 is the upper 16 bits of an FP32 number
+    (val.to_bits() >> 16) as u16
+}
+
+/// Write tensors to a safetensors file.
+///
+/// Produces standard safetensors format:
+///   [8 bytes: header_length as little-endian u64]
+///   [header_length bytes: JSON metadata]
+///   [remaining bytes: raw tensor data]
+pub fn write_safetensors(path: &Path, tensors: &[TensorToWrite]) -> Result<()> {
+    let num = |v: u64| -> serde_json::Value {
+        serde_json::Value::Number(serde_json::Number::from(v))
+    };
+
+    let mut header_json = serde_json::Map::new();
+    let mut data_blob = Vec::new();
+
+    // Build header and serialize data in order
+    for tensor in tensors {
+        let start = data_blob.len();
+        let byte_data = f32_to_bytes(&tensor.data_f32, tensor.dtype);
+        data_blob.extend_from_slice(&byte_data);
+        let end = data_blob.len();
+
+        let mut meta = serde_json::Map::new();
+        meta.insert("dtype".to_string(), serde_json::Value::String(tensor.dtype.as_str().to_string()));
+        meta.insert(
+            "shape".to_string(),
+            serde_json::Value::Array(tensor.shape.iter().map(|&d| num(d as u64)).collect()),
+        );
+        meta.insert(
+            "data_offsets".to_string(),
+            serde_json::Value::Array(vec![num(start as u64), num(end as u64)]),
+        );
+        header_json.insert(tensor.name.clone(), serde_json::Value::Object(meta));
+    }
+
+    let header_str = serde_json::to_string(&header_json)
+        .map_err(|e| FerrisResError::Shape(format!("Failed to serialize safetensors header: {}", e)))?;
+    let header_bytes = header_str.as_bytes();
+    let header_len = header_bytes.len() as u64;
+
+    use std::io::Write;
+    let mut file = File::create(path)
+        .map_err(|e| FerrisResError::Shape(format!("Failed to create safetensors file: {}", e)))?;
+    file.write_all(&header_len.to_le_bytes())
+        .map_err(|e| FerrisResError::Shape(format!("Failed to write header length: {}", e)))?;
+    file.write_all(header_bytes)
+        .map_err(|e| FerrisResError::Shape(format!("Failed to write header: {}", e)))?;
+    file.write_all(&data_blob)
+        .map_err(|e| FerrisResError::Shape(format!("Failed to write tensor data: {}", e)))?;
+
+    tracing::info!(
+        "Wrote {} tensors ({} bytes) to {}",
+        tensors.len(),
+        data_blob.len(),
+        path.display()
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -584,5 +728,118 @@ mod tests {
         let raw: Vec<u8> = bytemuck::cast_slice(&data).to_vec();
         let result = bytes_to_f32(&raw, "F32").unwrap();
         assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_write_safetensors_round_trip() {
+        let dir = std::env::temp_dir().join("ferrisres_writer_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test_write.safetensors");
+
+        let tensors = vec![
+            TensorToWrite {
+                name: "layer1.weight".to_string(),
+                shape: vec![3, 4],
+                dtype: SafeDtype::F32,
+                data_f32: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            },
+            TensorToWrite {
+                name: "layer1.bias".to_string(),
+                shape: vec![4],
+                dtype: SafeDtype::F32,
+                data_f32: vec![0.1, 0.2, 0.3, 0.4],
+            },
+        ];
+
+        write_safetensors(&path, &tensors).unwrap();
+        assert!(path.exists());
+
+        // Load back and verify
+        let loaded = load_safetensors(&path).unwrap();
+        let w = loaded.get("layer1.weight").unwrap();
+        assert_eq!(w.shape, vec![3, 4]);
+        assert_eq!(w.data.len(), 12);
+        assert!((w.data[0] - 1.0).abs() < 1e-6);
+        assert!((w.data[11] - 12.0).abs() < 1e-6);
+
+        let b = loaded.get("layer1.bias").unwrap();
+        assert_eq!(b.shape, vec![4]);
+        assert!((b.data[0] - 0.1).abs() < 1e-6);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_write_safetensors_f16_round_trip() {
+        let dir = std::env::temp_dir().join("ferrisres_writer_f16");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test_f16.safetensors");
+
+        let original = vec![0.0, 1.0, -1.0, 0.5, 2.0];
+        let tensors = vec![
+            TensorToWrite {
+                name: "test".to_string(),
+                shape: vec![5],
+                dtype: SafeDtype::F16,
+                data_f32: original.clone(),
+            },
+        ];
+
+        write_safetensors(&path, &tensors).unwrap();
+        let loaded = load_safetensors(&path).unwrap();
+        let t = loaded.get("test").unwrap();
+        // F16 has limited precision (~3 decimal digits)
+        for (i, (orig, got)) in original.iter().zip(t.data.iter()).enumerate() {
+            assert!((orig - got).abs() < 0.01, "Mismatch at {}: {} vs {}", i, orig, got);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_write_safetensors_bf16_round_trip() {
+        let dir = std::env::temp_dir().join("ferrisres_writer_bf16");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test_bf16.safetensors");
+
+        let original = vec![0.0, 1.0, -1.0, 0.5, 100.0];
+        let tensors = vec![
+            TensorToWrite {
+                name: "test".to_string(),
+                shape: vec![5],
+                dtype: SafeDtype::BF16,
+                data_f32: original.clone(),
+            },
+        ];
+
+        write_safetensors(&path, &tensors).unwrap();
+        let loaded = load_safetensors(&path).unwrap();
+        let t = loaded.get("test").unwrap();
+        // BF16 has even less mantissa precision
+        for (i, (orig, got)) in original.iter().zip(t.data.iter()).enumerate() {
+            assert!((orig - got).abs() < 0.1, "Mismatch at {}: {} vs {}", i, orig, got);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_f32_to_f16_round_trip() {
+        let values = vec![0.0, 1.0, -1.0, 0.5, 2.0, 0.333, 65504.0];
+        for v in &values {
+            let bits = f32_to_f16_bits(*v);
+            let recovered = f16_to_f32(bits);
+            assert!((v - recovered).abs() < 0.01, "F16 round trip failed: {} -> {} -> {}", v, bits, recovered);
+        }
+    }
+
+    #[test]
+    fn test_f32_to_bf16_round_trip() {
+        let values = vec![0.0, 1.0, -1.0, 0.5, 2.0, 100.0, -1000.0];
+        for v in &values {
+            let bits = f32_to_bf16_bits(*v);
+            let recovered = bf16_to_f32(bits);
+            assert!((v - recovered).abs() < 0.1, "BF16 round trip failed: {} -> {} -> {}", v, bits, recovered);
+        }
     }
 }

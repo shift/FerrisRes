@@ -8,7 +8,9 @@ use ferrisres::training::AdamOptimizer;
 use ferrisres::model::gemma_mapper::{
     self, Gemma4Config, Gemma4Teacher, Gemma4Student, DistillationConfig,
     BlockSummaryLayer, load_gemma4_model, run_distillation,
+    DistillationCheckpoint, load_gemma4_model_gguf,
 };
+use ferrisres::model::tokenizer::HfTokenizer;
 
 #[derive(Parser)]
 #[command(name = "ferrisres", about = "Block AttnRes runtime for SLM/LLM training and inference")]
@@ -101,6 +103,18 @@ enum Commands {
         /// Log loss every N steps.
         #[arg(long, default_value_t = 10)]
         log_every: usize,
+        /// Resume from checkpoint.
+        #[arg(long)]
+        resume: Option<String>,
+        /// Model file format: safetensors or gguf.
+        #[arg(long, default_value = "safetensors")]
+        model_format: String,
+        /// Path to tokenizer.json (HuggingFace format).
+        #[arg(long)]
+        tokenizer: Option<String>,
+        /// Save checkpoint every N steps.
+        #[arg(long, default_value_t = 100)]
+        checkpoint_every: usize,
     },
 
     /// Evaluate teacher/student perplexity.
@@ -154,7 +168,8 @@ async fn main() -> anyhow::Result<()> {
         } => cmd_benchmark(hidden_dim, num_blocks, block_size, iterations).await,
         Commands::Distill {
             model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every,
-        } => cmd_distill(model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every).await,
+            resume, model_format, tokenizer, checkpoint_every,
+        } => cmd_distill(model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every, resume, model_format, tokenizer, checkpoint_every).await,
         Commands::Evaluate {
             model_path, config, text,
         } => cmd_evaluate(model_path, config, text).await,
@@ -664,6 +679,10 @@ async fn cmd_distill(
     data_path: Option<String>,
     output_path: String,
     log_every: usize,
+    resume_path: Option<String>,
+    model_format: String,
+    tokenizer_path: Option<String>,
+    _checkpoint_every: usize,
 ) -> anyhow::Result<()> {
     info!("=== FerrisRes Gemma 4 → Block AttnRes Distillation ===");
 
@@ -673,7 +692,13 @@ async fn cmd_distill(
         "e4b" => { info!("Using Gemma 4 E4B config (MoE-16, ~8 GB)"); Gemma4Config::gemma4_e4b() }
         "12b" => { info!("Using Gemma 4 12B config (MoE-128, ~24 GB)"); Gemma4Config::gemma4_12b() }
         "27b" => { info!("Using Gemma 4 27B config (MoE-128, ~54 GB)"); Gemma4Config::gemma4_27b() }
-        other => anyhow::bail!("Unknown config '{}'. Use: e2b, e4b, 12b, 27b", other),
+        "llama3-8b" => { info!("Using LLaMA 3.1 8B config"); Gemma4Config::llama3_8b() }
+        "llama3-70b" => { info!("Using LLaMA 3.1 70B config"); Gemma4Config::llama3_70b() }
+        "mistral-7b" => { info!("Using Mistral 7B config"); Gemma4Config::mistral_7b() }
+        "mixtral-8x7b" => { info!("Using Mixtral 8x7B config"); Gemma4Config::mixtral_8x7b() }
+        "phi3-mini" => { info!("Using Phi-3 Mini config"); Gemma4Config::phi3_mini() }
+        "qwen2-7b" => { info!("Using Qwen 2.5 7B config"); Gemma4Config::qwen2_7b() }
+        other => anyhow::bail!("Unknown config '{}'. Use: e2b, e4b, 12b, 27b, llama3-8b, llama3-70b, mistral-7b, mixtral-8x7b, phi3-mini, qwen2-7b", other),
     };
 
     info!("Model: hidden={} layers={} heads={} vocab={}",
@@ -686,7 +711,14 @@ async fn cmd_distill(
         anyhow::bail!("Model file not found: {}", model_path);
     }
 
-    let model1 = load_gemma4_model(path, config.clone())
+    let load_model = |p: &std::path::Path| -> Result<gemma_mapper::MappedGemma4Model, String> {
+        match model_format.as_str() {
+            "gguf" => load_gemma4_model_gguf(p, config.clone()),
+            _ => load_gemma4_model(p, config.clone()),
+        }
+    };
+
+    let model1 = load_model(path)
         .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
     info!("Model loaded: {} layers, {} params",
         model1.layers.len(),
@@ -708,7 +740,7 @@ async fn cmd_distill(
     info!("Teacher model created (frozen)");
 
     // Create student with Block Summary
-    let model2 = load_gemma4_model(path, config.clone())
+    let model2 = load_model(path)
         .map_err(|e| anyhow::anyhow!("Failed to reload model for student: {}", e))?;
 
     let injection_points = config.block_summary_injection_points();
@@ -727,15 +759,40 @@ async fn cmd_distill(
 
     let mut student = Gemma4Student::new(model2, block_summaries, distill_config.clone());
 
+    // Resume from checkpoint if specified
+    if let Some(ref ckpt_path) = resume_path {
+        let ckpt = DistillationCheckpoint::load(std::path::Path::new(ckpt_path))
+            .map_err(|e| anyhow::anyhow!("Failed to load checkpoint: {}", e))?;
+        info!("Resuming from checkpoint at step {}", ckpt.global_step);
+        let optimizers = ckpt.apply(&mut student);
+        info!("Restored {} Block Summary layers from checkpoint", optimizers.len());
+    }
+
+    // Load tokenizer
+    let hf_tokenizer = if let Some(ref tok_path) = tokenizer_path {
+        let tok = HfTokenizer::from_tokenizer_json(std::path::Path::new(tok_path))
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+        info!("Loaded tokenizer with vocab size {}", tok.vocab_size());
+        Some(tok)
+    } else {
+        info!("No tokenizer specified, using byte-fallback tokenization");
+        None
+    };
+
     // Load training data
     let token_ids = if let Some(ref dp) = data_path {
         info!("Loading training data from: {}", dp);
         let text = std::fs::read_to_string(dp)
             .map_err(|e| anyhow::anyhow!("Failed to read data: {}", e))?;
-        // Byte-level tokenization for now (use BPE tokenizer for real runs)
-        let ids: Vec<u32> = text.bytes().map(|b| b as u32).collect();
-        info!("Loaded {} tokens from training data", ids.len());
-        ids
+        if let Some(ref tok) = hf_tokenizer {
+            let ids = tok.encode_raw(&text);
+            info!("Tokenized to {} tokens using provided tokenizer", ids.len());
+            ids
+        } else {
+            let ids: Vec<u32> = text.bytes().map(|b| b as u32).collect();
+            info!("Loaded {} byte-level tokens from training data", ids.len());
+            ids
+        }
     } else {
         // Synthetic data for testing
         info!("No training data provided, using synthetic tokens");
@@ -780,11 +837,43 @@ async fn cmd_distill(
         info!("Saved Block Summary {} → {} ({} params)", i, save_path, params.len());
     }
 
+    // Save full checkpoint (for resume)
+    let ckpt_path = format!("{}.checkpoint.bin", output_path);
+    // We don't have the optimizers here — save a simple version
+    let final_ckpt = DistillationCheckpoint {
+        version: 1,
+        global_step: results.last().map(|r| r.step).unwrap_or(0),
+        layer_checkpoints: student.block_summaries.iter().map(|bs| {
+            use gemma_mapper::BlockSummaryCheckpoint;
+            let params = bs.export_trainable();
+            let _hd = bs.hidden_dim;
+            BlockSummaryCheckpoint {
+                params,
+                adam_m: vec![],
+                adam_v: vec![],
+                adam_t: 0,
+                bridge_weight: bs.bridge_weight,
+                bw_m: 0.0, bw_v: 0.0,
+                norm_weight: vec![],
+                norm_bias: vec![],
+            }
+        }).collect(),
+    };
+    final_ckpt.save(std::path::Path::new(&ckpt_path))
+        .map_err(|e| anyhow::anyhow!("Failed to save checkpoint: {}", e))?;
+    info!("Checkpoint saved → {}", ckpt_path);
+
     // Save loss curve as CSV
     let csv_path = format!("{}.loss_curve.csv", output_path);
-    let mut csv = String::from("step,kl_loss,bridge_weight,learning_rate\n");
+    let mut csv = String::from("step,kl_loss,bridge_weight,learning_rate,cosine_sim_avg\n");
     for r in &results {
-        csv.push_str(&format!("{},{},{},{}\n", r.step, r.kl_loss, r.bridge_weight, r.learning_rate));
+        let avg_cos = if r.layer_cosine_sim.is_empty() {
+            String::from("n/a")
+        } else {
+            let avg = r.layer_cosine_sim.iter().sum::<f32>() / r.layer_cosine_sim.len() as f32;
+            format!("{:.6}", avg)
+        };
+        csv.push_str(&format!("{},{},{},{},{}\n", r.step, r.kl_loss, r.bridge_weight, r.learning_rate, avg_cos));
     }
     std::fs::write(&csv_path, &csv)?;
     info!("Loss curve saved → {}", csv_path);
@@ -814,9 +903,9 @@ async fn cmd_evaluate(
 
     let teacher = Gemma4Teacher::new(model);
 
-    // Tokenize (byte-level)
+    // Tokenize
     let token_ids: Vec<u32> = text.bytes().map(|b| b as u32).collect();
-    info!("Evaluating on {} tokens", token_ids.len());
+    info!("Evaluating on {} byte-level tokens", token_ids.len());
 
     let logits = teacher.forward(&token_ids);
     let vs = config.vocab_size;

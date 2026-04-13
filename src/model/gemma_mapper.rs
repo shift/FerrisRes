@@ -595,6 +595,108 @@ impl Gemma4Config {
         }
     }
 
+    /// LLaMA 3.1 8B config.
+    pub fn llama3_8b() -> Self {
+        Self {
+            hidden_dim: 4096,
+            num_layers: 32,
+            num_heads: 32,
+            head_dim: 128,
+            intermediate_dim: 14336,
+            num_experts: 1,
+            top_k: 1,
+            vocab_size: 128256,
+            max_position_embeddings: 131072,
+            sliding_window: 8192,
+            moe_layers: vec![],
+        }
+    }
+
+    /// LLaMA 3.1 70B config (dense).
+    pub fn llama3_70b() -> Self {
+        Self {
+            hidden_dim: 8192,
+            num_layers: 80,
+            num_heads: 64,
+            head_dim: 128,
+            intermediate_dim: 28672,
+            num_experts: 1,
+            top_k: 1,
+            vocab_size: 128256,
+            max_position_embeddings: 131072,
+            sliding_window: 8192,
+            moe_layers: vec![],
+        }
+    }
+
+    /// Mistral 7B v0.3 config.
+    pub fn mistral_7b() -> Self {
+        Self {
+            hidden_dim: 4096,
+            num_layers: 32,
+            num_heads: 32,
+            head_dim: 128,
+            intermediate_dim: 14336,
+            num_experts: 1,
+            top_k: 1,
+            vocab_size: 32768,
+            max_position_embeddings: 32768,
+            sliding_window: 4096,
+            moe_layers: vec![],
+        }
+    }
+
+    /// Mistral 8x7B (MoE) config.
+    pub fn mixtral_8x7b() -> Self {
+        Self {
+            hidden_dim: 4096,
+            num_layers: 32,
+            num_heads: 32,
+            head_dim: 128,
+            intermediate_dim: 14336,
+            num_experts: 8,
+            top_k: 2,
+            vocab_size: 32000,
+            max_position_embeddings: 32768,
+            sliding_window: 4096,
+            moe_layers: (0..32).step_by(2).collect(),
+        }
+    }
+
+    /// Phi-3 mini (3.8B) config.
+    pub fn phi3_mini() -> Self {
+        Self {
+            hidden_dim: 3072,
+            num_layers: 32,
+            num_heads: 32,
+            head_dim: 96,
+            intermediate_dim: 8192,
+            num_experts: 1,
+            top_k: 1,
+            vocab_size: 32064,
+            max_position_embeddings: 131072,
+            sliding_window: 4096,
+            moe_layers: vec![],
+        }
+    }
+
+    /// Qwen 2.5 7B config.
+    pub fn qwen2_7b() -> Self {
+        Self {
+            hidden_dim: 3584,
+            num_layers: 28,
+            num_heads: 28,
+            head_dim: 128,
+            intermediate_dim: 18944,
+            num_experts: 1,
+            top_k: 1,
+            vocab_size: 152064,
+            max_position_embeddings: 131072,
+            sliding_window: 4096,
+            moe_layers: vec![],
+        }
+    }
+
     /// Convert to BlockAttnResConfig.
     pub fn to_block_attnres_config(&self) -> BlockAttnResConfig {
         // Map sliding window → block_size
@@ -1465,6 +1567,50 @@ impl Gemma4Teacher {
 
         output
     }
+
+    /// Forward pass that returns per-layer hidden states.
+    /// Used for computing layer-wise cosine similarity between teacher and student.
+    pub fn forward_with_hidden_states(&self, token_ids: &[u32]) -> Vec<Vec<f32>> {
+        let config = &self.model.config;
+        let hd = config.hidden_dim;
+        let nh = config.num_heads;
+        let head_d = config.head_dim;
+        let seq = token_ids.len();
+        let mut layer_states = Vec::new();
+
+        // Embedding
+        let mut hidden = vec![0.0f32; seq * hd];
+        for (t, &tid) in token_ids.iter().enumerate() {
+            let id = tid as usize;
+            if id * hd + hd <= self.model.embed_tokens.len() {
+                for d in 0..hd { hidden[t * hd + d] = self.model.embed_tokens[id * hd + d]; }
+            }
+        }
+        let scale = (hd as f32).sqrt();
+        for h in hidden.iter_mut() { *h *= scale; }
+        layer_states.push(hidden.clone()); // Embedding state
+
+        for (layer_idx, layer) in self.model.layers.iter().enumerate() {
+            let residual = hidden.clone();
+            let normed = rms_norm(&hidden, &layer.attn.input_norm, hd, 1e-6);
+            let attn_out = self.attention_forward(&normed, &layer.attn, nh, head_d, seq, hd, config.sliding_window, layer_idx);
+            for i in 0..hidden.len() { hidden[i] = residual[i] + attn_out[i]; }
+            let residual2 = hidden.clone();
+            let normed2 = rms_norm(&hidden, &layer.attn.post_attn_norm, hd, 1e-6);
+            let ffn_out = match &layer.ffn {
+                Gemma4FfnWeights::Dense { gate_proj, up_proj, down_proj } => {
+                    self.dense_ffn(&normed2, gate_proj, up_proj, down_proj, hd, config.intermediate_dim)
+                }
+                Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs } => {
+                    self.moe_ffn(&normed2, router, expert_gates, expert_ups, expert_downs, hd, config.intermediate_dim, config.num_experts, config.top_k)
+                }
+            };
+            for i in 0..hidden.len() { hidden[i] = residual2[i] + ffn_out[i]; }
+            layer_states.push(hidden.clone()); // Post-layer state
+        }
+
+        layer_states
+    }
 }
 
 /// Simple CPU matmul: C[m×n] = A[m×k] × B[k×n].
@@ -1601,6 +1747,75 @@ impl Gemma4Student {
         }
 
         logits
+    }
+
+    /// Forward pass that returns per-layer hidden states.
+    /// Includes states after Block Summary injection for comparison with teacher.
+    pub fn forward_with_hidden_states(&self, token_ids: &[u32]) -> Vec<Vec<f32>> {
+        let config = &self.model.config;
+        let hd = config.hidden_dim;
+        let nh = config.num_heads;
+        let head_d = config.head_dim;
+        let seq = token_ids.len();
+        let mut layer_states = Vec::new();
+
+        // Embedding
+        let mut hidden = vec![0.0f32; seq * hd];
+        for (t, &tid) in token_ids.iter().enumerate() {
+            let id = tid as usize;
+            if id * hd + hd <= self.model.embed_tokens.len() {
+                for d in 0..hd { hidden[t * hd + d] = self.model.embed_tokens[id * hd + d]; }
+            }
+        }
+        let scale = (hd as f32).sqrt();
+        for h in hidden.iter_mut() { *h *= scale; }
+        layer_states.push(hidden.clone());
+
+        let mut summary_idx = 0;
+        for (layer_idx, layer) in self.model.layers.iter().enumerate() {
+            let residual = hidden.clone();
+            let normed = rms_norm(&hidden, &layer.attn.input_norm, hd, 1e-6);
+            let attn_out = self.student_attention(&normed, &layer.attn, nh, head_d, seq, hd);
+            for i in 0..hidden.len() { hidden[i] = residual[i] + attn_out[i]; }
+
+            // Block Summary injection
+            if config.moe_layers.contains(&layer_idx) {
+                if summary_idx < self.block_summaries.len() {
+                    let bs = &self.block_summaries[summary_idx];
+                    let block_tokens = hidden.clone();
+                    let summary = bs.forward(&block_tokens);
+                    if summary.len() == hd {
+                        for t in 0..seq {
+                            for d in 0..hd {
+                                hidden[t * hd + d] = (1.0 - bs.bridge_weight) * hidden[t * hd + d]
+                                    + bs.bridge_weight * summary[d];
+                            }
+                        }
+                    }
+                    summary_idx += 1;
+                }
+            }
+
+            let residual2 = hidden.clone();
+            let normed2 = rms_norm(&hidden, &layer.attn.post_attn_norm, hd, 1e-6);
+            let ffn_out = match &layer.ffn {
+                Gemma4FfnWeights::Dense { gate_proj, up_proj, down_proj } => {
+                    swiglu_ffn(&normed2, gate_proj, up_proj, down_proj, hd, config.intermediate_dim)
+                }
+                Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs } => {
+                    let mut moe = CpuMoELayer::new(hd, config.intermediate_dim, config.num_experts, config.top_k);
+                    moe.gate_weights = router.clone();
+                    moe.expert_gate = expert_gates.clone();
+                    moe.expert_up = expert_ups.clone();
+                    moe.expert_down = expert_downs.clone();
+                    moe.forward(&normed2, seq)
+                }
+            };
+            for i in 0..hidden.len() { hidden[i] = residual2[i] + ffn_out[i]; }
+            layer_states.push(hidden.clone());
+        }
+
+        layer_states
     }
 
     /// Student attention (same architecture as teacher, but factored out).
@@ -1814,14 +2029,14 @@ impl AdamState {
 
 /// Adam optimizer for Block Summary trainable parameters.
 pub struct BlockSummaryAdam {
-    sq_state: AdamState,
-    qp_state: AdamState,
-    op_state: AdamState,
-    bw_m: f32,
-    bw_v: f32,
-    nw_state: AdamState,
-    nb_state: AdamState,
-    lr: f32,
+    pub sq_state: AdamState,
+    pub qp_state: AdamState,
+    pub op_state: AdamState,
+    pub bw_m: f32,
+    pub bw_v: f32,
+    pub nw_state: AdamState,
+    pub nb_state: AdamState,
+    pub lr: f32,
     beta1: f32,
     beta2: f32,
     eps: f32,
@@ -1916,6 +2131,36 @@ pub struct DistillationStepResult {
     pub kl_loss: f32,
     pub bridge_weight: f32,
     pub learning_rate: f32,
+    /// Per-layer cosine similarity between teacher and student hidden states.
+    /// layer_cosine_sim[0] = embedding similarity, [1..] = post-layer similarity.
+    pub layer_cosine_sim: Vec<f32>,
+}
+
+/// Compute cosine similarity between two vectors.
+/// Returns a value in [-1, 1] where 1 = identical direction.
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for i in 0..a.len().min(b.len()) {
+        dot += a[i] as f64 * b[i] as f64;
+        norm_a += a[i] as f64 * a[i] as f64;
+        norm_b += b[i] as f64 * b[i] as f64;
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom < 1e-12 { return 0.0; }
+    (dot / denom) as f32
+}
+
+/// Compute per-layer cosine similarity between teacher and student hidden states.
+/// Returns a vec where index i = cosine_sim(teacher_states[i], student_states[i]).
+pub fn layer_cosine_similarities(
+    teacher_states: &[Vec<f32>],
+    student_states: &[Vec<f32>],
+) -> Vec<f32> {
+    teacher_states.iter().zip(student_states.iter())
+        .map(|(t, s)| cosine_similarity(t, s))
+        .collect()
 }
 
 /// Run the distillation loop.
@@ -1999,6 +2244,15 @@ pub fn run_distillation(
             optimizers[si].step(&mut student.block_summaries[si], &grads);
         }
 
+        // Compute layer-wise cosine similarity (every 10 steps to save time)
+        let layer_cos = if step % 10 == 0 {
+            let t_states = teacher.forward_with_hidden_states(batch_tokens);
+            let s_states = student.forward_with_hidden_states(batch_tokens);
+            layer_cosine_similarities(&t_states, &s_states)
+        } else {
+            vec![] // Skip on most steps for performance
+        };
+
         let bridge_w = student.block_summaries.first()
             .map(|bs| bs.bridge_weight)
             .unwrap_or(0.0);
@@ -2008,6 +2262,7 @@ pub fn run_distillation(
             kl_loss: loss,
             bridge_weight: bridge_w,
             learning_rate: lr,
+            layer_cosine_sim: layer_cos,
         });
 
         // Early stop if loss is negligible
@@ -2017,6 +2272,234 @@ pub fn run_distillation(
     }
 
     results
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint Save / Load for Distillation Resume
+// ---------------------------------------------------------------------------
+
+/// Checkpoint data for one Block Summary layer, including Adam optimizer state.
+#[derive(Debug, Clone)]
+pub struct BlockSummaryCheckpoint {
+    pub params: Vec<f32>,
+    pub adam_m: Vec<f32>,
+    pub adam_v: Vec<f32>,
+    pub adam_t: usize,
+    pub bridge_weight: f32,
+    pub bw_m: f32,
+    pub bw_v: f32,
+    pub norm_weight: Vec<f32>,
+    pub norm_bias: Vec<f32>,
+}
+
+/// Full distillation checkpoint.
+#[derive(Debug, Clone)]
+pub struct DistillationCheckpoint {
+    pub version: u32,
+    pub global_step: usize,
+    pub layer_checkpoints: Vec<BlockSummaryCheckpoint>,
+}
+
+impl DistillationCheckpoint {
+    const FORMAT_VERSION: u32 = 1;
+
+    /// Save checkpoint to a binary file.
+    ///
+    /// Format:
+    ///   [version: u32]
+    ///   [global_step: u64]
+    ///   [num_layers: u32]
+    ///   For each layer:
+    ///     [param_count: u64] [params: f32 × param_count]
+    ///     [adam_m: f32 × param_count] [adam_v: f32 × param_count] [adam_t: u64]
+    ///     [bridge_weight: f32] [bw_m: f32] [bw_v: f32]
+    ///     [norm_w_count: u64] [norm_weight: f32 × count] [norm_bias: f32 × count]
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+
+        buf.extend_from_slice(&self.version.to_le_bytes());
+        buf.extend_from_slice(&(self.global_step as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.layer_checkpoints.len() as u32).to_le_bytes());
+
+        for lc in &self.layer_checkpoints {
+            let pc = lc.params.len() as u64;
+            buf.extend_from_slice(&pc.to_le_bytes());
+            for &v in &lc.params { buf.extend_from_slice(&v.to_le_bytes()); }
+            for &v in &lc.adam_m { buf.extend_from_slice(&v.to_le_bytes()); }
+            for &v in &lc.adam_v { buf.extend_from_slice(&v.to_le_bytes()); }
+            buf.extend_from_slice(&(lc.adam_t as u64).to_le_bytes());
+            buf.extend_from_slice(&lc.bridge_weight.to_le_bytes());
+            buf.extend_from_slice(&lc.bw_m.to_le_bytes());
+            buf.extend_from_slice(&lc.bw_v.to_le_bytes());
+            let nwc = lc.norm_weight.len() as u64;
+            buf.extend_from_slice(&nwc.to_le_bytes());
+            for &v in &lc.norm_weight { buf.extend_from_slice(&v.to_le_bytes()); }
+            for &v in &lc.norm_bias { buf.extend_from_slice(&v.to_le_bytes()); }
+        }
+
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(&buf)?;
+        Ok(())
+    }
+
+    /// Load checkpoint from a binary file.
+    pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        std::fs::File::open(path)?.read_to_end(&mut buf)?;
+        let mut pos = 0usize;
+
+        let read_u32 = |buf: &[u8], pos: &mut usize| -> u32 {
+            let v = u32::from_le_bytes(buf[*pos..*pos+4].try_into().unwrap());
+            *pos += 4; v
+        };
+        let read_u64 = |buf: &[u8], pos: &mut usize| -> u64 {
+            let v = u64::from_le_bytes(buf[*pos..*pos+8].try_into().unwrap());
+            *pos += 8; v
+        };
+        let read_f32 = |buf: &[u8], pos: &mut usize| -> f32 {
+            let v = f32::from_le_bytes(buf[*pos..*pos+4].try_into().unwrap());
+            *pos += 4; v
+        };
+        let read_vec_f32 = |buf: &[u8], pos: &mut usize, n: usize| -> Vec<f32> {
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n { v.push(read_f32(buf, pos)); }
+            v
+        };
+
+        let version = read_u32(&buf, &mut pos);
+        if version != Self::FORMAT_VERSION {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                format!("Checkpoint version {} does not match expected {}", version, Self::FORMAT_VERSION)));
+        }
+
+        let global_step = read_u64(&buf, &mut pos) as usize;
+        let num_layers = read_u32(&buf, &mut pos) as usize;
+
+        let mut layer_checkpoints = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            let pc = read_u64(&buf, &mut pos) as usize;
+            let params = read_vec_f32(&buf, &mut pos, pc);
+            let adam_m = read_vec_f32(&buf, &mut pos, pc);
+            let adam_v = read_vec_f32(&buf, &mut pos, pc);
+            let adam_t = read_u64(&buf, &mut pos) as usize;
+            let bridge_weight = read_f32(&buf, &mut pos);
+            let bw_m = read_f32(&buf, &mut pos);
+            let bw_v = read_f32(&buf, &mut pos);
+            let nwc = read_u64(&buf, &mut pos) as usize;
+            let norm_weight = read_vec_f32(&buf, &mut pos, nwc);
+            let norm_bias = read_vec_f32(&buf, &mut pos, nwc);
+
+            layer_checkpoints.push(BlockSummaryCheckpoint {
+                params, adam_m, adam_v, adam_t,
+                bridge_weight, bw_m, bw_v,
+                norm_weight, norm_bias,
+            });
+        }
+
+        Ok(Self { version, global_step, layer_checkpoints })
+    }
+
+    /// Create checkpoint from current student + optimizer state.
+    pub fn from_student(
+        student: &Gemma4Student,
+        optimizers: &[BlockSummaryAdam],
+        global_step: usize,
+    ) -> Self {
+        let layer_checkpoints = student.block_summaries.iter().enumerate()
+            .map(|(i, bs)| {
+                let params = bs.export_trainable();
+                let (adam_m, adam_v, adam_t, bw_m, bw_v, norm_w, norm_b) =
+                    if i < optimizers.len() {
+                        let opt = &optimizers[i];
+                        let mut m = Vec::new();
+                        m.extend_from_slice(&opt.sq_state.m);
+                        m.extend_from_slice(&opt.qp_state.m);
+                        m.extend_from_slice(&opt.op_state.m);
+                        let mut v = Vec::new();
+                        v.extend_from_slice(&opt.sq_state.v);
+                        v.extend_from_slice(&opt.qp_state.v);
+                        v.extend_from_slice(&opt.op_state.v);
+                        (m, v, opt.sq_state.t, opt.bw_m, opt.bw_v,
+                         opt.nw_state.m.clone(), opt.nb_state.m.clone())
+                    } else {
+                        let hd = bs.hidden_dim;
+                        let sz = params.len().max(bs.summary_queries.len() + hd*hd + hd*hd);
+                        (vec![0.0; sz], vec![0.0; sz], 0, 0.0, 0.0,
+                         vec![0.0; hd], vec![0.0; hd])
+                    };
+                let _hd = bs.hidden_dim;
+                BlockSummaryCheckpoint {
+                    params,
+                    adam_m,
+                    adam_v,
+                    adam_t,
+                    bridge_weight: bs.bridge_weight,
+                    bw_m,
+                    bw_v,
+                    norm_weight: norm_w,
+                    norm_bias: norm_b,
+                }
+            })
+            .collect();
+
+        Self {
+            version: Self::FORMAT_VERSION,
+            global_step,
+            layer_checkpoints,
+        }
+    }
+
+    /// Apply checkpoint to restore student state + reconstruct optimizers.
+    pub fn apply(&self, student: &mut Gemma4Student) -> Vec<BlockSummaryAdam> {
+        let lr = student.distill_config.learning_rate;
+        let mut optimizers = Vec::with_capacity(self.layer_checkpoints.len());
+
+        for (i, lc) in self.layer_checkpoints.iter().enumerate() {
+            if i >= student.block_summaries.len() { break; }
+            let bs = &mut student.block_summaries[i];
+
+            // Restore trainable params
+            bs.import_trainable(&lc.params);
+            bs.bridge_weight = lc.bridge_weight;
+
+            // Reconstruct Adam with restored state
+            let hd = bs.hidden_dim;
+            let sq_len = bs.summary_queries.len();
+            let sq_m: Vec<f32> = lc.adam_m.get(..sq_len).unwrap_or(&[]).to_vec();
+            let sq_v: Vec<f32> = lc.adam_v.get(..sq_len).unwrap_or(&[]).to_vec();
+            let qp_off = sq_len;
+            let qp_end = qp_off + hd * hd;
+            let op_off = qp_end;
+            let op_end = op_off + hd * hd;
+
+            let mut opt = BlockSummaryAdam::new(bs, lr);
+            opt.sq_state.m = if sq_m.len() == sq_len { sq_m } else { vec![0.0; sq_len] };
+            opt.sq_state.v = if sq_v.len() == sq_len { sq_v } else { vec![0.0; sq_len] };
+            opt.sq_state.t = lc.adam_t;
+            if qp_end <= lc.adam_m.len() {
+                opt.qp_state.m = lc.adam_m[qp_off..qp_end].to_vec();
+                opt.qp_state.v = lc.adam_v[qp_off..qp_end].to_vec();
+            }
+            if op_end <= lc.adam_m.len() {
+                opt.op_state.m = lc.adam_m[op_off..op_end].to_vec();
+                opt.op_state.v = lc.adam_v[op_off..op_end].to_vec();
+            }
+            opt.bw_m = lc.bw_m;
+            opt.bw_v = lc.bw_v;
+            if lc.norm_weight.len() == hd {
+                opt.nw_state.m = lc.norm_weight.clone();
+            }
+            if lc.norm_bias.len() == hd {
+                opt.nb_state.m = lc.norm_bias.clone();
+            }
+
+            optimizers.push(opt);
+        }
+
+        optimizers
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2295,8 +2778,147 @@ pub fn load_gemma4_model(
     MappedGemma4Model::from_loaded_weights(config, &weights)
 }
 
-// ---------------------------------------------------------------------------
-// Tests
+/// Load a model from GGUF format.
+/// Dequantizes tensors to F32 on load.
+pub fn load_gemma4_model_gguf(
+    path: &std::path::Path,
+    config: Gemma4Config,
+) -> Result<MappedGemma4Model, String> {
+    let gguf = crate::model::gguf::load_gguf(path)
+        .map_err(|e| format!("Failed to load GGUF: {:?}", e))?;
+
+    // Map GGUF tensor names to HuggingFace names
+    let name_map = gguf.standard_name_map();
+
+    // Load all tensors and map names
+    let raw_tensors: HashMap<String, Vec<f32>> = gguf.tensor_infos.keys()
+        .filter_map(|name| {
+            let loaded = gguf.load_tensor(name).ok()?;
+            // Try mapped name first, then original
+            let target_name = name_map.get(name)
+                .cloned()
+                .unwrap_or_else(|| name.clone());
+            Some((target_name, loaded.data))
+        })
+        .collect();
+
+    // Build a LoadedWeights-compatible wrapper
+    let fake_weights = RawWeights { tensors: raw_tensors };
+    MappedGemma4Model::from_raw_weights(config, &fake_weights)
+}
+
+/// Simple wrapper around a HashMap for weight loading.
+pub struct RawWeights {
+    tensors: HashMap<String, Vec<f32>>,
+}
+
+impl RawWeights {
+    fn get(&self, name: &str) -> Option<Vec<f32>> {
+        self.tensors.get(name).cloned()
+    }
+}
+
+use std::collections::HashMap;
+
+impl MappedGemma4Model {
+    /// Build model from a raw weight map (used by GGUF and LLaMA loaders).
+    pub fn from_raw_weights(
+        config: Gemma4Config,
+        weights: &RawWeights,
+    ) -> Result<Self, String> {
+        let get = |name: &str| -> Option<Vec<f32>> {
+            weights.get(name)
+        };
+
+        // Embedding — try multiple naming conventions
+        let embed_tokens = get("model.embed_tokens.weight")
+            .or_else(|| get("embedding.weight"))
+            .ok_or_else(|| "Missing embedding weights".to_string())?;
+
+        // LM head (may be tied to embedding)
+        let lm_head = get("lm_head.weight")
+            .or_else(|| get("output.weight"))
+            .unwrap_or_else(|| embed_tokens.clone());
+
+        // Final norm
+        let final_norm = get("model.norm.weight")
+            .or_else(|| get("final_norm.weight"))
+            .or_else(|| get("output_norm.weight"))
+            .ok_or_else(|| "Missing final norm".to_string())?;
+
+        // Per-layer weights — try both Gemma and standard LLaMA naming
+        let mut layers = Vec::new();
+        for layer_idx in 0..config.num_layers {
+            let q = get(&format!("model.layers.{}.self_attn.q_proj.weight", layer_idx))
+                .or_else(|| get(&format!("layers.{}.q_proj.weight", layer_idx)))
+                .ok_or_else(|| format!("Missing q_proj for layer {}", layer_idx))?;
+            let k = get(&format!("model.layers.{}.self_attn.k_proj.weight", layer_idx))
+                .or_else(|| get(&format!("layers.{}.k_proj.weight", layer_idx)))
+                .ok_or_else(|| format!("Missing k_proj for layer {}", layer_idx))?;
+            let v = get(&format!("model.layers.{}.self_attn.v_proj.weight", layer_idx))
+                .or_else(|| get(&format!("layers.{}.v_proj.weight", layer_idx)))
+                .ok_or_else(|| format!("Missing v_proj for layer {}", layer_idx))?;
+            let o = get(&format!("model.layers.{}.self_attn.o_proj.weight", layer_idx))
+                .or_else(|| get(&format!("layers.{}.out_proj.weight", layer_idx)))
+                .ok_or_else(|| format!("Missing o_proj for layer {}", layer_idx))?;
+            let inorm = get(&format!("model.layers.{}.input_layernorm.weight", layer_idx))
+                .or_else(|| get(&format!("layers.{}.attn_norm.weight", layer_idx)))
+                .ok_or_else(|| format!("Missing input_norm for layer {}", layer_idx))?;
+            let pnorm = get(&format!("model.layers.{}.post_attention_layernorm.weight", layer_idx))
+                .or_else(|| get(&format!("layers.{}.ff_norm.weight", layer_idx)))
+                .ok_or_else(|| format!("Missing post_attn_norm for layer {}", layer_idx))?;
+
+            let attn = Gemma4AttnWeights {
+                q_proj: q, k_proj: k, v_proj: v, o_proj: o,
+                input_norm: inorm,
+                post_attn_norm: pnorm,
+            };
+
+            let ffn = if config.moe_layers.contains(&layer_idx) {
+                let router = get(&format!("model.layers.{}.block_sparse_moe.gate.weight", layer_idx))
+                    .or_else(|| get(&format!("layers.{}.ff_gate.weight", layer_idx)))
+                    .ok_or_else(|| format!("Missing MoE router for layer {}", layer_idx))?;
+
+                let mut expert_gates = Vec::new();
+                let mut expert_ups = Vec::new();
+                let mut expert_downs = Vec::new();
+
+                for e in 0..config.num_experts {
+                    let g = get(&format!("model.layers.{}.block_sparse_moe.experts.{}.w1.weight", layer_idx, e))
+                        .or_else(|| get(&format!("layers.{}.expert.{}.gate.weight", layer_idx, e)))
+                        .ok_or_else(|| format!("Missing expert {} gate for layer {}", e, layer_idx))?;
+                    let u = get(&format!("model.layers.{}.block_sparse_moe.experts.{}.w3.weight", layer_idx, e))
+                        .or_else(|| get(&format!("layers.{}.expert.{}.up.weight", layer_idx, e)))
+                        .ok_or_else(|| format!("Missing expert {} up for layer {}", e, layer_idx))?;
+                    let d = get(&format!("model.layers.{}.block_sparse_moe.experts.{}.w2.weight", layer_idx, e))
+                        .or_else(|| get(&format!("layers.{}.expert.{}.down.weight", layer_idx, e)))
+                        .ok_or_else(|| format!("Missing expert {} down for layer {}", e, layer_idx))?;
+                    expert_gates.push(g);
+                    expert_ups.push(u);
+                    expert_downs.push(d);
+                }
+
+                Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs }
+            } else {
+                let gate = get(&format!("model.layers.{}.mlp.gate_proj.weight", layer_idx))
+                    .or_else(|| get(&format!("layers.{}.ff_gate.weight", layer_idx)))
+                    .ok_or_else(|| format!("Missing gate_proj for layer {}", layer_idx))?;
+                let up = get(&format!("model.layers.{}.mlp.up_proj.weight", layer_idx))
+                    .or_else(|| get(&format!("layers.{}.ff_up.weight", layer_idx)))
+                    .ok_or_else(|| format!("Missing up_proj for layer {}", layer_idx))?;
+                let down = get(&format!("model.layers.{}.mlp.down_proj.weight", layer_idx))
+                    .or_else(|| get(&format!("layers.{}.ff_down.weight", layer_idx)))
+                    .ok_or_else(|| format!("Missing down_proj for layer {}", layer_idx))?;
+
+                Gemma4FfnWeights::Dense { gate_proj: gate, up_proj: up, down_proj: down }
+            };
+
+            layers.push(Gemma4LayerWeights { attn, ffn });
+        }
+
+        Ok(Self { config, embed_tokens, layers, final_norm, lm_head })
+    }
+}
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

@@ -299,7 +299,7 @@ FerrisRes requires a working Vulkan driver. On Linux the recommended path is thr
 ```bash
 nix develop          # enters the dev shell with Rust + Vulkan layers
 cargo build
-cargo test            # 637 tests
+cargo test            # 647 tests
 cargo bench
 ```
 
