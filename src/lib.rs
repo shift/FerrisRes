@@ -20,3 +20,4 @@ pub use inference::sampling::{sample_argmax, sample_temperature, sample_top_k, s
 pub use compute::turboquant::{TurboQuantConfig, TurboQuantEngine, TurboQuantError, OutlierChannelSplitter};
 pub use training::{CrossEntropyLoss, AdamOptimizer, SgdOptimizer};
 pub use training::lora::{LoraConfig, LoraLayer, LoraManager};
+pub mod server;
