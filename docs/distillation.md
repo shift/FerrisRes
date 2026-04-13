@@ -177,32 +177,72 @@ cargo run -- distill \
   --data training_data.txt \
   --output my_distilled_model \
   --log-every 50
+
+# Using GGUF format (smaller download, quantized weights)
+cargo run -- distill \
+  --model-path ./model-Q4_K_M.gguf \
+  --config e2b \
+  --model-format gguf \
+  --steps 1000
+
+# With real tokenizer for accurate perplexity
+cargo run -- distill \
+  --model-path ./model.safetensors \
+  --config e2b \
+  --tokenizer ./tokenizer.json \
+  --data training_data.txt
+
+# Resume a previously interrupted run
+cargo run -- distill \
+  --model-path ./model.safetensors \
+  --config e2b \
+  --resume my_distilled_model.checkpoint.bin \
+  --steps 2000
+
+# Non-Gemma models (LLaMA, Mistral, Phi, Qwen)
+cargo run -- distill \
+  --model-path ./llama-3.1-8b.safetensors \
+  --config llama3-8b \
+  --steps 1000
+
+cargo run -- distill \
+  --model-path ./mistral-7b.gguf \
+  --config mistral-7b \
+  --model-format gguf
 ```
 
 ### 3. Monitor Progress
 
 ```bash
 # Watch the loss curve
+# CSV now includes cosine similarity between teacher/student hidden states
 cat my_distilled_model.loss_curve.csv
-# step,kl_loss,bridge_weight,learning_rate
-# 0,2.3456,0.0000,0.00001
-# 10,2.1234,0.0012,0.00001
+# step,kl_loss,bridge_weight,learning_rate,cosine_sim_avg
+# 0,2.3456,0.0000,0.00001,0.9998
+# 10,2.1234,0.0012,0.00001,0.9985
 # ...
 
-# Plot it
+# Plot loss + cosine similarity
 python3 -c "
 import csv
 import matplotlib.pyplot as plt
 with open('my_distilled_model.loss_curve.csv') as f:
     reader = csv.DictReader(f)
-    steps, losses = [], []
+    steps, losses, cosines = [], [], []
     for row in reader:
         steps.append(int(row['step']))
         losses.append(float(row['kl_loss']))
-plt.plot(steps, losses)
-plt.xlabel('Step')
-plt.ylabel('KL Divergence Loss')
-plt.title('Distillation Progress')
+        c = row.get('cosine_sim_avg', 'n/a')
+        cosines.append(float(c) if c != 'n/a' else None)
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+ax1.plot(steps, losses)
+ax1.set_ylabel('KL Divergence Loss')
+ax1.set_title('Distillation Progress')
+valid_cos = [(s, c) for s, c in zip(steps, cosines) if c is not None]
+if valid_cos:
+    ax2.plot([s for s, _ in valid_cos], [c for _, c in valid_cos])
+    ax2.set_ylabel('Cosine Similarity')
+    ax2.set_xlabel('Step')
 plt.savefig('loss_curve.png')
 "
 ```
@@ -215,9 +255,6 @@ cargo run -- evaluate \
   --model-path ./model.safetensors \
   --config e2b \
   --text "The meaning of life is"
-
-# Compare with student (after distillation)
-# [would load distilled model + compare perplexity]
 ```
 
 ---
@@ -230,17 +267,26 @@ cargo run -- evaluate \
 Usage: ferrisres distill [OPTIONS]
 
 Required:
-  --model-path <PATH>     Path to Gemma 4 safetensors file
+  --model-path <PATH>     Path to model weights (safetensors or GGUF)
 
 Options:
-  --config <CONFIG>       Model config: e2b, e4b, 12b, 27b [default: e2b]
+  --config <CONFIG>       Model config [default: e2b]
+                          Gemma:    e2b, e4b, 12b, 27b
+                          LLaMA:    llama3-8b, llama3-70b
+                          Mistral:  mistral-7b, mixtral-8x7b
+                          Phi:      phi3-mini
+                          Qwen:     qwen2-7b
+  --model-format <FMT>    File format: safetensors or gguf [default: safetensors]
   --seq-len <N>           Training sequence length [default: 512]
   --steps <N>             Number of distillation steps [default: 1000]
   --lr <RATE>             Learning rate [default: 0.0001]
   --temperature <T>       KL divergence temperature [default: 2.0]
   --data <PATH>           Training text file (one doc per line)
+  --tokenizer <PATH>      Path to tokenizer.json (HuggingFace format)
   --output <PATH>         Output prefix [default: distilled_model]
   --log-every <N>         Log every N steps [default: 10]
+  --resume <PATH>         Resume from checkpoint file
+  --checkpoint-every <N>  Save checkpoint every N steps [default: 100]
 ```
 
 ### `evaluate`
@@ -249,7 +295,7 @@ Options:
 Usage: ferrisres evaluate --model-path <PATH> --text <TEXT>
 
 Options:
-  --config <CONFIG>       Model config: e2b, e4b [default: e2b]
+  --config <CONFIG>       Model config [default: e2b]
 ```
 
 ### `info`
@@ -359,8 +405,28 @@ Temperature 8.0:  Nearly uniform — too soft, don't use
 
 1. **KL Divergence Loss** — primary metric, should decrease monotonically
 2. **Bridge Weight** — should increase from 0 toward 0.3-0.7
-3. **Perplexity** — teacher and student should converge
-4. **Learning Rate** — verify warmup is working
+3. **Cosine Similarity** — layer-by-layer teacher vs student alignment (1.0 = perfect)
+4. **Perplexity** — teacher and student should converge
+5. **Learning Rate** — verify warmup is working
+
+### Interpreting Cosine Similarity
+
+The CSV `cosine_sim_avg` column shows the average cosine similarity across
+all layers between teacher and student hidden states. This is the most
+informative distillation quality signal:
+
+```
+cosine_sim = 1.0    →  Teacher and student are identical
+ cosine_sim = 0.99   →  Nearly identical (excellent distillation)
+cosine_sim = 0.95   →  Minor divergence (good)
+cosine_sim = 0.90   →  Moderate divergence (acceptable)
+cosine_sim = 0.80   →  Significant divergence (check learning rate)
+cosine_sim < 0.70   →  Poor — something is wrong
+```
+
+Cosine similarity is computed every 10 steps (to save compute) and
+logged as `n/a` on other steps. It measures direction alignment of the
+hidden state vectors, independent of magnitude.
 
 ### Interpreting Bridge Weight
 
@@ -398,6 +464,52 @@ Error: Layer count mismatch: config says 18, safetensors has 48
 - `gemma-4-e2b` → `--config e2b` (18 layers)
 - `gemma-4-e4b` → `--config e4b` (24 layers)
 - `gemma-4-12b` → `--config 12b` (48 layers)
+- `llama-3.1-8b` → `--config llama3-8b` (32 layers)
+- `mistral-7b` → `--config mistral-7b` (32 layers)
+- `phi-3-mini` → `--config phi3-mini` (32 layers)
+
+### "Failed to load GGUF"
+
+```
+Error: Invalid GGUF magic
+```
+
+**Fix:** Make sure you're using `--model-format gguf`:
+```bash
+cargo run -- distill --model-path ./model.gguf --config e2b --model-format gguf
+```
+
+### GGUF tensor name mismatch
+
+GGUF files use different tensor naming (`blk.N.attn_q.weight`) than
+safetensors (`model.layers.N.self_attn.q_proj.weight`). The GGUF loader
+automatically maps these via `standard_name_map()`. If tensors are missing,
+check the GGUF file's tensor names:
+
+```bash
+# Inspect GGUF metadata
+python3 -c "
+from gguf import GGUFReader
+reader = GGUFReader('model.gguf')
+for tensor in reader.tensors:
+    print(tensor.name)
+"
+```
+
+### Tokenizer not found
+
+```
+Error: Failed to read tokenizer.json
+```
+
+**Fix:** Download the tokenizer from HuggingFace:
+```bash
+wget https://huggingface.co/google/gemma-4-e2b-it/resolve/main/tokenizer.json
+```
+
+Without `--tokenizer`, the distillation uses byte-level tokenization.
+This is fine for pipeline testing but produces meaningless perplexity.
+For real distillation, always provide a tokenizer.
 
 ### "Hidden dim mismatch"
 
@@ -443,8 +555,28 @@ After distillation, the output includes:
 
 ```
 distilled_model.bin.block_summary_0.bin    # Trained Block Summary params
-distilled_model.bin.loss_curve.csv          # Loss history
+distilled_model.bin.checkpoint.bin          # Full checkpoint (for resume)
+distilled_model.bin.loss_curve.csv          # Loss + cosine similarity history
 ```
+
+### Resuming a Run
+
+If a distillation run is interrupted (OOM, Ctrl+C, crash), resume from
+the last checkpoint:
+
+```bash
+cargo run -- distill \
+  --model-path ./model.safetensors \
+  --config e2b \
+  --resume distilled_model.checkpoint.bin \
+  --steps 2000    # Total steps (not additional)
+```
+
+The checkpoint preserves:
+- Block Summary trainable parameters
+- Adam optimizer state (first/second moments, timestep)
+- Bridge weight values
+- Layer norm weights
 
 ### Deploying the Distilled Model
 
@@ -454,15 +586,26 @@ The distilled model can be loaded for O(n) inference:
 use ferrisres::model::gemma_mapper::{
     load_gemma4_model, Gemma4Config, Gemma4Student,
     BlockSummaryLayer, DistillationConfig,
+    DistillationCheckpoint,
 };
 
 // Load model
 let config = Gemma4Config::gemma4_e2b();
 let model = load_gemma4_model(path, config)?;
-let block_summaries = load_block_summaries("distilled_model.bin")?;
-let student = Gemma4Student::new(model, block_summaries, config);
+
+// Load checkpoint to restore Block Summary params
+let ckpt = DistillationCheckpoint::load("distilled_model.checkpoint.bin")?;
+let block_summaries = /* restored from ckpt */;
+
+// Or save params separately with the safetensors writer
+use ferrisres::model::safetensors::{write_safetensors, TensorToWrite, SafeDtype};
+write_safetensors(
+    Path::new("distilled_block_summaries.safetensors"),
+    &tensor_list,
+)?;
 
 // Run inference — O(n) instead of O(n²)
+let student = Gemma4Student::new(model, block_summaries, config);
 let logits = student.forward(&token_ids);
 ```
 
@@ -568,6 +711,8 @@ lm_head.weight                                         # [vocab × hidden]
 
 ### Model Configurations
 
+**Gemma 4:**
+
 | Parameter | E2B | E4B | 12B | 27B |
 |:----------|:----|:----|:----|:-----|
 | hidden_dim | 2048 | 2560 | 4096 | 4608 |
@@ -583,16 +728,32 @@ lm_head.weight                                         # [vocab × hidden]
 | MoE layers | none | 6,12,18 | every other | every other |
 | FP16 size | ~4 GB | ~8 GB | ~24 GB | ~54 GB |
 
+**Other supported architectures:**
+
+| Model | `--config` | hidden | layers | params | Notes |
+|:------|:----------|:-------|:-------|:-------|:------|
+| LLaMA 3.1 8B | `llama3-8b` | 4096 | 32 | ~8B | Dense |
+| LLaMA 3.1 70B | `llama3-70b` | 8192 | 80 | ~70B | Dense |
+| Mistral 7B | `mistral-7b` | 4096 | 32 | ~7B | Dense |
+| Mixtral 8x7B | `mixtral-8x7b` | 4096 | 32 | ~47B | 8 experts |
+| Phi-3 Mini | `phi3-mini` | 3072 | 32 | ~3.8B | Dense |
+| Qwen 2.5 7B | `qwen2-7b` | 3584 | 28 | ~7B | Dense |
+
+All models use the same RMSNorm + GQA + SwiGLU architecture and are
+compatible with both safetensors and GGUF loading.
+
 ---
 
 ## File Reference
 
 | File | Purpose |
 |:-----|:--------|
-| `src/model/gemma_mapper.rs` | Core distillation logic (~3000 LOC) |
+| `src/model/gemma_mapper.rs` | Core distillation logic (~3500 LOC) |
+| `src/model/safetensors.rs` | Weight loading + **safetensors writer** |
+| `src/model/gguf.rs` | GGUF weight loading + dequantization |
+| `src/model/tokenizer.rs` | SimpleTokenizer, BpeTokenizer, **HfTokenizer** |
 | `src/autodiff/graph.rs` | BlockSummaryCrossAttn node |
 | `src/autodiff/backward.rs` | Backward pass for Block Summary |
-| `src/model/safetensors.rs` | Weight loading |
 | `src/main.rs` | CLI entry points |
 
 ---
@@ -600,9 +761,16 @@ lm_head.weight                                         # [vocab × hidden]
 ## FAQ
 
 **Q: Can I use this with non-Gemma models (LLaMA, Mistral)?**
-A: The weight loader expects Gemma 4 naming, but the architecture is
-similar to LLaMA. You'd need to adjust `Gemma4TensorNames` for your model.
-The Block AttnRes conversion itself is model-agnostic.
+A: Yes! The pipeline now supports LLaMA 3, Mistral, Mixtral, Phi-3, and
+Qwen 2 out of the box. Use `--config llama3-8b`, `--config mistral-7b`,
+`--config phi3-mini`, or `--config qwen2-7b`. All share the same
+RMSNorm + GQA + SwiGLU architecture.
+
+**Q: Can I use GGUF files instead of safetensors?**
+A: Yes. Use `--model-format gguf` and point to any GGUF file. The loader
+supports Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K quantization formats,
+automatically dequantizing to F32 for the teacher/student forward pass.
+GGUF files are typically 2-4× smaller than FP16 safetensors.
 
 **Q: How long does distillation take?**
 A: E2B on CPU: ~30-60 minutes for 1000 steps. With GPU: ~5-10 minutes.
@@ -613,9 +781,15 @@ A: The most common issue is learning rate. Start with 0.0001, try
 0.0005 if it's too slow, or 0.00001 if it oscillates.
 
 **Q: Can I resume a distillation run?**
-A: Currently no — the checkpoint format only saves Block Summary params,
-not optimizer state. This is a known limitation. Workaround: reduce
-`--steps` and run multiple times.
+A: Yes. Use `--resume <checkpoint.bin>` to restore the full training state
+including Adam optimizer moments and Block Summary parameters. The
+checkpoint is saved automatically at the end of each run.
+
+**Q: Do I need a tokenizer?**
+A: For testing the pipeline, no — it uses byte-level fallback. For real
+distillation with meaningful perplexity, yes — use `--tokenizer tokenizer.json`
+with a HuggingFace tokenizer file. Without it, perplexity numbers are
+not comparable to published benchmarks.
 
 **Q: What's the minimum data needed?**
 A: ~50K tokens (a few MB). Quality matters more than quantity — use
@@ -625,3 +799,9 @@ Wikitext or C4, not random web text.
 A: At step 0: yes, identical to teacher. After distillation: 95-99%
 of teacher quality, measured by perplexity. The 1-5% loss is the trade
 for O(n) scaling.
+
+**Q: What does cosine similarity tell me?**
+A: It measures how similar the teacher and student hidden states are at
+each layer. A value of 1.0 = identical, 0.99+ = excellent. If it drops
+below 0.90, the Block Summary is compressing too aggressively — reduce
+learning rate or increase temperature.
