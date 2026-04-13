@@ -1,0 +1,328 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  # Suppress wgpu Vulkan linking on platforms that don't need it
+  RUSTFLAGS: ""
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Build matrix ──────────────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 (glibc)
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            features: vulkan
+            artifact: ferrisres-x86_64-linux
+            build_flags: ""
+
+          # Linux x86_64 (musl — fully static)
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            features: vulkan
+            artifact: ferrisres-x86_64-linux-musl
+            build_flags: ""
+
+          # Linux aarch64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            features: vulkan
+            artifact: ferrisres-aarch64-linux
+            build_flags: ""
+
+          # macOS Apple Silicon
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            features: metal
+            artifact: ferrisres-aarch64-macos
+            build_flags: ""
+
+          # macOS Intel
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            features: metal
+            artifact: ferrisres-x86_64-macos
+            build_flags: ""
+
+          # Windows x86_64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            features: dx12
+            artifact: ferrisres-x86_64-windows
+            build_flags: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # ── Linux cross-compilation deps ─────────────────────────────
+      - name: Install cross-compilation tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            gcc-multilib
+
+          # musl target
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            sudo apt-get install -y musl-tools
+          fi
+
+          # aarch64 cross-compiler
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            sudo apt-get install -y \
+              gcc-aarch64-linux-gnu \
+              g++-aarch64-linux-gnu \
+              libc6-dev-arm64-cross
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          fi
+
+      # ── macOS deps ───────────────────────────────────────────────
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          # Xcode should be pre-installed; Metal SDK comes with it
+          xcode-select -p || xcode-select --install
+
+      # ── Windows deps ─────────────────────────────────────────────
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # DirectX 12 SDK is part of Windows SDK (pre-installed)
+          # Ensure we have the right linker
+          rustup target add ${{ matrix.target }}
+
+      # ── Build ────────────────────────────────────────────────────
+      - name: Build release binary
+        run: |
+          cargo build --release --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }} ${{ matrix.build_flags }}
+
+      # ── Package ──────────────────────────────────────────────────
+      - name: Package binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -e
+          BINARY="target/${{ matrix.target }}/release/ferrisres"
+          chmod +x "$BINARY"
+          cp "$BINARY" "${{ matrix.artifact }}"
+          # Strip debug symbols for smaller binary
+          strip "${{ matrix.artifact }}" 2>/dev/null || true
+          # Create tarball
+          tar czf "${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
+          # SHA256
+          shasum -a 256 "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.tar.gz.sha256"
+
+      - name: Package binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $binary = "target/${{ matrix.target }}/release/ferrisres.exe"
+          Copy-Item $binary "${{ matrix.artifact }}.exe"
+          Compress-Archive -Path "${{ matrix.artifact }}.exe" -DestinationPath "${{ matrix.artifact }}.zip"
+          $hash = (Get-FileHash "${{ matrix.artifact }}.zip" -Algorithm SHA256).Hash
+          "$hash  ${{ matrix.artifact }}.zip" | Out-File -Encoding utf8 "${{ matrix.artifact }}.zip.sha256"
+
+      - name: Print binary info (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          file "${{ matrix.artifact }}" || true
+          ls -lh "${{ matrix.artifact }}.tar.gz"
+          cat "${{ matrix.artifact }}.tar.gz.sha256"
+
+      - name: Print binary info (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Item "${{ matrix.artifact }}.exe" | Select-Object Length
+          Get-Content "${{ matrix.artifact }}.zip.sha256"
+
+      # ── Upload artifact ──────────────────────────────────────────
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
+            ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.zip.sha256
+          retention-days: 5
+          if-no-files-found: ignore
+
+  # ── Tests ─────────────────────────────────────────────────────────
+  test:
+    name: Test suite
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev
+
+      - name: Run tests
+        run: cargo test --lib --no-default-features --features vulkan -- -D warnings
+
+      - name: Run clippy
+        run: cargo clippy --no-default-features --features vulkan -- -D warnings
+
+  # ── Create GitHub Release ─────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-22.04
+    needs: [build, test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts/
+          merge-multiple: false
+
+      - name: List artifacts
+        run: find release-artifacts/ -type f | sort
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          cat > release_notes.md << 'HEADER'
+          ## FerrisRes — Block AttnRes Runtime
+
+          O(n) linear-time transformer inference and training.
+
+          ### Downloads
+
+          | Platform | File | Notes |
+          |:---------|:-----|:------|
+          | Linux x86_64 (glibc) | `ferrisres-x86_64-linux.tar.gz` | Most common Linux |
+          | Linux x86_64 (musl) | `ferrisres-x86_64-linux-musl.tar.gz` | Fully static, Alpine-compatible |
+          | Linux ARM64 | `ferrisres-aarch64-linux.tar.gz` | ARM servers, Raspberry Pi 5 |
+          | macOS Apple Silicon | `ferrisres-aarch64-macos.tar.gz` | M1/M2/M3/M4 Macs |
+          | macOS Intel | `ferrisres-x86_64-macos.tar.gz` | Older Intel Macs |
+          | Windows x86_64 | `ferrisres-x86_64-windows.zip` | Windows 10/11 |
+
+          ### Quick Start
+
+          ```bash
+          # Linux/macOS
+          tar xzf ferrisres-$(uname -m)-$(uname -s | tr A-Z a-z).tar.gz
+          ./ferrisres info
+          ./ferrisres distill --model-path model.safetensors --config e2b
+
+          # Windows
+          Expand-Archive ferrisres-x86_64-windows.zip
+          .\ferrisres.exe info
+          ```
+
+          ### Verify Download
+
+          ```bash
+          shasum -a 256 -c ferrisres-*.sha256
+          ```
+
+          ### Supported Models
+
+          Gemma 4 (E2B/E4B/12B/27B), LLaMA 3.1, Mistral 7B, Mixtral 8x7B,
+          Phi-3 Mini, Qwen 2.5 — via safetensors or GGUF format.
+
+          ---
+
+          **Full Changelog**: https://github.com/shift/FerrisRes/compare/...$TAG
+          HEADER
+
+          sed -i "s|\$TAG|$TAG|g" release_notes.md
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.notes.outputs.tag }}
+          name: FerrisRes ${{ steps.notes.outputs.tag }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ contains(steps.notes.outputs.tag, '-alpha') || contains(steps.notes.outputs.tag, '-beta') || contains(steps.notes.outputs.tag, '-rc') }}
+          files: |
+            release-artifacts/**/*.tar.gz
+            release-artifacts/**/*.sha256
+            release-artifacts/**/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Verify release ────────────────────────────────────────────────
+  verify:
+    name: Verify Release Artifacts
+    runs-on: ubuntu-22.04
+    needs: [release]
+    steps:
+      - name: Fetch release info
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "Checking release for tag: $TAG"
+
+          # Get release assets via GitHub API
+          RELEASE_ID=$(gh api repos/${{ github.repository }}/releases/tags/$TAG --jq '.id')
+          echo "Release ID: $RELEASE_ID"
+
+          # List all assets
+          ASSETS=$(gh api repos/${{ github.repository }}/releases/$RELEASE_ID/assets --jq '.[].name')
+          echo "Assets found:"
+          echo "$ASSETS"
+
+          # Verify we have expected assets (at least the platforms that should build)
+          EXPECTED="x86_64-linux x86_64-linux-musl aarch64-linux aarch64-macos x86_64-macos x86_64-windows"
+          MISSING=0
+          for platform in $EXPECTED; do
+            if echo "$ASSETS" | grep -q "$platform"; then
+              echo "  ✅ $platform found"
+            else
+              echo "  ❌ $platform MISSING"
+              MISSING=$((MISSING + 1))
+            fi
+          done
+
+          # Check SHA256 files exist
+          SHA_COUNT=$(echo "$ASSETS" | grep -c "\.sha256" || true)
+          echo "SHA256 checksum files: $SHA_COUNT"
+
+          if [ $MISSING -gt 0 ]; then
+            echo "WARNING: $MISSING platform(s) missing from release"
+          fi
+
+          # Verify asset sizes are non-trivial
+          echo ""
+          echo "Asset sizes:"
+          gh api repos/${{ github.repository }}/releases/$RELEASE_ID/assets --jq '.[] | "  \(.name): \(.size / 1024 / 1024 * 100 | floor / 100) MB"'
