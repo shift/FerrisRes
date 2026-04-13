@@ -16,6 +16,7 @@ pub mod standard_transformer;
 pub mod dispatcher;
 pub mod audio;
 pub mod vqvae;
+pub mod streaming_image;
 
 pub use config::BlockAttnResConfig;
 pub use linear::Linear;
