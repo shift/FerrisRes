@@ -7,6 +7,7 @@ pub mod turboquant;
 pub mod async_pipeline;
 pub mod distributed;
 pub mod hardware;
+pub mod transport;
 
 pub use pipeline::WgpuCompute;
 pub use buffer::GpuBuffer;

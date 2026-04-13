@@ -14,12 +14,11 @@
 //! The computation of tile N's forward pass can overlap with the
 //! accumulation of tile N-1's gradients (pipeline parallelism).
 
-use std::sync::Arc;
-use wgpu::{Device, Queue};
-
 use crate::compute::buffer::GpuBuffer;
 use crate::compute::kernels::elementwise::ElementWiseOp;
 use crate::error::Result;
+use std::sync::Arc;
+use wgpu::{Device, Queue};
 
 // ---------------------------------------------------------------------------
 // GradientTileConfig
@@ -125,7 +124,10 @@ impl GradientAccumulator {
         self.tiles_accumulated = 0;
     }
 
-    /// Accumulate a tile's gradient into the master buffer.
+    /// Accumulate a tile's gradient into the master buffer at the correct offset.
+    ///
+    /// Uses copy-to-temp → add → copy-back pattern since wgpu bind groups
+    /// don't support dynamic buffer offsets for storage buffers.
     pub fn accumulate(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -134,27 +136,32 @@ impl GradientAccumulator {
     ) -> Result<()> {
         let tile_size = self.config.tile_size_for(tile_idx);
         let hidden_dim = self.config.hidden_dim;
-        let f32_size = std::mem::size_of::<f32>();
+        let numel = (tile_size * hidden_dim) as u32;
+        let offset_bytes = tile_idx * self.config.tile_size * hidden_dim * std::mem::size_of::<f32>();
 
         if tile_idx == 0 && self.config.zero_before_accumulate {
             self.zero(encoder);
         }
 
-        // Add tile gradient to accumulated at the correct offset
-        let offset = tile_idx * self.config.tile_size * hidden_dim * f32_size;
-        let numel = tile_size * hidden_dim;
+        // Copy the relevant region from accumulated to a temp buffer
+        let tmp = GpuBuffer::new(&self.device, (numel as usize) * std::mem::size_of::<f32>(), Some("accum_tmp"))?;
+        encoder.copy_buffer_to_buffer(
+            self.accumulated.buffer(), offset_bytes as u64,
+            tmp.buffer(), 0,
+            (numel as usize * std::mem::size_of::<f32>()) as u64,
+        );
 
-        // Use add with offset: accumulated[offset..] += tile_gradient[0..tile_size*hidden_dim]
-        self.elementwise.dispatch_add(
-            encoder,
-            &self.accumulated, // This needs sub-buffer support
-            tile_gradient,
-            &self.accumulated,
-            numel as u32,
-        )?;
+        // Add tile gradient: tmp = tmp + tile_gradient
+        self.elementwise.dispatch_add(encoder, &tmp, tile_gradient, &tmp, numel)?;
+
+        // Copy result back to accumulated at the correct offset
+        encoder.copy_buffer_to_buffer(
+            tmp.buffer(), 0,
+            self.accumulated.buffer(), offset_bytes as u64,
+            (numel as usize * std::mem::size_of::<f32>()) as u64,
+        );
 
         self.tiles_accumulated += 1;
-        let _ = offset; // For future sub-buffer accumulation
         Ok(())
     }
 

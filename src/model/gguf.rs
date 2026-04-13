@@ -152,13 +152,19 @@ impl GgmlType {
             // Q8_0: 2 bytes scale + 32 bytes quants
             Self::Q8_0 => 34,
             Self::Q8_1 => 40,
-            // K-quants use super-blocks of 256
-            Self::Q2K => 256 / 16 * 2 + 256 / 4, // simplified
-            Self::Q3K => 256,
-            Self::Q4K => 144 + 2 + 2 + 12, // scales + d + dmin + qs
-            Self::Q5K => 144 + 2 + 2 + 32 + 12,
-            Self::Q6K => 210 + 2 + 2 + 16,
-            Self::Q8K => 256 * 4 + 4 + 2 + 2,
+            // K-quants use super-blocks of 256 elements (QK_K = 256)
+            // Q2_K: d(2) + dmin(2) + scales[16] + qs[64] = 84
+            Self::Q2K => 84,
+            // Q3_K: d(2) + hmask[32] + qs[64] + scales[12] = 110
+            Self::Q3K => 110,
+            // Q4_K: d(2) + dmin(2) + scales[12] + qs[128] = 144
+            Self::Q4K => 144,
+            // Q5_K: d(2) + dmin(2) + scales[12] + qh[32] + qs[128] = 176
+            Self::Q5K => 176,
+            // Q6_K: ql[128] + qh[64] + scales[16] + d(2) = 210
+            Self::Q6K => 210,
+            // Q8_K: d(2) + dmin(2) + qs[256] = 292 (approximate)
+            Self::Q8K => 292,
             _ => 4,
         }
     }
@@ -383,140 +389,254 @@ fn dequantize_q4_0(raw: &[u8], n_elements: usize) -> Vec<f32> {
     out
 }
 
-/// Dequantize Q4_K (super-block of 256).
-/// Simplified: treat as Q4_0-like with per-subgroup scales.
-fn dequantize_q4_k(raw: &[u8], n_elements: usize) -> Vec<f32> {
-    // Q4_K super-block layout (256 values):
-    //   scales: 12 bytes (6-bit packed), qs: 128 bytes (4 bits each),
-    //   d: f16, dmin: f16
-    // For simplicity, dequantize as Q4_0 approximation
+/// Helper: extract scale and min from Q4_K/Q5_K packed scales.
+/// The 12-byte scales array encodes 8 scale+min pairs using 6-bit packing.
+/// Reference: llama.cpp ggml-quants.c get_scale_min_k4()
+#[inline]
+fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
+    let (sc, m) = if j < 4 {
+        (scales[j] & 63, scales[j + 4] & 63)
+    } else {
+        let d = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
+        let m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+        (d, m)
+    };
+    (sc, m)
+}
+
+/// Bit-accurate Q2_K dequantization.
+/// Block layout (84 bytes, 256 elements):
+///   scales[16]: scale/min pairs, 4 bits each
+///   qs[64]: 2-bit quantized values
+///   d: f16 super-block scale
+///   dmin: f16 super-block min scale
+/// Reference: llama.cpp dequantize_row_q2_K()
+fn dequantize_q2_k(raw: &[u8], n_elements: usize) -> Vec<f32> {
     let block_size = 256usize;
+    let bytes_per_block = 84usize; // scales(16) + qs(64) + d(2) + dmin(2)
     let n_blocks = (n_elements + block_size - 1) / block_size;
     let mut out = Vec::with_capacity(n_elements);
 
     for b in 0..n_blocks {
-        let block_start = b * 160; // approximate bytes per Q4_K super-block
-        if block_start + 160 > raw.len() {
-            // Fallback: zero-fill remaining
-            for i in 0..block_size {
-                if b * block_size + i < n_elements {
-                    out.push(0.0);
-                }
-            }
+        let bs = b * bytes_per_block;
+        if bs + bytes_per_block > raw.len() {
+            let remaining = n_elements.saturating_sub(b * block_size);
+            out.extend(std::iter::repeat(0.0f32).take(remaining));
             continue;
         }
-        let d = f16_to_f32(u16::from_le_bytes([raw[block_start + 144], raw[block_start + 145]]));
-        let _dmin = f16_to_f32(u16::from_le_bytes([raw[block_start + 146], raw[block_start + 147]]));
 
-        // Skip scale unpacking (complex 6-bit), use d as global scale
-        let qs_start = block_start + 12; // after scales
-        for i in 0..block_size {
-            let idx = b * block_size + i;
-            if idx >= n_elements {
-                break;
-            }
-            let byte_idx = i / 2;
-            let nibble = if byte_idx < 128 {
-                if i % 2 == 0 {
-                    raw[qs_start + byte_idx] & 0x0F
-                } else {
-                    (raw[qs_start + byte_idx] >> 4) & 0x0F
+        // Layout: scales[0..16] + qs[0..64] + d(f16) + dmin(f16)
+        let d = f16_to_f32(u16::from_le_bytes([raw[bs + 80], raw[bs + 81]]));
+        let min = f16_to_f32(u16::from_le_bytes([raw[bs + 82], raw[bs + 83]]));
+
+        let mut is = 0usize;
+        let mut q_offset = 16usize; // qs starts after scales
+
+        for _n in (0..block_size).step_by(128) {
+            let mut shift = 0u32;
+            for _j in 0..4 {
+                let sc = raw[bs + is];
+                is += 1;
+                let dl = d * (sc & 0xF) as f32;
+                let ml = min * (sc >> 4) as f32;
+                for l in 0..16 {
+                    let q_val = ((raw[bs + q_offset + l] >> shift) & 3) as i8;
+                    out.push(dl * q_val as f32 - ml);
                 }
-            } else {
-                0
-            };
-            out.push((nibble as f32 - 8.0) * d);
+
+                let sc = raw[bs + is];
+                is += 1;
+                let dl = d * (sc & 0xF) as f32;
+                let ml = min * (sc >> 4) as f32;
+                for l in 0..16 {
+                    let q_val = ((raw[bs + q_offset + l + 16] >> shift) & 3) as i8;
+                    out.push(dl * q_val as f32 - ml);
+                }
+
+                shift += 2;
+            }
+            q_offset += 32;
         }
     }
+
+    out.truncate(n_elements);
     out
 }
 
-/// Dequantize Q5_K (super-block of 256).
+/// Bit-accurate Q4_K dequantization.
+/// Block layout (144 bytes, 256 elements):
+///   d: f16 super-block scale
+///   dmin: f16 super-block min scale
+///   scales[12]: 6-bit packed scale+min pairs (8 sub-blocks)
+///   qs[128]: 4-bit quantized values
+/// Reference: llama.cpp dequantize_row_q4_K()
+fn dequantize_q4_k(raw: &[u8], n_elements: usize) -> Vec<f32> {
+    let block_size = 256usize;
+    let bytes_per_block = 144usize;
+    let n_blocks = (n_elements + block_size - 1) / block_size;
+    let mut out = Vec::with_capacity(n_elements);
+
+    for b in 0..n_blocks {
+        let bs = b * bytes_per_block;
+        if bs + bytes_per_block > raw.len() {
+            let remaining = n_elements.saturating_sub(b * block_size);
+            out.extend(std::iter::repeat(0.0f32).take(remaining));
+            continue;
+        }
+
+        // Layout: d(2) + dmin(2) + scales(12) + qs(128)
+        let d = f16_to_f32(u16::from_le_bytes([raw[bs], raw[bs + 1]]));
+        let min = f16_to_f32(u16::from_le_bytes([raw[bs + 2], raw[bs + 3]]));
+
+        let qs_start = bs + 4 + 12; // qs starts after d+dmin+scales
+        let mut is = 0usize;
+
+        for j in (0..block_size).step_by(64) {
+            let (sc1, m1) = get_scale_min_k4(is, &raw[bs + 4..bs + 16]);
+            let d1 = d * sc1 as f32;
+            let m1 = min * m1 as f32;
+            is += 1;
+
+            let (sc2, m2) = get_scale_min_k4(is, &raw[bs + 4..bs + 16]);
+            let d2 = d * sc2 as f32;
+            let m2 = min * m2 as f32;
+            is += 1;
+
+            let q_base = qs_start + (j / 2); // Each byte holds 2 nibbles
+            for l in 0..32 {
+                out.push(d1 * (raw[q_base + l] & 0x0F) as f32 - m1);
+            }
+            for l in 0..32 {
+                out.push(d2 * (raw[q_base + l] >> 4) as f32 - m2);
+            }
+        }
+    }
+
+    out.truncate(n_elements);
+    out
+}
+
+/// Bit-accurate Q5_K dequantization.
+/// Block layout (176 bytes, 256 elements):
+///   d: f16 super-block scale
+///   dmin: f16 super-block min scale
+///   scales[12]: 6-bit packed scale+min pairs (8 sub-blocks)
+///   qh[32]: high bits (5th bit per element)
+///   qs[128]: low 4 bits per element
+/// Reference: llama.cpp dequantize_row_q5_K()
 fn dequantize_q5_k(raw: &[u8], n_elements: usize) -> Vec<f32> {
     let block_size = 256usize;
+    let bytes_per_block = 176usize;
     let n_blocks = (n_elements + block_size - 1) / block_size;
     let mut out = Vec::with_capacity(n_elements);
 
     for b in 0..n_blocks {
-        let block_start = b * 208; // approximate Q5_K block size
-        if block_start + 208 > raw.len() {
-            for i in 0..block_size {
-                if b * block_size + i < n_elements {
-                    out.push(0.0);
-                }
-            }
+        let bs = b * bytes_per_block;
+        if bs + bytes_per_block > raw.len() {
+            let remaining = n_elements.saturating_sub(b * block_size);
+            out.extend(std::iter::repeat(0.0f32).take(remaining));
             continue;
         }
-        let d = f16_to_f32(u16::from_le_bytes([raw[block_start + 176], raw[block_start + 177]]));
 
-        // Q5_K: 128 bytes qs (4-bit) + 32 bytesqh (5th bits) + scales + d
-        let qs_start = block_start + 12;
-        let qh_start = block_start + 140;
-        for i in 0..block_size {
-            let idx = b * block_size + i;
-            if idx >= n_elements {
-                break;
+        // Layout: d(2) + dmin(2) + scales(12) + qh(32) + qs(128)
+        let d = f16_to_f32(u16::from_le_bytes([raw[bs], raw[bs + 1]]));
+        let min = f16_to_f32(u16::from_le_bytes([raw[bs + 2], raw[bs + 3]]));
+        let scales_start = bs + 4;
+        let qh_start = bs + 4 + 12;
+        let qs_start = bs + 4 + 12 + 32;
+
+        let mut is = 0usize;
+        let mut u1 = 1u8;
+        let mut u2 = 2u8;
+
+        for j in (0..block_size).step_by(64) {
+            let (sc1, m1) = get_scale_min_k4(is, &raw[scales_start..scales_start + 12]);
+            let d1 = d * sc1 as f32;
+            let m1 = min * m1 as f32;
+
+            let (sc2, m2) = get_scale_min_k4(is + 1, &raw[scales_start..scales_start + 12]);
+            let d2 = d * sc2 as f32;
+            let m2 = min * m2 as f32;
+            is += 2;
+
+            let ql_base = qs_start + (j / 2);
+            let qh_base = qh_start + (j / 8); // 1 bit per element, but packed differently
+
+            for l in 0..32 {
+                let low4 = raw[ql_base + l] & 0x0F;
+                let high = if raw[qh_base + l] & u1 != 0 { 16 } else { 0 };
+                out.push(d1 * (low4 + high) as f32 - m1);
             }
-            let byte_idx = i / 2;
-            let low4 = if byte_idx < 128 {
-                if i % 2 == 0 {
-                    raw[qs_start + byte_idx] & 0x0F
-                } else {
-                    (raw[qs_start + byte_idx] >> 4) & 0x0F
-                }
-            } else {
-                0
-            };
-            let bit5 = if i < 256 {
-                (raw[qh_start + i / 8] >> (i % 8)) & 1
-            } else {
-                0
-            };
-            let q = (low4 as f32 + (bit5 as f32) * 16.0) - 16.0;
-            out.push(q * d);
+            for l in 0..32 {
+                let low4 = raw[ql_base + l] >> 4;
+                let high = if raw[qh_base + l] & u2 != 0 { 16 } else { 0 };
+                out.push(d2 * (low4 + high) as f32 - m2);
+            }
+
+            u1 <<= 2;
+            u2 <<= 2;
         }
     }
+
+    out.truncate(n_elements);
     out
 }
 
-/// Dequantize Q6_K (super-block of 256).
+/// Bit-accurate Q6_K dequantization.
+/// Block layout (210 bytes, 256 elements):
+///   ql[128]: lower 4 bits
+///   qh[64]: upper 2 bits
+///   scales[16]: int8 per-sub-block scales
+///   d: f16 super-block scale
+/// Reference: llama.cpp dequantize_row_q6_K()
 fn dequantize_q6_k(raw: &[u8], n_elements: usize) -> Vec<f32> {
     let block_size = 256usize;
+    let bytes_per_block = 210usize;
     let n_blocks = (n_elements + block_size - 1) / block_size;
     let mut out = Vec::with_capacity(n_elements);
 
     for b in 0..n_blocks {
-        let block_start = b * 210;
-        if block_start + 210 > raw.len() {
-            for i in 0..block_size {
-                if b * block_size + i < n_elements {
-                    out.push(0.0);
-                }
-            }
+        let bs = b * bytes_per_block;
+        if bs + bytes_per_block > raw.len() {
+            let remaining = n_elements.saturating_sub(b * block_size);
+            out.extend(std::iter::repeat(0.0f32).take(remaining));
             continue;
         }
-        let d = f16_to_f32(u16::from_le_bytes([raw[block_start + 208], raw[block_start + 209]]));
 
-        // Q6_K: ql (128 bytes), qh (64 bytes), scales (16 bytes), d (2 bytes)
-        let ql_start = block_start;
-        let qh_start = block_start + 128;
-        for i in 0..block_size {
-            let idx = b * block_size + i;
-            if idx >= n_elements {
-                break;
+        // Layout: ql(128) + qh(64) + scales(16) + d(2)
+        let d = f16_to_f32(u16::from_le_bytes([raw[bs + 208], raw[bs + 209]]));
+        let ql_start = bs;
+        let qh_start = bs + 128;
+        let sc_start = bs + 192;
+
+        let mut _y_off = 0usize;
+        let mut ql_off = 0usize;
+        let mut qh_off = 0usize;
+        let mut sc_off = 0usize;
+
+        for _n in (0..block_size).step_by(128) {
+            for l in 0..32 {
+                let is_idx = l / 16;
+
+                let q1 = (((raw[ql_start + ql_off + l] & 0x0F) as i32) | (((raw[qh_start + qh_off + l] >> 0) & 3) as i32) << 4) - 32;
+                let q2 = (((raw[ql_start + ql_off + l + 32] & 0x0F) as i32) | (((raw[qh_start + qh_off + l] >> 2) & 3) as i32) << 4) - 32;
+                let q3 = (((raw[ql_start + ql_off + l] >> 4) as i32) | (((raw[qh_start + qh_off + l] >> 4) & 3) as i32) << 4) - 32;
+                let q4 = (((raw[ql_start + ql_off + l + 32] >> 4) as i32) | (((raw[qh_start + qh_off + l] >> 6) & 3) as i32) << 4) - 32;
+
+                let sc = &raw[sc_start..sc_start + 16];
+                out.push(d * sc[sc_off + is_idx + 0] as f32 * q1 as f32);
+                out.push(d * sc[sc_off + is_idx + 2] as f32 * q2 as f32);
+                out.push(d * sc[sc_off + is_idx + 4] as f32 * q3 as f32);
+                out.push(d * sc[sc_off + is_idx + 6] as f32 * q4 as f32);
             }
-            let q = if i < 128 {
-                let l = raw[ql_start + i] as i32;
-                (l - 32) as f32 * d
-            } else if i < 256 {
-                let h = raw[qh_start + (i - 128)] as i32;
-                (h - 32) as f32 * d
-            } else {
-                0.0
-            };
-            out.push(q);
+            _y_off += 128;
+            ql_off += 64;
+            qh_off += 32;
+            sc_off += 8;
         }
     }
+
+    out.truncate(n_elements);
     out
 }
 
@@ -582,6 +702,7 @@ fn dequantize(raw: &[u8], ggml_type: GgmlType, n_elements: usize) -> Result<Vec<
         }
         GgmlType::Q8_0 => Ok(dequantize_q8_0(raw, n_elements)),
         GgmlType::Q4_0 => Ok(dequantize_q4_0(raw, n_elements)),
+        GgmlType::Q2K => Ok(dequantize_q2_k(raw, n_elements)),
         GgmlType::Q4K => Ok(dequantize_q4_k(raw, n_elements)),
         GgmlType::Q5K => Ok(dequantize_q5_k(raw, n_elements)),
         GgmlType::Q6K => Ok(dequantize_q6_k(raw, n_elements)),
