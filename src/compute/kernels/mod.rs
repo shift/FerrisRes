@@ -12,6 +12,7 @@ pub mod causal_mask;
 pub mod prefill_attn;
 pub mod turboquant_kernels;
 pub mod fft;
+pub mod conv3d;
 
 pub use turboquant_kernels::TURBOQUANT_WGSL;
 pub use fused_patch_embed::FusedPatchEmbedOp;
