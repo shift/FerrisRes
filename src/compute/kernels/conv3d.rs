@@ -366,6 +366,59 @@ fn spatial_conv(
 "#;
 
 // ---------------------------------------------------------------------------
+// GPU dispatch operations
+// ---------------------------------------------------------------------------
+
+/// GPU dispatch operation for factored Conv3D.
+pub struct Conv3DGpuOp {
+    config: Conv3DConfig,
+}
+
+impl Conv3DGpuOp {
+    /// Create from a Conv3DConfig.
+    pub fn new(config: Conv3DConfig) -> Self {
+        Self { config }
+    }
+
+    /// Get the temporal conv WGSL source.
+    pub fn temporal_shader(&self) -> &str { TEMPORAL_CONV_WGSL }
+
+    /// Get the spatial conv WGSL source.
+    pub fn spatial_shader(&self) -> &str { SPATIAL_CONV_WGSL }
+
+    /// Temporal dispatch entry point.
+    pub fn temporal_entry_point(&self) -> &str { "temporal_conv" }
+
+    /// Spatial dispatch entry point.
+    pub fn spatial_entry_point(&self) -> &str { "spatial_conv" }
+
+    /// Temporal workgroup count.
+    pub fn temporal_workgroup(&self, batch: u32, time_out: u32) -> (u32, u32, u32) {
+        let wg = 64u32;
+        ((batch * time_out + wg - 1) / wg, 1, 1)
+    }
+
+    /// Spatial workgroup count.
+    pub fn spatial_workgroup(&self, batch: u32, h_out: u32, w_out: u32) -> (u32, u32, u32) {
+        let wg = 64u32;
+        ((batch * h_out * w_out + wg - 1) / wg, 1, 1)
+    }
+
+    /// CPU fallback forward pass.
+    pub fn forward_cpu(
+        &self,
+        input: &[f32],
+        shape: (usize, usize, usize, usize),
+    ) -> crate::error::Result<Vec<f32>> {
+        let conv = FactoredConv3D::new(self.config.clone());
+        conv.forward(input, shape)
+    }
+
+    /// Get config reference.
+    pub fn config(&self) -> &Conv3DConfig { &self.config }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -460,5 +513,40 @@ mod tests {
         assert!(TEMPORAL_CONV_WGSL.contains("temporal_conv"));
         assert!(!SPATIAL_CONV_WGSL.is_empty());
         assert!(SPATIAL_CONV_WGSL.contains("spatial_conv"));
+    }
+
+    #[test]
+    fn test_conv3d_gpu_op_creation() {
+        let config = Conv3DConfig::conv3x3x3(3, 16);
+        let op = Conv3DGpuOp::new(config);
+        assert_eq!(op.temporal_entry_point(), "temporal_conv");
+        assert_eq!(op.spatial_entry_point(), "spatial_conv");
+    }
+
+    #[test]
+    fn test_conv3d_gpu_op_shaders() {
+        let config = Conv3DConfig::conv3x3x3(3, 16);
+        let op = Conv3DGpuOp::new(config);
+        assert!(op.temporal_shader().contains("temporal_conv"));
+        assert!(op.spatial_shader().contains("spatial_conv"));
+    }
+
+    #[test]
+    fn test_conv3d_gpu_op_workgroup() {
+        let config = Conv3DConfig::conv3x3x3(3, 16);
+        let op = Conv3DGpuOp::new(config);
+        let (x, _, _) = op.temporal_workgroup(2, 10);
+        assert!(x > 0);
+        let (x2, _, _) = op.spatial_workgroup(2, 8, 8);
+        assert!(x2 > 0);
+    }
+
+    #[test]
+    fn test_conv3d_gpu_op_cpu_fallback() {
+        let config = Conv3DConfig::conv3x3x3(1, 2);
+        let op = Conv3DGpuOp::new(config);
+        let input = vec![1.0f32; 1 * 3 * 3 * 3]; // batch=1, t=3, h=3, w=3
+        let result = op.forward_cpu(&input, (1, 3, 3, 3));
+        assert!(result.is_ok());
     }
 }

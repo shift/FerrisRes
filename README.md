@@ -79,6 +79,7 @@ The `TokenGenerator` orchestrates both phases and exposes `generate_stream` for 
 - **SGD / Adam optimizers** — GPU-side parameter updates
 - **Cross-entropy loss** — GPU loss computation
 - **LoRA adapters** — low-rank fine-tuning with merge/unmerge, auto-populate, hot-swap, merge_all()
+- **QLoRA** — quantized-weight training: NF4 base + LoRA adapters, only adapters trainable
 - **Gradient checkpointing** — PerBlock/PerLayer/PerAttention with recompute_block() (ADR-010)
 - **CPU/Async gradient offload** — CPU-side accumulation and async GPU→CPU transfer for iGPUs
 - **Tile-based gradient accumulation** — split batch into GPU-sized tiles, accumulate partials
@@ -255,6 +256,26 @@ let output = generator.generate_with_rag(
 
 ---
 
+## API Server
+
+FerrisRes includes an OpenAI-compatible HTTP API server:
+
+```
+# Start the API server
+cargo run -- serve --port 8080
+```
+
+Endpoints:
+- `POST /v1/chat/completions` — chat with messages
+- `POST /v1/completions` — text completion
+- `GET /v1/models` — list models
+- `GET /health` — health check
+
+Supports SSE streaming, CORS for browser integration, and works with any
+OpenAI-compatible client (Open WebUI, curl, etc.).
+
+---
+
 ## Building
 
 FerrisRes requires a working Vulkan driver. On Linux the recommended path is through the provided Nix dev-shell:
@@ -262,7 +283,7 @@ FerrisRes requires a working Vulkan driver. On Linux the recommended path is thr
 ```bash
 nix develop          # enters the dev shell with Rust + Vulkan layers
 cargo build
-cargo test            # 495 tests
+cargo test            # 539 tests
 cargo bench
 ```
 

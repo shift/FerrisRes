@@ -140,6 +140,136 @@ impl EntropyModel {
     pub fn window_size(&self) -> usize {
         self.window_size
     }
+
+    /// Export all weights as a single flat vector.
+    /// Order: w1, b1, w2, [b2].
+    pub fn export_weights(&self) -> Vec<f32> {
+        let mut weights = Vec::with_capacity(self.num_params());
+        weights.extend_from_slice(&self.w1);
+        weights.extend_from_slice(&self.b1);
+        weights.extend_from_slice(&self.w2);
+        weights.push(self.b2);
+        weights
+    }
+
+    /// Import weights from a flat vector.
+    pub fn import_weights(&mut self, weights: &[f32]) {
+        let expected = self.num_params();
+        assert_eq!(weights.len(), expected, "Weight count mismatch: got {} expected {}", weights.len(), expected);
+        let mut offset = 0;
+        let w1_len = self.w1.len();
+        self.w1.copy_from_slice(&weights[offset..offset + w1_len]);
+        offset += w1_len;
+        let b1_len = self.b1.len();
+        self.b1.copy_from_slice(&weights[offset..offset + b1_len]);
+        offset += b1_len;
+        let w2_len = self.w2.len();
+        self.w2.copy_from_slice(&weights[offset..offset + w2_len]);
+        offset += w2_len;
+        self.b2 = weights[offset];
+    }
+
+    /// Number of total parameters.
+    pub fn num_params(&self) -> usize {
+        self.w1.len() + self.b1.len() + self.w2.len() + 1
+    }
+
+    /// Compute gradients for entropy prediction.
+    /// Returns (grad_w1, grad_b1, grad_w2, grad_b2).
+    pub fn compute_gradients(&self, context: &[u8], target_entropy: f32) -> EntropyGradients {
+        let in_dim = self.window_size * 256;
+
+        // Forward pass (saving intermediates)
+        let mut hidden = self.b1.clone();
+        for (pos, &byte) in context.iter().enumerate() {
+            let offset = pos * 256 + byte as usize;
+            for h in 0..self.hidden_dim {
+                hidden[h] += self.w1[h * in_dim + offset];
+            }
+        }
+
+        // Save pre-ReLU hidden for gradient
+        let pre_relu = hidden.clone();
+
+        // ReLU
+        let mut relu_mask = vec![0.0f32; self.hidden_dim];
+        for h in 0..self.hidden_dim {
+            if pre_relu[h] > 0.0 {
+                relu_mask[h] = 1.0;
+            } else {
+                hidden[h] = 0.0;
+            }
+        }
+
+        // Output
+        let mut out = self.b2;
+        for h in 0..self.hidden_dim {
+            out += self.w2[h] * hidden[h];
+        }
+        let sigmoid = 1.0 / (1.0 + (-out).exp());
+
+        // Loss: MSE = 0.5 * (sigmoid - target)^2
+        let d_loss = sigmoid - target_entropy;
+
+        // Backward through sigmoid: d_sigmoid = sigmoid * (1 - sigmoid)
+        let d_out = d_loss * sigmoid * (1.0 - sigmoid);
+
+        // Gradients for w2 and b2
+        let mut grad_w2 = vec![0.0; self.hidden_dim];
+        for h in 0..self.hidden_dim {
+            grad_w2[h] = d_out * hidden[h];
+        }
+        let grad_b2 = d_out;
+
+        // Backprop through hidden
+        let mut d_hidden = vec![0.0; self.hidden_dim];
+        for h in 0..self.hidden_dim {
+            d_hidden[h] = d_out * self.w2[h] * relu_mask[h];
+        }
+
+        // Gradients for w1 and b1
+        let mut grad_w1 = vec![0.0; self.w1.len()];
+        for h in 0..self.hidden_dim {
+            grad_w1[h * (self.hidden_dim + 1) + h] = 0.0; // placeholder
+        }
+        // Only non-zero for active one-hot positions
+        for (pos, &byte) in context.iter().enumerate() {
+            let offset = pos * 256 + byte as usize;
+            for h in 0..self.hidden_dim {
+                grad_w1[h * in_dim + offset] += d_hidden[h];
+            }
+        }
+        let grad_b1 = d_hidden;
+
+        EntropyGradients {
+            grad_w1,
+            grad_b1,
+            grad_w2,
+            grad_b2,
+        }
+    }
+
+    /// Apply gradients with learning rate.
+    pub fn apply_gradients(&mut self, grads: &EntropyGradients, lr: f32) {
+        for (w, g) in self.w1.iter_mut().zip(grads.grad_w1.iter()) {
+            *w -= lr * g;
+        }
+        for (b, g) in self.b1.iter_mut().zip(grads.grad_b1.iter()) {
+            *b -= lr * g;
+        }
+        for (w, g) in self.w2.iter_mut().zip(grads.grad_w2.iter()) {
+            *w -= lr * g;
+        }
+        self.b2 -= lr * grads.grad_b2;
+    }
+}
+
+/// Gradients for the entropy model.
+pub struct EntropyGradients {
+    pub grad_w1: Vec<f32>,
+    pub grad_b1: Vec<f32>,
+    pub grad_w2: Vec<f32>,
+    pub grad_b2: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -753,5 +883,45 @@ mod tests {
         let bytes = tokenizer.text_to_bytes(text);
         let decoded = tokenizer.bytes_to_text(&bytes);
         assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn test_entropy_model_export_import() {
+        let model = EntropyModel::new(4, 32);
+        let weights = model.export_weights();
+        assert_eq!(weights.len(), model.num_params());
+
+        let mut model2 = EntropyModel::new(4, 32);
+        model2.import_weights(&weights);
+        let weights2 = model2.export_weights();
+        assert_eq!(weights, weights2);
+    }
+
+    #[test]
+    fn test_entropy_model_gradients() {
+        let model = EntropyModel::new(4, 16);
+        let context = b"hell";
+        let grads = model.compute_gradients(context, 0.5);
+        assert_eq!(grads.grad_w1.len(), model.w1.len());
+        assert_eq!(grads.grad_b1.len(), model.b1.len());
+        assert_eq!(grads.grad_w2.len(), model.w2.len());
+    }
+
+    #[test]
+    fn test_entropy_model_training_step() {
+        let mut model = EntropyModel::new(4, 16);
+        let context = b"test";
+
+        // Train towards low entropy
+        let before = model.predict_entropy(context);
+        for _ in 0..10 {
+            let grads = model.compute_gradients(context, 0.1);
+            model.apply_gradients(&grads, 0.01);
+        }
+        let after = model.predict_entropy(context);
+
+        // Prediction should have moved towards target
+        // (may not always decrease, but the model should be different)
+        assert!(before != after || (before - 0.1).abs() < 0.01);
     }
 }

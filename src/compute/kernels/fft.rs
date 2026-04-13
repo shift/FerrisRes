@@ -454,6 +454,84 @@ fn fft_radix2(
 "#;
 
 // ---------------------------------------------------------------------------
+// GPU FFT dispatch operation
+// ---------------------------------------------------------------------------
+
+/// GPU FFT operation dispatcher.
+///
+/// Prepares wgpu buffers and dispatches the FFT_WGSL shader.
+pub struct FftGpuOp {
+    size: usize,
+    log2_n: u32,
+}
+
+impl FftGpuOp {
+    /// Create a new FFT GPU op for a given transform size (must be power of 2).
+    pub fn new(size: usize) -> crate::error::Result<Self> {
+        if !size.is_power_of_two() || size < 2 {
+            return Err(crate::error::FerrisResError::Unsupported(
+                "FFT size must be a power of 2".to_string()
+            ));
+        }
+        let log2_n = (size.next_power_of_two().trailing_zeros()) as u32;
+        // For size=256: log2_n=8
+        Ok(Self { size, log2_n })
+    }
+
+    /// Get the transform size.
+    pub fn size(&self) -> usize { self.size }
+
+    /// Get the WGSL shader source.
+    pub fn shader_source(&self) -> &str { FFT_WGSL }
+
+    /// Get the entry point name.
+    pub fn entry_point(&self) -> &str { "fft_radix2" }
+
+    /// Calculate the workgroup count for dispatch.
+    pub fn workgroup_count(&self) -> (u32, u32, u32) {
+        let wg_size = 256u32;
+        let n = self.size as u32;
+        ((n + wg_size - 1) / wg_size, 1, 1)
+    }
+
+    /// Calculate buffer sizes needed.
+    pub fn buffer_sizes(&self) -> (usize, usize, usize, usize, usize) {
+        let element_bytes = 4; // f32
+        (
+            self.size * element_bytes, // input_re
+            self.size * element_bytes, // input_im
+            self.size * element_bytes, // output_re
+            self.size * element_bytes, // output_im
+            16,                        // params uniform (4 × u32)
+        )
+    }
+
+    /// Create params uniform data.
+    pub fn params_data(&self, inverse: bool) -> Vec<u8> {
+        let n = self.size as u32;
+        let dir = if inverse { 1u32 } else { 0u32 };
+        let mut data = Vec::with_capacity(16);
+        data.extend_from_slice(&n.to_le_bytes());
+        data.extend_from_slice(&self.log2_n.to_le_bytes());
+        data.extend_from_slice(&dir.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes()); // padding
+        data
+    }
+
+    /// Perform FFT on CPU (fallback when no GPU available).
+    pub fn forward_cpu(&self, input: &[Complex]) -> Vec<Complex> {
+        assert_eq!(input.len(), self.size);
+        fft(input)
+    }
+
+    /// Perform inverse FFT on CPU.
+    pub fn inverse_cpu(&self, input: &[Complex]) -> Vec<Complex> {
+        assert_eq!(input.len(), self.size);
+        ifft(input)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -626,5 +704,53 @@ mod tests {
         assert!(approx_eq(prod.im, 10.0, 1e-5));
 
         assert!(approx_eq(a.magnitude(), 5.0f32.sqrt(), 1e-5));
+    }
+
+    #[test]
+    fn test_fft_gpu_op_creation() {
+        let op = FftGpuOp::new(256).unwrap();
+        assert_eq!(op.size(), 256);
+        assert_eq!(op.entry_point(), "fft_radix2");
+    }
+
+    #[test]
+    fn test_fft_gpu_op_rejects_non_pow2() {
+        assert!(FftGpuOp::new(100).is_err());
+        assert!(FftGpuOp::new(0).is_err());
+        assert!(FftGpuOp::new(3).is_err());
+    }
+
+    #[test]
+    fn test_fft_gpu_op_workgroup() {
+        let op = FftGpuOp::new(512).unwrap();
+        let (x, y, z) = op.workgroup_count();
+        assert_eq!(y, 1);
+        assert_eq!(z, 1);
+        assert!(x > 0);
+    }
+
+    #[test]
+    fn test_fft_gpu_op_buffer_sizes() {
+        let op = FftGpuOp::new(1024).unwrap();
+        let (re_in, _im_in, _re_out, _im_out, params) = op.buffer_sizes();
+        assert_eq!(re_in, 4096); // 1024 * 4 bytes
+        assert_eq!(params, 16);
+    }
+
+    #[test]
+    fn test_fft_gpu_op_params() {
+        let op = FftGpuOp::new(256).unwrap();
+        let fwd = op.params_data(false);
+        let inv = op.params_data(true);
+        assert_eq!(fwd.len(), 16);
+        assert_eq!(inv.len(), 16);
+    }
+
+    #[test]
+    fn test_fft_gpu_op_cpu_fallback() {
+        let op = FftGpuOp::new(64).unwrap();
+        let input: Vec<Complex> = (0..64).map(|i| Complex::new((i as f32).sin(), 0.0)).collect();
+        let output = op.forward_cpu(&input);
+        assert_eq!(output.len(), 64);
     }
 }

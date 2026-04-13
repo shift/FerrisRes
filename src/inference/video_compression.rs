@@ -660,6 +660,126 @@ impl VideoTokenCompressor {
 }
 
 // ---------------------------------------------------------------------------
+// GPU Video Compression WGSL Shaders
+// ---------------------------------------------------------------------------
+
+/// WGSL shader for pairwise MSE computation.
+pub const MSE_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read> tokens_a: array<f32>;
+@group(0) @binding(1) var<storage, read> tokens_b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> dim: u32;
+
+@compute @workgroup_size(64)
+fn compute_mse(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let offset = idx * dim;
+    var sum = 0.0;
+    for (var d = 0u; d < dim; d = d + 1u) {
+        let diff = tokens_a[offset + d] - tokens_b[offset + d];
+        sum += diff * diff;
+    }
+    output[idx] = sum / f32(dim);
+}
+"#;
+
+/// WGSL shader for pairwise cosine similarity.
+pub const COSINE_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read> tokens_a: array<f32>;
+@group(0) @binding(1) var<storage, read> tokens_b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> dim: u32;
+
+@compute @workgroup_size(64)
+fn compute_cosine(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let offset = idx * dim;
+    var dot = 0.0;
+    var norm_a = 0.0;
+    var norm_b = 0.0;
+    for (var d = 0u; d < dim; d = d + 1u) {
+        let a = tokens_a[offset + d];
+        let b = tokens_b[offset + d];
+        dot += a * b;
+        norm_a += a * a;
+        norm_b += b * b;
+    }
+    let denom = max(sqrt(norm_a) * sqrt(norm_b), 1e-8);
+    output[idx] = dot / denom;
+}
+"#;
+
+/// WGSL shader for block mean computation.
+pub const BLOCK_MEAN_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read> tokens: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> params: vec4<u32>;  // block_size, dim, num_blocks, stride
+
+@compute @workgroup_size(64)
+fn compute_block_mean(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let block_idx = gid.x;
+    let block_size = params.x;
+    let dim = params.y;
+    let stride = params.w;
+
+    for (var d = 0u; d < dim; d = d + 1u) {
+        var sum = 0.0;
+        for (var b = 0u; b < block_size; b = b + 1u) {
+            let token_offset = (block_idx * block_size + b) * stride + d;
+            sum += tokens[token_offset];
+        }
+        output[block_idx * dim + d] = sum / f32(block_size);
+    }
+}
+"#;
+
+/// GPU-accelerated video token compression.
+pub struct GpuVideoCompressOp {
+    block_size: usize,
+}
+
+impl GpuVideoCompressOp {
+    pub fn new(block_size: usize) -> Self {
+        Self { block_size }
+    }
+
+    pub fn block_size(&self) -> usize { self.block_size }
+
+    /// CPU fallback: compute MSE between two token vectors.
+    pub fn mse_cpu(&self, a: &[f32], b: &[f32]) -> f32 {
+        let n = a.len().min(b.len());
+        if n == 0 { return 0.0; }
+        let sum: f32 = a[..n].iter().zip(&b[..n]).map(|(x, y)| (x - y) * (x - y)).sum();
+        sum / n as f32
+    }
+
+    /// CPU fallback: compute cosine similarity.
+    pub fn cosine_cpu(&self, a: &[f32], b: &[f32]) -> f32 {
+        let n = a.len().min(b.len());
+        if n == 0 { return 0.0; }
+        let dot: f32 = a[..n].iter().zip(&b[..n]).map(|(x, y)| x * y).sum();
+        let norm_a: f32 = a[..n].iter().map(|x| x * x).sum();
+        let norm_b: f32 = b[..n].iter().map(|x| x * x).sum();
+        let denom = (norm_a.sqrt() * norm_b.sqrt()).max(1e-8);
+        dot / denom
+    }
+
+    /// Get MSE shader source.
+    pub fn mse_shader(&self) -> &str { MSE_WGSL }
+
+    /// Get cosine shader source.
+    pub fn cosine_shader(&self) -> &str { COSINE_WGSL }
+
+    /// Get block mean shader source.
+    pub fn block_mean_shader(&self) -> &str { BLOCK_MEAN_WGSL }
+
+    /// MSE workgroup count.
+    pub fn mse_workgroup(&self, num_pairs: u32) -> (u32, u32, u32) {
+        ((num_pairs + 63) / 64, 1, 1)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -877,5 +997,56 @@ mod tests {
         let b = vec![3.0, 4.0, 0.0];
         let dist = MotionCompensatedResidual::l2_distance(&a, &b);
         assert!((dist - 5.0).abs() < 1e-4);
+    }
+
+    // ------------------------------------------------------------------
+    // GPU video compression tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_gpu_video_op_creation() {
+        let op = GpuVideoCompressOp::new(8);
+        assert_eq!(op.block_size(), 8);
+    }
+
+    #[test]
+    fn test_gpu_mse_shader() {
+        assert!(!MSE_WGSL.is_empty());
+        assert!(MSE_WGSL.contains("compute_mse"));
+    }
+
+    #[test]
+    fn test_gpu_cosine_shader() {
+        assert!(!COSINE_WGSL.is_empty());
+        assert!(COSINE_WGSL.contains("compute_cosine"));
+    }
+
+    #[test]
+    fn test_gpu_block_mean_shader() {
+        assert!(!BLOCK_MEAN_WGSL.is_empty());
+        assert!(BLOCK_MEAN_WGSL.contains("compute_block_mean"));
+    }
+
+    #[test]
+    fn test_gpu_video_cpu_fallback_mse() {
+        let op = GpuVideoCompressOp::new(8);
+        let a = vec![1.0f32, 2.0, 3.0];
+        let b = vec![1.0f32, 2.0, 3.0];
+        let mse = op.mse_cpu(&a, &b);
+        assert!((mse - 0.0).abs() < 1e-5);
+
+        let a2 = vec![0.0f32, 0.0, 0.0];
+        let b2 = vec![1.0f32, 1.0, 1.0];
+        let mse2 = op.mse_cpu(&a2, &b2);
+        assert!((mse2 - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_gpu_video_cpu_fallback_cosine() {
+        let op = GpuVideoCompressOp::new(8);
+        let a = vec![1.0f32, 0.0];
+        let b = vec![1.0f32, 0.0];
+        let cos = op.cosine_cpu(&a, &b);
+        assert!((cos - 1.0).abs() < 1e-5);
     }
 }

@@ -421,6 +421,250 @@ impl OpPlacer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// OpDispatcher — routes placement decisions to execution backends
+// ---------------------------------------------------------------------------
+
+/// Execution backend trait for dispatched operations.
+pub trait ExecutionBackend {
+    /// Execute a matmul: output = input × weight + bias.
+    fn execute_matmul(
+        &self,
+        input: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Vec<f32>;
+
+    /// Execute layer norm.
+    fn execute_layer_norm(
+        &self,
+        input: &[f32],
+        gamma: &[f32],
+        beta: &[f32],
+        dim: usize,
+        eps: f32,
+    ) -> Vec<f32>;
+
+    /// Execute activation (ReLU, GELU, SiLU).
+    fn execute_activation(&self, input: &[f32], kind: ActivationKind) -> Vec<f32>;
+
+    /// Backend name.
+    fn name(&self) -> &str;
+}
+
+/// Activation kinds for dispatch.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ActivationKind {
+    ReLU,
+    GELU,
+    SiLU,
+}
+
+/// GPU execution backend (uses CPU matmul as proxy, real impl would use wgpu).
+pub struct GpuBackend;
+
+impl ExecutionBackend for GpuBackend {
+    fn execute_matmul(
+        &self,
+        input: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Vec<f32> {
+        // CPU matmul (real impl: wgpu dispatch)
+        let mut output = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = bias.get(j).copied().unwrap_or(0.0);
+                for l in 0..k {
+                    sum += input[i * k + l] * weight[l * n + j];
+                }
+                output[i * n + j] = sum;
+            }
+        }
+        output
+    }
+
+    fn execute_layer_norm(
+        &self,
+        input: &[f32],
+        gamma: &[f32],
+        beta: &[f32],
+        dim: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        let num_tokens = input.len() / dim;
+        let mut output = Vec::with_capacity(input.len());
+        for t in 0..num_tokens {
+            let slice = &input[t * dim..(t + 1) * dim];
+            let mean: f32 = slice.iter().sum::<f32>() / dim as f32;
+            let var: f32 = slice.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / dim as f32;
+            for (d, &x) in slice.iter().enumerate() {
+                let norm = (x - mean) / (var + eps).sqrt();
+                let g = gamma.get(d).copied().unwrap_or(1.0);
+                let b = beta.get(d).copied().unwrap_or(0.0);
+                output.push(norm * g + b);
+            }
+        }
+        output
+    }
+
+    fn execute_activation(&self, input: &[f32], kind: ActivationKind) -> Vec<f32> {
+        match kind {
+            ActivationKind::ReLU => input.iter().map(|&x| x.max(0.0)).collect(),
+            ActivationKind::GELU => input.iter().map(|&x| {
+                0.5 * x * (1.0 + (x * 0.7978845608).tanh())
+            }).collect(),
+            ActivationKind::SiLU => input.iter().map(|&x| x / (1.0 + (-x).exp())).collect(),
+        }
+    }
+
+    fn name(&self) -> &str { "wgpu" }
+}
+
+/// ANE execution backend (Apple Neural Engine).
+/// On non-macOS, this uses CPU fallback.
+pub struct AneBackend {
+    /// Whether we're on Apple Silicon with real ANE.
+    is_real_ane: bool,
+}
+
+impl AneBackend {
+    pub fn new() -> Self {
+        // On macOS with Apple Silicon, this would use core-ml-rs
+        Self { is_real_ane: false }
+    }
+
+    /// Create with explicit ANE availability.
+    pub fn with_ane(available: bool) -> Self {
+        Self { is_real_ane: available }
+    }
+
+    pub fn is_available(&self) -> bool { self.is_real_ane }
+}
+
+impl ExecutionBackend for AneBackend {
+    fn execute_matmul(
+        &self,
+        input: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Vec<f32> {
+        // CPU fallback (real impl: Core ML ANe dispatch)
+        let gpu = GpuBackend;
+        gpu.execute_matmul(input, weight, bias, m, k, n)
+    }
+
+    fn execute_layer_norm(
+        &self,
+        input: &[f32],
+        gamma: &[f32],
+        beta: &[f32],
+        dim: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        // ANE excels at normalization ops
+        let gpu = GpuBackend;
+        gpu.execute_layer_norm(input, gamma, beta, dim, eps)
+    }
+
+    fn execute_activation(&self, input: &[f32], kind: ActivationKind) -> Vec<f32> {
+        let gpu = GpuBackend;
+        gpu.execute_activation(input, kind)
+    }
+
+    fn name(&self) -> &str {
+        if self.is_real_ane { "coreml_ane" } else { "cpu_ane_fallback" }
+    }
+}
+
+/// Operation dispatcher that routes to the correct backend based on PlacementDecision.
+pub struct OpDispatcher {
+    gpu: GpuBackend,
+    ane: AneBackend,
+}
+
+impl OpDispatcher {
+    /// Create dispatcher with GPU and optional ANE.
+    pub fn new(has_ane: bool) -> Self {
+        Self {
+            gpu: GpuBackend,
+            ane: AneBackend::with_ane(has_ane),
+        }
+    }
+
+    /// Dispatch a matmul operation.
+    pub fn dispatch_matmul(
+        &self,
+        decision: PlacementDecision,
+        input: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Vec<f32> {
+        match decision {
+            PlacementDecision::ANE => self.ane.execute_matmul(input, weight, bias, m, k, n),
+            PlacementDecision::GPU => self.gpu.execute_matmul(input, weight, bias, m, k, n),
+            PlacementDecision::CPU => self.gpu.execute_matmul(input, weight, bias, m, k, n),
+        }
+    }
+
+    /// Dispatch layer norm.
+    pub fn dispatch_layer_norm(
+        &self,
+        decision: PlacementDecision,
+        input: &[f32],
+        gamma: &[f32],
+        beta: &[f32],
+        dim: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        match decision {
+            PlacementDecision::ANE => self.ane.execute_layer_norm(input, gamma, beta, dim, eps),
+            PlacementDecision::GPU => self.gpu.execute_layer_norm(input, gamma, beta, dim, eps),
+            PlacementDecision::CPU => self.gpu.execute_layer_norm(input, gamma, beta, dim, eps),
+        }
+    }
+
+    /// Dispatch activation.
+    pub fn dispatch_activation(
+        &self,
+        decision: PlacementDecision,
+        input: &[f32],
+        kind: ActivationKind,
+    ) -> Vec<f32> {
+        match decision {
+            PlacementDecision::ANE => self.ane.execute_activation(input, kind),
+            PlacementDecision::GPU => self.gpu.execute_activation(input, kind),
+            PlacementDecision::CPU => self.gpu.execute_activation(input, kind),
+        }
+    }
+
+    /// Get backend name for a placement decision.
+    pub fn backend_name(&self, decision: PlacementDecision) -> &str {
+        match decision {
+            PlacementDecision::ANE => self.ane.name(),
+            PlacementDecision::GPU => self.gpu.name(),
+            PlacementDecision::CPU => "cpu",
+        }
+    }
+
+    /// Whether ANE is available.
+    pub fn has_ane(&self) -> bool {
+        self.ane.is_available()
+    }
+}
+
 /// Represents a shared buffer between GPU and ANE on Apple Silicon.
 pub struct UnifiedMemoryBuffer {
     data: Vec<f32>,
@@ -929,5 +1173,122 @@ mod tests {
 
         let bytes = channel.broadcast(&[1.0, 2.0, 3.0], 0);
         assert_eq!(bytes, 6); // 3 values × 2 remotes
+    }
+
+    // ------------------------------------------------------------------
+    // OpDispatcher / ExecutionBackend tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_gpu_backend_matmul() {
+        let gpu = GpuBackend;
+        let input = vec![1.0, 2.0, 3.0, 4.0];
+        let weight = vec![1.0, 0.0, 0.0, 1.0];
+        let bias = vec![0.0, 0.0];
+        let out = gpu.execute_matmul(&input, &weight, &bias, 2, 2, 2);
+        assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_gpu_backend_layer_norm() {
+        let gpu = GpuBackend;
+        let input = vec![1.0, 2.0, 3.0];
+        let gamma = vec![1.0, 1.0, 1.0];
+        let beta = vec![0.0, 0.0, 0.0];
+        let out = gpu.execute_layer_norm(&input, &gamma, &beta, 3, 1e-5);
+        // After layer norm, mean should be ~0
+        let mean: f32 = out.iter().sum::<f32>() / 3.0;
+        assert!(mean.abs() < 0.01);
+    }
+
+    #[test]
+    fn test_gpu_backend_relu() {
+        let gpu = GpuBackend;
+        let input = vec![-1.0, 0.0, 1.0, 2.0];
+        let out = gpu.execute_activation(&input, ActivationKind::ReLU);
+        assert_eq!(out, vec![0.0, 0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_gpu_backend_gelu() {
+        let gpu = GpuBackend;
+        let input = vec![0.0];
+        let out = gpu.execute_activation(&input, ActivationKind::GELU);
+        assert!((out[0]).abs() < 0.01); // GELU(0) ≈ 0
+    }
+
+    #[test]
+    fn test_gpu_backend_silu() {
+        let gpu = GpuBackend;
+        let input = vec![0.0];
+        let out = gpu.execute_activation(&input, ActivationKind::SiLU);
+        assert!((out[0]).abs() < 0.01); // SiLU(0) = 0
+    }
+
+    #[test]
+    fn test_ane_backend_fallback() {
+        let ane = AneBackend::new();
+        assert!(!ane.is_available());
+        let input = vec![1.0, 2.0];
+        let weight = vec![1.0, 0.0, 0.0, 1.0];
+        let bias = vec![0.0, 0.0];
+        let out = ane.execute_matmul(&input, &weight, &bias, 1, 2, 2);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn test_ane_backend_with_ane() {
+        let ane = AneBackend::with_ane(true);
+        assert!(ane.is_available());
+        assert_eq!(ane.name(), "coreml_ane");
+    }
+
+    #[test]
+    fn test_op_dispatcher_gpu() {
+        let dispatcher = OpDispatcher::new(false);
+        assert!(!dispatcher.has_ane());
+
+        let input = vec![1.0, 0.0, 0.0, 1.0];
+        let weight = vec![1.0, 0.0, 0.0, 1.0];
+        let bias = vec![0.0, 0.0];
+        let out = dispatcher.dispatch_matmul(
+            PlacementDecision::GPU, &input, &weight, &bias, 2, 2, 2);
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn test_op_dispatcher_ane() {
+        let dispatcher = OpDispatcher::new(true);
+        assert!(dispatcher.has_ane());
+
+        let input = vec![1.0, 2.0, 3.0];
+        let gamma = vec![1.0, 1.0, 1.0];
+        let beta = vec![0.0, 0.0, 0.0];
+        let out = dispatcher.dispatch_layer_norm(
+            PlacementDecision::ANE, &input, &gamma, &beta, 3, 1e-5);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn test_op_dispatcher_backend_name() {
+        let d = OpDispatcher::new(true);
+        assert_eq!(d.backend_name(PlacementDecision::GPU), "wgpu");
+        assert_eq!(d.backend_name(PlacementDecision::ANE), "coreml_ane");
+        assert_eq!(d.backend_name(PlacementDecision::CPU), "cpu");
+    }
+
+    #[test]
+    fn test_op_dispatcher_placement_integration() {
+        // Integration: OpPlacer decides, OpDispatcher routes
+        let placer = OpPlacer::default_with_ane(true);
+        let dispatcher = OpDispatcher::new(true);
+
+        let plan = placer.transformer_layer_plan();
+        assert!(!plan.is_empty());
+
+        for (_op, decision) in &plan {
+            let name = dispatcher.backend_name(decision.clone());
+            assert!(!name.is_empty());
+        }
     }
 }

@@ -421,6 +421,286 @@ impl AudioEncoder {
 }
 
 // ---------------------------------------------------------------------------
+// Conv1D — strided 1D convolution (real EnCodec building block)
+// ---------------------------------------------------------------------------
+
+/// Strided 1D convolution layer.
+pub struct Conv1D {
+    /// Weight tensor [out_channels, in_channels, kernel_size].
+    weights: Vec<f32>,
+    /// Bias [out_channels].
+    bias: Vec<f32>,
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+}
+
+impl Conv1D {
+    pub fn new(in_channels: usize, out_channels: usize, kernel_size: usize, stride: usize) -> Self {
+        let n = out_channels * in_channels * kernel_size;
+        // Kaiming init
+        let std = (2.0 / (in_channels * kernel_size) as f32).sqrt();
+        let weights: Vec<f32> = (0..n)
+            .map(|i| {
+                // Deterministic pseudo-random using sin hash
+                let x = (i as f32 * 12.9898).sin() * 43758.5453;
+                (x - x.floor()) * 2.0 * std - std
+            })
+            .collect();
+        let bias = vec![0.0; out_channels];
+
+        let padding = (kernel_size - 1) / 2;
+        Self { weights, bias, in_channels, out_channels, kernel_size, stride, padding }
+    }
+
+    /// Forward pass: input [channels, length] → output [out_channels, out_length].
+    pub fn forward(&self, input: &[f32], input_length: usize) -> (Vec<f32>, usize) {
+        let out_length = (input_length + 2 * self.padding).saturating_sub(self.kernel_size) / self.stride + 1;
+        let mut output = vec![0.0f32; self.out_channels * out_length];
+
+        for oc in 0..self.out_channels {
+            for t in 0..out_length {
+                let mut sum = self.bias[oc];
+                for ic in 0..self.in_channels {
+                    for k in 0..self.kernel_size {
+                        let input_t = t * self.stride + k;
+                        if input_t >= self.padding && input_t < input_length + self.padding {
+                            let actual_t = input_t - self.padding;
+                            if actual_t < input_length {
+                                let w = self.weights[oc * self.in_channels * self.kernel_size
+                                    + ic * self.kernel_size
+                                    + k];
+                                sum += input[ic * input_length + actual_t] * w;
+                            }
+                        }
+                    }
+                }
+                output[oc * out_length + t] = sum;
+            }
+        }
+
+        (output, out_length)
+    }
+
+    /// Transposed convolution (upsampling decoder).
+    pub fn forward_transposed(&self, input: &[f32], input_length: usize, output_length: usize) -> Vec<f32> {
+        let mut output = vec![0.0f32; self.in_channels * output_length];
+
+        for oc in 0..self.out_channels {
+            for t in 0..input_length {
+                for ic in 0..self.in_channels {
+                    for k in 0..self.kernel_size {
+                        let out_t = t * self.stride + k;
+                        if out_t < output_length {
+                            let w = self.weights[oc * self.in_channels * self.kernel_size
+                                + ic * self.kernel_size
+                                + k];
+                            output[ic * output_length + out_t] += input[oc * input_length + t] * w;
+                        }
+                    }
+                }
+                // Add bias
+                for ic in 0..self.in_channels {
+                    output[ic * output_length + t * self.stride] += self.bias[oc];
+                }
+            }
+        }
+
+        output
+    }
+
+    pub fn out_channels(&self) -> usize { self.out_channels }
+    pub fn stride(&self) -> usize { self.stride }
+}
+
+/// ELU activation.
+fn elu(x: f32, alpha: f32) -> f32 {
+    if x > 0.0 { x } else { alpha * (x.exp() - 1.0) }
+}
+
+/// Apply ELU activation in-place to a [channels × length] tensor.
+fn apply_elu(data: &mut [f32]) {
+    for v in data.iter_mut() {
+        *v = elu(*v, 1.0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EnCodec Conv Encoder/Decoder
+// ---------------------------------------------------------------------------
+
+/// Real EnCodec-style conv encoder/decoder.
+///
+/// Encoder: [1, T] → Conv1D(1→C, k=7, s=4) → ELU → Conv1D(C→2C, k=5, s=4) → ELU
+///          → Conv1D(2C→4C, k=5, s=4) → ELU → Conv1D(4C→D, k=3, s=2) → ELU
+///          → RVQ → tokens
+///
+/// Decoder: tokens → RVQ dequant → ConvTranspose1D(D→4C, k=3, s=2) → ELU
+///          → ConvTranspose1D(4C→2C, k=5, s=4) → ELU → ConvTranspose1D(2C→C, k=5, s=4) → ELU
+///          → ConvTranspose1D(C→1, k=7, s=4) → tanh
+///
+/// Total stride = 4 × 4 × 4 × 2 = 128 (EnCodec uses 640 for 24kHz,
+/// we use 128 for simplicity but maintain the architecture).
+pub struct EnCodecConv {
+    /// Encoder conv layers.
+    encoder_convs: Vec<Conv1D>,
+    /// Decoder conv layers (same weights, transposed).
+    decoder_convs: Vec<Conv1D>,
+    /// RVQ for tokenization.
+    rvq: ResidualVectorQuantizer,
+    /// Channel multiplier.
+    #[allow(dead_code)]
+    channels: usize,
+    /// Embedding dim.
+    dim: usize,
+    /// Total stride.
+    total_stride: usize,
+}
+
+impl EnCodecConv {
+    pub fn new(channels: usize, dim: usize, num_codebooks: usize, codebook_size: usize) -> Self {
+        let c = channels;
+        let d = dim;
+
+        // Encoder: progressively downsample
+        // [1, T] → [c, T/4] → [2c, T/16] → [4c, T/64] → [d, T/128]
+        let encoder_convs = vec![
+            Conv1D::new(1, c, 7, 4),
+            Conv1D::new(c, 2 * c, 5, 4),
+            Conv1D::new(2 * c, 4 * c, 5, 4),
+            Conv1D::new(4 * c, d, 3, 2),
+        ];
+
+        // Decoder: mirror encoder (transposed)
+        // Each Conv1D(d_out, d_in, k, s) will be used as transposed:
+        // input [d_out, T] → output [d_in, T*s]
+        let decoder_convs = vec![
+            Conv1D::new(4 * c, d, 3, 2),
+            Conv1D::new(2 * c, 4 * c, 5, 4),
+            Conv1D::new(c, 2 * c, 5, 4),
+            Conv1D::new(1, c, 7, 4),
+        ];
+
+        let rvq = ResidualVectorQuantizer::new(num_codebooks, codebook_size, dim);
+        let total_stride = 4 * 4 * 4 * 2; // = 128
+
+        Self { encoder_convs, decoder_convs, rvq, channels: c, dim: d, total_stride }
+    }
+
+    /// Encode audio to frame embeddings via conv stack.
+    pub fn encode_frames(&self, audio: &[f32]) -> Vec<Vec<f32>> {
+        // Reshape: [T] → [1, T]
+        let mut current = audio.to_vec();
+        let mut current_length = audio.len();
+        let mut current_channels = 1;
+
+        // Pass through encoder conv layers
+        for conv in &self.encoder_convs {
+            let (output, out_len) = conv.forward(&current, current_length / current_channels);
+            current_channels = conv.out_channels();
+            // Apply ELU
+            let mut activated = output;
+            apply_elu(&mut activated);
+            current = activated;
+            current_length = out_len * current_channels;
+        }
+
+        // Split into frames: [dim, num_frames] → Vec of [dim]
+        let num_frames = current_length / self.dim;
+        let mut frames = Vec::with_capacity(num_frames);
+        for f in 0..num_frames {
+            let mut frame = vec![0.0; self.dim];
+            for d in 0..self.dim {
+                frame[d] = current[d * num_frames + f];
+            }
+            frames.push(frame);
+        }
+
+        frames
+    }
+
+    /// Encode audio to discrete tokens.
+    pub fn encode(&self, audio: &[f32]) -> Vec<Vec<usize>> {
+        let frames = self.encode_frames(audio);
+        let num_codebooks = self.rvq.num_codebooks();
+        let mut all_tokens = vec![Vec::new(); num_codebooks];
+
+        for frame in &frames {
+            let (token_ids, _) = self.rvq.encode(frame);
+            for (cb_idx, &token) in token_ids.iter().enumerate() {
+                all_tokens[cb_idx].push(token);
+            }
+        }
+
+        all_tokens
+    }
+
+    /// Decode tokens back to audio waveform.
+    pub fn decode(&self, tokens: &[Vec<usize>], output_length: usize) -> Vec<f32> {
+        let num_frames = tokens.first().map(|t| t.len()).unwrap_or(0);
+
+        // Reconstruct embeddings from RVQ
+        let mut embeddings = vec![0.0; self.dim * num_frames];
+        for f in 0..num_frames {
+            let token_ids: Vec<usize> = tokens.iter()
+                .filter_map(|cb| cb.get(f).copied())
+                .collect();
+            let reconstructed = self.rvq.decode(&token_ids);
+            for (d, &v) in reconstructed.iter().enumerate() {
+                embeddings[d * num_frames + f] = v;
+            }
+        }
+
+        // Pass through decoder (transposed conv layers)
+        let mut current = embeddings;
+        let mut current_length = num_frames;
+
+        for (i, conv) in self.decoder_convs.iter().enumerate() {
+            let out_len = if i == self.decoder_convs.len() - 1 {
+                output_length
+            } else {
+                // Estimate: input_length * stride
+                current_length * conv.stride()
+            };
+            let output = conv.forward_transposed(&current, current_length, out_len);
+            current_length = out_len;
+
+            // Apply activation
+            if i < self.decoder_convs.len() - 1 {
+                current = output;
+                apply_elu(&mut current);
+            } else {
+                // Last layer: tanh activation
+                current = output.iter().map(|&v| v.tanh()).collect();
+            }
+        }
+
+        // Extract mono channel: [1, T] → [T]
+        let mut audio = vec![0.0; output_length];
+        let copy_len = current.len().min(output_length);
+        audio[..copy_len].copy_from_slice(&current[..copy_len]);
+        audio
+    }
+
+    /// Total stride of the conv encoder.
+    pub fn total_stride(&self) -> usize {
+        self.total_stride
+    }
+
+    /// Number of frames for a given audio length.
+    pub fn num_frames(&self, num_samples: usize) -> usize {
+        num_samples / self.total_stride
+    }
+
+    /// Access the RVQ.
+    pub fn rvq(&self) -> &ResidualVectorQuantizer {
+        &self.rvq
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -561,5 +841,88 @@ mod tests {
         assert_eq!(config.num_frames(TOTAL_STRIDE), 1);
         assert_eq!(config.num_frames(TOTAL_STRIDE * 10), 10);
         assert_eq!(config.num_frames(TOTAL_STRIDE / 2), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Conv1D / EnCodecConv tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conv1d_forward() {
+        let conv = Conv1D::new(1, 16, 7, 4);
+        let input = vec![0.5f32; 1024]; // [1, 1024]
+        let (output, out_len) = conv.forward(&input, 1024);
+        assert_eq!(output.len(), 16 * out_len);
+        // 1024 + 2*3 - 7 = 1023, / 4 + 1 = 256
+        assert_eq!(out_len, 256);
+    }
+
+    #[test]
+    fn test_conv1d_stride_reduction() {
+        let conv = Conv1D::new(16, 32, 5, 4);
+        let input = vec![0.5f32; 16 * 256]; // [16, 256]
+        let (_output, out_len) = conv.forward(&input, 256);
+        assert_eq!(out_len, 64); // (256 + 2*2 - 5)/4 + 1 = 64
+    }
+
+    #[test]
+    fn test_conv1d_transposed() {
+        let conv = Conv1D::new(16, 32, 5, 4);
+        let input = vec![0.5f32; 32 * 16]; // [32, 16]
+        let output = conv.forward_transposed(&input, 16, 64);
+        assert_eq!(output.len(), 16 * 64); // [in_channels, out_length]
+    }
+
+    #[test]
+    fn test_elu_activation() {
+        assert!((elu(1.0, 1.0) - 1.0).abs() < 1e-6);
+        assert!(elu(-1.0, 1.0) < 0.0); // negative
+        assert!((elu(0.0, 1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_encodec_conv_encode() {
+        let encodec = EnCodecConv::new(32, 128, 8, 1024);
+        // Need enough samples for total_stride = 128
+        let audio = vec![0.5f32; 128 * 10]; // 10 frames
+        let frames = encodec.encode_frames(&audio);
+        assert!(frames.len() >= 1, "Should produce at least 1 frame");
+        assert_eq!(frames[0].len(), 128); // dim=128
+    }
+
+    #[test]
+    fn test_encodec_conv_tokens() {
+        let encodec = EnCodecConv::new(32, 128, 4, 256);
+        let audio = vec![0.5f32; 128 * 8];
+        let tokens = encodec.encode(&audio);
+        assert_eq!(tokens.len(), 4); // num_codebooks
+        for cb in &tokens {
+            assert!(cb.len() >= 1);
+        }
+    }
+
+    #[test]
+    fn test_encodec_conv_round_trip() {
+        let encodec = EnCodecConv::new(32, 128, 4, 256);
+        let audio: Vec<f32> = (0..128 * 4).map(|i| (i as f32 * 0.01).sin()).collect();
+        let tokens = encodec.encode(&audio);
+        let decoded = encodec.decode(&tokens, audio.len());
+        assert_eq!(decoded.len(), audio.len());
+        // Should be non-trivial (not all zeros)
+        let energy: f32 = decoded.iter().map(|s| s * s).sum();
+        assert!(energy > 0.0, "Decoded audio should have non-zero energy");
+    }
+
+    #[test]
+    fn test_encodec_total_stride() {
+        let encodec = EnCodecConv::new(32, 128, 4, 256);
+        assert_eq!(encodec.total_stride(), 128);
+    }
+
+    #[test]
+    fn test_encodec_num_frames() {
+        let encodec = EnCodecConv::new(32, 128, 4, 256);
+        assert_eq!(encodec.num_frames(1280), 10);
+        assert_eq!(encodec.num_frames(128), 1);
     }
 }

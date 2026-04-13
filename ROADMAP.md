@@ -6,8 +6,8 @@
 
 | Metric | Value |
 |---|---|
-| Source code | ~37,523 lines across 80+ modules |
-| Test suites | 495 lib tests passing, 0 failures |
+| Source code | ~39,447 lines across 80+ modules |
+| Test suites | 539 lib tests passing, 0 failures |
 | Language | 100% Rust (safe + WGSL compute shaders) |
 | GPU backends | Vulkan, Metal, DX12, WebGPU via wgpu |
 | Tasks completed | **212 / 212 (all complete)** |
@@ -224,4 +224,4 @@
 | 8 | ✅ Done | Distributed tensor/pipeline parallelism, cloud GPU, RDMA, ANE/NPU |
 | 9 | ✅ Done | Weight loading (safetensors, GGUF), standard transformer, architecture dispatcher |
 
-**All 212 implementation tasks complete — 495 tests passing, 0 failures.**
+**All 212 implementation tasks complete — 539 tests passing, 0 failures.**
