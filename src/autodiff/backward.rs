@@ -906,17 +906,17 @@ impl BackwardPass {
             }
 
             NodeKind::BlockSummaryCrossAttn { num_queries, hidden_dim, block_size } => {
-                // Block Summary backward: allocate gradient buffers for inputs.
-                // Real gradient computation happens in CPU-side backprop_block_summary()
-                // in gemma_mapper.rs, which is the primary distillation path.
-                // This ensures the autodiff graph doesn't panic on unknown op.
+                // Block Summary backward: dispatch GPU backward shader to compute
+                // d_queries and d_tokens from d_output (upstream gradient).
                 let hd = *hidden_dim as usize;
                 let nq = *num_queries as usize;
                 let bs = *block_size as usize;
 
                 let tokens_id = inputs[0];
                 let queries_id = inputs[1];
+                let output_id = output_id;
 
+                // Allocate gradient buffers if needed
                 let tokens_grad_size = bs * hd * std::mem::size_of::<f32>();
                 let queries_grad_size = nq * hd * std::mem::size_of::<f32>();
 
@@ -929,6 +929,7 @@ impl BackwardPass {
                             tokens_grad_size, Some("bs_tokens_grad"))?;
                     }
                 }
+
                 {
                     let q_node = graph.get_node_mut(queries_id).ok_or_else(|| {
                         FerrisResError::Device("block_summary queries node not found".to_string())
@@ -939,7 +940,66 @@ impl BackwardPass {
                     }
                 }
 
-                tracing::debug!("Backward: block_summary nq={} hd={} bs={}", nq, hd, bs);
+                // Get buffer references for dispatch
+                let d_output_buf = {
+                    let n = graph.get_node(output_id).ok_or_else(|| {
+                        FerrisResError::Device("block_summary output node not found".to_string())
+                    })?;
+                    n.grad.buffer().clone()
+                };
+                let d_output_gpu = GpuBuffer::from_existing(d_output_buf, tokens_grad_size);
+
+                let tokens_buf = {
+                    let n = graph.get_node(tokens_id).ok_or_else(|| {
+                        FerrisResError::Device("block_summary tokens node not found".to_string())
+                    })?;
+                    n.buf.buffer().clone()
+                };
+                let tokens_gpu = GpuBuffer::from_existing(tokens_buf, tokens_grad_size);
+
+                let queries_buf = {
+                    let n = graph.get_node(queries_id).ok_or_else(|| {
+                        FerrisResError::Device("block_summary queries node not found".to_string())
+                    })?;
+                    n.buf.buffer().clone()
+                };
+                let queries_gpu = GpuBuffer::from_existing(queries_buf, queries_grad_size);
+
+                let d_tokens_buf = {
+                    let n = graph.get_node(tokens_id).ok_or_else(|| {
+                        FerrisResError::Device("block_summary tokens node not found".to_string())
+                    })?;
+                    n.grad.buffer().clone()
+                };
+                let d_tokens_gpu = GpuBuffer::from_existing(d_tokens_buf, tokens_grad_size);
+
+                let d_queries_buf = {
+                    let n = graph.get_node(queries_id).ok_or_else(|| {
+                        FerrisResError::Device("block_summary queries node not found".to_string())
+                    })?;
+                    n.grad.buffer().clone()
+                };
+                let d_queries_gpu = GpuBuffer::from_existing(d_queries_buf, queries_grad_size);
+
+                // Dispatch GPU backward pass
+                let gpu_op = crate::model::gemma_mapper::BlockSummaryGpuOp::new(
+                    self.device.clone(), self.queue.clone(),
+                    nq, hd, bs,
+                );
+                let mut bs_encoder = self.device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor { label: Some("BlockSummary Backward") }
+                );
+                gpu_op.dispatch_backward(
+                    &mut bs_encoder,
+                    &d_output_gpu,
+                    &queries_gpu,
+                    &tokens_gpu,
+                    &d_queries_gpu,
+                    &d_tokens_gpu,
+                )?;
+                self.queue.submit(std::iter::once(bs_encoder.finish()));
+
+                tracing::debug!("Backward: block_summary GPU dispatch nq={} hd={} bs={}", nq, hd, bs);
             }
 
             NodeKind::Parameter { .. } | NodeKind::Input { .. } => {
