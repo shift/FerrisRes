@@ -18,6 +18,7 @@ pub mod speculative;
 pub mod paged_attention;
 pub mod cross_modal;
 pub mod circular_kv;
+pub mod video_compression;
 
 pub use kv_cache::{LayerKVCache, ModelKVCache};
 pub use two_phase::{TwoPhaseConfig, TwoPhaseInference, KVCache, Sampler, GenerationState};

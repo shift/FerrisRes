@@ -4,6 +4,7 @@ pub mod cpu_offload;
 pub mod async_offload;
 pub mod lora;
 pub mod gradient_accum;
+pub mod partial_backprop;
 
 pub use optimizer::{SgdOptimizer, AdamOptimizer, CrossEntropyLoss};
 pub use checkpointing::CheckpointStore;
