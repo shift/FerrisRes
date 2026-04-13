@@ -274,6 +274,22 @@ Endpoints:
 Supports SSE streaming, CORS for browser integration, and works with any
 OpenAI-compatible client (Open WebUI, curl, etc.).
 
+## Distillation
+
+FerrisRes can convert standard transformer models (Gemma 4) into native
+Block AttnRes models through structural linearization — a lossless
+distillation process that reduces attention from O(n²) to O(n).
+
+```bash
+# Convert Gemma 4 E2B to Block AttnRes
+cargo run -- distill \
+  --model-path ./model.safetensors \
+  --config e2b \
+  --steps 1000
+```
+
+See [docs/distillation.md](docs/distillation.md) for the full guide.
+
 ---
 
 ## Building
