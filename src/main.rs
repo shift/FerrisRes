@@ -5,6 +5,10 @@ use tracing::{info, warn};
 use ferrisres::{WgpuCompute, DeviceProfile, BlockAttnResConfig, BlockAttnResModel, SimpleTokenizer};
 use ferrisres::compute::{GpuBuffer, MatMulOp, RmsNormOp, SoftmaxOp, ElementWiseOp};
 use ferrisres::training::AdamOptimizer;
+use ferrisres::model::gemma_mapper::{
+    self, Gemma4Config, Gemma4Teacher, Gemma4Student, DistillationConfig,
+    BlockSummaryLayer, load_gemma4_model, run_distillation,
+};
 
 #[derive(Parser)]
 #[command(name = "ferrisres", about = "Block AttnRes runtime for SLM/LLM training and inference")]
@@ -67,6 +71,50 @@ enum Commands {
         #[arg(long, default_value_t = 100)]
         iterations: u32,
     },
+
+    /// Distill a Gemma 4 model into Block AttnRes format.
+    Distill {
+        /// Path to Gemma 4 safetensors file.
+        #[arg(long)]
+        model_path: String,
+        /// Model config: e2b, e4b, 12b, 27b.
+        #[arg(long, default_value = "e2b")]
+        config: String,
+        /// Sequence length for training.
+        #[arg(long, default_value_t = 512)]
+        seq_len: usize,
+        /// Number of distillation steps.
+        #[arg(long, default_value_t = 1000)]
+        steps: usize,
+        /// Learning rate for Block Summary trainable weights.
+        #[arg(long, default_value_t = 0.0001)]
+        learning_rate: f64,
+        /// KL divergence temperature.
+        #[arg(long, default_value_t = 2.0)]
+        temperature: f64,
+        /// Path to training data (text file, one doc per line).
+        #[arg(long)]
+        data: Option<String>,
+        /// Output path for distilled model.
+        #[arg(long, default_value = "distilled_model.bin")]
+        output: String,
+        /// Log loss every N steps.
+        #[arg(long, default_value_t = 10)]
+        log_every: usize,
+    },
+
+    /// Evaluate teacher/student perplexity.
+    Evaluate {
+        /// Path to Gemma 4 safetensors file.
+        #[arg(long)]
+        model_path: String,
+        /// Model config: e2b, e4b, 12b, 27b.
+        #[arg(long, default_value = "e2b")]
+        config: String,
+        /// Text to evaluate on.
+        #[arg(long)]
+        text: String,
+    },
 }
 
 #[tokio::main]
@@ -104,6 +152,12 @@ async fn main() -> anyhow::Result<()> {
             block_size,
             iterations,
         } => cmd_benchmark(hidden_dim, num_blocks, block_size, iterations).await,
+        Commands::Distill {
+            model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every,
+        } => cmd_distill(model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every).await,
+        Commands::Evaluate {
+            model_path, config, text,
+        } => cmd_evaluate(model_path, config, text).await,
     }
 }
 
@@ -596,6 +650,211 @@ async fn cmd_benchmark(
 
     info!("");
     info!("=== Benchmark Complete ===");
+
+    Ok(())
+}
+
+async fn cmd_distill(
+    model_path: String,
+    config_name: String,
+    seq_len: usize,
+    steps: usize,
+    learning_rate: f64,
+    temperature: f64,
+    data_path: Option<String>,
+    output_path: String,
+    log_every: usize,
+) -> anyhow::Result<()> {
+    info!("=== FerrisRes Gemma 4 → Block AttnRes Distillation ===");
+
+    // Parse config
+    let config = match config_name.as_str() {
+        "e2b" => { info!("Using Gemma 4 E2B config (dense, ~4 GB)"); Gemma4Config::gemma4_e2b() }
+        "e4b" => { info!("Using Gemma 4 E4B config (MoE-16, ~8 GB)"); Gemma4Config::gemma4_e4b() }
+        "12b" => { info!("Using Gemma 4 12B config (MoE-128, ~24 GB)"); Gemma4Config::gemma4_12b() }
+        "27b" => { info!("Using Gemma 4 27B config (MoE-128, ~54 GB)"); Gemma4Config::gemma4_27b() }
+        other => anyhow::bail!("Unknown config '{}'. Use: e2b, e4b, 12b, 27b", other),
+    };
+
+    info!("Model: hidden={} layers={} heads={} vocab={}",
+        config.hidden_dim, config.num_layers, config.num_heads, config.vocab_size);
+
+    // Load weights
+    info!("Loading weights from: {}", model_path);
+    let path = std::path::Path::new(&model_path);
+    if !path.exists() {
+        anyhow::bail!("Model file not found: {}", model_path);
+    }
+
+    let model1 = load_gemma4_model(path, config.clone())
+        .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
+    info!("Model loaded: {} layers, {} params",
+        model1.layers.len(),
+        model1.embed_tokens.len() + model1.layers.iter().map(|l| {
+            let attn = l.attn.q_proj.len() + l.attn.k_proj.len() + l.attn.v_proj.len() + l.attn.o_proj.len();
+            let ffn = match &l.ffn {
+                gemma_mapper::Gemma4FfnWeights::Dense { gate_proj, up_proj, down_proj } => gate_proj.len() + up_proj.len() + down_proj.len(),
+                gemma_mapper::Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs } => {
+                    router.len() + expert_gates.iter().map(|v| v.len()).sum::<usize>()
+                        + expert_ups.iter().map(|v| v.len()).sum::<usize>()
+                        + expert_downs.iter().map(|v| v.len()).sum::<usize>()
+                }
+            };
+            attn + ffn
+        }).sum::<usize>() + model1.final_norm.len() + model1.lm_head.len());
+
+    // Create teacher (frozen)
+    let teacher = Gemma4Teacher::new(model1);
+    info!("Teacher model created (frozen)");
+
+    // Create student with Block Summary
+    let model2 = load_gemma4_model(path, config.clone())
+        .map_err(|e| anyhow::anyhow!("Failed to reload model for student: {}", e))?;
+
+    let injection_points = config.block_summary_injection_points();
+    let block_summaries: Vec<BlockSummaryLayer> = injection_points.iter()
+        .map(|_| BlockSummaryLayer::new_identity(config.hidden_dim, config.sliding_window))
+        .collect();
+    info!("Student model created with {} Block Summary layers", block_summaries.len());
+
+    let distill_config = DistillationConfig {
+        learning_rate: learning_rate as f32,
+        temperature: temperature as f32,
+        num_steps: steps,
+        max_seq_len: seq_len,
+        ..DistillationConfig::default()
+    };
+
+    let mut student = Gemma4Student::new(model2, block_summaries, distill_config.clone());
+
+    // Load training data
+    let token_ids = if let Some(ref dp) = data_path {
+        info!("Loading training data from: {}", dp);
+        let text = std::fs::read_to_string(dp)
+            .map_err(|e| anyhow::anyhow!("Failed to read data: {}", e))?;
+        // Byte-level tokenization for now (use BPE tokenizer for real runs)
+        let ids: Vec<u32> = text.bytes().map(|b| b as u32).collect();
+        info!("Loaded {} tokens from training data", ids.len());
+        ids
+    } else {
+        // Synthetic data for testing
+        info!("No training data provided, using synthetic tokens");
+        (0..10000).map(|i| i % config.vocab_size as u32).collect()
+    };
+
+    info!("");
+    info!("Starting distillation: {} steps, seq_len={}, lr={}, temp={}",
+        steps, seq_len, learning_rate, temperature);
+    info!("");
+
+    // Run distillation
+    let results = run_distillation(&teacher, &mut student, &token_ids, seq_len);
+
+    // Report results
+    info!("");
+    info!("=== Distillation Results ===");
+    info!("Steps completed: {}", results.len());
+
+    if let Some(first) = results.first() {
+        info!("Initial KL loss: {:.6}", first.kl_loss);
+    }
+    if let Some(last) = results.last() {
+        info!("Final KL loss:   {:.6}", last.kl_loss);
+        info!("Final bridge_weight: {:.6}", last.bridge_weight);
+    }
+
+    // Log loss curve
+    for result in &results {
+        if result.step % log_every == 0 {
+            info!("Step {:>5}: loss={:.6} bridge_w={:.4} lr={:.6}",
+                result.step, result.kl_loss, result.bridge_weight, result.learning_rate);
+        }
+    }
+
+    // Save distilled model (block summary params)
+    for (i, bs) in student.block_summaries.iter().enumerate() {
+        let params = bs.export_trainable();
+        let save_path = format!("{}.block_summary_{}.bin", output_path, i);
+        let bytes: Vec<u8> = params.iter().flat_map(|f| f.to_le_bytes()).collect();
+        std::fs::write(&save_path, &bytes)?;
+        info!("Saved Block Summary {} → {} ({} params)", i, save_path, params.len());
+    }
+
+    // Save loss curve as CSV
+    let csv_path = format!("{}.loss_curve.csv", output_path);
+    let mut csv = String::from("step,kl_loss,bridge_weight,learning_rate\n");
+    for r in &results {
+        csv.push_str(&format!("{},{},{},{}\n", r.step, r.kl_loss, r.bridge_weight, r.learning_rate));
+    }
+    std::fs::write(&csv_path, &csv)?;
+    info!("Loss curve saved → {}", csv_path);
+
+    info!("");
+    info!("Distillation complete!");
+
+    Ok(())
+}
+
+async fn cmd_evaluate(
+    model_path: String,
+    config_name: String,
+    text: String,
+) -> anyhow::Result<()> {
+    info!("=== FerrisRes Evaluation ===");
+
+    let config = match config_name.as_str() {
+        "e2b" => Gemma4Config::gemma4_e2b(),
+        "e4b" => Gemma4Config::gemma4_e4b(),
+        _ => anyhow::bail!("Use e2b or e4b for evaluation"),
+    };
+
+    let path = std::path::Path::new(&model_path);
+    let model = load_gemma4_model(path, config.clone())
+        .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
+
+    let teacher = Gemma4Teacher::new(model);
+
+    // Tokenize (byte-level)
+    let token_ids: Vec<u32> = text.bytes().map(|b| b as u32).collect();
+    info!("Evaluating on {} tokens", token_ids.len());
+
+    let logits = teacher.forward(&token_ids);
+    let vs = config.vocab_size;
+    let seq = token_ids.len();
+
+    // Compute perplexity: exp(average NLL)
+    let mut total_nll = 0.0f64;
+    let mut count = 0usize;
+    for t in 0..seq.saturating_sub(1) {
+        let target = token_ids[t + 1] as usize;
+        if target < vs {
+            // Softmax to get probabilities
+            let offset = t * vs;
+            let mut max_logit = f32::NEG_INFINITY;
+            for v in 0..vs {
+                let l = logits.get(offset + v).copied().unwrap_or(0.0);
+                if l > max_logit { max_logit = l; }
+            }
+            let mut sum_exp = 0.0f32;
+            let mut probs = vec![0.0f32; vs];
+            for v in 0..vs {
+                probs[v] = (logits.get(offset + v).copied().unwrap_or(0.0) - max_logit).exp();
+                sum_exp += probs[v];
+            }
+            let target_prob = probs.get(target).copied().unwrap_or(0.0) / sum_exp;
+            if target_prob > 1e-10 {
+                total_nll -= (target_prob as f64).ln();
+                count += 1;
+            }
+        }
+    }
+
+    let avg_nll = if count > 0 { total_nll / count as f64 } else { f64::INFINITY };
+    let perplexity = avg_nll.exp();
+
+    info!("Tokens evaluated: {}", count);
+    info!("Average NLL: {:.4}", avg_nll);
+    info!("Perplexity: {:.2}", perplexity);
 
     Ok(())
 }

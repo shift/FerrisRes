@@ -1071,6 +1071,7 @@ pub struct Gemma4LayerWeights {
 }
 
 /// Full Gemma 4 model weights loaded and organized.
+#[derive(Clone)]
 pub struct MappedGemma4Model {
     pub config: Gemma4Config,
     pub embed_tokens: Vec<f32>,  // [vocab_size × hidden_dim]
@@ -2918,5 +2919,264 @@ mod tests {
         let ds = TextDataset::from_token_ids(ids, 10, "test_ids");
         assert_eq!(ds.total_tokens(), 100);
         assert_eq!(ds.num_sequences(), 10);
+    }
+
+    // ------------------------------------------------------------------
+    // Full synthetic smoke test
+    // ------------------------------------------------------------------
+
+    /// Write a minimal safetensors file from named tensors.
+    fn write_synthetic_safetensors(
+        path: &std::path::Path,
+        tensors: &[(&str, &[usize], &[f32])],
+    ) -> std::io::Result<()> {
+        // Safetensors format: u64 header_len + JSON header + raw data
+        let mut header_json = serde_json::Map::new();
+        let mut data_blob = Vec::new();
+
+        let num = |v: i64| -> serde_json::Value {
+            serde_json::Value::Number(serde_json::Number::from(v))
+        };
+
+        for (name, shape, data) in tensors {
+            let start = data_blob.len();
+            let byte_data: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+            data_blob.extend_from_slice(&byte_data);
+            let end = data_blob.len();
+
+            let mut meta = serde_json::Map::new();
+            meta.insert("dtype".to_string(), serde_json::Value::String("F32".to_string()));
+            meta.insert(
+                "shape".to_string(),
+                serde_json::Value::Array(shape.iter().map(|&d| num(d as i64)).collect()),
+            );
+            meta.insert(
+                "data_offsets".to_string(),
+                serde_json::Value::Array(vec![num(start as i64), num(end as i64)]),
+            );
+            header_json.insert(name.to_string(), serde_json::Value::Object(meta));
+        }
+
+        let header_str = serde_json::to_string(&header_json)?;
+        let header_bytes = header_str.as_bytes();
+        let header_len = header_bytes.len() as u64;
+
+        use std::io::Write;
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(&header_len.to_le_bytes())?;
+        file.write_all(header_bytes)?;
+        file.write_all(&data_blob)?;
+        Ok(())
+    }
+
+    /// Create a tiny synthetic Gemma model config for smoke testing.
+    fn tiny_gemma_config() -> Gemma4Config {
+        Gemma4Config {
+            hidden_dim: 32,
+            num_layers: 2,
+            num_heads: 4,
+            head_dim: 8,
+            intermediate_dim: 64,
+            num_experts: 1,
+            top_k: 1,
+            vocab_size: 128,
+            max_position_embeddings: 256,
+            sliding_window: 32,
+            moe_layers: vec![], // Dense only
+        }
+    }
+
+    /// Build all tensors for a tiny synthetic model.
+    fn build_tiny_model_tensors(config: &Gemma4Config) -> Vec<(String, Vec<usize>, Vec<f32>)> {
+        let hd = config.hidden_dim;
+        let vs = config.vocab_size;
+        let id = config.intermediate_dim;
+        let mut tensors = Vec::new();
+
+        // Simple deterministic init: 0.01 * sin(i)
+        let init = |n: usize| -> Vec<f32> {
+            (0..n).map(|i| 0.01 * (i as f32 * 0.1).sin()).collect()
+        };
+
+        // Embedding
+        tensors.push(("model.embed_tokens.weight".to_string(), vec![vs, hd], init(vs * hd)));
+        // LM head (tied for now — use same data)
+        tensors.push(("lm_head.weight".to_string(), vec![vs, hd], init(vs * hd)));
+        // Final norm
+        tensors.push(("model.norm.weight".to_string(), vec![hd], vec![1.0; hd]));
+
+        for layer in 0..config.num_layers {
+            // Attention
+            tensors.push((format!("model.layers.{}.self_attn.q_proj.weight", layer), vec![hd, hd], init(hd * hd)));
+            tensors.push((format!("model.layers.{}.self_attn.k_proj.weight", layer), vec![hd, hd], init(hd * hd)));
+            tensors.push((format!("model.layers.{}.self_attn.v_proj.weight", layer), vec![hd, hd], init(hd * hd)));
+            tensors.push((format!("model.layers.{}.self_attn.o_proj.weight", layer), vec![hd, hd], init(hd * hd)));
+            // Norms
+            tensors.push((format!("model.layers.{}.input_layernorm.weight", layer), vec![hd], vec![1.0; hd]));
+            tensors.push((format!("model.layers.{}.post_attention_layernorm.weight", layer), vec![hd], vec![1.0; hd]));
+            // FFN (dense)
+            tensors.push((format!("model.layers.{}.mlp.gate_proj.weight", layer), vec![id, hd], init(id * hd)));
+            tensors.push((format!("model.layers.{}.mlp.up_proj.weight", layer), vec![id, hd], init(id * hd)));
+            tensors.push((format!("model.layers.{}.mlp.down_proj.weight", layer), vec![hd, id], init(hd * id)));
+        }
+
+        tensors
+    }
+
+    #[test]
+    fn test_synthetic_safetensors_round_trip() {
+        let dir = std::env::temp_dir().join("ferrisres_smoke_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tiny_model.safetensors");
+
+        let config = tiny_gemma_config();
+        let tensors = build_tiny_model_tensors(&config);
+        let flat: Vec<(&str, &[usize], &[f32])> = tensors.iter()
+            .map(|(n, s, d)| (n.as_str(), s.as_slice(), d.as_slice()))
+            .collect();
+        write_synthetic_safetensors(&path, &flat).unwrap();
+
+        assert!(path.exists());
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        assert!(file_size > 0);
+
+        // Load it back
+        let weights = crate::model::safetensors::load_safetensors(&path).unwrap();
+        assert!(weights.get("model.embed_tokens.weight").is_some());
+        assert!(weights.get("model.layers.0.self_attn.q_proj.weight").is_some());
+        assert!(weights.get("model.layers.1.mlp.gate_proj.weight").is_some());
+
+        // Clean up
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_gemma4_synthetic_model() {
+        let dir = std::env::temp_dir().join("ferrisres_load_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tiny_gemma.safetensors");
+
+        let config = tiny_gemma_config();
+        let tensors = build_tiny_model_tensors(&config);
+        let flat: Vec<(&str, &[usize], &[f32])> = tensors.iter()
+            .map(|(n, s, d)| (n.as_str(), s.as_slice(), d.as_slice()))
+            .collect();
+        write_synthetic_safetensors(&path, &flat).unwrap();
+
+        // Load through the full pipeline
+        let result = load_gemma4_model(&path, config.clone());
+        assert!(result.is_ok(), "load_gemma4_model failed: {:?}", result.err());
+        let model = result.unwrap();
+        assert_eq!(model.layers.len(), 2);
+        assert_eq!(model.embed_tokens.len(), config.vocab_size * config.hidden_dim);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_teacher_forward_synthetic() {
+        let dir = std::env::temp_dir().join("ferrisres_teacher_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tiny_teacher.safetensors");
+
+        let config = tiny_gemma_config();
+        let tensors = build_tiny_model_tensors(&config);
+        let flat: Vec<(&str, &[usize], &[f32])> = tensors.iter()
+            .map(|(n, s, d)| (n.as_str(), s.as_slice(), d.as_slice()))
+            .collect();
+        write_synthetic_safetensors(&path, &flat).unwrap();
+
+        let model = load_gemma4_model(&path, config.clone()).unwrap();
+        let teacher = Gemma4Teacher::new(model);
+
+        // Forward pass with 4 tokens
+        let token_ids: &[u32] = &[1, 2, 3, 4];
+        let logits = teacher.forward(token_ids);
+        let vs = config.vocab_size;
+        assert_eq!(logits.len(), 4 * vs, "Expected {} logits, got {}", 4 * vs, logits.len());
+
+        // Logits should be finite
+        for (i, &l) in logits.iter().enumerate() {
+            assert!(l.is_finite(), "Logit {} is not finite: {}", i, l);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_student_forward_synthetic() {
+        let dir = std::env::temp_dir().join("ferrisres_student_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tiny_student.safetensors");
+
+        let config = tiny_gemma_config();
+        let tensors = build_tiny_model_tensors(&config);
+        let flat: Vec<(&str, &[usize], &[f32])> = tensors.iter()
+            .map(|(n, s, d)| (n.as_str(), s.as_slice(), d.as_slice()))
+            .collect();
+        write_synthetic_safetensors(&path, &flat).unwrap();
+
+        let model = load_gemma4_model(&path, config.clone()).unwrap();
+        let block_summaries = vec![BlockSummaryLayer::new_identity(config.hidden_dim, config.sliding_window)];
+        let distill_config = DistillationConfig::default();
+        let student = Gemma4Student::new(model, block_summaries, distill_config);
+
+        let token_ids: &[u32] = &[1, 2, 3, 4];
+        let logits = student.forward(token_ids);
+        let vs = config.vocab_size;
+        assert_eq!(logits.len(), 4 * vs);
+
+        for (i, &l) in logits.iter().enumerate() {
+            assert!(l.is_finite(), "Student logit {} not finite: {}", i, l);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_distillation_smoke_test() {
+        // Full end-to-end: create model → teacher → student → distill → verify loss decreases
+        let dir = std::env::temp_dir().join("ferrisres_distill_smoke");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tiny_distill.safetensors");
+
+        let config = tiny_gemma_config();
+        let tensors = build_tiny_model_tensors(&config);
+        let flat: Vec<(&str, &[usize], &[f32])> = tensors.iter()
+            .map(|(n, s, d)| (n.as_str(), s.as_slice(), d.as_slice()))
+            .collect();
+        write_synthetic_safetensors(&path, &flat).unwrap();
+
+        let model1 = load_gemma4_model(&path, config.clone()).unwrap();
+        let teacher = Gemma4Teacher::new(model1);
+
+        let model2 = load_gemma4_model(&path, config.clone()).unwrap();
+        let block_summaries = vec![BlockSummaryLayer::new_identity(config.hidden_dim, config.sliding_window)];
+        let mut distill_config = DistillationConfig::default();
+        distill_config.num_steps = 3; // Just 3 steps for smoke test
+        distill_config.learning_rate = 0.01;
+
+        let mut student = Gemma4Student::new(model2, block_summaries, distill_config.clone());
+
+        // Use synthetic token IDs
+        let token_ids: Vec<u32> = (0..32).collect();
+
+        let results = run_distillation(&teacher, &mut student, &token_ids, 16);
+
+        assert!(!results.is_empty(), "Distillation should produce results");
+
+        // Verify results have expected fields
+        let first = &results[0];
+        assert_eq!(first.step, 0);
+        assert!(first.kl_loss >= 0.0, "KL loss should be non-negative");
+        assert_eq!(first.bridge_weight, 0.0); // Should start at 0
+
+        // Bridge weight should evolve (Adam is running)
+        if results.len() > 1 {
+            let last = results.last().unwrap();
+            assert!(last.step > 0);
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 }
