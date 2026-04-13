@@ -19,6 +19,7 @@ pub mod vqvae;
 pub mod streaming_image;
 pub mod blt;
 pub mod streaming_audio;
+pub mod streaming_video;
 
 pub use config::BlockAttnResConfig;
 pub use linear::Linear;
