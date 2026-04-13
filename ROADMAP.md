@@ -6,11 +6,11 @@
 
 | Metric | Value |
 |---|---|
-| Source code | ~29,065 lines across 80+ modules |
-| Test suites | 279 lib tests passing, 0 failures |
+| Source code | ~37,523 lines across 80+ modules |
+| Test suites | 495 lib tests passing, 0 failures |
 | Language | 100% Rust (safe + WGSL compute shaders) |
 | GPU backends | Vulkan, Metal, DX12, WebGPU via wgpu |
-| Tasks completed | 195 / 212 (17 low-priority remaining) |
+| Tasks completed | **212 / 212 (all complete)** |
 | License | AGPL-3.0-or-later |
 
 ---
@@ -58,6 +58,14 @@
 │  │  + verify)   │  │  COW, prefix │  │  audio fusion)   │  │
 │  │              │  │  sharing)    │  │                  │  │
 │  └──────────────┘  └──────────────┘  └──────────────────┘  │
+│  ┌──────────────┐  ┌──────────────┐                         │
+│  │ Video Token  │  │ Streaming    │                         │
+│  │ Compression  │  │ I/O Pipelines│                         │
+│  │ (temporal    │  │ (image/audio │                         │
+│  │  redundancy, │  │  /video:     │                         │
+│  │  motion comp,│  │  progressive │                         │
+│  │  4-8× reduce)│  │  decode)     │                         │
+│  └──────────────┘  └──────────────┘                         │
 ├─────────────────────────────────────────────────────────────┤
 │                      Model Layer                            │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
@@ -70,18 +78,20 @@
 │  │ Safetensors  │  │ GGUF Loader  │  ┌──────────────────┐  │
 │  │ (F32/F16/    │  │ (v2/v3, Q8_0 │  │ Audio Encoder    │  │
 │  │  BF16, shard)│  │  Q4_0/Q4_K/  │  │ (EnCodec-style,  │  │
-│  │              │  │  Q5_K/Q6_K)  │  │  RVQ codecbooks) │  │
+│  │              │  │  Q5_K/Q6_K)  │  │  RVQ codebooks)  │  │
 │  └──────────────┘  └──────────────┘  └──────────────────┘  │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ BPE Tokenizer│  │ QA-Token     │  │ VisionEncoder    │  │
-│  │ + Domain     │  │ (quality-    │  │ (Implicit GEMM   │  │
-│  │ Vocabulary   │  │  aware)      │  │  + ToMe merge)   │  │
+│  │ BPE Tokenizer│  │ BLT Tokenizer│  │ QA-Token         │  │
+│  │ + Domain     │  │ (byte-level, │  │ (quality-aware)  │  │
+│  │ Vocabulary   │  │  entropy     │  │                  │  │
+│  │              │  │  patching)   │  │                  │  │
 │  └──────────────┘  └──────────────┘  └──────────────────┘  │
-│  ┌──────────────┐  ┌──────────────┐                         │
-│  │ ModelShard   │  │ Image        │                         │
-│  │ (F32/F16/    │  │ Preprocessor │                         │
-│  │  I8/I4)      │  │              │                         │
-│  └──────────────┘  └──────────────┘                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │ VisionEncoder│  │ VQ-VAE       │  │ ModelShard       │  │
+│  │ (Implicit    │  │ Codebook     │  │ (F32/F16/I8/I4)  │  │
+│  │  GEMM + ToMe)│  │ (EMA, multi- │  │                  │  │
+│  │              │  │  codebook)   │  │                  │  │
+│  └──────────────┘  └──────────────┘  └──────────────────┘  │
 ├─────────────────────────────────────────────────────────────┤
 │                    Training Layer                            │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
@@ -91,10 +101,12 @@
 │  │  hot-swap)   │  │  based       │  │                  │  │
 │  │              │  │  recompute)  │  │                  │  │
 │  └──────────────┘  └──────────────┘  └──────────────────┘  │
-│  ┌──────────────┐  ┌──────────────┐                         │
-│  │ Adam/SGD     │  │ CPU/Async    │                         │
-│  │ Optimizers   │  │ Offload      │                         │
-│  └──────────────┘  └──────────────┘                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │ Adam/SGD     │  │ Tile-Based   │  │ Partial          │  │
+│  │ Optimizers   │  │ Gradient     │  │ Backpropagation  │  │
+│  │              │  │ Accumulation │  │ (layer freeze,   │  │
+│  │              │  │              │  │  selective bwd)  │  │
+│  └──────────────┘  └──────────────┘  └──────────────────┘  │
 ├─────────────────────────────────────────────────────────────┤
 │                    Compute Layer                             │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
@@ -105,9 +117,10 @@
 │  │              │  │  2.5-bit)    │  │                  │  │
 │  └──────────────┘  └──────────────┘  └──────────────────┘  │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ MatMul +     │  │ RoPE +       │  │ RMSNorm +        │  │
-│  │ FusedPatch   │  │ InPlace      │  │ Elementwise      │  │
-│  │ Embed WGSL   │  │ RoPE WGSL    │  │ WGSL             │  │
+│  │ Tensor       │  │ Pipeline     │  │ 3D Factored      │  │
+│  │ Parallelism  │  │ Parallelism  │  │ Convolution      │  │
+│  │ (weight      │  │ (GPipe/1F1B  │  │ (temporal +      │  │
+│  │  sharding)   │  │  schedules)  │  │  spatial)        │  │
 │  └──────────────┘  └──────────────┘  └──────────────────┘  │
 ├─────────────────────────────────────────────────────────────┤
 │                     Device Layer                             │
@@ -117,10 +130,19 @@
 │  │  + memory)   │  │              │  │  coalescing,     │  │
 │  │              │  │              │  │  compute params) │  │
 │  └──────────────┘  └──────────────┘  └──────────────────┘  │
+├─────────────────────────────────────────────────────────────┤
+│                 Distributed / Hardware Layer                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │ Cloud GPU    │  │ ANE / NPU    │  │ RDMA / DirectGPU │  │
+│  │ Orchestrator │  │ Op Placement │  │ (NVLink/RoCE/    │  │
+│  │ (workers,    │  │ (auto route  │  │  InfiniBand/TCP) │  │
+│  │  fault tol,  │  │  ops to GPU  │  │                  │  │
+│  │  cost sched) │  │  or ANE)     │  │                  │  │
+│  └──────────────┘  └──────────────┘  └──────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Key Features (implemented)
+## Key Features (all implemented)
 
 ### Core
 - **Block AttnRes transformer**: O(n) inference via block-partitioned attention with full backward pass
@@ -143,44 +165,63 @@
 - **Speculative decoding**: n-gram draft model + rejection sampling verification
 - **PagedAttention**: vLLM-style block management, copy-on-write, prefix sharing
 - **ToMe token merging**: bipartite soft-match merging for vision tokens
+- **Circular KV buffer**: virtual ring buffer for streaming KV cache
 
 ### Training
 - **Gradient checkpointing**: closure-based recompute (ADR-010)
 - **LoRA**: merge/unmerge, auto-populate, hot-swap adapters
 - **Autodiff**: ComputationGraph + backward pass
 - **Adam/SGD optimizers**
+- **Tile-based gradient accumulation**: memory-efficient large-batch training
+- **Partial backpropagation**: layer freeze, selective backward, gradual unfreezing
 
 ### Multimodal
 - **VisionEncoder**: implicit GEMM fused patch embedding + ToMe merge
 - **EnCodec audio encoder**: strided conv encoder + residual vector quantization (8 codebooks)
 - **Cross-modal attention**: Q from text, K/V from vision/audio, early/mid/late fusion
 - **Modality type embeddings**: text/vision/audio learnable type IDs
+- **VQ-VAE codebook**: nearest-neighbor lookup, EMA updates, commitment+codebook loss, multi-codebook modes
+- **Streaming image I/O**: progressive patch extraction, tiled reading for large images
+- **Streaming audio I/O**: chunked window processing, SPSC ring buffer, streaming EnCodec encoding
+- **Streaming video I/O**: frame sampling, temporal buffering, progressive decode
+- **Video token compression**: temporal redundancy removal, motion-compensated residuals, cross-frame token merging (4-8× reduction)
+- **3D/factored convolution**: temporal (T×1×1) + spatial (1×H×W) decomposition with WGSL kernels
 
-### Tools & Pipeline
-- **Logit processors**: temperature → top-k → top-p → repetition/frequency/presence penalty
-- **Prompt templates**: ChatML, Llama2, Mistral, Alpaca, Raw
-- **RAG pipeline**: dense/sparse/hybrid retrieval + Matryoshka elastic embeddings
-- **Tool search**: keyword/embedding/hybrid registry with `[tool_call]` detection
-- **DECS**: reasoning token optimization with plateau detection
-- **HullKVCache**: 2D convex hull attention O(log n)
-- **LLM-Computer**: CALM virtual machine (LookUp → Compute → BranchIf)
+### Tokenizers
+- **BPE tokenizer**: byte-pair encoding with DomainVocabulary for specialized tokens
+- **BLT tokenizer**: Byte Latent Transformer — raw UTF-8 bytes, entropy-based dynamic patching, cross-patch attention
+- **QA-Token**: quality-aware tokenization with confidence-weighted vocabulary
 
-## Remaining Tasks (17, all Low priority)
+### Distributed & Hardware
+- **Tensor parallelism**: split weight matrices across N GPUs, all-reduce after attention/FFN
+- **Pipeline parallelism**: assign layers to different GPUs, GPipe and 1F1B schedules
+- **Weight sharding**: split_rows/cols with reconstruct, scatter/gather primitives
+- **Cloud GPU orchestration**: worker registration, shard assignment, gradient aggregation, fault tolerance, cost-aware spot scheduling
+- **Apple Neural Engine (ANE)**: automatic op placement (GPU for matmul/attention, ANE for BN/activation), unified memory buffers
+- **RDMA/DirectGPU**: NVLink, RoCE, InfiniBand, TCP fallback with bandwidth/latency estimates
 
-| Task | Description |
-|---|---|
-| Remove deprecated AutoregressiveGenerator | Cleanup |
-| Audit 43 dead_code annotations | Cleanup |
-| Virtual circular KV buffer | Future optimization |
-| Partial backpropagation | Future training |
-| Cloud GPU server training | Infrastructure |
-| Apple Neural Engine (ANE) | Hardware |
-| Tile-based gradient accumulation | Training |
-| RDMA/DirectGPU multi-node | Distributed |
-| Streaming image/video/audio I/O | I/O pipelines |
-| 3D/factored convolution | Multimodal |
-| Video token compression | Multimodal |
-| Byte Latent Transformer (BLT) | Architecture |
-| VQ-VAE codebook | Multimodal |
-| WGSL FFT for audio | Audio |
-| Distributed tensor parallelism | Distributed |
+### WGSL Compute Kernels
+- Tiled matmul (16×16 + double-buffer)
+- RMSNorm, Softmax (online), CausalMask
+- RoPE (in-place), Elementwise (add/scale/ReLU/copy)
+- FlashDecode + Tiled, PrefillAttn (batched causal)
+- FusedPatchEmbed (implicit GEMM), im2col
+- MoE routing, ToMeMerge
+- TurboQuant (rotation, quantize, dequantize, QJL)
+- FFT + Mel-spectrogram
+- Temporal/Spatial Conv3D
+- Circular KV buffer
+
+## Phase Completion
+
+| Phase | Status | Description |
+|---|---|---|
+| 1–3 | ✅ Done | wgpu foundation, BlockAttnRes model, tiered compute, caching |
+| 4 | ✅ Done | Autodiff, training, tokenizer, embedding, benches |
+| 5 | ✅ Done | Streaming inference, RoPE, KV cache, flash-decode, logit processors |
+| 6 | ✅ Done | TurboQuant, LoRA, RAG, YaRN, templates, DECS, HullKVCache, LLM-Computer |
+| 7 | ✅ Done | Vision, audio, video, cross-modal, streaming I/O, VQ-VAE, BLT, 3D convolution, video compression |
+| 8 | ✅ Done | Distributed tensor/pipeline parallelism, cloud GPU, RDMA, ANE/NPU |
+| 9 | ✅ Done | Weight loading (safetensors, GGUF), standard transformer, architecture dispatcher |
+
+**All 212 implementation tasks complete — 495 tests passing, 0 failures.**

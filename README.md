@@ -16,6 +16,8 @@ FerrisRes is a Rust-native AI inference and training engine built around **Block
 | Training only on high-end GPUs | Gradient checkpointing + CPU offload for 8 GB iGPUs and below |
 | KV cache memory blowout | TurboQuant 2-bit compression: 16× memory reduction |
 | Rigid inference pipeline | Composable: LoRA hot-swap, YaRN context extension, RAG, tool-calling |
+| Single-modality only | Vision, audio, video with streaming I/O and cross-modal attention |
+| Single-GPU bottleneck | Tensor parallelism, pipeline parallelism, RDMA/NVLink, cloud orchestration |
 
 ---
 
@@ -45,6 +47,7 @@ The `TokenGenerator` orchestrates both phases and exposes `generate_stream` for 
 ### Inference Pipeline
 
 - **TokenGenerator** — full prefill+decode pipeline with `generate()`, `generate_stream()`, `generate_with_rag()`, `generate_with_tools()`
+- **UnifiedTokenGenerator** — supports both BlockAttnRes and standard transformer (LLaMA/Mistral/Gemma) via `AnyModel` enum
 - **Logit processors** — composable chain: repetition → frequency/presence penalty → temperature → top-k → top-p → sample
 - **Prompt templates** — ChatML, Llama 2, Mistral, Alpaca, Raw (CLI `--template` flag)
 - **Context extension** — YaRN (NTK-aware RoPE scaling) and StreamingLLM (attention sinks), effective position computed per decode step
@@ -55,6 +58,20 @@ The `TokenGenerator` orchestrates both phases and exposes `generate_stream` for 
 - **Token merging (ToMe)** — CPU bipartite soft matching for training-free visual token reduction
 - **HullKVCache** — 2D convex hull attention with O(log n) lookups
 - **LLM-Computer** — CALM virtual machine: LookUp → Compute → BranchIf instruction set
+- **Speculative decoding** — n-gram draft model + rejection sampling verification
+- **PagedAttention** — vLLM-style block management, copy-on-write, prefix sharing
+
+### Multimodal
+
+- **VisionEncoder** — ViT-style with Implicit GEMM (0 MB intermediate) or legacy im2col + ToMe
+- **EnCodec audio encoder** — strided conv encoder + residual vector quantization (8 codebooks)
+- **Cross-modal attention** — text/vision/audio fusion with early/mid/late fusion modes
+- **VQ-VAE codebook** — nearest-neighbor lookup, EMA updates, multi-codebook (multi-head + residual)
+- **Streaming image I/O** — progressive patch extraction, tiled reading for large images
+- **Streaming audio I/O** — chunked window processing, ring buffer capture, streaming EnCodec
+- **Streaming video I/O** — frame sampling, temporal buffering, progressive decode
+- **Video token compression** — temporal redundancy removal, motion-compensated residuals, cross-frame merging (4-8× reduction)
+- **3D/factored convolution** — temporal (T×1×1) + spatial (1×H×W) decomposition with WGSL kernels
 
 ### Training
 
@@ -64,16 +81,30 @@ The `TokenGenerator` orchestrates both phases and exposes `generate_stream` for 
 - **LoRA adapters** — low-rank fine-tuning with merge/unmerge, auto-populate, hot-swap, merge_all()
 - **Gradient checkpointing** — PerBlock/PerLayer/PerAttention with recompute_block() (ADR-010)
 - **CPU/Async gradient offload** — CPU-side accumulation and async GPU→CPU transfer for iGPUs
+- **Tile-based gradient accumulation** — split batch into GPU-sized tiles, accumulate partials
+- **Partial backpropagation** — layer freeze, selective backward, gradual unfreezing, LoRA integration
 
-### Model Components
+### Tokenizers
 
-- **BlockAttnResModel** — stack of layers with forward() and backward() (ADR-010)
-- **MoELinear** — Mixture-of-Experts with top-k gating
-- **TokenEmbedding / LMHead** — embedding lookup and logit projection
-- **QuantizedBuffer** — F32, F16, Int8, Int4 storage with quantize_data()
 - **BPE tokenizer** — byte-pair encoding with DomainVocabulary for specialized tokens
 - **QA-Token** — quality-aware tokenization with confidence-weighted vocabulary
-- **VisionEncoder** — ViT-style with Implicit GEMM (0 MB intermediate) or legacy im2col + ToMe
+- **BLT tokenizer** — Byte Latent Transformer: raw UTF-8 bytes, entropy-based dynamic patching, cross-patch attention
+
+### Model Loading
+
+- **Safetensors** — F32/F16/BF16, multi-shard, architecture detection
+- **GGUF** — v2/v3, Q8_0/Q4_0/Q4_K/Q5_K/Q6_K dequantization, name mapping
+- **Standard transformer** — O(n²) compatibility mode for LLaMA/Mistral/Gemma
+- **Architecture dispatcher** — auto-detect model type from weights, `AnyModel` unified interface
+
+### Distributed & Hardware
+
+- **Tensor parallelism** — split weight matrices across N GPUs, all-reduce after attention/FFN
+- **Pipeline parallelism** — assign layers to different GPUs, GPipe and 1F1B schedules
+- **Weight sharding** — split_rows/cols with reconstruct, scatter/gather primitives
+- **Cloud GPU orchestration** — worker registration, shard assignment, gradient aggregation, fault tolerance, cost-aware spot scheduling
+- **Apple Neural Engine (ANE)** — automatic op placement (GPU for matmul/attention, ANE for BN/activation), unified memory buffers
+- **RDMA/DirectGPU** — NVLink, RoCE, InfiniBand, TCP fallback with bandwidth/latency estimates
 
 ### Compute Kernels (WGSL)
 
@@ -91,6 +122,11 @@ The `TokenGenerator` orchestrates both phases and exposes `generate_stream` for 
 | MoE | Expert routing and gather |
 | TurboQuant | Rotation, quantize, dequantize, QJL projection |
 | ToMeMerge | Scatter-merge for token reduction |
+| FFT | Fast Fourier Transform for audio spectrograms |
+| Mel-spectrogram | Log-mel filterbank from FFT output |
+| Temporal/Spatial Conv | 3D factored convolution (video processing) |
+| Circular KV | Virtual circular buffer for KV cache |
+| TurboQuant kernels | Rotation, quantize, dequantize, QJL projection |
 
 ### Hardware Adaptation
 
@@ -226,7 +262,7 @@ FerrisRes requires a working Vulkan driver. On Linux the recommended path is thr
 ```bash
 nix develop          # enters the dev shell with Rust + Vulkan layers
 cargo build
-cargo test            # 191 tests
+cargo test            # 495 tests
 cargo bench
 ```
 
@@ -240,32 +276,58 @@ src/
 ├── lib.rs               # Public API re-exports
 ├── autodiff/             # Reverse-mode autodiff graph
 ├── compute/
-│   ├── kernels/          # 13 WGSL compute shaders
+│   ├── kernels/          # 17+ WGSL compute shaders
+│   │   ├── matmul.rs     # Tiled + double-buffer matmul
+│   │   ├── flash_decode  # Single-query decode attention
+│   │   ├── rope.rs       # RoPE in-place
+│   │   ├── fft.rs        # FFT for audio
+│   │   ├── conv3d.rs     # 3D factored convolution (temporal + spatial)
+│   │   └── ...           # RMSNorm, softmax, causal, elementwise, etc.
 │   ├── buffer.rs         # GpuBuffer
 │   ├── turboquant.rs     # TurboQuant engine
+│   ├── distributed.rs    # Tensor/pipeline parallelism, weight sharding
+│   ├── hardware.rs       # Cloud GPU, ANE/NPU, RDMA/DirectGPU
 │   └── async_pipeline.rs # FA3 double-buffer dispatch
-├── device/               # GPU detection + DeviceProfile
+├── device/               # GPU detection + DeviceProfile + hardware tuning
 ├── inference/
 │   ├── generator.rs      # TokenGenerator (generate/stream/rag/tools)
+│   ├── unified_generator # UnifiedTokenGenerator (AnyModel)
+│   ├── speculative.rs    # Speculative decoding (n-gram draft)
+│   ├── paged_attention   # vLLM-style block pool, COW, prefix sharing
+│   ├── cross_modal.rs    # Text/vision/audio cross-attention fusion
+│   ├── video_compression # Temporal redundancy, motion compensation, merging
 │   ├── logit_processors.rs
 │   ├── prompt_templates.rs
 │   ├── context_extension.rs
 │   ├── rag.rs / matryoshka.rs / tool_search.rs
 │   ├── token_merging.rs / paca.rs
 │   ├── decs.rs / hull_kv_cache.rs / llm_computer.rs
+│   ├── circular_kv.rs    # Virtual circular KV buffer
 │   └── kv_cache.rs / sampling.rs
 ├── model/
 │   ├── model.rs          # BlockAttnResModel (forward + backward)
 │   ├── block_attn_res.rs # BlockAttnResLayer
+│   ├── standard_transformer.rs  # O(n²) compatibility mode
+│   ├── dispatcher.rs     # Architecture auto-detection (AnyModel)
+│   ├── safetensors.rs    # Safetensors loader
+│   ├── gguf.rs           # GGUF v2/v3 loader
 │   ├── tokenizer.rs      # BPE + DomainVocabulary
+│   ├── blt.rs            # Byte Latent Transformer tokenizer
 │   ├── qa_tokenizer.rs   # QA-Token
-│   ├── vision.rs         # VisionEncoder
+│   ├── vision.rs         # VisionEncoder (Implicit GEMM + ToMe)
+│   ├── audio.rs          # EnCodec audio encoder (RVQ)
+│   ├── vqvae.rs          # VQ-VAE codebook (EMA, multi-codebook)
+│   ├── streaming_image.rs # Progressive patch extraction
+│   ├── streaming_audio.rs # Chunked audio processing + ring buffer
+│   ├── streaming_video.rs # Frame sampling + temporal buffering
 │   └── shard.rs          # ModelShard + QuantizedBuffer
 ├── tensor/               # GpuTensor
 └── training/
     ├── optimizer.rs      # SGD, Adam, CrossEntropyLoss
     ├── checkpointing.rs  # CheckpointStore (recompute_block)
     ├── lora.rs           # LoRA adapter
+    ├── gradient_accum.rs # Tile-based gradient accumulation
+    ├── partial_backprop  # Layer freeze, selective backward
     └── cpu_offload.rs / async_offload.rs
 ```
 
@@ -279,9 +341,11 @@ src/
 | 4 | ✅ Done | Autodiff, training, tokenizer, embedding, benches |
 | 5 | ✅ Done | Streaming inference, RoPE, KV cache, flash-decode, logit processors |
 | 6 | ✅ Done | TurboQuant, LoRA, RAG, YaRN, templates, DECS, HullKVCache, LLM-Computer |
-| 7 | 🔧 Mostly done | Vision (Implicit GEMM, ToMe, PaCa), Matryoshka. Audio + cross-modal remain |
-| 8 | 📝 Planned | Distributed / multi-GPU training, tensor parallelism |
-| 9 | 📝 Planned | Weight loading (safetensors / GGUF) |
+| 7 | ✅ Done | Vision (Implicit GEMM, ToMe, PaCa), Matryoshka, audio, cross-modal, streaming I/O, VQ-VAE, BLT, video compression, 3D convolution |
+| 8 | ✅ Done | Distributed tensor/pipeline parallelism, cloud GPU orchestration, RDMA/DirectGPU, ANE/NPU |
+| 9 | ✅ Done | Weight loading (safetensors, GGUF), standard transformer compatibility, architecture dispatcher |
+
+**All 212 tasks complete.**
 
 See [ROADMAP.md](ROADMAP.md) for full technical details.
 
