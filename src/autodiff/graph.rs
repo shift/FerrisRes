@@ -80,7 +80,6 @@ pub struct Node {
     pub kind: NodeKind,
     pub buf: GpuBuffer,
     pub grad: GpuBuffer,
-    #[allow(dead_code)]
     pub is_leaf: bool,
     pub requires_grad: bool,
 }

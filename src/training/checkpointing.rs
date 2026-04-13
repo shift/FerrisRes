@@ -83,7 +83,6 @@ impl CheckpointStore {
     }
     
     /// Create checkpoint store with TurboQuant compression enabled
-    #[allow(dead_code)]
     pub fn with_compression(
         device: Arc<Device>,
         compression: CheckpointCompressionConfig,

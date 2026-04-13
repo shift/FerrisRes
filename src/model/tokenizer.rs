@@ -72,14 +72,15 @@ impl Default for SimpleTokenizer {
 }
 
 /// BPE (Byte-Pair Encoding) subword tokenizer
-#[allow(dead_code)]
 pub struct BpeTokenizer {
     vocab: Vec<String>,
     token_to_id: HashMap<String, u32>,
     merges: Vec<(String, String)>,
+    #[allow(dead_code)]
     vocab_size: usize,
     unk_id: u32,
     eos_id: u32,
+    #[allow(dead_code)]
     bos_id: u32,
 }
 

@@ -40,7 +40,6 @@ pub struct TokenEmbedding {
 impl TokenEmbedding {
     pub fn new(
         device: Arc<Device>,
-    #[allow(dead_code)]
     queue: Arc<Queue>,
         vocab_size: usize,
         hidden_dim: usize,

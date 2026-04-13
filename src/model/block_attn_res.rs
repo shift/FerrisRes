@@ -128,7 +128,6 @@ pub struct BlockAttnResLayer {
     hidden_dim: usize,
     num_heads: usize,
     head_dim: usize,
-    #[allow(dead_code)]
     intermediate_dim: usize,
 
     attn_norm: RmsNormOp,
@@ -146,13 +145,11 @@ pub struct BlockAttnResLayer {
     pseudo_query: GpuBuffer,
     #[allow(dead_code)]
     attn_res_proj: Linear,
-    #[allow(dead_code)]
     attn_res_norm: RmsNormOp,
 
     elementwise: ElementWiseOp,
     matmul: MatMulOp,
     head_weight_mul: HeadWeightMulOp,
-    #[allow(dead_code)]
     softmax: SoftmaxOp,
     rope: RopeOp,
     #[allow(dead_code)]
@@ -161,7 +158,6 @@ pub struct BlockAttnResLayer {
     prefill_attn: PrefillAttnOp,
 
     device: Arc<Device>,
-    #[allow(dead_code)]
     queue: Arc<Queue>,
 }
 

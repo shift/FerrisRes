@@ -360,13 +360,14 @@ impl CompressedKVCacheConfig {
 }
 
 /// Compressed LayerKVCache using TurboQuant
-#[allow(dead_code)]
 pub struct CompressedLayerKVCache {
     /// The underlying uncompressed cache (may be None if using indices-only storage)
     key_cache: Option<GpuBuffer>,
     value_cache: Option<GpuBuffer>,
     // Quantized indices storage (for keys and values separately)
+    #[allow(dead_code)]
     key_indices: Option<GpuBuffer>,
+    #[allow(dead_code)]
     value_indices: Option<GpuBuffer>,
     /// TurboQuant engine for compression/decompression
     engine: TurboQuantEngine,

@@ -153,7 +153,6 @@ pub struct AdamOptimizer {
     m_buffers: HashMap<String, GpuBuffer>,
     v_buffers: HashMap<String, GpuBuffer>,
     device: Arc<Device>,
-    #[allow(dead_code)]
     queue: Arc<Queue>,
     #[allow(dead_code)]
     elementwise: ElementWiseOp,

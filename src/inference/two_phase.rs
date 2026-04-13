@@ -76,7 +76,6 @@ impl TwoPhaseConfig {
     }
 }
 
-#[allow(dead_code)]
 pub struct TwoPhaseInference {
     config: TwoPhaseConfig,
     model: BlockAttnResModel,
@@ -84,7 +83,9 @@ pub struct TwoPhaseInference {
     lse_buffer: GpuBuffer,
     elementwise: ElementWiseOp,
     // TurboQuant compression state
+    #[allow(dead_code)]
     turboquant_config: Option<TurboQuantConfig>,
+    #[allow(dead_code)]
     outlier_splitter: Option<OutlierChannelSplitter>,
     device: Arc<Device>,
     queue: Arc<Queue>,

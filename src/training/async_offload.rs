@@ -31,8 +31,8 @@ pub struct AsyncGradientOffload {
     write_slot: usize,
     /// Size in bytes of each gradient buffer.
     grad_size: usize,
-    #[allow(dead_code)]
     /// Shared device reference.
+    #[allow(dead_code)]
     device: Arc<Device>,
 }
 

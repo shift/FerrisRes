@@ -276,7 +276,6 @@ impl QuantizedBuffer {
 
     /// Quantize raw f32 data into a QuantizedBuffer on the GPU.
     /// `device` and `queue` are needed to upload the quantized data.
-    #[allow(dead_code)]
     pub fn quantize_data(
         device: &Device,
         queue: &wgpu::Queue,
@@ -386,7 +385,6 @@ impl QuantizedBuffer {
     }
 
     /// Get compression ratio vs f32
-    #[allow(dead_code)]
     pub fn compression_ratio(&self) -> f32 {
         match self.dtype {
             QuantDtype::F32 => 1.0,

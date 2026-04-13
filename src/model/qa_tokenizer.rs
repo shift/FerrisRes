@@ -88,15 +88,16 @@ impl Default for QaTokenConfig {
 
 /// A learned merge rule with quality metadata.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct MergeRule {
     /// Left token.
     left: String,
     /// Right token.
     right: String,
     /// Quality-weighted frequency score.
+    #[allow(dead_code)]
     weighted_score: f32,
     /// Average quality of training data that produced this merge.
+    #[allow(dead_code)]
     avg_quality: f32,
     /// Whether this is a high-quality merge (longer, more specific).
     is_high_quality: bool,

@@ -359,7 +359,6 @@ pub struct PagedAttentionManager {
     /// Prefix sharing manager.
     prefix_manager: PrefixSharingManager,
     /// Block size.
-    #[allow(dead_code)]
     block_size: usize,
     /// Hidden dimension.
     #[allow(dead_code)]
