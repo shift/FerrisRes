@@ -75,19 +75,19 @@ impl Capability {
                 cap.adapter_name = name.clone();
                 cap.gpu_kind = kind;
                 cap.vendor = GpuVendor::from_adapter_name(&name);
-                info!(vram_mb = vram, kind = ?kind, vendor = ?cap.vendor, method = "ash", "Detected GPU via Vulkan");
+                info!(event = "gpu_detected", vram_mb = vram, kind = ?kind, vendor = ?cap.vendor, method = "ash", "detected GPU via Vulkan");
             }
             None => {
-                warn!("ash VRAM detection failed, trying sysfs fallback");
+                warn!(event = "ash_vram_detection_failed_trying_sysfs", "ash VRAM detection failed, trying sysfs fallback");
                 match detect_vram_sysfs() {
                     Some((vram, name)) => {
                         cap.vram_mb = vram;
                         cap.adapter_name = name.clone();
                         cap.vendor = GpuVendor::from_adapter_name(&name);
-                        info!(vram_mb = vram, vendor = ?cap.vendor, method = "sysfs", "Detected GPU VRAM via sysfs");
+                        info!(event = "gpu_detected", vram_mb = vram, vendor = ?cap.vendor, method = "sysfs", "detected GPU VRAM via sysfs");
                     }
                     None => {
-                        warn!("No GPU VRAM detected via any method");
+                        warn!(event = "no_gpu_vram_detected_via_any", "No GPU VRAM detected via any method");
                     }
                 }
             }
@@ -221,7 +221,7 @@ fn detect_vram_ash() -> Option<(u64, String, GpuKind)> {
         };
 
         if name.contains("llvmpipe") || name.contains("lavapipe") || name.contains("swrast") {
-            warn!(adapter = %name, "Skipping software Vulkan renderer");
+            warn!(event = "skipping_software_renderer", adapter = %name, "skipping software Vulkan renderer");
             continue;
         }
 

@@ -205,7 +205,7 @@ impl TokenGenerator {
         // --- RAG augmentation: retrieve and prepend context ---
         let final_tokens = if let Some(ref rag_config) = config.rag_config {
             let store = crate::inference::rag::RagStore::new(rag_config.clone());
-            tracing::debug!("RAG enabled with {} documents", store.len());
+            tracing::debug!(event = "rag_enabled_with_documents", "RAG enabled with {} documents", store.len());
             prompt_tokens.to_vec()
         } else {
             prompt_tokens.to_vec()
@@ -216,7 +216,7 @@ impl TokenGenerator {
             .map(|c: &crate::inference::context_extension::ContextExtensionConfig| crate::inference::context_extension::ContextExtensionEngine::new(c.clone()))
             .unwrap_or_else(crate::inference::context_extension::ContextExtensionEngine::none);
         if ctx_ext.is_active() {
-            tracing::debug!("Context extension active: scale_factor={}", ctx_ext.config().scale_factor());
+            tracing::debug!(event = "context_extension_active_scale_factor", "Context extension active: scale_factor={}", ctx_ext.config().scale_factor());
         }
 
         let hidden_dim = self.model.config().hidden_dim;
@@ -328,7 +328,7 @@ impl TokenGenerator {
                 let tokenizer = SimpleTokenizer::new();
                 let output_text = tokenizer.decode(&output_tokens);
                 if output_text.contains("[tool_call]") {
-                    tracing::debug!("Tool call detected in generate() output, tool registry has {} tools", registry.len());
+                    tracing::debug!(event = "tool_call_detected_in_generate_output", "Tool call detected in generate() output, tool registry has {} tools", registry.len());
                 }
             }
         }
@@ -572,7 +572,7 @@ impl TokenGenerator {
             rag_store.build_rag_prompt(prompt, &retrieved)
         };
 
-        tracing::info!("RAG: retrieved {} documents, augmented prompt {} -> {} chars",
+        tracing::info!(event = "rag_augmented", "rag: retrieved {} documents, augmented prompt {} -> {} chars",
             retrieved.len(), prompt.len(), augmented.len());
 
         // Tokenize the augmented prompt and generate
@@ -609,7 +609,7 @@ impl TokenGenerator {
             )
         };
 
-        tracing::info!("Tool-calling: {} tools selected, prompt {} chars", selected.len(), tools_prompt.len());
+        tracing::info!(event = "tool_calling_tools_selected_prompt_chars", "Tool-calling: {} tools selected, prompt {} chars", selected.len(), tools_prompt.len());
 
         let tokenizer = SimpleTokenizer::new();
         let tokens = tokenizer.encode(&tools_prompt);
@@ -632,7 +632,7 @@ impl TokenGenerator {
                 (call_text.trim().to_string(), String::new())
             };
 
-            tracing::info!("Tool call detected: name={}, args={}", tool_name, args);
+            tracing::info!(event = "tool_call_detected_name_args", "Tool call detected: name={}, args={}", tool_name, args);
 
             // Create tool result
             let result = if tool_registry.get(&tool_name).is_some() {

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 use clap::{Parser, Subcommand};
-use tracing::{info, warn};
+use tracing::{info, warn, trace};
 use ferrisres::{WgpuCompute, DeviceProfile, BlockAttnResConfig, BlockAttnResModel, SimpleTokenizer};
 use ferrisres::compute::{GpuBuffer, MatMulOp, RmsNormOp, SoftmaxOp, ElementWiseOp};
 use ferrisres::training::AdamOptimizer;
@@ -210,22 +210,22 @@ async fn cmd_info() -> anyhow::Result<()> {
     let profile = DeviceProfile::from_env()
         .unwrap_or_else(|| DeviceProfile::from_vram_and_kind(capability.vram_mb, capability.gpu_kind));
 
-    info!("Adapter: {} ({})", capability.adapter_name, capability.backend);
-    info!("GPU kind: {:?}", capability.gpu_kind);
-    info!("Dedicated VRAM: {} MB", capability.vram_mb);
-    info!("System RAM: {} MB", capability.shared_ram_mb);
-    info!("Effective VRAM: {} MB", capability.effective_vram_mb());
+    info!(event = "adapter", "Adapter: {} ({})", capability.adapter_name, capability.backend);
+    info!(event = "gpu_kind", "GPU kind: {:?}", capability.gpu_kind);
+    info!(event = "dedicated_vram_mb", "Dedicated VRAM: {} MB", capability.vram_mb);
+    info!(event = "system_ram_mb", "System RAM: {} MB", capability.shared_ram_mb);
+    info!(event = "effective_vram_mb", "Effective VRAM: {} MB", capability.effective_vram_mb());
 
-    info!("Device profile: {:?}", profile);
-    info!("Compute mode: {:?}", profile.compute_mode());
-    info!("Recommended batch size: {}", profile.recommended_batch_size());
-    info!("Cache size: {} MB", profile.cache_size() / (1024 * 1024));
+    info!(event = "device_profile", "Device profile: {:?}", profile);
+    info!(event = "compute_mode", "Compute mode: {:?}", profile.compute_mode());
+    info!(event = "recommended_batch_size", "Recommended batch size: {}", profile.recommended_batch_size());
+    info!(event = "cache_size_mb", "Cache size: {} MB", profile.cache_size() / (1024 * 1024));
 
-    info!("Max workgroup size: {}", capability.max_compute_workgroup_size);
-    info!("Max invocations/workgroup: {}", capability.max_compute_invocations_per_workgroup);
-    info!("Max storage buffer: {} MB", capability.max_storage_buffer_range / (1024 * 1024));
-    info!("Max storage buffers/stage: {}", capability.max_storage_buffers_per_shader_stage);
-    info!("Max bind groups: {}", capability.max_bind_groups);
+    info!(event = "max_workgroup_size", "Max workgroup size: {}", capability.max_compute_workgroup_size);
+    info!(event = "max_invocations_workgroup", "Max invocations/workgroup: {}", capability.max_compute_invocations_per_workgroup);
+    info!(event = "max_storage_buffer_mb", "Max storage buffer: {} MB", capability.max_storage_buffer_range / (1024 * 1024));
+    info!(event = "max_storage_buffers_stage", "Max storage buffers/stage: {}", capability.max_storage_buffers_per_shader_stage);
+    info!(event = "max_bind_groups", "Max bind groups: {}", capability.max_bind_groups);
 
     Ok(())
 }
@@ -240,7 +240,7 @@ async fn cmd_train(
     data: Option<String>,
     lora_rank: Option<usize>,
 ) -> anyhow::Result<()> {
-    info!("Initializing training pipeline");
+    info!(event = "initializing_training_pipeline", "Initializing training pipeline");
 
     let compute = WgpuCompute::new().await?;
     let _capability = compute.detect_capability();
@@ -280,27 +280,27 @@ async fn cmd_train(
         // Register LoRA layers for the model's attention projections
         mgr.add_adapter(0, "q_proj", config.hidden_dim, config.hidden_dim);
         mgr.add_adapter(0, "v_proj", config.hidden_dim, config.hidden_dim);
-        info!("LoRA enabled: rank={} alpha={}", rank, rank * 2);
+        info!(event = "lora_enabled_rank_alpha", "LoRA enabled: rank={} alpha={}", rank, rank * 2);
         Some(mgr)
     } else {
         None
     };
 
-    info!("Model config: hidden_dim={} num_blocks={} block_size={} total_layers={} heads={} intermediate_dim={}",
+    info!(event = "model_config_detail", "model config: hidden_dim={} num_blocks={} block_size={} total_layers={} heads={} intermediate_dim={}",
         config.hidden_dim, config.num_blocks, config.block_size, config.total_layers(),
         config.attention_heads, config.intermediate_dim);
 
-    info!("Optimizer: Adam lr={} beta1=0.9 beta2=0.999 eps=1e-8", learning_rate);
+    info!(event = "optimizer_adam_lr_beta1_0_9", "Optimizer: Adam lr={} beta1=0.9 beta2=0.999 eps=1e-8", learning_rate);
 
     let sample = "Hello world from FerrisRes training";
     let tokens = tokenizer.encode(sample);
-    info!("Sample tokenized ({} tokens): {:?}", tokens.len(), tokens);
+    info!(event = "sample_tokenized_tokens", "Sample tokenized ({} tokens): {:?}", tokens.len(), tokens);
 
     if let Some(data_path) = &data {
-        info!("Data path: {}", data_path);
+        info!(event = "data_path", "Data path: {}", data_path);
     }
 
-    info!("Training would run for {} epochs with batch_size={} learning_rate={}", epochs, batch_size, learning_rate);
+    info!(event = "training_would_run_for_epochs_with", "Training would run for {} epochs with batch_size={} learning_rate={}", epochs, batch_size, learning_rate);
 
     // Wire up the autodiff training loop
     use ferrisres::training::CrossEntropyLoss;
@@ -320,7 +320,7 @@ async fn cmd_train(
     // Loss computation
     let loss_fn = CrossEntropyLoss::new(Arc::clone(&device));
 
-    info!("Autodiff graph built: {} parameters tracked", 2); // input + logits as tracked nodes
+    info!(event = "autodiff_graph_built_parameters_tracked", "Autodiff graph built: {} parameters tracked", 2);
 
     for epoch in 0..epochs {
         let mut epoch_loss = 0.0f32;
@@ -359,10 +359,10 @@ async fn cmd_train(
                     let dummy_hidden = vec![0.0f32; config.hidden_dim];
                     // Compute LoRA forward for each target module at layer 0
                     if let Some(delta) = lora.forward(0, "q_proj", &dummy_hidden, 1) {
-                        tracing::trace!("LoRA q_proj delta: {} values", delta.len());
+                        trace!(event = "lora_q_proj_delta_values", "LoRA q_proj delta: {} values", delta.len());
                     }
                     if let Some(delta) = lora.forward(0, "v_proj", &dummy_hidden, 1) {
-                        tracing::trace!("LoRA v_proj delta: {} values", delta.len());
+                        trace!(event = "lora_v_proj_delta_values", "LoRA v_proj delta: {} values", delta.len());
                     }
                 }
 
@@ -385,11 +385,11 @@ async fn cmd_train(
         }
 
         if batches > 0 {
-            info!("Epoch {}/{}: avg_loss={:.4} batches={}", epoch + 1, epochs, epoch_loss / batches as f32, batches);
+            info!(event = "epoch_avg_loss_batches", "Epoch {}/{}: avg_loss={:.4} batches={}", epoch + 1, epochs, epoch_loss / batches as f32, batches);
         }
     }
 
-    info!("Training complete");
+    info!(event = "training_complete", "Training complete");
 
     // Merge LoRA adapters back into base weights for zero-cost inference
     if let Some(ref mut lora) = _lora_manager {
@@ -397,10 +397,10 @@ async fn cmd_train(
             lora.merge_all(&mut |layer_idx: usize, module_name: &str| {
                 // In a full implementation, this would return mutable slices
                 // into the model's weight GpuBuffers. For now, log the merge.
-                tracing::info!("Merging LoRA adapter: layer={}, module={}", layer_idx, module_name);
+                info!(event = "merging_lora_adapter_layer_module", "Merging LoRA adapter: layer={}, module={}", layer_idx, module_name);
                 None::<&mut [f32]>
             });
-            info!("LoRA adapters merged: {} adapters, {} params", lora.num_adapters(), lora.total_params());
+            info!(event = "lora_adapters_merged_adapters_params", "LoRA adapters merged: {} adapters, {} params", lora.num_adapters(), lora.total_params());
         }
     }
 
@@ -418,7 +418,7 @@ async fn cmd_infer(
     yarn_scale: Option<f32>,
     image: Option<String>,
 ) -> anyhow::Result<()> {
-    info!("Initializing inference pipeline");
+    info!(event = "initializing_inference_pipeline", "Initializing inference pipeline");
 
     let compute = WgpuCompute::new().await?;
     let _capability = compute.detect_capability();
@@ -439,11 +439,11 @@ async fn cmd_infer(
             Some(fmt) => {
                 let registry = ferrisres::PromptTemplateRegistry::new(fmt);
                 let result = registry.apply_single(&prompt);
-                info!("Applied {} template: {} chars → {} chars", template_name, prompt.len(), result.len());
+                info!(event = "applied_template_chars_chars", "Applied {} template: {} chars → {} chars", template_name, prompt.len(), result.len());
                 result
             }
             None => {
-                info!("Unknown template '{}', using raw prompt", template_name);
+                info!(event = "unknown_template_using_raw_prompt", "Unknown template '{}', using raw prompt", template_name);
                 prompt.clone()
             }
         }
@@ -455,7 +455,7 @@ async fn cmd_infer(
     let model = BlockAttnResModel::new(Arc::clone(&device), Arc::clone(&queue), config.clone(), tokenizer.vocab_size())?;
 
     let tokens = tokenizer.encode(&formatted_prompt);
-    info!("Encoded tokens ({}): {:?}", tokens.len(), tokens);
+    info!(event = "encoded_tokens", "Encoded tokens ({}): {:?}", tokens.len(), tokens);
 
     // Wire image preprocessing: upload patches to GPU and run Im2ColOp
     let mut image_patch_count: usize = 0;
@@ -466,7 +466,7 @@ async fn cmd_infer(
                 match preprocessor.preprocess(&image_data) {
                     Ok(patches) => {
                         let num_patches = patches.len();
-                        info!("Image preprocessed: {} float values from {}", num_patches, image_path);
+                        info!(event = "image_preprocessed_float_values_from", "Image preprocessed: {} float values from {}", num_patches, image_path);
 
                         // Upload patches to GPU
                         let patch_bytes = bytemuck::cast_slice(&patches);
@@ -487,17 +487,17 @@ async fn cmd_infer(
                         queue.submit(std::iter::once(encoder.finish()));
 
                         image_patch_count = (224 / 16) * (224 / 16);
-                        info!("Im2Col: {} patches of dim {} uploaded to GPU", image_patch_count, patch_dim);
+                        info!(event = "im2col_patches_of_dim_uploaded_to", "Im2Col: {} patches of dim {} uploaded to GPU", image_patch_count, patch_dim);
 
                         // In a full multimodal model, the im2col_output would be projected
                         // through a linear layer to match hidden_dim, then concatenated with
                         // text token embeddings. The patch embeddings are now on GPU ready
                         // for that projection step.
                     }
-                    Err(e) => warn!("Image preprocessing failed: {}", e),
+                    Err(e) => warn!(event = "image_preprocess_error", "image preprocessing failed: {}", e),
                 }
             }
-            Err(e) => warn!("Failed to read image {}: {}", image_path, e),
+            Err(e) => warn!(event = "image_read_error", "failed to read image {}: {}", image_path, e),
         }
     }
 
@@ -539,7 +539,7 @@ async fn cmd_infer(
     
     // Decode and print
     let decoded = tokenizer.decode(&output_tokens);
-    info!("Generated {} tokens{}", output_tokens.len(),
+    info!(event = "generation_complete", "generated {} tokens{}", output_tokens.len(),
         if image_patch_count > 0 { format!(" (with {} image patches)", image_patch_count) } else { String::new() });
     println!("{}", decoded);
 
@@ -552,11 +552,11 @@ async fn cmd_benchmark(
     _block_size: usize,
     iterations: u32,
 ) -> anyhow::Result<()> {
-    info!("Initializing benchmark ({} iterations)", iterations);
+    info!(event = "initializing_benchmark_iterations", "Initializing benchmark ({} iterations)", iterations);
 
     let compute = WgpuCompute::new().await?;
     let capability = compute.detect_capability();
-    info!("Adapter: {} ({})", capability.adapter_name, capability.backend);
+    info!(event = "adapter", "Adapter: {} ({})", capability.adapter_name, capability.backend);
 
     let device = Arc::new(compute.device().clone());
     let queue = Arc::new(compute.queue().clone());
@@ -567,7 +567,7 @@ async fn cmd_benchmark(
     let ew_op = ElementWiseOp::new(&device, &queue);
 
     info!("");
-    info!("=== Benchmark Results ===");
+    info!(event = "benchmark_results", "=== Benchmark Results ===");
     info!("");
 
     for size in [128u32, 256u32, 512u32] {
@@ -589,7 +589,7 @@ async fn cmd_benchmark(
         let flops = 2.0 * (size as f64).powi(3) * iterations as f64;
         let gflops = flops / elapsed.as_secs_f64() / 1e9;
 
-        info!("MatMul {}x{}: {:.2?} total, {:.2} GFLOPS", size, size, elapsed, gflops);
+        info!(event = "matmul_x_total_gflops", "MatMul {}x{}: {:.2?} total, {:.2} GFLOPS", size, size, elapsed, gflops);
     }
 
     info!("");
@@ -612,7 +612,7 @@ async fn cmd_benchmark(
         let elapsed = start.elapsed();
         let us_per_call = elapsed.as_micros() as f64 / iterations as f64;
 
-        info!("RmsNorm hidden_dim={}: {:.2?} total, {:.1} us/call", hd, elapsed, us_per_call);
+        info!(event = "rmsnorm_hidden_dim_total_us_call", "RmsNorm hidden_dim={}: {:.2?} total, {:.1} us/call", hd, elapsed, us_per_call);
     }
 
     info!("");
@@ -634,7 +634,7 @@ async fn cmd_benchmark(
         let elapsed = start.elapsed();
         let us_per_call = elapsed.as_micros() as f64 / iterations as f64;
 
-        info!("Softmax {}x{}: {:.2?} total, {:.1} us/call", rows, cols, elapsed, us_per_call);
+        info!(event = "softmax_x_total_us_call", "Softmax {}x{}: {:.2?} total, {:.1} us/call", rows, cols, elapsed, us_per_call);
     }
 
     info!("");
@@ -663,11 +663,11 @@ async fn cmd_benchmark(
         let elapsed = start.elapsed();
         let us_per_call = elapsed.as_micros() as f64 / iterations as f64;
 
-        info!("ElementWise {} numel={}: {:.2?} total, {:.1} us/call", op_name, numel, elapsed, us_per_call);
+        info!(event = "elementwise_numel_total_us_call", "ElementWise {} numel={}: {:.2?} total, {:.1} us/call", op_name, numel, elapsed, us_per_call);
     }
 
     info!("");
-    info!("=== Benchmark Complete ===");
+    info!(event = "benchmark_complete", "=== Benchmark Complete ===");
 
     Ok(())
 }
@@ -685,32 +685,42 @@ async fn cmd_distill(
     resume_path: Option<String>,
     model_format: String,
     tokenizer_path: Option<String>,
-    _checkpoint_every: usize,
+    checkpoint_every: usize,
     use_gpu: bool,
 ) -> anyhow::Result<()> {
-    info!("=== FerrisRes Gemma 4 → Block AttnRes Distillation ===");
+    info!(event = "ferrisres_gemma_4_block_attnres_distillation", "=== FerrisRes Gemma 4 → Block AttnRes Distillation ===");
 
     // Parse config
     let config = match config_name.as_str() {
-        "e2b" => { info!("Using Gemma 4 E2B config (dense, ~4 GB)"); Gemma4Config::gemma4_e2b() }
-        "e4b" => { info!("Using Gemma 4 E4B config (MoE-16, ~8 GB)"); Gemma4Config::gemma4_e4b() }
-        "12b" => { info!("Using Gemma 4 12B config (MoE-128, ~24 GB)"); Gemma4Config::gemma4_12b() }
-        "27b" => { info!("Using Gemma 4 27B config (MoE-128, ~54 GB)"); Gemma4Config::gemma4_27b() }
-        "27b-mm" => { info!("Using Gemma 4 27B Multimodal IT config (dense, 35 layers, ~10 GB)"); Gemma4Config::gemma4_27b_mm() }
-        "llama3-8b" => { info!("Using LLaMA 3.1 8B config"); Gemma4Config::llama3_8b() }
-        "llama3-70b" => { info!("Using LLaMA 3.1 70B config"); Gemma4Config::llama3_70b() }
-        "mistral-7b" => { info!("Using Mistral 7B config"); Gemma4Config::mistral_7b() }
-        "mixtral-8x7b" => { info!("Using Mixtral 8x7B config"); Gemma4Config::mixtral_8x7b() }
-        "phi3-mini" => { info!("Using Phi-3 Mini config"); Gemma4Config::phi3_mini() }
-        "qwen2-7b" => { info!("Using Qwen 2.5 7B config"); Gemma4Config::qwen2_7b() }
+        "e2b" => { info!(event = "model_config_selected", config = "e2b", "Using Gemma 4 E2B config (dense, ~4 GB)"); Gemma4Config::gemma4_e2b() }
+
+        "e4b" => { info!(event = "model_config_selected", config = "e4b", "Using Gemma 4 E4B config (MoE-16, ~8 GB)"); Gemma4Config::gemma4_e4b() }
+
+        "12b" => { info!(event = "model_config_selected", config = "12b", "Using Gemma 4 12B config (MoE-128, ~24 GB)"); Gemma4Config::gemma4_12b() }
+
+        "27b" => { info!(event = "model_config_selected", config = "27b", "Using Gemma 4 27B config (MoE-128, ~54 GB)"); Gemma4Config::gemma4_27b() }
+
+        "27b-mm" => { info!(event = "model_config_selected", config = "27b-mm", "Using Gemma 4 27B Multimodal IT config (dense, 35 layers, ~10 GB)"); Gemma4Config::gemma4_27b_mm() }
+
+        "llama3-8b" => { info!(event = "model_config_selected", config = "llama3-8b", "Using LLaMA 3.1 8B config"); Gemma4Config::llama3_8b() }
+
+        "llama3-70b" => { info!(event = "model_config_selected", config = "llama3-70b", "Using LLaMA 3.1 70B config"); Gemma4Config::llama3_70b() }
+
+        "mistral-7b" => { info!(event = "model_config_selected", config = "mistral-7b", "Using Mistral 7B config"); Gemma4Config::mistral_7b() }
+
+        "mixtral-8x7b" => { info!(event = "model_config_selected", config = "mixtral-8x7b", "Using Mixtral 8x7B config"); Gemma4Config::mixtral_8x7b() }
+
+        "phi3-mini" => { info!(event = "model_config_selected", config = "phi3-mini", "Using Phi-3 Mini config"); Gemma4Config::phi3_mini() }
+
+        "qwen2-7b" => { info!(event = "model_config_selected", config = "qwen2-7b", "Using Qwen 2.5 7B config"); Gemma4Config::qwen2_7b() }
+
         other => anyhow::bail!("Unknown config '{}'. Use: e2b, e4b, 12b, 27b, llama3-8b, llama3-70b, mistral-7b, mixtral-8x7b, phi3-mini, qwen2-7b", other),
     };
 
-    info!("Model: hidden={} layers={} heads={} vocab={}",
-        config.hidden_dim, config.num_layers, config.num_heads, config.vocab_size);
+    info!(event = "model_config", hidden = config.hidden_dim, layers = config.num_layers, heads = config.num_heads, vocab = config.vocab_size, "model config");
 
     // Load weights
-    info!("Loading weights from: {}", model_path);
+    info!(event = "loading_weights_from", "Loading weights from: {}", model_path);
     let path = std::path::Path::new(&model_path);
     if !path.exists() {
         anyhow::bail!("Model file not found: {}", model_path);
@@ -725,9 +735,7 @@ async fn cmd_distill(
 
     let model1 = load_model(path)
         .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
-    info!("Model loaded: {} layers, {} params",
-        model1.layers.len(),
-        model1.embed_tokens.len() + model1.layers.iter().map(|l| {
+    let total_params = model1.embed_tokens.len() + model1.layers.iter().map(|l| {
             let attn = l.attn.q_proj.len() + l.attn.k_proj.len() + l.attn.v_proj.len() + l.attn.o_proj.len();
             let ffn = match &l.ffn {
                 gemma_mapper::Gemma4FfnWeights::Dense { gate_proj, up_proj, down_proj } => gate_proj.len() + up_proj.len() + down_proj.len(),
@@ -738,38 +746,39 @@ async fn cmd_distill(
                 }
             };
             attn + ffn
-        }).sum::<usize>() + model1.final_norm.len() + model1.lm_head.len());
+        }).sum::<usize>() + model1.final_norm.len() + model1.lm_head.len();
+    info!(event = "model_loaded", layers = model1.layers.len(), params = total_params, "model loaded");
 
     // Create teacher (frozen) — compute logits, then free weights
     let teacher = Gemma4Teacher::new(model1);
-    info!("Teacher model created (frozen)");
+    info!(event = "teacher_model_created_frozen", "Teacher model created (frozen)");
 
     // Load training data
     let hf_tokenizer = if let Some(ref tok_path) = tokenizer_path {
         let tok = HfTokenizer::from_tokenizer_json(std::path::Path::new(tok_path))
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
-        info!("Loaded tokenizer with vocab size {}", tok.vocab_size());
+        info!(event = "loaded_tokenizer_with_vocab_size", "Loaded tokenizer with vocab size {}", tok.vocab_size());
         Some(tok)
     } else {
-        info!("No tokenizer specified, using byte-fallback tokenization");
+        info!(event = "no_tokenizer_specified_using_byte_fallback", "No tokenizer specified, using byte-fallback tokenization");
         None
     };
 
     let token_ids = if let Some(ref dp) = data_path {
-        info!("Loading training data from: {}", dp);
+        info!(event = "loading_training_data_from", "Loading training data from: {}", dp);
         let text = std::fs::read_to_string(dp)
             .map_err(|e| anyhow::anyhow!("Failed to read data: {}", e))?;
         if let Some(ref tok) = hf_tokenizer {
             let ids = tok.encode_raw(&text);
-            info!("Tokenized to {} tokens using provided tokenizer", ids.len());
+            info!(event = "tokenized_to_tokens_using_provided_tokenizer", "Tokenized to {} tokens using provided tokenizer", ids.len());
             ids
         } else {
             let ids: Vec<u32> = text.bytes().map(|b| b as u32).collect();
-            info!("Loaded {} byte-level tokens from training data", ids.len());
+            info!(event = "loaded_byte_level_tokens_from_training", "Loaded {} byte-level tokens from training data", ids.len());
             ids
         }
     } else {
-        info!("No training data provided, using synthetic tokens");
+        info!(event = "no_training_data_provided_using_synthetic", "No training data provided, using synthetic tokens");
         (0..10000).map(|i| i % config.vocab_size as u32).collect()
     };
 
@@ -780,7 +789,7 @@ async fn cmd_distill(
 
     if use_gpu {
         // GPU-accelerated teacher forward
-        info!("Using GPU matmul acceleration for teacher forward");
+        info!(event = "using_gpu_matmul_acceleration_for_teacher", "Using GPU matmul acceleration for teacher forward");
         let mut gpu_accel = ferrisres::model::gpu_forward::GpuMatmulAccelerator::new()
             .map_err(|e| anyhow::anyhow!("Failed to init GPU: {:?}", e))?;
         gpu_accel.validate_model(teacher.model())
@@ -854,7 +863,7 @@ async fn cmd_distill(
     // Re-load model for student (single copy in memory now)
     let model2 = load_model(path)
         .map_err(|e| anyhow::anyhow!("Failed to reload model for student: {}", e))?;
-    info!("Student model loaded");
+    info!(event = "student_model_loaded", "Student model loaded");
 
     let injection_points = config.block_summary_injection_points();
     let block_summaries: Vec<BlockSummaryLayer> = injection_points.iter()
@@ -872,35 +881,40 @@ async fn cmd_distill(
 
     let mut student = Gemma4Student::new(model2, block_summaries, distill_config.clone());
 
+    // Initialize optimizers (fresh or from checkpoint)
+    let mut global_step: usize = 0;
+    let mut optimizers: Vec<gemma_mapper::BlockSummaryAdam> = student.block_summaries.iter()
+        .map(|bs| gemma_mapper::BlockSummaryAdam::new(bs, distill_config.learning_rate))
+        .collect();
+    let mut best_loss = f32::INFINITY;
+
     // Resume from checkpoint if specified
     if let Some(ref ckpt_path) = resume_path {
         let ckpt = DistillationCheckpoint::load(std::path::Path::new(ckpt_path))
             .map_err(|e| anyhow::anyhow!("Failed to load checkpoint: {}", e))?;
-        info!("Resuming from checkpoint at step {}", ckpt.global_step);
-        let _optimizers = ckpt.apply(&mut student);
-        info!("Restored Block Summary layers from checkpoint");
+        global_step = ckpt.global_step;
+        info!(event = "resuming_from_checkpoint", step = global_step, "resuming from checkpoint");
+        optimizers = ckpt.apply(&mut student);
+        info!(event = "checkpoint_restored", layers = student.block_summaries.len(), "restored block summary layers and optimizer state");
     }
 
     info!("");
-    info!(event = "distill_start", steps = steps, seq_len = seq_len, lr = learning_rate, temp = temperature, "starting distillation");
+    info!(event = "distill_start", total_steps = steps, start_step = global_step, seq_len = seq_len, lr = learning_rate, temp = temperature, "starting distillation");
     info!("");
 
     // Run distillation using pre-computed teacher logits
     let vs = config.vocab_size;
     let mut results: Vec<gemma_mapper::DistillationStepResult> = Vec::new();
-    let mut optimizers: Vec<gemma_mapper::BlockSummaryAdam> = student.block_summaries.iter()
-        .map(|bs| gemma_mapper::BlockSummaryAdam::new(bs, distill_config.learning_rate))
-        .collect();
 
     let train_start = std::time::Instant::now();
     let mut prev_loss = f32::NAN;
-    let mut best_loss = f32::INFINITY;
     let mut loss_ema = f32::NAN; // Exponential moving average for smoothing
+    let target_step = global_step + steps;
 
-    for step in 0..steps {
+    while global_step < target_step {
         let step_start = std::time::Instant::now();
-        let chunk_idx = step % teacher_logits_chunks.len();
-        let batch_idx = step % (token_ids.len() / seq_len.max(1));
+        let chunk_idx = global_step % teacher_logits_chunks.len();
+        let batch_idx = global_step % (token_ids.len() / seq_len.max(1));
         let start = (batch_idx * seq_len) % token_ids.len();
         let end = (start + seq_len).min(token_ids.len());
         let batch_tokens = &token_ids[start..end];
@@ -966,33 +980,34 @@ async fn cmd_distill(
         let bridge_min = bridge_weights.iter().cloned().fold(f32::INFINITY, f32::min);
         let bridge_max = bridge_weights.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
-        let lr = if step < distill_config.warmup_steps {
-            distill_config.learning_rate * (step + 1) as f32 / distill_config.warmup_steps.max(1) as f32
+        let lr = if global_step < distill_config.warmup_steps {
+            distill_config.learning_rate * (global_step + 1) as f32 / distill_config.warmup_steps.max(1) as f32
         } else {
             distill_config.learning_rate
         };
 
         let step_ms = step_start.elapsed().as_millis();
         let tps = actual_seq as f32 / step_start.elapsed().as_secs_f32();
+        let steps_done = global_step + 1; // steps completed so far in this run
         let elapsed = train_start.elapsed().as_secs_f32();
-        let per_step = elapsed / (step + 1) as f32;
-        let eta = per_step * (steps - step - 1) as f32;
+        let per_step = elapsed / steps_done as f32;
+        let remaining = target_step - global_step - 1;
+        let eta = per_step * remaining as f32;
         let loss_delta = if prev_loss.is_nan() { 0.0 } else { loss - prev_loss };
-        let _delta_sign = if loss_delta < -1e-8 { "↓" } else if loss_delta > 1e-8 { "↑" } else { "→" };
 
         results.push(gemma_mapper::DistillationStepResult {
-            step,
+            step: global_step,
             kl_loss: loss,
             bridge_weight: bridge_w,
             learning_rate: lr,
             layer_cosine_sim: vec![],
         });
 
-        if step % log_every == 0 {
+        if global_step % log_every == 0 {
             info!(
                 event = "distill_step",
-                step = step,
-                steps = steps,
+                step = global_step,
+                target = target_step,
                 loss = format_args!("{:.6}", loss),
                 loss_delta = format_args!("{:+.6}", loss_delta),
                 loss_ema = format_args!("{:.6}", loss_ema),
@@ -1009,28 +1024,37 @@ async fn cmd_distill(
             );
         }
 
+        // Mid-training checkpoint
+        if checkpoint_every > 0 && (global_step + 1) % checkpoint_every == 0 {
+            let ckpt = DistillationCheckpoint::from_student(&student, &optimizers, global_step + 1);
+            let ckpt_path = format!("{}.checkpoint.bin", output_path);
+            ckpt.save(std::path::Path::new(&ckpt_path))
+                .map_err(|e| anyhow::anyhow!("Failed to save checkpoint: {}", e))?;
+            info!(event = "checkpoint_saved", step = global_step + 1, path = %ckpt_path, "mid-training checkpoint saved");
+        }
+
         prev_loss = loss;
+        global_step += 1;
         if loss < 1e-6 { break; }
     }
 
     // Report results
     info!("");
-    info!("=== Distillation Results ===");
-    info!("Steps completed: {}", results.len());
+    info!(event = "distillation_results", "=== Distillation Results ===");
+    info!(event = "steps_completed", "Steps completed: {}", results.len());
 
     if let Some(first) = results.first() {
-        info!("Initial KL loss: {:.6}", first.kl_loss);
+        info!(event = "initial_kl_loss", "Initial KL loss: {:.6}", first.kl_loss);
     }
     if let Some(last) = results.last() {
-        info!("Final KL loss:   {:.6}", last.kl_loss);
-        info!("Final bridge_weight: {:.6}", last.bridge_weight);
+        info!(event = "final_kl_loss", "Final KL loss:   {:.6}", last.kl_loss);
+        info!(event = "final_bridge_weight", "Final bridge_weight: {:.6}", last.bridge_weight);
     }
 
     // Log loss curve
     for result in &results {
         if result.step % log_every == 0 {
-            info!("Step {:>5}: loss={:.6} bridge_w={:.4} lr={:.6}",
-                result.step, result.kl_loss, result.bridge_weight, result.learning_rate);
+            info!(event = "distill_step_summary", step = result.step, loss = result.kl_loss, bridge_w = result.bridge_weight, lr = result.learning_rate, "distillation step summary");
         }
     }
 
@@ -1040,34 +1064,16 @@ async fn cmd_distill(
         let save_path = format!("{}.block_summary_{}.bin", output_path, i);
         let bytes: Vec<u8> = params.iter().flat_map(|f| f.to_le_bytes()).collect();
         std::fs::write(&save_path, &bytes)?;
-        info!("Saved Block Summary {} → {} ({} params)", i, save_path, params.len());
+        info!(event = "saved_block_summary_params", "Saved Block Summary {} → {} ({} params)", i, save_path, params.len());
     }
 
-    // Save full checkpoint (for resume)
+    // Save full checkpoint (for resume) with optimizer state
     let ckpt_path = format!("{}.checkpoint.bin", output_path);
-    // We don't have the optimizers here — save a simple version
-    let final_ckpt = DistillationCheckpoint {
-        version: 1,
-        global_step: results.last().map(|r| r.step).unwrap_or(0),
-        layer_checkpoints: student.block_summaries.iter().map(|bs| {
-            use gemma_mapper::BlockSummaryCheckpoint;
-            let params = bs.export_trainable();
-            let _hd = bs.hidden_dim;
-            BlockSummaryCheckpoint {
-                params,
-                adam_m: vec![],
-                adam_v: vec![],
-                adam_t: 0,
-                bridge_weight: bs.bridge_weight,
-                bw_m: 0.0, bw_v: 0.0,
-                norm_weight: vec![],
-                norm_bias: vec![],
-            }
-        }).collect(),
-    };
+    let final_step = results.last().map(|r| r.step).unwrap_or(0) + 1;
+    let final_ckpt = DistillationCheckpoint::from_student(&student, &optimizers, final_step);
     final_ckpt.save(std::path::Path::new(&ckpt_path))
         .map_err(|e| anyhow::anyhow!("Failed to save checkpoint: {}", e))?;
-    info!("Checkpoint saved → {}", ckpt_path);
+    info!(event = "checkpoint_saved", step = final_step, path = %ckpt_path, "final checkpoint saved");
 
     // Save loss curve as CSV
     let csv_path = format!("{}.loss_curve.csv", output_path);
@@ -1082,10 +1088,10 @@ async fn cmd_distill(
         csv.push_str(&format!("{},{},{},{},{}\n", r.step, r.kl_loss, r.bridge_weight, r.learning_rate, avg_cos));
     }
     std::fs::write(&csv_path, &csv)?;
-    info!("Loss curve saved → {}", csv_path);
+    info!(event = "loss_curve_saved", "Loss curve saved → {}", csv_path);
 
     info!("");
-    info!("Distillation complete!");
+    info!(event = "distillation_complete", "Distillation complete!");
 
     Ok(())
 }
@@ -1095,7 +1101,7 @@ async fn cmd_evaluate(
     config_name: String,
     text: String,
 ) -> anyhow::Result<()> {
-    info!("=== FerrisRes Evaluation ===");
+    info!(event = "ferrisres_evaluation", "=== FerrisRes Evaluation ===");
 
     let config = match config_name.as_str() {
         "e2b" => Gemma4Config::gemma4_e2b(),
@@ -1112,7 +1118,7 @@ async fn cmd_evaluate(
 
     // Tokenize
     let token_ids: Vec<u32> = text.bytes().map(|b| b as u32).collect();
-    info!("Evaluating on {} byte-level tokens", token_ids.len());
+    info!(event = "evaluating_on_byte_level_tokens", "Evaluating on {} byte-level tokens", token_ids.len());
 
     let logits = teacher.forward(&token_ids);
     let vs = config.vocab_size;
@@ -1148,9 +1154,9 @@ async fn cmd_evaluate(
     let avg_nll = if count > 0 { total_nll / count as f64 } else { f64::INFINITY };
     let perplexity = avg_nll.exp();
 
-    info!("Tokens evaluated: {}", count);
-    info!("Average NLL: {:.4}", avg_nll);
-    info!("Perplexity: {:.2}", perplexity);
+    info!(event = "tokens_evaluated", "Tokens evaluated: {}", count);
+    info!(event = "average_nll", "Average NLL: {:.4}", avg_nll);
+    info!(event = "perplexity", "Perplexity: {:.2}", perplexity);
 
     Ok(())
 }
