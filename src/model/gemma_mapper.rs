@@ -1639,16 +1639,8 @@ impl Gemma4Teacher {
         hidden = rms_norm(&hidden, &self.model.final_norm, hd, 1e-6);
 
         // 4. LM head: [seq × hd] × [hd × vs] → [seq × vs]
-        let mut logits = vec![0.0f32; seq * vs];
-        for t in 0..seq {
-            for v in 0..vs {
-                let mut sum = 0.0f32;
-                for d in 0..hd {
-                    sum += hidden[t * hd + d] * self.model.lm_head[v * hd + d];
-                }
-                logits[t * vs + v] = sum;
-            }
-        }
+        // LM head: [seq × hd] × [hd × vs] → [seq × vs] (via fast GEMM)
+        let logits = matmul(&hidden, &self.model.lm_head, seq, hd, vs);
 
         logits
     }
@@ -1995,16 +1987,8 @@ impl Gemma4Student {
         // 3. Final norm + LM head
         hidden = rms_norm(&hidden, &self.model.final_norm, hd, 1e-6);
 
-        let mut logits = vec![0.0f32; seq * vs];
-        for t in 0..seq {
-            for v in 0..vs {
-                let mut sum = 0.0f32;
-                for d in 0..hd {
-                    sum += hidden[t * hd + d] * self.model.lm_head[v * hd + d];
-                }
-                logits[t * vs + v] = sum;
-            }
-        }
+        // LM head: [seq × hd] × [hd × vs] → [seq × vs] (via fast GEMM)
+        let logits = matmul(&hidden, &self.model.lm_head, seq, hd, vs);
 
         logits
     }
@@ -2197,16 +2181,8 @@ impl Gemma4Student {
         // Final norm + LM head
         hidden = rms_norm(&hidden, &self.model.final_norm, hd, 1e-6);
 
-        let mut logits = vec![0.0f32; seq * vs];
-        for t in 0..seq {
-            for v in 0..vs {
-                let mut sum = 0.0f32;
-                for d in 0..hd {
-                    sum += hidden[t * hd + d] * self.model.lm_head[v * hd + d];
-                }
-                logits[t * vs + v] = sum;
-            }
-        }
+        // LM head: [seq × hd] × [hd × vs] → [seq × vs] (via fast GEMM)
+        let logits = matmul(&hidden, &self.model.lm_head, seq, hd, vs);
 
         logits
     }
@@ -2275,16 +2251,8 @@ impl Gemma4Student {
         // Final norm + LM head
         hidden = rms_norm(&hidden, &self.model.final_norm, hd, 1e-6);
 
-        let mut logits = vec![0.0f32; seq * vs];
-        for t in 0..seq {
-            for v in 0..vs {
-                let mut sum = 0.0f32;
-                for d in 0..hd {
-                    sum += hidden[t * hd + d] * self.model.lm_head[v * hd + d];
-                }
-                logits[t * vs + v] = sum;
-            }
-        }
+        // LM head: [seq × hd] × [hd × vs] → [seq × vs] (via fast GEMM)
+        let logits = matmul(&hidden, &self.model.lm_head, seq, hd, vs);
 
         logits
     }
