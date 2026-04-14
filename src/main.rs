@@ -792,19 +792,38 @@ async fn cmd_distill(
         (0..10000).map(|i| i % config.vocab_size as u32).collect()
     };
 
+    // Initialize GPU accelerator (kept alive for entire distillation)
+    let gpu_accel: Option<ferrisres::model::gpu_forward::GpuMatmulAccelerator> = if use_gpu {
+        match ferrisres::model::gpu_forward::GpuMatmulAccelerator::new() {
+            Ok(mut accel) => {
+                match accel.validate_model(teacher.model()) {
+                    Ok(()) => {
+                        info!(event = "gpu_ready", profile = ?accel.profile(), "GPU accelerator initialized");
+                        Some(accel)
+                    }
+                    Err(e) => {
+                        info!(event = "gpu_validation_failed", error = %e, "GPU validation failed, falling back to CPU");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                info!(event = "gpu_init_failed", error = ?e, "GPU init failed, falling back to CPU");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Pre-compute teacher logits for each chunk, then drop teacher to free ~10GB
     info!(event = "teacher_precompute_start", "pre-computing teacher logits");
     let mut teacher_logits_chunks: Vec<Vec<f32>> = Vec::new();
     let num_chunks = (token_ids.len() + seq_len - 1) / seq_len;
 
-    if use_gpu {
+    if gpu_accel.is_some() {
         // GPU-accelerated teacher forward
         info!(event = "using_gpu_matmul_acceleration_for_teacher", "Using GPU matmul acceleration for teacher forward");
-        let mut gpu_accel = ferrisres::model::gpu_forward::GpuMatmulAccelerator::new()
-            .map_err(|e| anyhow::anyhow!("Failed to init GPU: {:?}", e))?;
-        gpu_accel.validate_model(teacher.model())
-            .map_err(|e| anyhow::anyhow!("Failed to upload weights: {:?}", e))?;
-        info!(event = "gpu_weights_ready", "GPU weights validated");
 
         let total_chunks = num_chunks.min(steps);
         let teacher_start = std::time::Instant::now();
@@ -814,7 +833,7 @@ async fn cmd_distill(
             let end = (start + seq_len).min(token_ids.len());
             let chunk: Vec<u32> = token_ids[start..end].to_vec();
             if chunk.len() < seq_len { break; }
-            let logits = gpu_accel.forward(teacher.model(), &chunk)
+            let logits = gpu_accel.as_ref().unwrap().forward(teacher.model(), &chunk)
                 .map_err(|e| anyhow::anyhow!("GPU forward failed: {:?}", e))?;
             teacher_logits_chunks.push(logits);
 
@@ -834,7 +853,6 @@ async fn cmd_distill(
                 "teacher forward"
             );
         }
-        drop(gpu_accel);
     } else {
         // CPU teacher forward
         let total_chunks = num_chunks.min(steps);
@@ -923,7 +941,31 @@ async fn cmd_distill(
     let first_injection = injection_points.first().copied().unwrap_or(0);
     let mut frozen_states_per_chunk: Vec<Vec<Vec<f32>>> = Vec::new();
 
-    info!(event = "precompute_frozen_states", chunks = teacher_logits_chunks.len(), first_injection = first_injection, "precomputing frozen base model hidden states");
+    // GPU-aware matmul helper: uses GPU if available, falls back to CPU
+    let gpu_matmul = |a: &[f32], b: &[f32], m: usize, k: usize, n: usize| -> Vec<f32> {
+        if let Some(ref gpu) = gpu_accel {
+            match gpu.gpu_matmul_cpu_b(a, b, m, k, n) {
+                Ok(result) => return result,
+                Err(e) => {
+                    tracing::warn!(event = "gpu_matmul_fallback", error = ?e, "GPU matmul failed, falling back to CPU");
+                }
+            }
+        }
+        gemma_mapper::matmul(a, b, m, k, n)
+    };
+
+    // GPU-aware SwiGLU FFN
+    let swiglu_ffn_gpu = |input: &[f32], gate: &[f32], up: &[f32], down: &[f32], hd: usize, id: usize| -> Vec<f32> {
+        let seq = input.len() / hd;
+        let gated = gpu_matmul(input, gate, seq, hd, id);
+        let gated: Vec<f32> = gated.iter().map(|&x| x / (1.0 + (-x).exp())).collect();
+        let upped = gpu_matmul(input, up, seq, hd, id);
+        let mut combined = vec![0.0f32; seq * id];
+        for i in 0..combined.len() { combined[i] = gated[i] * upped[i]; }
+        gpu_matmul(&combined, down, seq, id, hd)
+    };
+
+    info!(event = "precompute_frozen_states", chunks = teacher_logits_chunks.len(), first_injection = first_injection, gpu = gpu_accel.is_some(), "precomputing frozen base model hidden states");
     let frozen_start = std::time::Instant::now();
     for (chunk_idx, _chunk_tokens) in teacher_logits_chunks.iter().enumerate() {
         // We need the token IDs for this chunk
@@ -957,9 +999,9 @@ async fn cmd_distill(
                 let normed = gemma_mapper::rms_norm(&hidden, &layer.attn.input_norm, hd, 1e-6);
                 let q_dim = config_ref.num_heads * config_ref.head_dim;
                 let kv_dim = config_ref.num_kv_heads * config_ref.head_dim;
-                let q = gemma_mapper::matmul(&normed, &layer.attn.q_proj, seq, hd, q_dim);
-                let k = gemma_mapper::matmul(&normed, &layer.attn.k_proj, seq, hd, kv_dim);
-                let v = gemma_mapper::matmul(&normed, &layer.attn.v_proj, seq, hd, kv_dim);
+                let q = gpu_matmul(&normed, &layer.attn.q_proj, seq, hd, q_dim);
+                let k = gpu_matmul(&normed, &layer.attn.k_proj, seq, hd, kv_dim);
+                let v = gpu_matmul(&normed, &layer.attn.v_proj, seq, hd, kv_dim);
                 let mut q = q; let mut k = k;
                 gemma_mapper::apply_rope(&mut q, seq, config_ref.num_heads, config_ref.head_dim, 0);
                 gemma_mapper::apply_rope_gqa(&mut k, seq, config_ref.num_kv_heads, config_ref.head_dim, 0);
@@ -991,13 +1033,13 @@ async fn cmd_distill(
                         }
                     }
                 }
-                let attn_proj = gemma_mapper::matmul(&attn_out, &layer.attn.o_proj, seq, q_dim, hd);
+                let attn_proj = gpu_matmul(&attn_out, &layer.attn.o_proj, seq, q_dim, hd);
                 for i in 0..hidden.len() { hidden[i] = residual[i] + attn_proj[i]; }
                 let residual2 = hidden.clone();
                 let normed2 = gemma_mapper::rms_norm(&hidden, &layer.attn.post_attn_norm, hd, 1e-6);
                 let ffn_out = match &layer.ffn {
                     gemma_mapper::Gemma4FfnWeights::Dense { gate_proj, up_proj, down_proj } => {
-                        gemma_mapper::swiglu_ffn(&normed2, gate_proj, up_proj, down_proj, hd, config_ref.intermediate_dim)
+                        swiglu_ffn_gpu(&normed2, gate_proj, up_proj, down_proj, hd, config_ref.intermediate_dim)
                     }
                     gemma_mapper::Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs } => {
                         let mut moe = gemma_mapper::CpuMoELayer::new(hd, config_ref.intermediate_dim, config_ref.num_experts, config_ref.top_k);
@@ -1095,21 +1137,18 @@ async fn cmd_distill(
         }
 
         // Project d_logits [seq × vocab] back through LM head to get d_hidden [seq × hd]
-        // d_hidden = d_logits × lm_head^T  (lm_head is [hd × vocab], so d_logits [seq × vocab] × [vocab × hd])
+        // d_hidden = d_logits × lm_head^T  (lm_head is [hd × vs], transposed to [vs × hd])
         let d_hidden: Vec<f32> = {
-            let lm_head_t = &student.model.lm_head; // [hd × vs]
-            let mut dh = vec![0.0f32; actual_seq * config.hidden_dim];
-            for t in 0..actual_seq {
-                for d in 0..config.hidden_dim {
-                    let mut sum = 0.0f32;
-                    for v in 0..vs {
-                        // lm_head[d * vs + v] transposed
-                        sum += d_logits[t * vs + v] * lm_head_t.get(d * vs + v).copied().unwrap_or(0.0);
-                    }
-                    dh[t * config.hidden_dim + d] = sum;
+            // Transpose lm_head from [hd × vs] to [vs × hd] for matmul
+            let lm_head = &student.model.lm_head;
+            let mut lm_head_t = vec![0.0f32; vs * config.hidden_dim];
+            for d in 0..config.hidden_dim {
+                for v in 0..vs {
+                    lm_head_t[v * config.hidden_dim + d] = lm_head.get(d * vs + v).copied().unwrap_or(0.0);
                 }
             }
-            dh
+            // d_hidden = d_logits [seq × vs] × lm_head_t [vs × hd] = [seq × hd]
+            gpu_matmul(&d_logits, &lm_head_t, actual_seq, vs, config.hidden_dim)
         };
 
         // Backprop through Block Summary layers using cached frozen hidden states
