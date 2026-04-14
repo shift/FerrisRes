@@ -818,7 +818,7 @@ async fn cmd_distill(
                 chunk = chunk_idx + 1,
                 total = total_chunks,
                 chunk_ms = chunk_ms,
-                tok_per_s = tps as u32,
+                tok_per_s = format_args!("{:.2}", tps),
                 elapsed_s = elapsed as u32,
                 eta_s = remaining as u32,
                 "teacher forward"
@@ -848,7 +848,7 @@ async fn cmd_distill(
                 chunk = chunk_idx + 1,
                 total = total_chunks,
                 chunk_ms = chunk_ms,
-                tok_per_s = tps as u32,
+                tok_per_s = format_args!("{:.2}", tps),
                 elapsed_s = elapsed as u32,
                 eta_s = remaining as u32,
                 "teacher forward"
@@ -1160,7 +1160,7 @@ async fn cmd_distill(
                 bridge_max = format_args!("{:.4}", bridge_max),
                 lr = format_args!("{:.2e}", lr),
                 step_ms = step_ms,
-                tok_per_s = tps as u32,
+                tok_per_s = format_args!("{:.2}", tps),
                 eta_s = eta as u32,
                 "distillation step"
             );
