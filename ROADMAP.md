@@ -6,8 +6,8 @@
 
 | Metric | Value |
 |---|---|
-| Source code | ~51,394 lines across 102 modules |
-| Test suites | 724 lib tests passing, 0 failures |
+| Source code | ~53,053 lines across 105 modules |
+| Test suites | 759 lib tests passing, 0 failures |
 | Language | 100% Rust (safe + WGSL compute shaders) |
 | GPU backends | Vulkan, Metal, DX12, WebGPU via wgpu |
 | Tasks completed | **212 / 212 (all complete)** |
@@ -243,5 +243,6 @@
 | 9 | ✅ Done | Weight loading (safetensors, GGUF), standard transformer, architecture dispatcher |
 | 10 | ✅ Done | Gemma 4 distillation pipeline, GPU forward pass, mmap loader, GQA, teacher-student memory optimization |
 | 11 | ✅ Done | Self-improvement loop: WASM sandbox, LSP-as-Oracle, Mirror Test, Speculative Block Decoding, Concept Memory, host tools |
+| 12 | ✅ Done | v0.2.0: Block AttnRes edge-case benchmarks, API stabilisation, quickstart/architecture/deployment/API-reference docs |
 
-**All 212 implementation tasks complete — 724 tests passing, 0 failures.**
+**All tasks complete — 759 tests passing, 0 failures.**

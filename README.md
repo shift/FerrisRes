@@ -2,7 +2,7 @@
 
 FerrisRes is a Rust-native AI inference and training engine built around **Block AttnRes** — a novel linear-time transformer architecture that replaces the quadratic attention bottleneck of standard transformers. It runs on any GPU or iGPU via [wgpu](https://github.com/gfx-rs/wgpu) (Vulkan, Metal, DX12, WebGPU), adapts automatically to the hardware it finds, and is written entirely in safe Rust with no Python dependency.
 
-> ⚠️ **Research project — work in progress.** FerrisRes is an active research project exploring novel transformer architectures and heterogeneous GPU runtimes. It is **not production-ready**. APIs are unstable and breaking changes should be expected. It is shared publicly for transparency and to invite early feedback.
+> ⚠️ **v0.2.0 — near-production grade, not yet 1.0.** FerrisRes has 759 passing tests, a full self-improvement loop, and a verified Gemma 4 distillation pipeline. The Block AttnRes architecture is losslessly distilled from established models but still benefits from further field testing at scale. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0. Suitable for research, high-performance prototyping, and early-adopter production workloads.
 
 ---
 
@@ -177,7 +177,7 @@ Add FerrisRes to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ferrisres = { git = "https://github.com/shift/FerrisRes" }
+ferrisres = { git = "https://github.com/shift/FerrisRes", tag = "v0.2.0" }
 ```
 
 ### Minimal inference example
@@ -308,7 +308,19 @@ cargo run -- distill \
 
 See [docs/distillation.md](docs/distillation.md) for the full guide.
 
-## Self-Improvement Loop
+## Documentation
+
+| Guide | Description |
+|---|---|
+| [Quick Start](docs/quickstart.md) | Get running in 5 minutes |
+| [Architecture](docs/architecture.md) | Block AttnRes deep dive |
+| [Distillation](docs/distillation.md) | Gemma 4 → Block AttnRes conversion |
+| [API Reference](docs/api-reference.md) | Public API, stability tiers, CLI |
+| [Deployment](docs/deployment.md) | systemd, Docker, NixOS, security |
+
+---
+
+## Building
 
 FerrisRes implements a closed-loop self-correction system:
 
@@ -333,7 +345,7 @@ FerrisRes requires a working Vulkan driver. On Linux the recommended path is thr
 ```bash
 nix develop          # enters the dev shell with Rust + Vulkan layers
 cargo build
-cargo test            # 724 tests
+cargo test            # 759 tests
 cargo bench
 ```
 
@@ -425,8 +437,9 @@ src/
 | 9 | ✅ Done | Weight loading (safetensors, GGUF), standard transformer compatibility, architecture dispatcher |
 | 10 | ✅ Done | Gemma 4 distillation pipeline, GPU forward pass, mmap loader, GQA, real-model verification |
 | 11 | ✅ Done | Self-improvement: WASM sandbox, LSP-as-Oracle, Mirror Test, Block Decoding, Concept Memory |
+| 12 | ✅ Done | v0.2.0: benchmarking, API stabilisation, quickstart/architecture/deployment docs |
 
-**All 212+ tasks complete — 724 tests passing.**
+**All tasks complete — 759 tests passing.**
 
 See [ROADMAP.md](ROADMAP.md) for full technical details.
 

@@ -18,6 +18,7 @@ pub mod audio;
 pub mod vqvae;
 pub mod streaming_image;
 pub mod blt;
+pub mod attn_benchmarks;
 pub mod streaming_audio;
 pub mod streaming_video;
 pub mod gemma_mapper;
