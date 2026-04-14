@@ -774,7 +774,7 @@ async fn cmd_distill(
     };
 
     // Pre-compute teacher logits for each chunk, then drop teacher to free ~10GB
-    info!("Pre-computing teacher logits...");
+    info!(event = "teacher_precompute_start", "pre-computing teacher logits");
     let mut teacher_logits_chunks: Vec<Vec<f32>> = Vec::new();
     let num_chunks = (token_ids.len() + seq_len - 1) / seq_len;
 
@@ -785,9 +785,12 @@ async fn cmd_distill(
             .map_err(|e| anyhow::anyhow!("Failed to init GPU: {:?}", e))?;
         gpu_accel.validate_model(teacher.model())
             .map_err(|e| anyhow::anyhow!("Failed to upload weights: {:?}", e))?;
-        info!("GPU weights uploaded");
+        info!(event = "gpu_weights_ready", "GPU weights validated");
 
-        for chunk_idx in 0..num_chunks.min(steps) {
+        let total_chunks = num_chunks.min(steps);
+        let teacher_start = std::time::Instant::now();
+        for chunk_idx in 0..total_chunks {
+            let chunk_start = std::time::Instant::now();
             let start = (chunk_idx * seq_len) % token_ids.len();
             let end = (start + seq_len).min(token_ids.len());
             let chunk: Vec<u32> = token_ids[start..end].to_vec();
@@ -795,25 +798,58 @@ async fn cmd_distill(
             let logits = gpu_accel.forward(teacher.model(), &chunk)
                 .map_err(|e| anyhow::anyhow!("GPU forward failed: {:?}", e))?;
             teacher_logits_chunks.push(logits);
-            info!("GPU teacher logits: chunk {}/{}", chunk_idx + 1, num_chunks.min(steps));
+
+            let elapsed = teacher_start.elapsed().as_secs_f32();
+            let per_chunk = elapsed / (chunk_idx + 1) as f32;
+            let remaining = per_chunk * (total_chunks - chunk_idx - 1) as f32;
+            let chunk_ms = chunk_start.elapsed().as_millis();
+            let tps = seq_len as f32 / chunk_start.elapsed().as_secs_f32();
+            info!(
+                event = "teacher_chunk",
+                chunk = chunk_idx + 1,
+                total = total_chunks,
+                chunk_ms = chunk_ms,
+                tok_per_s = tps as u32,
+                elapsed_s = elapsed as u32,
+                eta_s = remaining as u32,
+                "teacher forward"
+            );
         }
     } else {
         // CPU teacher forward
-        for chunk_idx in 0..num_chunks.min(steps) {
+        let total_chunks = num_chunks.min(steps);
+        let teacher_start = std::time::Instant::now();
+        for chunk_idx in 0..total_chunks {
+            let chunk_start = std::time::Instant::now();
             let start = (chunk_idx * seq_len) % token_ids.len();
             let end = (start + seq_len).min(token_ids.len());
             let chunk: Vec<u32> = token_ids[start..end].to_vec();
             if chunk.len() < seq_len { break; }
             let logits = teacher.forward(&chunk);
             teacher_logits_chunks.push(logits);
-            info!("CPU teacher logits: chunk {}/{}", chunk_idx + 1, num_chunks.min(steps));
+
+            let elapsed = teacher_start.elapsed().as_secs_f32();
+            let per_chunk = elapsed / (chunk_idx + 1) as f32;
+            let remaining = per_chunk * (total_chunks - chunk_idx - 1) as f32;
+            let chunk_ms = chunk_start.elapsed().as_millis();
+            let tps = seq_len as f32 / chunk_start.elapsed().as_secs_f32();
+            info!(
+                event = "teacher_chunk",
+                chunk = chunk_idx + 1,
+                total = total_chunks,
+                chunk_ms = chunk_ms,
+                tok_per_s = tps as u32,
+                elapsed_s = elapsed as u32,
+                eta_s = remaining as u32,
+                "teacher forward"
+            );
         }
     }
-    info!("Teacher logits computed: {} chunks", teacher_logits_chunks.len());
+    info!(event = "teacher_precompute_done", chunks = teacher_logits_chunks.len(), "teacher logits computed");
 
     // Drop teacher to free ~10GB RAM
     drop(teacher);
-    info!("Teacher freed, memory released for student");
+    info!(event = "teacher_freed", "teacher weights freed");
 
     // Re-load model for student (single copy in memory now)
     let model2 = load_model(path)
@@ -824,7 +860,7 @@ async fn cmd_distill(
     let block_summaries: Vec<BlockSummaryLayer> = injection_points.iter()
         .map(|_| BlockSummaryLayer::new_identity(config.hidden_dim, config.sliding_window))
         .collect();
-    info!("Student model created with {} Block Summary layers", block_summaries.len());
+    info!(event = "student_ready", block_summary_layers = block_summaries.len(), "student model created");
 
     let distill_config = DistillationConfig {
         learning_rate: learning_rate as f32,
@@ -846,8 +882,7 @@ async fn cmd_distill(
     }
 
     info!("");
-    info!("Starting distillation: {} steps, seq_len={}, lr={}, temp={}",
-        steps, seq_len, learning_rate, temperature);
+    info!(event = "distill_start", steps = steps, seq_len = seq_len, lr = learning_rate, temp = temperature, "starting distillation");
     info!("");
 
     // Run distillation using pre-computed teacher logits
@@ -857,7 +892,13 @@ async fn cmd_distill(
         .map(|bs| gemma_mapper::BlockSummaryAdam::new(bs, distill_config.learning_rate))
         .collect();
 
+    let train_start = std::time::Instant::now();
+    let mut prev_loss = f32::NAN;
+    let mut best_loss = f32::INFINITY;
+    let mut loss_ema = f32::NAN; // Exponential moving average for smoothing
+
     for step in 0..steps {
+        let step_start = std::time::Instant::now();
         let chunk_idx = step % teacher_logits_chunks.len();
         let batch_idx = step % (token_ids.len() / seq_len.max(1));
         let start = (batch_idx * seq_len) % token_ids.len();
@@ -875,6 +916,11 @@ async fn cmd_distill(
             teacher_logits, &student_logits,
             distill_config.temperature, vs, actual_seq,
         );
+
+        // Update EMA
+        loss_ema = if loss_ema.is_nan() { loss }
+                   else { 0.9 * loss_ema + 0.1 * loss };
+        if loss < best_loss { best_loss = loss; }
 
         // Compute d_loss / d_student_logits
         let mut d_logits = vec![0.0f32; actual_seq * vs];
@@ -900,20 +946,39 @@ async fn cmd_distill(
             })
             .collect();
 
+        // Track gradient norm across all block summary layers
+        let grad_norm: f32 = all_grads.iter()
+            .map(|(_, g)| g.d_bridge_weight * g.d_bridge_weight)
+            .sum::<f32>()
+            .sqrt();
+
         for (si, grads) in all_grads {
             optimizers[si].step(&mut student.block_summaries[si], &grads);
         }
 
-        let bridge_w = student.block_summaries.first()
+        // Collect per-layer bridge weights
+        let bridge_weights: Vec<f32> = student.block_summaries.iter()
             .map(|bs| bs.bridge_weight)
-            .unwrap_or(0.0);
+            .collect();
+        let bridge_w = bridge_weights.first().copied().unwrap_or(0.0);
+        let bridge_mean = if bridge_weights.is_empty() { 0.0 }
+            else { bridge_weights.iter().sum::<f32>() / bridge_weights.len() as f32 };
+        let bridge_min = bridge_weights.iter().cloned().fold(f32::INFINITY, f32::min);
+        let bridge_max = bridge_weights.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
         let lr = if step < distill_config.warmup_steps {
-            // Use (step+1) so step 0 gets lr/warmup_steps, not 0
             distill_config.learning_rate * (step + 1) as f32 / distill_config.warmup_steps.max(1) as f32
         } else {
             distill_config.learning_rate
         };
+
+        let step_ms = step_start.elapsed().as_millis();
+        let tps = actual_seq as f32 / step_start.elapsed().as_secs_f32();
+        let elapsed = train_start.elapsed().as_secs_f32();
+        let per_step = elapsed / (step + 1) as f32;
+        let eta = per_step * (steps - step - 1) as f32;
+        let loss_delta = if prev_loss.is_nan() { 0.0 } else { loss - prev_loss };
+        let _delta_sign = if loss_delta < -1e-8 { "↓" } else if loss_delta > 1e-8 { "↑" } else { "→" };
 
         results.push(gemma_mapper::DistillationStepResult {
             step,
@@ -924,10 +989,27 @@ async fn cmd_distill(
         });
 
         if step % log_every == 0 {
-            info!("Step {:>5}: loss={:.6} bridge_w={:.4} lr={:.6}",
-                step, loss, bridge_w, lr);
+            info!(
+                event = "distill_step",
+                step = step,
+                steps = steps,
+                loss = format_args!("{:.6}", loss),
+                loss_delta = format_args!("{:+.6}", loss_delta),
+                loss_ema = format_args!("{:.6}", loss_ema),
+                best_loss = format_args!("{:.6}", best_loss),
+                grad_norm = format_args!("{:.3e}", grad_norm),
+                bridge_mean = format_args!("{:.4}", bridge_mean),
+                bridge_min = format_args!("{:.4}", bridge_min),
+                bridge_max = format_args!("{:.4}", bridge_max),
+                lr = format_args!("{:.2e}", lr),
+                step_ms = step_ms,
+                tok_per_s = tps as u32,
+                eta_s = eta as u32,
+                "distillation step"
+            );
         }
 
+        prev_loss = loss;
         if loss < 1e-6 { break; }
     }
 
