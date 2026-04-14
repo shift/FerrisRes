@@ -7,7 +7,7 @@ use ferrisres::compute::{GpuBuffer, MatMulOp, RmsNormOp, SoftmaxOp, ElementWiseO
 use ferrisres::training::AdamOptimizer;
 use ferrisres::model::gemma_mapper::{
     self, Gemma4Config, Gemma4Teacher, Gemma4Student, DistillationConfig,
-    BlockSummaryLayer, load_gemma4_model, run_distillation,
+    BlockSummaryLayer, load_gemma4_model_mmap,
     DistillationCheckpoint, load_gemma4_model_gguf,
 };
 use ferrisres::model::tokenizer::HfTokenizer;
@@ -692,6 +692,7 @@ async fn cmd_distill(
         "e4b" => { info!("Using Gemma 4 E4B config (MoE-16, ~8 GB)"); Gemma4Config::gemma4_e4b() }
         "12b" => { info!("Using Gemma 4 12B config (MoE-128, ~24 GB)"); Gemma4Config::gemma4_12b() }
         "27b" => { info!("Using Gemma 4 27B config (MoE-128, ~54 GB)"); Gemma4Config::gemma4_27b() }
+        "27b-mm" => { info!("Using Gemma 4 27B Multimodal IT config (dense, 35 layers, ~10 GB)"); Gemma4Config::gemma4_27b_mm() }
         "llama3-8b" => { info!("Using LLaMA 3.1 8B config"); Gemma4Config::llama3_8b() }
         "llama3-70b" => { info!("Using LLaMA 3.1 70B config"); Gemma4Config::llama3_70b() }
         "mistral-7b" => { info!("Using Mistral 7B config"); Gemma4Config::mistral_7b() }
@@ -714,7 +715,7 @@ async fn cmd_distill(
     let load_model = |p: &std::path::Path| -> Result<gemma_mapper::MappedGemma4Model, String> {
         match model_format.as_str() {
             "gguf" => load_gemma4_model_gguf(p, config.clone()),
-            _ => load_gemma4_model(p, config.clone()),
+            _ => load_gemma4_model_mmap(p, config.clone()),
         }
     };
 
@@ -735,13 +736,62 @@ async fn cmd_distill(
             attn + ffn
         }).sum::<usize>() + model1.final_norm.len() + model1.lm_head.len());
 
-    // Create teacher (frozen)
+    // Create teacher (frozen) — compute logits, then free weights
     let teacher = Gemma4Teacher::new(model1);
     info!("Teacher model created (frozen)");
 
-    // Create student with Block Summary
+    // Load training data
+    let hf_tokenizer = if let Some(ref tok_path) = tokenizer_path {
+        let tok = HfTokenizer::from_tokenizer_json(std::path::Path::new(tok_path))
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+        info!("Loaded tokenizer with vocab size {}", tok.vocab_size());
+        Some(tok)
+    } else {
+        info!("No tokenizer specified, using byte-fallback tokenization");
+        None
+    };
+
+    let token_ids = if let Some(ref dp) = data_path {
+        info!("Loading training data from: {}", dp);
+        let text = std::fs::read_to_string(dp)
+            .map_err(|e| anyhow::anyhow!("Failed to read data: {}", e))?;
+        if let Some(ref tok) = hf_tokenizer {
+            let ids = tok.encode_raw(&text);
+            info!("Tokenized to {} tokens using provided tokenizer", ids.len());
+            ids
+        } else {
+            let ids: Vec<u32> = text.bytes().map(|b| b as u32).collect();
+            info!("Loaded {} byte-level tokens from training data", ids.len());
+            ids
+        }
+    } else {
+        info!("No training data provided, using synthetic tokens");
+        (0..10000).map(|i| i % config.vocab_size as u32).collect()
+    };
+
+    // Pre-compute teacher logits for each chunk, then drop teacher to free ~10GB
+    info!("Pre-computing teacher logits...");
+    let mut teacher_logits_chunks: Vec<Vec<f32>> = Vec::new();
+    let num_chunks = (token_ids.len() + seq_len - 1) / seq_len;
+    for chunk_idx in 0..num_chunks.min(steps) {
+        let start = (chunk_idx * seq_len) % token_ids.len();
+        let end = (start + seq_len).min(token_ids.len());
+        let chunk: Vec<u32> = token_ids[start..end].to_vec();
+        if chunk.len() < seq_len { break; }
+        let logits = teacher.forward(&chunk);
+        teacher_logits_chunks.push(logits);
+        info!("Teacher logits: chunk {}/{}", chunk_idx + 1, num_chunks.min(steps));
+    }
+    info!("Teacher logits computed: {} chunks", teacher_logits_chunks.len());
+
+    // Drop teacher to free ~10GB RAM
+    drop(teacher);
+    info!("Teacher freed, memory released for student");
+
+    // Re-load model for student (single copy in memory now)
     let model2 = load_model(path)
         .map_err(|e| anyhow::anyhow!("Failed to reload model for student: {}", e))?;
+    info!("Student model loaded");
 
     let injection_points = config.block_summary_injection_points();
     let block_summaries: Vec<BlockSummaryLayer> = injection_points.iter()
@@ -764,48 +814,94 @@ async fn cmd_distill(
         let ckpt = DistillationCheckpoint::load(std::path::Path::new(ckpt_path))
             .map_err(|e| anyhow::anyhow!("Failed to load checkpoint: {}", e))?;
         info!("Resuming from checkpoint at step {}", ckpt.global_step);
-        let optimizers = ckpt.apply(&mut student);
-        info!("Restored {} Block Summary layers from checkpoint", optimizers.len());
+        let _optimizers = ckpt.apply(&mut student);
+        info!("Restored Block Summary layers from checkpoint");
     }
-
-    // Load tokenizer
-    let hf_tokenizer = if let Some(ref tok_path) = tokenizer_path {
-        let tok = HfTokenizer::from_tokenizer_json(std::path::Path::new(tok_path))
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
-        info!("Loaded tokenizer with vocab size {}", tok.vocab_size());
-        Some(tok)
-    } else {
-        info!("No tokenizer specified, using byte-fallback tokenization");
-        None
-    };
-
-    // Load training data
-    let token_ids = if let Some(ref dp) = data_path {
-        info!("Loading training data from: {}", dp);
-        let text = std::fs::read_to_string(dp)
-            .map_err(|e| anyhow::anyhow!("Failed to read data: {}", e))?;
-        if let Some(ref tok) = hf_tokenizer {
-            let ids = tok.encode_raw(&text);
-            info!("Tokenized to {} tokens using provided tokenizer", ids.len());
-            ids
-        } else {
-            let ids: Vec<u32> = text.bytes().map(|b| b as u32).collect();
-            info!("Loaded {} byte-level tokens from training data", ids.len());
-            ids
-        }
-    } else {
-        // Synthetic data for testing
-        info!("No training data provided, using synthetic tokens");
-        (0..10000).map(|i| i % config.vocab_size as u32).collect()
-    };
 
     info!("");
     info!("Starting distillation: {} steps, seq_len={}, lr={}, temp={}",
         steps, seq_len, learning_rate, temperature);
     info!("");
 
-    // Run distillation
-    let results = run_distillation(&teacher, &mut student, &token_ids, seq_len);
+    // Run distillation using pre-computed teacher logits
+    let vs = config.vocab_size;
+    let mut results: Vec<gemma_mapper::DistillationStepResult> = Vec::new();
+    let mut optimizers: Vec<gemma_mapper::BlockSummaryAdam> = student.block_summaries.iter()
+        .map(|bs| gemma_mapper::BlockSummaryAdam::new(bs, distill_config.learning_rate))
+        .collect();
+
+    for step in 0..steps {
+        let chunk_idx = step % teacher_logits_chunks.len();
+        let batch_idx = step % (token_ids.len() / seq_len.max(1));
+        let start = (batch_idx * seq_len) % token_ids.len();
+        let end = (start + seq_len).min(token_ids.len());
+        let batch_tokens = &token_ids[start..end];
+        let actual_seq = batch_tokens.len();
+
+        let teacher_logits = &teacher_logits_chunks[chunk_idx];
+
+        // Student forward
+        let student_logits = student.forward(batch_tokens);
+
+        // KL divergence loss
+        let loss = gemma_mapper::kl_divergence_loss(
+            teacher_logits, &student_logits,
+            distill_config.temperature, vs, actual_seq,
+        );
+
+        // Compute d_loss / d_student_logits
+        let mut d_logits = vec![0.0f32; actual_seq * vs];
+        let scale = 1.0 / (distill_config.temperature * distill_config.temperature);
+        for t in 0..actual_seq {
+            for v in 0..vs {
+                let idx = t * vs + v;
+                let t_logit = teacher_logits.get(idx).copied().unwrap_or(0.0) / distill_config.temperature;
+                let s_logit = student_logits.get(idx).copied().unwrap_or(0.0) / distill_config.temperature;
+                let t_prob = t_logit.exp();
+                let s_prob = s_logit.exp();
+                d_logits[idx] = (s_prob - t_prob) * scale;
+            }
+        }
+
+        // Backprop through Block Summary layers
+        let all_grads: Vec<(usize, gemma_mapper::BlockSummaryGradients)> = student.block_summaries.iter().enumerate()
+            .filter(|(_, bs)| bs.trainable)
+            .filter(|(si, _)| *si < optimizers.len())
+            .map(|(si, bs)| {
+                let grads = gemma_mapper::backprop_block_summary(bs, &student.model.embed_tokens, &d_logits);
+                (si, grads)
+            })
+            .collect();
+
+        for (si, grads) in all_grads {
+            optimizers[si].step(&mut student.block_summaries[si], &grads);
+        }
+
+        let bridge_w = student.block_summaries.first()
+            .map(|bs| bs.bridge_weight)
+            .unwrap_or(0.0);
+
+        let lr = if step < distill_config.warmup_steps {
+            distill_config.learning_rate * step as f32 / distill_config.warmup_steps.max(1) as f32
+        } else {
+            distill_config.learning_rate
+        };
+
+        results.push(gemma_mapper::DistillationStepResult {
+            step,
+            kl_loss: loss,
+            bridge_weight: bridge_w,
+            learning_rate: lr,
+            layer_cosine_sim: vec![],
+        });
+
+        if step % log_every == 0 {
+            info!("Step {:>5}: loss={:.6} bridge_w={:.4} lr={:.6}",
+                step, loss, bridge_w, lr);
+        }
+
+        if loss < 1e-6 { break; }
+    }
 
     // Report results
     info!("");
@@ -894,11 +990,12 @@ async fn cmd_evaluate(
     let config = match config_name.as_str() {
         "e2b" => Gemma4Config::gemma4_e2b(),
         "e4b" => Gemma4Config::gemma4_e4b(),
-        _ => anyhow::bail!("Use e2b or e4b for evaluation"),
+        "27b-mm" => Gemma4Config::gemma4_27b_mm(),
+        _ => anyhow::bail!("Use e2b, e4b, or 27b-mm for evaluation"),
     };
 
     let path = std::path::Path::new(&model_path);
-    let model = load_gemma4_model(path, config.clone())
+    let model = load_gemma4_model_mmap(path, config.clone())
         .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
 
     let teacher = Gemma4Teacher::new(model);

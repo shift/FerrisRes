@@ -483,6 +483,57 @@ impl std::fmt::Display for ModelArchitecture {
     }
 }
 
+/// Detect architecture from a list of tensor names (shared logic).
+pub fn detect_architecture_from_names(names: &[&str]) -> ModelArchitecture {
+    // Check for BlockAttnRes-specific names
+    if names.iter().any(|n| n.contains("q_proj") && n.contains("block_attn")) {
+        return ModelArchitecture::BlockAttnRes;
+    }
+
+    let has_attn_q = names.iter().any(|n| n.contains("q_proj") || n.contains("query"));
+    let has_attn_k = names.iter().any(|n| n.contains("k_proj") || n.contains("key"));
+    let has_attn_v = names.iter().any(|n| n.contains("v_proj") || n.contains("value"));
+
+    if has_attn_q && has_attn_k && has_attn_v {
+        if names.iter().any(|n| n.starts_with("model.layers.")) {
+            if names.iter().any(|n| n.contains("gate_proj")) {
+                return ModelArchitecture::Llama;
+            }
+            return ModelArchitecture::Mistral;
+        }
+        if names.iter().any(|n| n.starts_with("transformer.h.")) {
+            return ModelArchitecture::GptNeoX;
+        }
+        return ModelArchitecture::Standard;
+    }
+
+    ModelArchitecture::Unknown
+}
+
+/// Infer number of layers from tensor names (shared logic).
+pub fn infer_layers_from_names(names: &[&str]) -> usize {
+    let mut max_layer = 0;
+    for name in names {
+        if let Some(idx) = name.find("layers.") {
+            let rest = &name[idx + 7..];
+            if let Some(dot) = rest.find('.') {
+                if let Ok(n) = rest[..dot].parse::<usize>() {
+                    max_layer = max_layer.max(n + 1);
+                }
+            }
+        }
+        if let Some(idx) = name.find("h.") {
+            let rest = &name[idx + 2..];
+            if let Some(dot) = rest.find('.') {
+                if let Ok(n) = rest[..dot].parse::<usize>() {
+                    max_layer = max_layer.max(n + 1);
+                }
+            }
+        }
+    }
+    max_layer
+}
+
 // ---------------------------------------------------------------------------
 // Safetensors Writer
 // ---------------------------------------------------------------------------
@@ -841,5 +892,170 @@ mod tests {
             let recovered = bf16_to_f32(bits);
             assert!((v - recovered).abs() < 0.1, "BF16 round trip failed: {} -> {} -> {}", v, bits, recovered);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Memory-mapped safetensors loader (for large models that don't fit in RAM)
+// ---------------------------------------------------------------------------
+
+/// Memory-mapped safetensors file. Keeps the file mmap'd and converts
+/// individual tensors to f32 on demand, avoiding the need to hold all
+/// tensors in RAM simultaneously.
+pub struct MmapedSafetensors {
+    /// The mmap'd file data.
+    #[allow(dead_code)]
+    mmap: memmap2::Mmap,
+    /// Parsed header: tensor name → (dtype, shape, start_offset, end_offset)
+    tensor_meta: HashMap<String, (String, Vec<usize>, usize, usize)>,
+    /// Byte offset where tensor data begins in the file.
+    data_offset: usize,
+}
+
+impl MmapedSafetensors {
+    /// Open a safetensors file using memory mapping.
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path)
+            .map_err(|e| FerrisResError::Shape(format!("Cannot open {}: {}", path.display(), e)))?;
+
+        let mmap = unsafe {
+            memmap2::Mmap::map(&file)
+                .map_err(|e| FerrisResError::Shape(format!("Cannot mmap {}: {}", path.display(), e)))?
+        };
+
+        // Parse header
+        if mmap.len() < 8 {
+            return Err(FerrisResError::Shape("File too small for safetensors header".into()));
+        }
+
+        let header_len = u64::from_le_bytes(
+            mmap[0..8].try_into().unwrap()
+        ) as usize;
+
+        if 8 + header_len > mmap.len() {
+            return Err(FerrisResError::Shape("Header extends beyond file".into()));
+        }
+
+        let header_json: HashMap<String, serde_json::Value> = serde_json::from_slice(
+            &mmap[8..8 + header_len]
+        ).map_err(|e| FerrisResError::Shape(format!("Invalid safetensors JSON: {}", e)))?;
+
+        let data_offset = 8 + header_len;
+        let mut tensor_meta = HashMap::new();
+
+        for (name, value) in &header_json {
+            // Skip __metadata__ entry
+            if name == "__metadata__" { continue; }
+
+            let obj = value.as_object()
+                .ok_or_else(|| FerrisResError::Shape(format!("Invalid tensor entry: {}", name)))?;
+
+            let dtype = obj.get("dtype")
+                .and_then(|v| v.as_str())
+                .unwrap_or("F32")
+                .to_string();
+
+            let shape: Vec<usize> = obj.get("shape")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+                .unwrap_or_default();
+
+            let offsets = obj.get("data_offsets")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect::<Vec<_>>())
+                .unwrap_or_default();
+
+            if offsets.len() >= 2 {
+                tensor_meta.insert(name.clone(), (dtype, shape, offsets[0], offsets[1]));
+            }
+        }
+
+        tracing::info!(
+            "Mmap'd {} tensors from {} ({} bytes, data_offset={})",
+            tensor_meta.len(), path.display(), mmap.len(), data_offset
+        );
+
+        Ok(Self { mmap, tensor_meta, data_offset })
+    }
+
+    /// Get a tensor as Vec<f32>, converting from the stored dtype.
+    /// Memory is only allocated for this one tensor.
+    pub fn get_tensor_f32(&self, name: &str) -> Result<Vec<f32>> {
+        let (dtype, _shape, start, end) = self.tensor_meta.get(name)
+            .ok_or_else(|| FerrisResError::Shape(format!("Tensor '{}' not found", name)))?;
+
+        let abs_start = self.data_offset + start;
+        let abs_end = self.data_offset + end;
+
+        if abs_end > self.mmap.len() {
+            return Err(FerrisResError::Shape(format!(
+                "Tensor '{}' data [{}, {}) exceeds mmap size {}", name, abs_start, abs_end, self.mmap.len()
+            )));
+        }
+
+        let raw = &self.mmap[abs_start..abs_end];
+        bytes_to_f32(raw, dtype)
+    }
+
+    /// Get tensor shape.
+    pub fn get_shape(&self, name: &str) -> Option<Vec<usize>> {
+        self.tensor_meta.get(name).map(|(_, shape, _, _)| shape.clone())
+    }
+
+    /// List all tensor names.
+    pub fn tensor_names(&self) -> Vec<&str> {
+        self.tensor_meta.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Number of tensors.
+    pub fn len(&self) -> usize {
+        self.tensor_meta.len()
+    }
+
+    /// Detect architecture from tensor names.
+    pub fn detect_architecture(&self) -> ModelArchitecture {
+        let names = self.tensor_names();
+        detect_architecture_from_names(&names)
+    }
+
+    /// Infer number of layers from tensor names.
+    pub fn infer_num_layers(&self) -> usize {
+        let names = self.tensor_names();
+        infer_layers_from_names(&names)
+    }
+
+    /// Infer hidden dimension from embed_tokens weight shape.
+    pub fn infer_hidden_dim(&self) -> Option<usize> {
+        if let Some((_, shape, _, _)) = self.tensor_meta.get("model.embed_tokens.weight") {
+            if shape.len() >= 2 { return Some(shape[1]); }
+        }
+        None
+    }
+
+    /// Infer vocab size from embed_tokens weight shape.
+    pub fn infer_vocab_size(&self) -> Option<usize> {
+        if let Some((_, shape, _, _)) = self.tensor_meta.get("model.embed_tokens.weight") {
+            if shape.len() >= 1 { return Some(shape[0]); }
+        }
+        None
+    }
+
+    /// Convert to LoadedWeights by loading all tensors (use only for small models).
+    pub fn to_loaded_weights(&self) -> Result<LoadedWeights> {
+        let mut tensors = HashMap::new();
+        for name in self.tensor_names() {
+            let (dtype, shape, _, _) = self.tensor_meta.get(name).cloned().unwrap();
+            let data = self.get_tensor_f32(name)?;
+            tensors.insert(name.to_string(), LoadedTensor {
+                name: name.to_string(),
+                shape,
+                dtype: dtype,
+                data,
+            });
+        }
+        Ok(LoadedWeights {
+            tensors,
+            source_files: vec![PathBuf::from("mmap")],
+        })
     }
 }
