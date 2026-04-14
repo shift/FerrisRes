@@ -2189,9 +2189,11 @@ impl Gemma4Student {
 
         // Final norm + LM head
         hidden = rms_norm(&hidden, &self.model.final_norm, hd, 1e-6);
+        eprintln!("[DIAG] forward_from_frozen: rms_norm done, calling matmul seq={} hd={} vs={}", seq, hd, vs);
 
         // LM head: [seq × hd] × [hd × vs] → [seq × vs] (via fast GEMM)
         let logits = matmul(&hidden, &self.model.lm_head, seq, hd, vs);
+        eprintln!("[DIAG] forward_from_frozen: matmul done, logits_len={}", logits.len());
 
         logits
     }
@@ -2259,9 +2261,11 @@ impl Gemma4Student {
 
         // Final norm + LM head
         hidden = rms_norm(&hidden, &self.model.final_norm, hd, 1e-6);
+        eprintln!("[DIAG] forward_from_frozen_fast: rms_norm done, calling matmul seq={} hd={} vs={}", seq, hd, vs);
 
         // LM head: [seq × hd] × [hd × vs] → [seq × vs] (via fast GEMM)
         let logits = matmul(&hidden, &self.model.lm_head, seq, hd, vs);
+        eprintln!("[DIAG] forward_from_frozen_fast: matmul done, logits_len={}", logits.len());
 
         logits
     }

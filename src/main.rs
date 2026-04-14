@@ -824,6 +824,7 @@ async fn cmd_distill(
                 "teacher forward"
             );
         }
+        drop(gpu_accel);
     } else {
         // CPU teacher forward
         let total_chunks = num_chunks.min(steps);
