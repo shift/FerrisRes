@@ -123,9 +123,6 @@ enum Commands {
         /// Number of steps with no improvement before stopping (requires --converge > 0).
         #[arg(long, default_value_t = 50)]
         converge_patience: usize,
-        /// Use GPU for matmul acceleration.
-        #[arg(long, default_value_t = false)]
-        gpu: bool,
     },
 
     /// Evaluate teacher/student perplexity.
@@ -179,8 +176,8 @@ async fn main() -> anyhow::Result<()> {
         } => cmd_benchmark(hidden_dim, num_blocks, block_size, iterations).await,
         Commands::Distill {
             model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every,
-            resume, model_format, tokenizer, checkpoint_every, converge, converge_patience, gpu,
-        } => cmd_distill(model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every, resume, model_format, tokenizer, checkpoint_every, converge, converge_patience, gpu).await,
+            resume, model_format, tokenizer, checkpoint_every, converge, converge_patience,
+        } => cmd_distill(model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every, resume, model_format, tokenizer, checkpoint_every, converge, converge_patience).await,
         Commands::Evaluate {
             model_path, config, text,
         } => cmd_evaluate(model_path, config, text).await,
@@ -696,7 +693,7 @@ async fn cmd_distill(
     checkpoint_every: usize,
     converge_threshold: f64,
     converge_patience: usize,
-    use_gpu: bool,
+    // use_gpu removed — now determined by DispatchPlan from model size + device capabilities
 ) -> anyhow::Result<()> {
     info!(event = "ferrisres_gemma_4_block_attnres_distillation", "=== FerrisRes Gemma 4 → Block AttnRes Distillation ===");
 
@@ -792,15 +789,17 @@ async fn cmd_distill(
         (0..10000).map(|i| i % config.vocab_size as u32).collect()
     };
 
-    // Initialize GPU accelerator (kept alive for entire distillation)
-    let gpu_accel: Option<ferrisres::model::gpu_forward::GpuMatmulAccelerator> = if use_gpu {
+    // === DispatchPlan: model-size-aware CPU/GPU delegation ===
+    // No more --gpu flag. We detect GPU, measure model size, and compute
+    // per-op dispatch decisions.
+    let model_file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    info!(event = "model_file_size", bytes = model_file_bytes, size_gb = format!("{:.2}", model_file_bytes as f64 / 1e9));
+
+    let gpu_accel: Option<ferrisres::model::gpu_forward::GpuMatmulAccelerator> =
         match ferrisres::model::gpu_forward::GpuMatmulAccelerator::new() {
             Ok(mut accel) => {
                 match accel.validate_model(teacher.model()) {
-                    Ok(()) => {
-                        info!(event = "gpu_ready", profile = ?accel.profile(), "GPU accelerator initialized");
-                        Some(accel)
-                    }
+                    Ok(()) => Some(accel),
                     Err(e) => {
                         info!(event = "gpu_validation_failed", error = %e, "GPU validation failed, falling back to CPU");
                         None
@@ -808,21 +807,38 @@ async fn cmd_distill(
                 }
             }
             Err(e) => {
-                info!(event = "gpu_init_failed", error = ?e, "GPU init failed, falling back to CPU");
+                info!(event = "gpu_unavailable", error = ?e, "No GPU available, using CPU-only dispatch");
                 None
             }
-        }
-    } else {
-        None
+        };
+
+    // Build DispatchPlan from real measurements
+    let (profile, vram_bytes, max_buffer_bytes) = match &gpu_accel {
+        Some(gpu) => (gpu.profile(), gpu.estimated_vram_bytes(), gpu.max_buffer_bytes()),
+        None => (ferrisres::device::DeviceProfile::Integrated, 0, 0),
     };
+    let dispatch = ferrisres::device::DispatchPlan::new(
+        profile,
+        model_file_bytes,
+        vram_bytes,
+        max_buffer_bytes,
+        config.hidden_dim as u64,
+        config.num_heads as u64,
+        config.head_dim as u64,
+        config.intermediate_dim as u64,
+        config.vocab_size as u64,
+        seq_len as u64,
+        config.num_kv_heads as u64,
+    );
+    info!(event = "dispatch_plan", "\n{}", dispatch.summary());
 
     // Pre-compute teacher logits for each chunk, then drop teacher to free ~10GB
     info!(event = "teacher_precompute_start", "pre-computing teacher logits");
     let mut teacher_logits_chunks: Vec<Vec<f32>> = Vec::new();
     let num_chunks = (token_ids.len() + seq_len - 1) / seq_len;
 
-    if gpu_accel.is_some() {
-        // GPU-accelerated teacher forward
+    if gpu_accel.is_some() && dispatch.attn_qkv_dispatch != ferrisres::device::OpTarget::Cpu {
+        // GPU-accelerated teacher forward (dispatch plan says GPU for QKV)
         info!(event = "using_gpu_matmul_acceleration_for_teacher", "Using GPU matmul acceleration for teacher forward");
 
         let total_chunks = num_chunks.min(steps);
@@ -965,7 +981,7 @@ async fn cmd_distill(
         gpu_matmul(&combined, down, seq, id, hd)
     };
 
-    info!(event = "precompute_frozen_states", chunks = teacher_logits_chunks.len(), first_injection = first_injection, gpu = gpu_accel.is_some(), "precomputing frozen base model hidden states");
+    info!(event = "precompute_frozen_states", chunks = teacher_logits_chunks.len(), first_injection = first_injection, dispatch = ?dispatch.attn_qkv_dispatch, "precomputing frozen base model hidden states");
     let frozen_start = std::time::Instant::now();
     for (chunk_idx, _chunk_tokens) in teacher_logits_chunks.iter().enumerate() {
         // We need the token IDs for this chunk
@@ -1090,7 +1106,14 @@ async fn cmd_distill(
         // Student forward (using cached frozen hidden states)
         let frozen_states = &frozen_states_per_chunk[chunk_idx];
         let student_logits = if let Some(ref gpu) = gpu_accel {
-            student.forward_from_frozen_gpu(frozen_states, gpu)
+            match dispatch.attn_qkv_dispatch {
+                ferrisres::device::OpTarget::Gpu | ferrisres::device::OpTarget::GpuTiled => {
+                    student.forward_from_frozen_gpu(frozen_states, gpu)
+                }
+                ferrisres::device::OpTarget::Cpu => {
+                    student.forward_from_frozen(frozen_states)
+                }
+            }
         } else {
             student.forward_from_frozen(frozen_states)
         };
