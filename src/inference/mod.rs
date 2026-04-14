@@ -20,6 +20,11 @@ pub mod cross_modal;
 pub mod circular_kv;
 pub mod video_compression;
 pub mod host_tools;
+pub mod lsp_tools;
+pub mod wasm_sandbox;
+pub mod mirror_test;
+pub mod block_draft;
+pub mod concept_memory;
 
 pub use kv_cache::{LayerKVCache, ModelKVCache};
 pub use two_phase::{TwoPhaseConfig, TwoPhaseInference, KVCache, Sampler, GenerationState};

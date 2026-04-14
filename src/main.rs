@@ -115,6 +115,9 @@ enum Commands {
         /// Save checkpoint every N steps.
         #[arg(long, default_value_t = 100)]
         checkpoint_every: usize,
+        /// Use GPU for matmul acceleration.
+        #[arg(long, default_value_t = false)]
+        gpu: bool,
     },
 
     /// Evaluate teacher/student perplexity.
@@ -168,8 +171,8 @@ async fn main() -> anyhow::Result<()> {
         } => cmd_benchmark(hidden_dim, num_blocks, block_size, iterations).await,
         Commands::Distill {
             model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every,
-            resume, model_format, tokenizer, checkpoint_every,
-        } => cmd_distill(model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every, resume, model_format, tokenizer, checkpoint_every).await,
+            resume, model_format, tokenizer, checkpoint_every, gpu,
+        } => cmd_distill(model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every, resume, model_format, tokenizer, checkpoint_every, gpu).await,
         Commands::Evaluate {
             model_path, config, text,
         } => cmd_evaluate(model_path, config, text).await,
@@ -683,6 +686,7 @@ async fn cmd_distill(
     model_format: String,
     tokenizer_path: Option<String>,
     _checkpoint_every: usize,
+    use_gpu: bool,
 ) -> anyhow::Result<()> {
     info!("=== FerrisRes Gemma 4 → Block AttnRes Distillation ===");
 
@@ -773,14 +777,37 @@ async fn cmd_distill(
     info!("Pre-computing teacher logits...");
     let mut teacher_logits_chunks: Vec<Vec<f32>> = Vec::new();
     let num_chunks = (token_ids.len() + seq_len - 1) / seq_len;
-    for chunk_idx in 0..num_chunks.min(steps) {
-        let start = (chunk_idx * seq_len) % token_ids.len();
-        let end = (start + seq_len).min(token_ids.len());
-        let chunk: Vec<u32> = token_ids[start..end].to_vec();
-        if chunk.len() < seq_len { break; }
-        let logits = teacher.forward(&chunk);
-        teacher_logits_chunks.push(logits);
-        info!("Teacher logits: chunk {}/{}", chunk_idx + 1, num_chunks.min(steps));
+
+    if use_gpu {
+        // GPU-accelerated teacher forward
+        info!("Using GPU matmul acceleration for teacher forward");
+        let mut gpu_accel = ferrisres::model::gpu_forward::GpuMatmulAccelerator::new()
+            .map_err(|e| anyhow::anyhow!("Failed to init GPU: {:?}", e))?;
+        gpu_accel.validate_model(teacher.model())
+            .map_err(|e| anyhow::anyhow!("Failed to upload weights: {:?}", e))?;
+        info!("GPU weights uploaded");
+
+        for chunk_idx in 0..num_chunks.min(steps) {
+            let start = (chunk_idx * seq_len) % token_ids.len();
+            let end = (start + seq_len).min(token_ids.len());
+            let chunk: Vec<u32> = token_ids[start..end].to_vec();
+            if chunk.len() < seq_len { break; }
+            let logits = gpu_accel.forward(teacher.model(), &chunk)
+                .map_err(|e| anyhow::anyhow!("GPU forward failed: {:?}", e))?;
+            teacher_logits_chunks.push(logits);
+            info!("GPU teacher logits: chunk {}/{}", chunk_idx + 1, num_chunks.min(steps));
+        }
+    } else {
+        // CPU teacher forward
+        for chunk_idx in 0..num_chunks.min(steps) {
+            let start = (chunk_idx * seq_len) % token_ids.len();
+            let end = (start + seq_len).min(token_ids.len());
+            let chunk: Vec<u32> = token_ids[start..end].to_vec();
+            if chunk.len() < seq_len { break; }
+            let logits = teacher.forward(&chunk);
+            teacher_logits_chunks.push(logits);
+            info!("CPU teacher logits: chunk {}/{}", chunk_idx + 1, num_chunks.min(steps));
+        }
     }
     info!("Teacher logits computed: {} chunks", teacher_logits_chunks.len());
 
