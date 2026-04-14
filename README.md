@@ -2,7 +2,7 @@
 
 FerrisRes is a Rust-native AI inference and training engine built around **Block AttnRes** — a novel linear-time transformer architecture that replaces the quadratic attention bottleneck of standard transformers. It runs on any GPU or iGPU via [wgpu](https://github.com/gfx-rs/wgpu) (Vulkan, Metal, DX12, WebGPU), adapts automatically to the hardware it finds, and is written entirely in safe Rust with no Python dependency.
 
-> ⚠️ **v0.2.0 — near-production grade, not yet 1.0.** FerrisRes has 759 passing tests, a full self-improvement loop, and a verified Gemma 4 distillation pipeline. The Block AttnRes architecture is losslessly distilled from established models but still benefits from further field testing at scale. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0. Suitable for research, high-performance prototyping, and early-adopter production workloads.
+> ⚠️ **v0.2.1 — near-production grade, not yet 1.0.** FerrisRes has 843 passing tests, a full self-improvement loop, a verified Gemma 4 distillation pipeline, five output modalities (vision, speech, tactile, robotics, scientific), and a 4-layer security proxy (FerrisRes Armor). The Block AttnRes architecture is losslessly distilled from established models but still benefits from further field testing at scale. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0. Suitable for research, high-performance prototyping, and early-adopter production workloads.
 
 ---
 
@@ -78,6 +78,28 @@ The `TokenGenerator` orchestrates both phases and exposes `generate_stream` for 
 - **Streaming video I/O** — frame sampling, temporal buffering, progressive decode
 - **Video token compression** — temporal redundancy removal, motion-compensated residuals, cross-frame merging (4-8× reduction)
 - **3D/factored convolution** — temporal (T×1×1) + spatial (1×H×W) decomposition with WGSL kernels
+
+### Output Modalities
+
+- **VisionHead** — VQ-VAE codebook logits with progressive row-by-row decode
+- **SpeechHead** — N-codebook EnCodec-style prediction
+- **VideoHead** — I-frame + P-frame residual prediction with VideoStreamReconstructor
+- **Streaming TTS** — AudioStreamReconstructor with overlap-add, crossfade, fade-in/out
+- **Robotics VLA** — ActionHead with binned (256 bins) and continuous (tanh-squashed) modes, ControlMode (Cartesian/Joint), safety checker
+- **ChemicalValidator** — SMILES valence-aware token masking for organic subset (C, N, O, P, S, halogens, B)
+- **MeshHead** — SDF prediction on sparse grid + Marching Cubes extraction → .obj export
+- **GCodeValidator + GCodeGenerator** — Klipper-style parsing, work envelope validation, 32-token vocabulary
+- **TactileHead** — 6-actuator (5 fingers + palm) 1000Hz haptic intensity prediction
+- **VisualTactileBridge** — cosine similarity visual-to-tactile texture translation
+- **SpeculativeHapticDecoder** — draft-then-verify for sub-20ms latency
+
+### Security (FerrisRes Armor)
+
+- **L0: Regex + Bloom filter** — 31 PII recognizers (email, SSN, phone, credit cards, IP, IBAN, API keys, etc.) + 5 prompt injection heuristics + 1MB Bloom filter for blocklist lookup
+- **L1: Neural scanner** — ArmorGuardTiny: 4-layer BERT (~3.5M params) for binary SAFE/INJECTION classification
+- **L2: RepE safety probe** — 6-category linear probes (violence, self-harm, sexual, hate, harassment, injection) on BlockSummary hidden states
+- **L3: Output sanitizer** — PII redaction with Mask/Replace/Truncate strategies, injection-heuristic exclusion
+- **ArmorLayer orchestrator** — verify_input (L0+L1), verify_hidden (L2), sanitize_output (L3), self-learning feedback loop
 
 ### Training
 
@@ -364,6 +386,7 @@ See [docs/distillation.md](docs/distillation.md) for the full guide.
 | [Quick Start](docs/quickstart.md) | Get running in 5 minutes |
 | [Architecture](docs/architecture.md) | Block AttnRes deep dive |
 | [Distillation](docs/distillation.md) | Gemma 4 → Block AttnRes conversion |
+| [Security](docs/security.md) | FerrisRes Armor: 4-layer security proxy |
 | [API Reference](docs/api-reference.md) | Public API, stability tiers, CLI |
 | [Deployment](docs/deployment.md) | systemd, Docker, NixOS, security |
 
@@ -441,6 +464,12 @@ src/
 │   ├── mirror_test.rs     # Recursive self-verification
 │   ├── block_draft.rs     # Speculative Block Decoding
 │   ├── concept_memory.rs  # Persistent concept memory + Hull-KV bridge
+│   ├── pdf_ingestion.rs   # Raw PDF text extraction
+│   ├── acp.rs             # Agent Capability Protocol router
+│   ├── tts_stream.rs      # Streaming TTS with overlap-add reconstruction
+│   ├── vla.rs             # Vision-Language-Action robotics controller
+│   ├── scientific.rs      # SMILES validator, Marching Cubes, G-Code validator/generator
+│   ├── tactile.rs         # TactileHead haptics + VisualTactileBridge
 │   └── kv_cache.rs / sampling.rs
 ├── model/
 │   ├── model.rs          # BlockAttnResModel (forward + backward)
@@ -460,7 +489,15 @@ src/
 │   ├── streaming_image.rs # Progressive patch extraction
 │   ├── streaming_audio.rs # Chunked audio processing + ring buffer
 │   ├── streaming_video.rs # Frame sampling + temporal buffering
+│   ├── generation_head.rs # VisionHead, SpeechHead, VideoHead output modalities
 │   └── shard.rs          # ModelShard + QuantizedBuffer
+├── security/
+│   ├── mod.rs            # Armor module registration
+│   ├── armor.rs          # ArmorLayer orchestrator + self-learning feedback
+│   ├── armor_l0.rs       # Regex PII engine + Bloom filter
+│   ├── armor_l1.rs       # ArmorGuardTiny neural injection scanner
+│   ├── armor_l2.rs       # RepE safety probe (6 categories)
+│   └── armor_l3.rs       # PII redaction output sanitizer
 ├── tensor/               # GpuTensor
 └── training/
     ├── optimizer.rs      # SGD, Adam, CrossEntropyLoss
@@ -487,8 +524,10 @@ src/
 | 10 | ✅ Done | Gemma 4 distillation pipeline, GPU forward pass, mmap loader, GQA, real-model verification |
 | 11 | ✅ Done | Self-improvement: WASM sandbox, LSP-as-Oracle, Mirror Test, Block Decoding, Concept Memory |
 | 12 | ✅ Done | v0.2.0: benchmarking, API stabilisation, quickstart/architecture/deployment docs |
+| 13 | ✅ Done | Output modalities: VisionHead, SpeechHead, VideoHead, TTS stream, VLA ActionHead, Scientific (SMILES/Mesh/GCode), TactileHead |
+| 14 | ✅ Done | FerrisRes Armor: L0 regex+bloom, L1 neural scanner, L2 RepE probe, L3 sanitizer, GPU-accelerated distillation |
 
-**All tasks complete — 759 tests passing.**
+**All tasks complete — 843 tests passing.**
 
 See [ROADMAP.md](ROADMAP.md) for full technical details.
 
