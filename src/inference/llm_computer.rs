@@ -177,6 +177,14 @@ impl VmState {
         self.memory.get(addr).copied().unwrap_or(0)
     }
 
+    /// Read a range of memory.
+    pub fn read_mem_range(&self, start: usize, len: usize) -> Vec<i32> {
+        self.memory[start..start.min(self.memory.len())].iter()
+            .take(len)
+            .copied()
+            .collect()
+    }
+
     /// Write to memory.
     pub fn write_mem(&mut self, addr: usize, value: i32) {
         if let Some(m) = self.memory.get_mut(addr) {
@@ -564,6 +572,381 @@ impl OnlineDistillationTrigger {
     /// Check if distillation is in progress.
     pub fn is_distilling(&self) -> bool {
         self.distilling
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VM State Persistence (task 1c0402e5)
+// ---------------------------------------------------------------------------
+
+/// Serializable VM snapshot for persistence across sessions.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VmSnapshot {
+    pub registers: Vec<i32>,
+    pub memory: Vec<i32>,
+    pub tables: Vec<Vec<(i32, i32)>>,
+    pub pc: usize,
+    pub halted: bool,
+    pub steps: usize,
+    pub max_steps: usize,
+    pub program: Vec<CalmInstructionSer>,
+    pub timestamp: u64,
+    pub label: String,
+}
+
+/// Serializable representation of CALM instructions.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum CalmInstructionSer {
+    LookUp { table_id: u32, key_reg: u32, output_reg: u32 },
+    Append { addr_reg: u32, value_reg: u32 },
+    Compute { op: String, a_reg: u32, b_reg: u32, output_reg: u32 },
+    BranchIf { condition_reg: u32, target: u32 },
+    Move { input_reg: u32, output_reg: u32 },
+    LoadConst { value: i32, output_reg: u32 },
+    Halt,
+}
+
+impl VmState {
+    /// Serialize current VM state to a snapshot.
+    pub fn snapshot(&self, program: &[CalmInstruction], label: &str) -> VmSnapshot {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        VmSnapshot {
+            registers: self.registers.clone(),
+            memory: self.memory.clone(),
+            tables: self.tables.clone(),
+            pc: self.pc,
+            halted: self.halted,
+            steps: self.steps,
+            max_steps: self.max_steps,
+            program: program.iter().map(CalmInstructionSer::from_instr).collect(),
+            timestamp,
+            label: label.to_string(),
+        }
+    }
+
+    /// Restore VM state from a snapshot.
+    pub fn from_snapshot(snapshot: &VmSnapshot) -> Self {
+        Self {
+            registers: snapshot.registers.clone(),
+            memory: snapshot.memory.clone(),
+            tables: snapshot.tables.clone(),
+            pc: snapshot.pc,
+            halted: snapshot.halted,
+            steps: snapshot.steps,
+            max_steps: snapshot.max_steps,
+        }
+    }
+}
+
+impl VmSnapshot {
+    /// Save snapshot to a file.
+    pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
+        let json = serde_json::to_string(self).map_err(|e| format!("Serialize: {}", e))?;
+        std::fs::write(path, json).map_err(|e| format!("Write: {}", e))
+    }
+
+    /// Load snapshot from a file.
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        let json = std::fs::read_to_string(path).map_err(|e| format!("Read: {}", e))?;
+        serde_json::from_str(&json).map_err(|e| format!("Deserialize: {}", e))
+    }
+}
+
+impl CalmInstructionSer {
+    fn from_instr(instr: &CalmInstruction) -> Self {
+        match instr {
+            CalmInstruction::LookUp { table_id, key_reg, output_reg } =>
+                Self::LookUp { table_id: *table_id, key_reg: *key_reg, output_reg: *output_reg },
+            CalmInstruction::Append { addr_reg, value_reg } =>
+                Self::Append { addr_reg: *addr_reg, value_reg: *value_reg },
+            CalmInstruction::Compute { op, a_reg, b_reg, output_reg } =>
+                Self::Compute {
+                    op: format!("{:?}", op).to_lowercase(),
+                    a_reg: *a_reg, b_reg: *b_reg, output_reg: *output_reg,
+                },
+            CalmInstruction::BranchIf { condition_reg, target } =>
+                Self::BranchIf { condition_reg: *condition_reg, target: *target },
+            CalmInstruction::Move { input_reg, output_reg } =>
+                Self::Move { input_reg: *input_reg, output_reg: *output_reg },
+            CalmInstruction::LoadConst { value, output_reg } =>
+                Self::LoadConst { value: *value, output_reg: *output_reg },
+            CalmInstruction::Halt => Self::Halt,
+        }
+    }
+
+    /// Deserialize back to a CalmInstruction.
+    pub fn to_instr(&self) -> Option<CalmInstruction> {
+        match self {
+            Self::LookUp { table_id, key_reg, output_reg } =>
+                Some(CalmInstruction::LookUp { table_id: *table_id, key_reg: *key_reg, output_reg: *output_reg }),
+            Self::Append { addr_reg, value_reg } =>
+                Some(CalmInstruction::Append { addr_reg: *addr_reg, value_reg: *value_reg }),
+            Self::Compute { op, a_reg, b_reg, output_reg } => {
+                let calm_op = match op.as_str() {
+                    "add" => CalmOp::Add, "sub" => CalmOp::Sub, "mul" => CalmOp::Mul,
+                    "div" => CalmOp::Div, "mod" => CalmOp::Mod,
+                    "and" => CalmOp::And, "or" => CalmOp::Or, "xor" => CalmOp::Xor,
+                    "shl" => CalmOp::Shl, "shr" => CalmOp::Shr,
+                    "eq" => CalmOp::Eq, "ne" => CalmOp::Ne, "lt" => CalmOp::Lt, "gt" => CalmOp::Gt,
+                    _ => return None,
+                };
+                Some(CalmInstruction::Compute { op: calm_op, a_reg: *a_reg, b_reg: *b_reg, output_reg: *output_reg })
+            }
+            Self::BranchIf { condition_reg, target } =>
+                Some(CalmInstruction::BranchIf { condition_reg: *condition_reg, target: *target }),
+            Self::Move { input_reg, output_reg } =>
+                Some(CalmInstruction::Move { input_reg: *input_reg, output_reg: *output_reg }),
+            Self::LoadConst { value, output_reg } =>
+                Some(CalmInstruction::LoadConst { value: *value, output_reg: *output_reg }),
+            Self::Halt => Some(CalmInstruction::Halt),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CALM Self-Authoring (task 82d7c212)
+// ---------------------------------------------------------------------------
+
+/// A self-authored CALM program generated by the model.
+#[derive(Debug, Clone)]
+pub struct SelfAuthoredProgram {
+    /// The program instructions.
+    pub instructions: Vec<CalmInstruction>,
+    /// Natural language description of what the program does.
+    pub description: String,
+    /// The model's confidence in the program's correctness.
+    pub confidence: f32,
+    /// Token IDs that generated this program.
+    pub source_tokens: Vec<u32>,
+}
+
+/// Authoring result — either a valid program or compilation errors.
+#[derive(Debug, Clone)]
+pub enum AuthoringResult {
+    Success(SelfAuthoredProgram),
+    CompileError { message: String, token_position: usize },
+}
+
+/// CALM self-authoring engine.
+/// Converts model output (token IDs) into executable CALM programs.
+pub struct CalmAuthoringEngine {
+    decoder: CalmDecoder,
+    max_program_length: usize,
+}
+
+impl CalmAuthoringEngine {
+    pub fn new(vocab_size: u32) -> Self {
+        Self {
+            decoder: CalmDecoder::new(vocab_size),
+            max_program_length: 256,
+        }
+    }
+
+    /// Author a CALM program from model-generated token IDs.
+    /// The tokens between CALM_START and CALM_END markers are decoded.
+    pub fn author_from_tokens(&self, tokens: &[u32]) -> AuthoringResult {
+        let program = self.decoder.decode(tokens);
+
+        if program.is_empty() {
+            return AuthoringResult::CompileError {
+                message: "No valid CALM instructions found in token sequence".into(),
+                token_position: 0,
+            };
+        }
+
+        if program.len() > self.max_program_length {
+            return AuthoringResult::CompileError {
+                message: format!("Program too long: {} > {}", program.len(), self.max_program_length),
+                token_position: tokens.len().saturating_sub(1),
+            };
+        }
+
+        // Validate: program must end with Halt
+        let has_halt = program.last().map_or(false, |i|
+            matches!(i, CalmInstruction::Halt)
+        );
+
+        let mut instructions = program;
+        if !has_halt {
+            instructions.push(CalmInstruction::Halt);
+        }
+
+        // Validate register bounds
+        for (idx, instr) in instructions.iter().enumerate() {
+            if let Err(msg) = self.validate_instruction(instr) {
+                return AuthoringResult::CompileError {
+                    message: msg,
+                    token_position: idx,
+                };
+            }
+        }
+
+        AuthoringResult::Success(SelfAuthoredProgram {
+            confidence: 0.5, // Will be updated after execution
+            description: String::new(), // Filled by model
+            source_tokens: tokens.to_vec(),
+            instructions,
+        })
+    }
+
+    /// Validate a single instruction.
+    fn validate_instruction(&self, instr: &CalmInstruction) -> Result<(), String> {
+        const MAX_REG: u32 = 15; // 16 registers
+        match instr {
+            CalmInstruction::LookUp { key_reg, output_reg, .. } => {
+                if *key_reg > MAX_REG || *output_reg > MAX_REG {
+                    return Err(format!("Register out of bounds"));
+                }
+            }
+            CalmInstruction::Compute { a_reg, b_reg, output_reg, .. } => {
+                if *a_reg > MAX_REG || *b_reg > MAX_REG || *output_reg > MAX_REG {
+                    return Err(format!("Register out of bounds"));
+                }
+            }
+            CalmInstruction::BranchIf { condition_reg, target } => {
+                if *condition_reg > MAX_REG {
+                    return Err(format!("Register out of bounds"));
+                }
+                if *target as usize >= self.max_program_length {
+                    return Err(format!("Branch target out of bounds: {}", target));
+                }
+            }
+            CalmInstruction::LoadConst { output_reg, .. } => {
+                if *output_reg > MAX_REG {
+                    return Err(format!("Register out of bounds"));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Execute a self-authored program and return the result.
+    pub fn execute_authored(&self, authored: &SelfAuthoredProgram) -> VmExecutionResult {
+        let config = LlmComputerConfig::default();
+        let mut computer = LlmComputer::new(config);
+        computer.load_program(authored.instructions.clone());
+        let state = computer.execute();
+
+        VmExecutionResult {
+            halted_normally: state.is_halted(),
+            final_register_0: state.read_reg(0),
+            steps: state.steps(),
+            memory_snapshot: state.read_mem_range(0, 64),
+        }
+    }
+}
+
+/// Result of executing a self-authored program.
+#[derive(Debug, Clone)]
+pub struct VmExecutionResult {
+    pub halted_normally: bool,
+    pub final_register_0: i32,
+    pub steps: usize,
+    pub memory_snapshot: Vec<i32>,
+}
+
+// ---------------------------------------------------------------------------
+// Self-Correction via VM Ground Truth (task 5f28d6ed)
+// ---------------------------------------------------------------------------
+
+/// Self-correction using VM execution as ground truth.
+/// The model predicts an answer, the VM computes the correct answer,
+/// and the difference becomes a loss signal for backpropagation.
+pub struct VmSelfCorrection {
+    engine: CalmAuthoringEngine,
+    /// History of corrections for curriculum learning.
+    corrections: Vec<CorrectionRecord>,
+}
+
+/// A single correction record.
+#[derive(Debug, Clone)]
+pub struct CorrectionRecord {
+    /// What the model predicted.
+    pub model_prediction: i32,
+    /// What the VM computed (ground truth).
+    pub vm_result: i32,
+    /// The loss from this correction.
+    pub loss: f32,
+    /// Whether the model was correct.
+    pub correct: bool,
+}
+
+impl VmSelfCorrection {
+    pub fn new(vocab_size: u32) -> Self {
+        Self {
+            engine: CalmAuthoringEngine::new(vocab_size),
+            corrections: Vec::new(),
+        }
+    }
+
+    /// Compute ground truth loss: compare model prediction to VM execution.
+    ///
+    /// `model_prediction`: the value the model predicted (e.g., register 0).
+    /// `program_tokens`: token IDs that encode the CALM program.
+    ///
+    /// Returns (loss, vm_result, correct).
+    pub fn compute_correction(
+        &mut self,
+        model_prediction: i32,
+        program_tokens: &[u32],
+    ) -> (f32, i32, bool) {
+        match self.engine.author_from_tokens(program_tokens) {
+            AuthoringResult::Success(program) => {
+                let result = self.engine.execute_authored(&program);
+                let vm_result = result.final_register_0;
+                let correct = model_prediction == vm_result;
+
+                // MSE-style loss
+                let diff = (model_prediction - vm_result) as f32;
+                let loss = diff * diff;
+
+                self.corrections.push(CorrectionRecord {
+                    model_prediction,
+                    vm_result,
+                    loss,
+                    correct,
+                });
+
+                (loss, vm_result, correct)
+            }
+            AuthoringResult::CompileError { message: _message, .. } => {
+                // Compilation failure → high loss
+                let loss = 100.0; // Penalty for non-compiling code
+                self.corrections.push(CorrectionRecord {
+                    model_prediction,
+                    vm_result: 0,
+                    loss,
+                    correct: false,
+                });
+                (loss, 0, false)
+            }
+        }
+    }
+
+    /// Compute batch correction loss.
+    pub fn batch_correction_loss(&self) -> f32 {
+        if self.corrections.is_empty() { return 0.0; }
+        self.corrections.iter().map(|c| c.loss).sum::<f32>() / self.corrections.len() as f32
+    }
+
+    /// Get accuracy over all corrections.
+    pub fn accuracy(&self) -> f32 {
+        if self.corrections.is_empty() { return 0.0; }
+        self.corrections.iter().filter(|c| c.correct).count() as f32 / self.corrections.len() as f32
+    }
+
+    /// Get correction history.
+    pub fn corrections(&self) -> &[CorrectionRecord] {
+        &self.corrections
+    }
+
+    /// Clear correction history.
+    pub fn reset(&mut self) {
+        self.corrections.clear();
     }
 }
 

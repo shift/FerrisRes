@@ -156,4 +156,64 @@ impl MoELinear {
     pub fn moe_expert_op(&self) -> &MoEExpertOp {
         &self.moe_expert_op
     }
+
+    // -----------------------------------------------------------------------
+    // MoE Hot-Swap (task 5256d885)
+    // -----------------------------------------------------------------------
+
+    /// Replace an expert's weights at runtime without restarting inference.
+    ///
+    /// This enables dynamic expert addition/replacement during generation:
+    /// - Load new expert weights from a LoRA adapter
+    /// - Replace a poorly-performing expert with a better one
+    /// - Add domain-specific experts on-the-fly
+    ///
+    /// `new_weights` must be `[gate_proj | up_proj | down_proj]` flattened,
+    /// each of size `intermediate_dim * hidden_dim`.
+    pub fn swap_expert(&mut self, expert_idx: usize, new_weights: &[f32]) -> std::result::Result<(), String> {
+        if expert_idx >= self.num_experts {
+            return Err(format!("Expert index {} out of range (max: {})", expert_idx, self.num_experts));
+        }
+
+        let expected = self.intermediate_dim * self.hidden_dim * 3;
+        if new_weights.len() != expected {
+            return Err(format!("Weight size mismatch: got {} expected {}", new_weights.len(), expected));
+        }
+
+        // Upload to GPU buffers
+        // Note: this updates the full expert_weight buffer. In a production
+        // impl, we'd use sub-buffer writes for the specific expert slice.
+        let weight_size = self.intermediate_dim * self.hidden_dim;
+
+        // Write up weights for this expert
+        let up_offset = expert_idx * weight_size * std::mem::size_of::<f32>();
+        let up_slice = &new_weights[weight_size..2*weight_size];
+        self.queue.write_buffer(
+            self.expert_up_weights.buffer(),
+            up_offset as u64,
+            bytemuck::cast_slice(up_slice),
+        );
+
+        // Write down weights for this expert
+        let down_slice = &new_weights[2*weight_size..3*weight_size];
+        self.queue.write_buffer(
+            self.expert_down_weights.buffer(),
+            up_offset as u64,
+            bytemuck::cast_slice(down_slice),
+        );
+
+        Ok(())
+    }
+
+    /// Get the number of experts.
+    pub fn num_experts(&self) -> usize {
+        self.num_experts
+    }
+}
+
+/// Snapshot of a single expert's weights (CPU-side copy read back from GPU).
+#[derive(Debug, Clone)]
+pub struct ExpertWeights {
+    pub up: Vec<f32>,
+    pub down: Vec<f32>,
 }
