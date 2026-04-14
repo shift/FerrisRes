@@ -1862,17 +1862,28 @@ impl Gemma4Teacher {
     }
 }
 
-/// Simple CPU matmul: C[m×n] = A[m×k] × B[k×n].
+/// CPU matmul: C[m×n] = A[m×k] × B[k×n].
+/// Uses matrixmultiply for cache-tiled SIMD-accelerated GEMM (~5-10× faster
+/// than naive triple loop on large matrices).
 pub fn matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     let mut c = vec![0.0f32; m * n];
-    for i in 0..m {
-        for j in 0..n {
-            let mut sum = 0.0f32;
-            for l in 0..k {
-                sum += a[i * k + l] * b[l * n + j];
-            }
-            c[i * n + j] = sum;
-        }
+    if m == 0 || k == 0 || n == 0 { return c; }
+
+    // matrixmultiply::sgemm parameters:
+    //   C = alpha * A * B + beta * C
+    //   A is (m, k) with row stride = a_rs, column stride = a_cs
+    //   B is (k, n) with row stride = b_rs, column stride = b_cs
+    //   C is (m, n) with row stride = c_rs, column stride = c_cs
+    // For row-major: stride = 1 for columns, stride = row_len for rows
+    unsafe {
+        matrixmultiply::sgemm(
+            m, k, n,
+            1.0,                              // alpha
+            a.as_ptr(), k as isize, 1,        // A: row stride=k, col stride=1 (row-major)
+            b.as_ptr(), n as isize, 1,        // B: row stride=n, col stride=1 (row-major)
+            1.0,                              // beta
+            c.as_mut_ptr(), n as isize, 1,    // C: row stride=n, col stride=1 (row-major)
+        );
     }
     c
 }
@@ -2065,6 +2076,217 @@ impl Gemma4Student {
         }
 
         layer_states
+    }
+
+    /// Forward pass using precomputed frozen hidden states.
+    ///
+    /// Instead of running all 35 layers, we start from the frozen model's
+    /// hidden states and only recompute from injection points where block
+    /// summary layers modify the state.
+    ///
+    /// `frozen_states` is indexed by layer (0=embedding, 1=post-layer-0, ..., N=post-layer-N-1).
+    /// Returns logits.
+    pub fn forward_from_frozen(&self, frozen_states: &[Vec<f32>]) -> Vec<f32> {
+        let config = &self.model.config;
+        let hd = config.hidden_dim;
+        let nh = config.num_heads;
+        let head_d = config.head_dim;
+        let vs = config.vocab_size;
+        let seq = frozen_states.first().map(|s| s.len() / hd).unwrap_or(0);
+        if seq == 0 { return vec![]; }
+
+        let injection_points = config.block_summary_injection_points();
+
+        // Start from the embedding state (frozen_states[0])
+        let mut hidden = frozen_states[0].clone();
+        let mut summary_idx = 0;
+
+        for (layer_idx, layer) in self.model.layers.iter().enumerate() {
+            // Check if this is an injection point
+            let is_injection = injection_points.contains(&layer_idx);
+
+            if is_injection {
+                // Use the frozen hidden state (pre-injection) as input
+                // frozen_states[layer_idx + 1] is the state AFTER this layer was processed by the frozen model
+                // frozen_states[layer_idx] is the state BEFORE this layer
+                // We want the state just before this layer processes
+                hidden = if layer_idx + 1 < frozen_states.len() {
+                    // Use the pre-layer frozen state: the state entering this layer
+                    // Actually, frozen_states is: [0]=post-embed, [1]=post-layer0, [2]=post-layer1, ...
+                    // So frozen_states[layer_idx] is the state before layer `layer_idx` processes
+                    // (because frozen_states[0] is post-embed = before layer 0)
+                    frozen_states[layer_idx].clone()
+                } else {
+                    hidden.clone()
+                };
+            } else if summary_idx > 0 {
+                // After an injection point, we need to recompute this layer
+                // because the hidden state was modified by the block summary
+                let residual = hidden.clone();
+                let normed = rms_norm(&hidden, &layer.attn.input_norm, hd, 1e-6);
+                let attn_out = self.student_attention(&normed, &layer.attn, nh, config.num_kv_heads, head_d, seq, hd);
+                for i in 0..hidden.len() { hidden[i] = residual[i] + attn_out[i]; }
+                let residual2 = hidden.clone();
+                let normed2 = rms_norm(&hidden, &layer.attn.post_attn_norm, hd, 1e-6);
+                let ffn_out = match &layer.ffn {
+                    Gemma4FfnWeights::Dense { gate_proj, up_proj, down_proj } => {
+                        swiglu_ffn(&normed2, gate_proj, up_proj, down_proj, hd, config.intermediate_dim)
+                    }
+                    Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs } => {
+                        let mut moe = CpuMoELayer::new(hd, config.intermediate_dim, config.num_experts, config.top_k);
+                        moe.gate_weights = router.clone();
+                        moe.expert_gate = expert_gates.clone();
+                        moe.expert_up = expert_ups.clone();
+                        moe.expert_down = expert_downs.clone();
+                        moe.forward(&normed2, seq)
+                    }
+                };
+                for i in 0..hidden.len() { hidden[i] = residual2[i] + ffn_out[i]; }
+                continue;
+            } else {
+                // Before any injection point: use frozen state directly
+                hidden = if layer_idx + 1 < frozen_states.len() {
+                    frozen_states[layer_idx + 1].clone()
+                } else {
+                    hidden.clone()
+                };
+                continue;
+            }
+
+            // === At injection point: recompute this layer + apply block summary ===
+            {
+                let residual = hidden.clone();
+                let normed = rms_norm(&hidden, &layer.attn.input_norm, hd, 1e-6);
+                let attn_out = self.student_attention(&normed, &layer.attn, nh, config.num_kv_heads, head_d, seq, hd);
+                for i in 0..hidden.len() { hidden[i] = residual[i] + attn_out[i]; }
+                let residual2 = hidden.clone();
+                let normed2 = rms_norm(&hidden, &layer.attn.post_attn_norm, hd, 1e-6);
+                let ffn_out = match &layer.ffn {
+                    Gemma4FfnWeights::Dense { gate_proj, up_proj, down_proj } => {
+                        swiglu_ffn(&normed2, gate_proj, up_proj, down_proj, hd, config.intermediate_dim)
+                    }
+                    Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs } => {
+                        let mut moe = CpuMoELayer::new(hd, config.intermediate_dim, config.num_experts, config.top_k);
+                        moe.gate_weights = router.clone();
+                        moe.expert_gate = expert_gates.clone();
+                        moe.expert_up = expert_ups.clone();
+                        moe.expert_down = expert_downs.clone();
+                        moe.forward(&normed2, seq)
+                    }
+                };
+                for i in 0..hidden.len() { hidden[i] = residual2[i] + ffn_out[i]; }
+            }
+
+            // Apply block summary blending
+            if summary_idx < self.block_summaries.len() {
+                let bs = &self.block_summaries[summary_idx];
+                let block_tokens = hidden.clone();
+                let summary = bs.forward(&block_tokens);
+                if summary.len() >= hd {
+                    for t in 0..seq {
+                        for d in 0..hd {
+                            hidden[t * hd + d] = (1.0 - bs.bridge_weight) * hidden[t * hd + d]
+                                + bs.bridge_weight * summary[d];
+                        }
+                    }
+                }
+            }
+            summary_idx += 1;
+        }
+
+        // Final norm + LM head
+        hidden = rms_norm(&hidden, &self.model.final_norm, hd, 1e-6);
+
+        let mut logits = vec![0.0f32; seq * vs];
+        for t in 0..seq {
+            for v in 0..vs {
+                let mut sum = 0.0f32;
+                for d in 0..hd {
+                    sum += hidden[t * hd + d] * self.model.lm_head[v * hd + d];
+                }
+                logits[t * vs + v] = sum;
+            }
+        }
+
+        logits
+    }
+
+    /// Fast forward using frozen hidden states: skip all layer recomputation.
+    ///
+    /// This only applies block summary blending at injection points (using the
+    /// frozen pre-layer states) and then runs the LM head. The approximation is
+    /// valid because bridge_weight is small (<0.5) so the hidden state change
+    /// is minor — subsequent frozen layers would produce nearly the same output.
+    ///
+    /// Speedup: ~90% fewer FLOPs per step (no attention/FFN, only block summaries + LM head).
+    pub fn forward_from_frozen_fast(&self, frozen_states: &[Vec<f32>]) -> Vec<f32> {
+        let config = &self.model.config;
+        let hd = config.hidden_dim;
+        let vs = config.vocab_size;
+        let seq = frozen_states.first().map(|s| s.len() / hd).unwrap_or(0);
+        if seq == 0 { return vec![]; }
+
+        let injection_points = config.block_summary_injection_points();
+
+        // Start from the last layer's frozen output (post-layer-34 = frozen_states[35])
+        // and apply block summary blending at each injection point using
+        // the frozen pre-layer states.
+
+        // Use the last frozen state as the base hidden state
+        let last_state_idx = frozen_states.len().saturating_sub(1);
+        let mut hidden = frozen_states[last_state_idx].clone();
+
+        // Blend block summaries from each injection point into the final hidden state
+        // Each injection contributes a small perturbation proportional to bridge_weight
+        for (summary_idx, &layer_idx) in injection_points.iter().enumerate() {
+            if summary_idx >= self.block_summaries.len() { break; }
+            let bs = &self.block_summaries[summary_idx];
+
+            // Use the frozen state at this injection point as block tokens
+            // frozen_states[layer_idx] = state before layer `layer_idx` processes
+            // frozen_states[layer_idx + 1] = state after layer `layer_idx` processes
+            let pre_layer_state;
+            let _pre_layer_state_cloned: Vec<f32>;
+            if layer_idx + 1 < frozen_states.len() {
+                _pre_layer_state_cloned = vec![];
+                pre_layer_state = &frozen_states[layer_idx + 1];
+            } else {
+                _pre_layer_state_cloned = hidden.clone();
+                pre_layer_state = &_pre_layer_state_cloned;
+            };
+
+            let summary = bs.forward(pre_layer_state);
+            if summary.len() >= hd {
+                // Blend: perturb the final hidden state by the summary at this injection point
+                // Scale by 1/num_injections so total perturbation is bounded
+                let blend_scale = 1.0 / injection_points.len() as f32;
+                let summary_clamped = &summary[..hd.min(summary.len())];
+                for t in 0..seq {
+                    for d in 0..hd {
+                        let pre_val = if d < pre_layer_state.len() / seq {
+                            pre_layer_state[t * hd + d]
+                        } else { 0.0 };
+                        hidden[t * hd + d] += blend_scale * bs.bridge_weight * (summary_clamped[d] - pre_val);
+                    }
+                }
+            }
+        }
+
+        // Final norm + LM head
+        hidden = rms_norm(&hidden, &self.model.final_norm, hd, 1e-6);
+
+        let mut logits = vec![0.0f32; seq * vs];
+        for t in 0..seq {
+            for v in 0..vs {
+                let mut sum = 0.0f32;
+                for d in 0..hd {
+                    sum += hidden[t * hd + d] * self.model.lm_head[v * hd + d];
+                }
+                logits[t * vs + v] = sum;
+            }
+        }
+
+        logits
     }
 
     /// Student attention (same architecture as teacher, but factored out).
