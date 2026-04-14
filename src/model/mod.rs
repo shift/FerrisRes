@@ -23,6 +23,7 @@ pub mod streaming_audio;
 pub mod streaming_video;
 pub mod gemma_mapper;
 pub mod gpu_forward;
+pub mod generation_head;
 
 pub use config::BlockAttnResConfig;
 pub use linear::Linear;
