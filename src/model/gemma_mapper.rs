@@ -333,14 +333,14 @@ impl BlockSummaryLayer {
 
     /// Forward: compress a block of tokens into a summary.
     ///
-    /// Input: [block_size × hidden_dim] tokens.
+    /// Input: [num_tokens × hidden_dim] tokens. Works with any number of tokens
+    /// (not limited to the configured block_size — it adapts to actual input length).
     /// Output: [num_summary_queries × hidden_dim] summary.
     pub fn forward(&self, block_tokens: &[f32]) -> Vec<f32> {
         let hd = self.hidden_dim;
         let nq = self.num_summary_queries;
-        let bs = self.block_size;
-
-        assert!(block_tokens.len() >= bs * hd, "Block tokens too small");
+        let num_tokens = block_tokens.len() / hd;
+        assert!(num_tokens > 0, "Block tokens too small: need at least 1 token ({} elements, hidden_dim={})", block_tokens.len(), hd);
 
         // 1. Project queries: Q = summary_queries × query_proj
         let mut queries = vec![0.0; nq * hd];
@@ -354,11 +354,11 @@ impl BlockSummaryLayer {
             }
         }
 
-        // 2. Project keys and values from tokens
-        let mut keys = vec![0.0; bs * hd];
-        let mut values = vec![0.0; bs * hd];
+        // 2. Project keys and values from tokens (adapt to actual token count)
+        let mut keys = vec![0.0; num_tokens * hd];
+        let mut values = vec![0.0; num_tokens * hd];
 
-        for t in 0..bs {
+        for t in 0..num_tokens {
             for d in 0..hd {
                 let mut k_sum = 0.0;
                 let mut v_sum = 0.0;
@@ -378,9 +378,9 @@ impl BlockSummaryLayer {
         let mut output = vec![0.0; nq * hd];
         for q in 0..nq {
             // Compute attention weights
-            let mut attn_weights = vec![0.0; bs];
+            let mut attn_weights = vec![0.0; num_tokens];
             let mut max_weight = f32::NEG_INFINITY;
-            for t in 0..bs {
+            for t in 0..num_tokens {
                 let mut dot = 0.0;
                 for d in 0..hd {
                     dot += queries[q * hd + d] * keys[t * hd + d];
@@ -404,7 +404,7 @@ impl BlockSummaryLayer {
             // Weighted sum of values
             for d in 0..hd {
                 let mut sum = 0.0;
-                for t in 0..bs {
+                for t in 0..num_tokens {
                     sum += attn_weights[t] * values[t * hd + d];
                 }
                 output[q * hd + d] = sum;
@@ -1479,7 +1479,7 @@ impl MappedGemma4Model {
             };
 
             layers.push(Gemma4LayerWeights { attn, ffn });
-            tracing::info!("Loaded layer {}/{}", layer_idx + 1, config.num_layers);
+            tracing::info!(event = "loaded_layer", "Loaded layer {}/{}", layer_idx + 1, config.num_layers);
         }
 
         Ok(Self { config, embed_tokens, layers, final_norm, lm_head })
@@ -3351,9 +3351,9 @@ pub fn load_gemma4_model_mmap(
     let uses_mm_naming = names.iter().any(|n| n.starts_with("model.language_model."));
 
     if uses_mm_naming {
-        tracing::info!("Detected Gemma 4 multimodal naming (model.language_model.layers.N.*)");
+        tracing::info!(event = "detected_gemma_4_multimodal_naming_model", "Detected Gemma 4 multimodal naming (model.language_model.layers.N.*)");
     } else {
-        tracing::info!("Detected standard naming (model.layers.N.*)");
+        tracing::info!(event = "detected_standard_naming_model_layers_n", "Detected standard naming (model.layers.N.*)");
     }
 
     // Verify dimensions — use language_model-specific detection for MM
@@ -3380,7 +3380,7 @@ pub fn load_gemma4_model_mmap(
     }
 
     // Stream tensors from mmap (only one in RAM at a time)
-    tracing::info!("Streaming tensors from mmap (one at a time)...");
+    tracing::info!(event = "streaming_tensors_from_mmap_one_at", "Streaming tensors from mmap (one at a time)...");
     if uses_mm_naming {
         MappedGemma4Model::from_mmap_mm(config, &mmaped)
     } else {
