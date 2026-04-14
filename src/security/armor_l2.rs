@@ -74,6 +74,7 @@ struct ProbeHead {
     /// Bias.
     bias: f32,
     /// Threshold for this category.
+    #[allow(dead_code)]
     threshold: f32,
 }
 

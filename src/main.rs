@@ -1094,6 +1094,24 @@ async fn cmd_distill(
             }
         }
 
+        // Project d_logits [seq × vocab] back through LM head to get d_hidden [seq × hd]
+        // d_hidden = d_logits × lm_head^T  (lm_head is [hd × vocab], so d_logits [seq × vocab] × [vocab × hd])
+        let d_hidden: Vec<f32> = {
+            let lm_head_t = &student.model.lm_head; // [hd × vs]
+            let mut dh = vec![0.0f32; actual_seq * config.hidden_dim];
+            for t in 0..actual_seq {
+                for d in 0..config.hidden_dim {
+                    let mut sum = 0.0f32;
+                    for v in 0..vs {
+                        // lm_head[d * vs + v] transposed
+                        sum += d_logits[t * vs + v] * lm_head_t.get(d * vs + v).copied().unwrap_or(0.0);
+                    }
+                    dh[t * config.hidden_dim + d] = sum;
+                }
+            }
+            dh
+        };
+
         // Backprop through Block Summary layers using cached frozen hidden states
         let frozen_states = &frozen_states_per_chunk[chunk_idx];
         let all_grads: Vec<(usize, gemma_mapper::BlockSummaryGradients)> = student.block_summaries.iter().enumerate()
@@ -1109,7 +1127,7 @@ async fn cmd_distill(
                     // Fallback: use embedding (should not happen)
                     &student.model.embed_tokens[..seq_len * config.hidden_dim]
                 };
-                let grads = gemma_mapper::backprop_block_summary(bs, block_tokens, &d_logits);
+                let grads = gemma_mapper::backprop_block_summary(bs, block_tokens, &d_hidden);
                 (si, grads)
             })
             .collect();
@@ -1120,7 +1138,25 @@ async fn cmd_distill(
             .sum::<f32>()
             .sqrt();
 
-        for (si, grads) in all_grads {
+        // Gradient clipping: prevent explosions (max norm = 1.0)
+        let max_grad_norm = 1.0f32;
+        let clipped_grads: Vec<(usize, gemma_mapper::BlockSummaryGradients)> = if grad_norm > max_grad_norm && grad_norm.is_finite() {
+            let scale = max_grad_norm / grad_norm;
+            all_grads.into_iter().map(|(si, mut g)| {
+                g.d_bridge_weight *= scale;
+                for v in &mut g.d_summary_queries { *v *= scale; }
+                for v in &mut g.d_out_proj { *v *= scale; }
+                for v in &mut g.d_query_proj { *v *= scale; }
+                (si, g)
+            }).collect()
+        } else if !grad_norm.is_finite() {
+            // Skip NaN/inf gradients entirely
+            vec![]
+        } else {
+            all_grads
+        };
+
+        for (si, grads) in clipped_grads {
             optimizers[si].step(&mut student.block_summaries[si], &grads);
         }
 
