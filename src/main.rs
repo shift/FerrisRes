@@ -101,7 +101,7 @@ enum Commands {
         #[arg(long, default_value = "distilled_model.bin")]
         output: String,
         /// Log loss every N steps.
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 1)]
         log_every: usize,
         /// Resume from checkpoint.
         #[arg(long)]
@@ -1035,9 +1035,7 @@ async fn cmd_distill(
 
         // Student forward (using cached frozen hidden states)
         let frozen_states = &frozen_states_per_chunk[chunk_idx];
-        eprintln!("[DIAG] step {} entering forward_from_frozen, frozen_states={} layers, seq={}", global_step, frozen_states.len(), actual_seq);
         let student_logits = student.forward_from_frozen(frozen_states);
-        eprintln!("[DIAG] step {} forward done, logits_len={}", global_step, student_logits.len());
 
         // KL divergence loss
         let loss = gemma_mapper::kl_divergence_loss(
@@ -1050,17 +1048,37 @@ async fn cmd_distill(
                    else { 0.9 * loss_ema + 0.1 * loss };
         if loss < best_loss { best_loss = loss; }
 
-        // Compute d_loss / d_student_logits
+        // Compute d_loss / d_student_logits (numerically stable)
+        // d_kl/d_s_logit = (softmax(s/T) - softmax(t/T)) / T
+        // Use log-softmax to avoid exp overflow on large logits
         let mut d_logits = vec![0.0f32; actual_seq * vs];
-        let scale = 1.0 / (distill_config.temperature * distill_config.temperature);
+        let inv_temp = 1.0 / distill_config.temperature;
         for t in 0..actual_seq {
+            let offset = t * vs;
+            // Find max for numerical stability
+            let mut t_max = f32::NEG_INFINITY;
+            let mut s_max = f32::NEG_INFINITY;
             for v in 0..vs {
-                let idx = t * vs + v;
-                let t_logit = teacher_logits.get(idx).copied().unwrap_or(0.0) / distill_config.temperature;
-                let s_logit = student_logits.get(idx).copied().unwrap_or(0.0) / distill_config.temperature;
-                let t_prob = t_logit.exp();
-                let s_prob = s_logit.exp();
-                d_logits[idx] = (s_prob - t_prob) * scale;
+                let tl = teacher_logits.get(offset + v).copied().unwrap_or(0.0) * inv_temp;
+                let sl = student_logits.get(offset + v).copied().unwrap_or(0.0) * inv_temp;
+                if tl > t_max { t_max = tl; }
+                if sl > s_max { s_max = sl; }
+            }
+            // Compute stable softmax probabilities
+            let mut t_sum = 0.0f32;
+            let mut s_sum = 0.0f32;
+            let mut t_probs = vec![0.0f32; vs];
+            let mut s_probs = vec![0.0f32; vs];
+            for v in 0..vs {
+                t_probs[v] = (teacher_logits.get(offset + v).copied().unwrap_or(0.0) * inv_temp - t_max).exp();
+                s_probs[v] = (student_logits.get(offset + v).copied().unwrap_or(0.0) * inv_temp - s_max).exp();
+                t_sum += t_probs[v];
+                s_sum += s_probs[v];
+            }
+            for v in 0..vs {
+                t_probs[v] /= t_sum;
+                s_probs[v] /= s_sum;
+                d_logits[offset + v] = (s_probs[v] - t_probs[v]) * inv_temp;
             }
         }
 

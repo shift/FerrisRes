@@ -20,3 +20,6 @@ papers_research/raw/*.pdf
 *.pt
 *.onnx
 *.safetensors.*
+*.block_summary_*.bin
+*.checkpoint.bin
+*.loss_curve.csv
