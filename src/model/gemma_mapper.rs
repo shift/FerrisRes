@@ -280,7 +280,8 @@ impl BlockSummaryLayer {
     /// Create with identity initialization.
     ///
     /// At step 0: output = input (pass-through).
-    /// The bridge_weight starts at 0.0 so the summary has no effect.
+    /// The bridge_weight starts at 0.1 — small but non-zero so student ≠ teacher
+    /// from step 0, giving a real KL divergence training signal.
     pub fn new_identity(hidden_dim: usize, block_size: usize) -> Self {
         let num_queries = 1; // Single summary query per block
         let hd = hidden_dim;
@@ -306,8 +307,9 @@ impl BlockSummaryLayer {
             out_proj[i * hd + i] = 1.0;
         }
 
-        // Bridge weight: 0.0 = no contribution (identity)
-        let bridge_weight = 0.0;
+        // Bridge weight: start at 0.1 — small but non-zero so student ≠ teacher
+        // from step 0, giving real KL divergence signal.
+        let bridge_weight = 0.1;
 
         // Layer norm: weight=1.0, bias=0.0 (identity)
         let norm_weight = vec![1.0; hd];
@@ -616,7 +618,11 @@ impl Gemma4Config {
             vocab_size: 262144,
             max_position_embeddings: 32768,
             sliding_window: 4096,
-            moe_layers: vec![],
+            // Inject a Block Summary after every 5th layer.
+            // 35 layers / 5 = 7 injection points.
+            // These are the layers where inter-block attention
+            // replaces intra-block, reducing O(n²) → O(n).
+            moe_layers: (4..35).step_by(5).collect(), // [4, 9, 14, 19, 24, 29, 34]
         }
     }
 
@@ -3586,7 +3592,7 @@ mod tests {
     #[test]
     fn test_block_summary_identity_init() {
         let layer = BlockSummaryLayer::new_identity(256, 4096);
-        assert_eq!(layer.bridge_weight, 0.0); // Identity = no contribution
+        assert_eq!(layer.bridge_weight, 0.1); // Starts at 0.1 for non-zero initial KL
         assert_eq!(layer.summary_queries.len(), 256);
         assert!(layer.trainable);
         // All summary queries should be 0 (no contribution at init)
@@ -3685,7 +3691,7 @@ mod tests {
         // But we can still create block summaries manually
         let bs = BlockSummaryLayer::new_identity(2048, 4096);
         assert_eq!(bs.hidden_dim, 2048);
-        assert_eq!(bs.bridge_weight, 0.0);
+        assert_eq!(bs.bridge_weight, 0.1);
     }
 
     #[test]
@@ -3848,7 +3854,7 @@ mod tests {
         let summaries = mapper.create_block_summary_layers();
         assert!(!summaries.is_empty());
         for s in &summaries {
-            assert_eq!(s.bridge_weight, 0.0); // Identity init
+            assert_eq!(s.bridge_weight, 0.1); // Starts at 0.1
             assert_eq!(s.hidden_dim, 4096);
             assert_eq!(s.block_size, 4096);
         }
@@ -4009,7 +4015,7 @@ mod tests {
         let grads = BlockSummaryGradients::zeros(&bs);
         // All zeros → no change
         adam.step(&mut bs, &grads);
-        assert_eq!(bs.bridge_weight, 0.0); // No change from zero grad
+        assert_eq!(bs.bridge_weight, 0.1); // No change from zero grad
     }
 
     #[test]
@@ -4378,7 +4384,7 @@ mod tests {
         let first = &results[0];
         assert_eq!(first.step, 0);
         assert!(first.kl_loss >= 0.0, "KL loss should be non-negative");
-        assert_eq!(first.bridge_weight, 0.0); // Should start at 0
+        assert_eq!(first.bridge_weight, 0.1); // Should start at 0.1
 
         // Bridge weight should evolve (Adam is running)
         if results.len() > 1 {

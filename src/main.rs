@@ -909,7 +909,8 @@ async fn cmd_distill(
             .unwrap_or(0.0);
 
         let lr = if step < distill_config.warmup_steps {
-            distill_config.learning_rate * step as f32 / distill_config.warmup_steps.max(1) as f32
+            // Use (step+1) so step 0 gets lr/warmup_steps, not 0
+            distill_config.learning_rate * (step + 1) as f32 / distill_config.warmup_steps.max(1) as f32
         } else {
             distill_config.learning_rate
         };
