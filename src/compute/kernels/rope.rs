@@ -174,7 +174,7 @@ impl RopeOp {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
-        tracing::debug!("RopeOp pipeline created");
+        tracing::debug!(event = "ropeop_pipeline_created", "RopeOp pipeline created");
 
         // --- In-place pipeline ---
         let inplace_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {

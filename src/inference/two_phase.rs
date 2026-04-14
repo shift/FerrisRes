@@ -160,7 +160,7 @@ impl TwoPhaseInference {
             (None, None)
         };
 
-        tracing::info!("TwoPhaseInference created successfully");
+        tracing::info!(event = "twophaseinference_created_successfully", "TwoPhaseInference created successfully");
 
         Ok(Self {
             config: inference_config,
@@ -226,7 +226,7 @@ impl TwoPhaseInference {
             self.queue.submit(std::iter::once(encoder.finish()));
         }
 
-        tracing::info!("TwoPhaseInference::forward complete");
+        tracing::info!(event = "twophaseinference_forward_complete", "TwoPhaseInference::forward complete");
         Ok(())
     }
 

@@ -110,7 +110,7 @@ impl TokenEmbedding {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
-        tracing::debug!("TokenEmbedding pipeline created successfully");
+        tracing::debug!(event = "tokenembedding_pipeline_created_successfully", "TokenEmbedding pipeline created successfully");
 
         Ok(Self {
             weight,

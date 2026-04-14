@@ -31,7 +31,7 @@ impl SimpleTokenizer {
             vocab.push(token);
         }
 
-        tracing::info!("SimpleTokenizer created with vocab_size={}", vocab.len());
+        tracing::info!(event = "simpletokenizer_created_with_vocab_size", "SimpleTokenizer created with vocab_size={}", vocab.len());
 
         Self {
             vocab,
@@ -157,7 +157,7 @@ impl BpeTokenizer {
             }
         }
         
-        tracing::info!("BPE trained with {} merges, vocab size = {}", self.merges.len(), self.vocab.len());
+        tracing::info!(event = "bpe_trained_with_merges_vocab_size", "BPE trained with {} merges, vocab size = {}", self.merges.len(), self.vocab.len());
     }
     
     /// Encode text to token IDs
@@ -260,7 +260,7 @@ impl DomainVocabulary {
             }
         }
         
-        tracing::info!("Domain vocabulary extended with {} tokens", self.domain_tokens.len());
+        tracing::info!(event = "domain_vocabulary_extended_with_tokens", "Domain vocabulary extended with {} tokens", self.domain_tokens.len());
     }
     
     /// Encode text with domain-specific token handling

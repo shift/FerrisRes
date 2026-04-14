@@ -1861,20 +1861,29 @@ pub fn matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     let mut c = vec![0.0f32; m * n];
     if m == 0 || k == 0 || n == 0 { return c; }
 
-    // matrixmultiply::sgemm parameters:
-    //   C = alpha * A * B + beta * C
-    //   A is (m, k) with row stride = a_rs, column stride = a_cs
-    //   B is (k, n) with row stride = b_rs, column stride = b_cs
-    //   C is (m, n) with row stride = c_rs, column stride = c_cs
-    // For row-major: stride = 1 for columns, stride = row_len for rows
+    // Bounds check: fall back to safe loop if dimensions don't match slices
+    if a.len() < m * k || b.len() < k * n {
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for l in 0..k {
+                    sum += a.get(i * k + l).copied().unwrap_or(0.0)
+                         * b.get(l * n + j).copied().unwrap_or(0.0);
+                }
+                c[i * n + j] = sum;
+            }
+        }
+        return c;
+    }
+
     unsafe {
         matrixmultiply::sgemm(
             m, k, n,
-            1.0,                              // alpha
-            a.as_ptr(), k as isize, 1,        // A: row stride=k, col stride=1 (row-major)
-            b.as_ptr(), n as isize, 1,        // B: row stride=n, col stride=1 (row-major)
-            1.0,                              // beta
-            c.as_mut_ptr(), n as isize, 1,    // C: row stride=n, col stride=1 (row-major)
+            1.0,
+            a.as_ptr(), k as isize, 1,
+            b.as_ptr(), n as isize, 1,
+            1.0,
+            c.as_mut_ptr(), n as isize, 1,
         );
     }
     c

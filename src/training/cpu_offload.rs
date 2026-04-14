@@ -64,7 +64,7 @@ impl CpuGradientBuffer {
     /// Subsequent `accumulate` calls for this parameter must match `numel`.
     pub fn register(&mut self, name: &str, numel: usize) {
         self.accumulators.insert(name.to_string(), vec![0.0f32; numel]);
-        tracing::debug!("CpuGradientBuffer: registered '{}' numel={}", name, numel);
+        tracing::debug!(event = "cpugradientbuffer_registered_numel", "CpuGradientBuffer: registered '{}' numel={}", name, numel);
     }
 
     /// Add `grad` element-wise into the CPU accumulation buffer for `name`.
@@ -87,7 +87,7 @@ impl CpuGradientBuffer {
         for (dst, src) in buf.iter_mut().zip(grad.iter()) {
             *dst += src;
         }
-        tracing::debug!("CpuGradientBuffer: accumulated '{}' ({} elements)", name, grad.len());
+        tracing::debug!(event = "cpugradientbuffer_accumulated_elements", "CpuGradientBuffer: accumulated '{}' ({} elements)", name, grad.len());
         Ok(())
     }
 
@@ -95,7 +95,7 @@ impl CpuGradientBuffer {
     /// parameter gradients have been offloaded and accumulated for that batch.
     pub fn increment_micro_batch(&mut self) {
         self.micro_batch_count += 1;
-        tracing::debug!("CpuGradientBuffer: micro_batch_count={}", self.micro_batch_count);
+        tracing::debug!(event = "cpugradientbuffer_micro_batch_count", "CpuGradientBuffer: micro_batch_count={}", self.micro_batch_count);
     }
 
     /// Returns the current micro-batch accumulation count.
@@ -141,7 +141,7 @@ impl CpuGradientBuffer {
             }
         }
         self.micro_batch_count = 0;
-        tracing::debug!("CpuGradientBuffer: reset");
+        tracing::debug!(event = "cpugradientbuffer_reset", "CpuGradientBuffer: reset");
     }
 
     // ── Single-buffer async upload/download (original API) ───────────────────
@@ -268,7 +268,7 @@ pub fn offload_gradients_to_cpu(
     drop(mapped);
     staging.unmap();
 
-    tracing::debug!("offload_gradients_to_cpu: read {} f32 values", numel);
+    tracing::debug!(event = "offload_gradients_to_cpu_read_f32", "offload_gradients_to_cpu: read {} f32 values", numel);
     Ok(data)
 }
 
@@ -293,7 +293,7 @@ pub fn upload_gradients_from_cpu(
         )));
     }
     queue.write_buffer(target.buffer(), 0, bytemuck::cast_slice(data));
-    tracing::debug!("upload_gradients_from_cpu: wrote {} f32 values", data.len());
+    tracing::debug!(event = "upload_gradients_from_cpu_wrote_f32", "upload_gradients_from_cpu: wrote {} f32 values", data.len());
     Ok(())
 }
 

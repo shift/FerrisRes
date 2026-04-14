@@ -20,7 +20,7 @@ pub struct GradientAccumulator {
 
 impl GradientAccumulator {
     pub fn new(device: Arc<Device>, queue: Arc<Queue>) -> Self {
-        tracing::info!("Creating GradientAccumulator");
+        tracing::info!(event = "creating_gradientaccumulator", "Creating GradientAccumulator");
         let elementwise = ElementWiseOp::new(&device, &queue);
         Self {
             accumulators: HashMap::new(),
@@ -36,7 +36,7 @@ impl GradientAccumulator {
     /// Create a GradientAccumulator with a specific number of accumulation steps.
     pub fn with_accumulation_steps(device: Arc<Device>, queue: Arc<Queue>, accumulation_steps: u32) -> Self {
         assert!(accumulation_steps >= 1, "accumulation_steps must be >= 1");
-        tracing::info!("Creating GradientAccumulator with {} accumulation steps", accumulation_steps);
+        tracing::info!(event = "creating_gradientaccumulator_with_accumulation_steps", "Creating GradientAccumulator with {} accumulation steps", accumulation_steps);
         let elementwise = ElementWiseOp::new(&device, &queue);
         Self {
             accumulators: HashMap::new(),
@@ -81,7 +81,7 @@ impl GradientAccumulator {
         let buf = GpuBuffer::zeros(&self.device, &self.queue, size, Some(&format!("grad_accum_{:?}", id)))?;
         self.accumulators.insert(id, buf);
         self.counts.insert(id, 0);
-        tracing::debug!("GradientAccumulator: registered {:?} size={}", id, size);
+        tracing::debug!(event = "gradientaccumulator_registered_size", "GradientAccumulator: registered {:?} size={}", id, size);
         Ok(())
     }
 
@@ -101,7 +101,7 @@ impl GradientAccumulator {
         let count = self.counts.entry(id).or_insert(0);
         *count += 1;
 
-        tracing::debug!("GradientAccumulator: accumulated {:?} count={}", id, count);
+        tracing::debug!(event = "gradientaccumulator_accumulated_count", "GradientAccumulator: accumulated {:?} count={}", id, count);
         Ok(())
     }
 
@@ -130,7 +130,7 @@ impl GradientAccumulator {
             self.counts.insert(*id, 0);
         }
         self.micro_batch_count = 0;
-        tracing::debug!("GradientAccumulator: reset all accumulators");
+        tracing::debug!(event = "gradientaccumulator_reset_all_accumulators", "GradientAccumulator: reset all accumulators");
         Ok(())
     }
 

@@ -53,7 +53,7 @@ pub struct ElementWiseOp {
 
 impl ElementWiseOp {
     pub fn new(device: &Arc<Device>, queue: &Arc<Queue>) -> Self {
-        tracing::debug!("Creating ElementWiseOp compute pipelines");
+        tracing::debug!(event = "creating_elementwiseop_compute_pipelines", "Creating ElementWiseOp compute pipelines");
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ElementWise Shader"),
@@ -184,7 +184,7 @@ impl ElementWiseOp {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
-        tracing::debug!("ElementWiseOp pipelines created successfully");
+        tracing::debug!(event = "elementwiseop_pipelines_created_successfully", "ElementWiseOp pipelines created successfully");
 
         Self {
             add_pipeline,

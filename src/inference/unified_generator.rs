@@ -190,7 +190,7 @@ impl UnifiedTokenGenerator {
     pub fn generate(&self, prompt_tokens: &[u32], config: &UnifiedGenerateConfig) -> Result<Vec<u32>> {
         // --- RAG augmentation ---
         let final_tokens = if config.rag_config.is_some() {
-            tracing::debug!("RAG enabled for unified generator");
+            tracing::debug!(event = "rag_enabled_for_unified_generator", "RAG enabled for unified generator");
             prompt_tokens.to_vec()
         } else {
             prompt_tokens.to_vec()

@@ -66,7 +66,7 @@ pub struct RmsNormOp {
 
 impl RmsNormOp {
     pub fn new(device: &Device) -> Result<Self> {
-        tracing::info!("Creating RmsNormOp compute pipeline");
+        tracing::info!(event = "creating_rmsnormop_compute_pipeline", "Creating RmsNormOp compute pipeline");
 
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("RmsNorm Shader"),

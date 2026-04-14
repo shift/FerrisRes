@@ -140,13 +140,13 @@ impl WgpuCompute {
 
         // Emit startup summary log.
         let adapter_info = self.adapter_info();
-        tracing::info!("=== FerrisRes Device Profile ===");
-        tracing::info!("  GPU: {}", adapter_info.name);
-        tracing::info!("  Profile: {:?}", profile);
-        tracing::info!("  Compute mode: {:?}", profile.compute_mode());
-        tracing::info!("  Batch size: {}", profile.recommended_batch_size());
-        tracing::info!("  Cache size: {} MB", profile.cache_size() / (1024 * 1024));
-        tracing::info!("================================");
+        tracing::info!(event = "ferrisres_device_profile", "=== FerrisRes Device Profile ===");
+        tracing::info!(event = "gpu", "  GPU: {}", adapter_info.name);
+        tracing::info!(event = "profile", "  Profile: {:?}", profile);
+        tracing::info!(event = "compute_mode", "  Compute mode: {:?}", profile.compute_mode());
+        tracing::info!(event = "batch_size", "  Batch size: {}", profile.recommended_batch_size());
+        tracing::info!(event = "cache_size_mb", "  Cache size: {} MB", profile.cache_size() / (1024 * 1024));
+        tracing::info!(event = "", "================================");
 
         profile
     }

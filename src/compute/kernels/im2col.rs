@@ -48,7 +48,7 @@ pub struct Im2ColOp {
 
 impl Im2ColOp {
     pub fn new(device: &Arc<Device>, queue: &Arc<Queue>) -> Self {
-        tracing::debug!("Creating Im2ColOp compute pipeline");
+        tracing::debug!(event = "creating_im2colop_compute_pipeline", "Creating Im2ColOp compute pipeline");
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Im2Col Shader"),
@@ -108,7 +108,7 @@ impl Im2ColOp {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
-        tracing::debug!("Im2ColOp pipeline created successfully");
+        tracing::debug!(event = "im2colop_pipeline_created_successfully", "Im2ColOp pipeline created successfully");
 
         Self {
             pipeline,

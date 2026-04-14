@@ -131,7 +131,7 @@ impl Drop for AsyncComputePipeline {
         // Auto-flush on drop to avoid losing work
         if self.pending.is_some() || self.current.is_some() {
             if let Err(e) = self.flush() {
-                tracing::warn!("AsyncComputePipeline drop flush failed: {}", e);
+                tracing::warn!(event = "asynccomputepipeline_drop_flush_failed", "AsyncComputePipeline drop flush failed: {}", e);
             }
         }
     }

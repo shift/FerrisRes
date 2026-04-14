@@ -306,7 +306,7 @@ pub fn execute_wasm_parse_with_runtime(call: &ToolCall, runtime: &WasmRuntime) -
             }
             Err(e) => {
                 // WASM module failed — fall back to built-in check
-                tracing::warn!("WASM parse failed ({}), using fallback: {}", lang, e);
+                tracing::warn!(event = "wasm_parse_failed_using_fallback", "WASM parse failed ({}), using fallback: {}", lang, e);
                 let diagnostics = crate::inference::lsp_tools::fallback_syntax_check(&code, &lang);
                 let loss = compiler_error_loss(&diagnostics);
                 let output = format!(

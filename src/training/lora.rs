@@ -319,7 +319,7 @@ impl LoraManager {
                     "up_proj" => (hidden_dim, intermediate_dim),
                     "down_proj" => (intermediate_dim, hidden_dim),
                     _ => {
-                        tracing::warn!("Unknown LoRA target module: {}", module_name);
+                        tracing::warn!(event = "unknown_lora_target_module", "Unknown LoRA target module: {}", module_name);
                         continue;
                     }
                 };

@@ -116,7 +116,7 @@ pub struct ComputationGraph {
 
 impl ComputationGraph {
     pub fn new(device: Arc<Device>, queue: Arc<Queue>) -> Self {
-        tracing::info!("Creating ComputationGraph");
+        tracing::info!(event = "creating_computationgraph", "Creating ComputationGraph");
         Self {
             nodes: HashMap::new(),
             tape: Vec::new(),
@@ -142,7 +142,7 @@ impl ComputationGraph {
             numel,
         };
 
-        tracing::debug!("Graph: added parameter '{}' id={:?} numel={}", name, id, numel);
+        tracing::debug!(event = "graph_added_parameter_id_numel", "Graph: added parameter '{}' id={:?} numel={}", name, id, numel);
 
         self.nodes.insert(id, Node {
             id,
@@ -166,7 +166,7 @@ impl ComputationGraph {
             numel,
         };
 
-        tracing::debug!("Graph: added input '{}' id={:?} numel={}", name, id, numel);
+        tracing::debug!(event = "graph_added_input_id_numel", "Graph: added input '{}' id={:?} numel={}", name, id, numel);
 
         self.nodes.insert(id, Node {
             id,
@@ -193,7 +193,7 @@ impl ComputationGraph {
         let grad = GpuBuffer::zeros(&self.device, &self.queue, output_buf.size(), Some("grad_matmul"))?;
 
         let op = NodeKind::MatMul { m, k, n };
-        tracing::debug!("Graph: record matmul id={:?} M={} K={} N={}", id, m, k, n);
+        tracing::debug!(event = "graph_record_matmul_id_m_k", "Graph: record matmul id={:?} M={} K={} N={}", id, m, k, n);
 
         self.nodes.insert(id, Node {
             id,
@@ -224,7 +224,7 @@ impl ComputationGraph {
         let grad = GpuBuffer::zeros(&self.device, &self.queue, output_buf.size(), Some("grad_add"))?;
 
         let op = NodeKind::Add { numel };
-        tracing::debug!("Graph: record add id={:?} numel={}", id, numel);
+        tracing::debug!(event = "graph_record_add_id_numel", "Graph: record add id={:?} numel={}", id, numel);
 
         self.nodes.insert(id, Node {
             id,
@@ -255,7 +255,7 @@ impl ComputationGraph {
         let grad = GpuBuffer::zeros(&self.device, &self.queue, output_buf.size(), Some("grad_scale"))?;
 
         let op = NodeKind::Scale { scale, numel };
-        tracing::debug!("Graph: record scale id={:?} scale={} numel={}", id, scale, numel);
+        tracing::debug!(event = "graph_record_scale_id_scale_numel", "Graph: record scale id={:?} scale={} numel={}", id, scale, numel);
 
         self.nodes.insert(id, Node {
             id,
@@ -285,7 +285,7 @@ impl ComputationGraph {
         let grad = GpuBuffer::zeros(&self.device, &self.queue, output_buf.size(), Some("grad_relu"))?;
 
         let op = NodeKind::ReLU { numel };
-        tracing::debug!("Graph: record relu id={:?} numel={}", id, numel);
+        tracing::debug!(event = "graph_record_relu_id_numel", "Graph: record relu id={:?} numel={}", id, numel);
 
         self.nodes.insert(id, Node {
             id,
@@ -316,7 +316,7 @@ impl ComputationGraph {
         let grad = GpuBuffer::zeros(&self.device, &self.queue, output_buf.size(), Some("grad_rmsnorm"))?;
 
         let op = NodeKind::RmsNorm { hidden_dim, eps };
-        tracing::debug!("Graph: record rmsnorm id={:?} hidden_dim={} eps={}", id, hidden_dim, eps);
+        tracing::debug!(event = "graph_record_rmsnorm_id_hidden_dim", "Graph: record rmsnorm id={:?} hidden_dim={} eps={}", id, hidden_dim, eps);
 
         self.nodes.insert(id, Node {
             id,
@@ -347,7 +347,7 @@ impl ComputationGraph {
         let grad = GpuBuffer::zeros(&self.device, &self.queue, output_buf.size(), Some("grad_softmax"))?;
 
         let op = NodeKind::Softmax { rows, cols };
-        tracing::debug!("Graph: record softmax id={:?} rows={} cols={}", id, rows, cols);
+        tracing::debug!(event = "graph_record_softmax_id_rows_cols", "Graph: record softmax id={:?} rows={} cols={}", id, rows, cols);
 
         self.nodes.insert(id, Node {
             id,
@@ -386,7 +386,7 @@ impl ComputationGraph {
 
         let has_bias = bias_id.is_some();
         let op = NodeKind::Linear { in_features, out_features, has_bias };
-        tracing::debug!("Graph: record linear id={:?} in={} out={} has_bias={}", id, in_features, out_features, has_bias);
+        tracing::debug!(event = "graph_record_linear_id_in_out", "Graph: record linear id={:?} in={} out={} has_bias={}", id, in_features, out_features, has_bias);
 
         self.nodes.insert(id, Node {
             id,
@@ -417,7 +417,7 @@ impl ComputationGraph {
         let grad = GpuBuffer::zeros(&self.device, &self.queue, output_buf.size(), Some("grad_embedding"))?;
 
         let op = NodeKind::Embedding { vocab_size, hidden_dim };
-        tracing::debug!("Graph: record embedding id={:?} vocab={} dim={}", id, vocab_size, hidden_dim);
+        tracing::debug!(event = "graph_record_embedding_id_vocab_dim", "Graph: record embedding id={:?} vocab={} dim={}", id, vocab_size, hidden_dim);
 
         self.nodes.insert(id, Node {
             id,
@@ -449,7 +449,7 @@ impl ComputationGraph {
         let grad = GpuBuffer::zeros(&self.device, &self.queue, output_buf.size(), Some("grad_loss"))?;
 
         let op = NodeKind::Loss { batch_size, vocab_size };
-        tracing::debug!("Graph: record loss id={:?} batch={} vocab={}", id, batch_size, vocab_size);
+        tracing::debug!(event = "graph_record_loss_id_batch_vocab", "Graph: record loss id={:?} batch={} vocab={}", id, batch_size, vocab_size);
 
         self.nodes.insert(id, Node {
             id,
@@ -536,7 +536,7 @@ impl ComputationGraph {
     }
 
     pub fn clear(&mut self) {
-        tracing::debug!("Graph: clearing tape and nodes");
+        tracing::debug!(event = "graph_clearing_tape_and_nodes", "Graph: clearing tape and nodes");
         self.tape.clear();
         self.nodes.clear();
         self.next_id = 0;

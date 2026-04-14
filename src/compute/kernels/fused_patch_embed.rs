@@ -154,7 +154,7 @@ pub struct FusedPatchEmbedOp {
 
 impl FusedPatchEmbedOp {
     pub fn new(device: &Arc<Device>, queue: &Arc<Queue>) -> Self {
-        tracing::debug!("Creating FusedPatchEmbedOp (Implicit GEMM) pipeline");
+        tracing::debug!(event = "creating_fusedpatchembedop_implicit_gemm_pipeline", "Creating FusedPatchEmbedOp (Implicit GEMM) pipeline");
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Fused Patch Embed Shader"),
@@ -226,7 +226,7 @@ impl FusedPatchEmbedOp {
             mapped_at_creation: false,
         });
 
-        tracing::debug!("FusedPatchEmbedOp pipeline created");
+        tracing::debug!(event = "fusedpatchembedop_pipeline_created", "FusedPatchEmbedOp pipeline created");
 
         Self {
             pipeline,

@@ -231,7 +231,7 @@ impl GpuMatmulAccelerator {
         hidden = rms_norm_cpu(&hidden, &model.final_norm, hd, 1e-6);
 
         // 4. LM head (CPU chunked — vocab is always huge)
-        tracing::debug!("LM head on CPU (chunked, vocab={})", vs);
+        tracing::debug!(event = "lm_head_on_cpu_chunked_vocab", "LM head on CPU (chunked, vocab={})", vs);
         let logits = cpu_lm_head(&hidden, &model.lm_head, seq, hd, vs);
 
         Ok(logits)

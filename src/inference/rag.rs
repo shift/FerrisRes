@@ -494,7 +494,7 @@ impl ElasticRagStore {
     pub fn set_query_dim(&mut self, dim: usize) {
         assert!(dim <= self.d_max, "query_dim {} > d_max {}", dim, self.d_max);
         self.query_dim = dim;
-        tracing::debug!("ElasticRagStore: query_dim set to {}", dim);
+        tracing::debug!(event = "elasticragstore_query_dim_set_to", "ElasticRagStore: query_dim set to {}", dim);
     }
 
     /// Apply a hardware profile, updating `query_dim` accordingly.

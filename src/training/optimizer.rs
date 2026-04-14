@@ -104,7 +104,7 @@ pub struct SgdOptimizer {
 
 impl SgdOptimizer {
     pub fn new(device: Arc<Device>, queue: Arc<Queue>, learning_rate: f32) -> Self {
-        tracing::info!("Creating SGD optimizer with lr={}", learning_rate);
+        tracing::info!(event = "creating_sgd_optimizer_with_lr", "Creating SGD optimizer with lr={}", learning_rate);
         let elementwise = ElementWiseOp::new(&device, &queue);
         Self {
             learning_rate,
@@ -139,7 +139,7 @@ impl SgdOptimizer {
     }
 
     pub fn set_learning_rate(&mut self, lr: f32) {
-        tracing::info!("SGD learning rate changed: {} -> {}", self.learning_rate, lr);
+        tracing::info!(event = "sgd_learning_rate_changed", "SGD learning rate changed: {} -> {}", self.learning_rate, lr);
         self.learning_rate = lr;
     }
 }
@@ -267,7 +267,7 @@ impl AdamOptimizer {
         let v_buf = GpuBuffer::zeros(&self.device, &self.queue, bytes, Some(&format!("adam_v_{}", name)))?;
         self.m_buffers.insert(name.to_string(), m_buf);
         self.v_buffers.insert(name.to_string(), v_buf);
-        tracing::debug!("Adam registered param '{}' with {} elements", name, shape);
+        tracing::debug!(event = "adam_registered_param_with_elements", "Adam registered param '{}' with {} elements", name, shape);
         Ok(())
     }
 
@@ -374,7 +374,7 @@ pub struct CrossEntropyLoss {
 
 impl CrossEntropyLoss {
     pub fn new(device: Arc<Device>) -> Self {
-        tracing::info!("Creating CrossEntropyLoss compute pipeline");
+        tracing::info!(event = "creating_crossentropyloss_compute_pipeline", "Creating CrossEntropyLoss compute pipeline");
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Cross Entropy Loss Shader"),

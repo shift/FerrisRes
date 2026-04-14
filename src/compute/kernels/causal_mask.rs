@@ -47,7 +47,7 @@ pub struct CausalMaskOp {
 
 impl CausalMaskOp {
     pub fn new(device: &Device) -> Result<Self> {
-        tracing::info!("Creating CausalMaskOp compute pipeline");
+        tracing::info!(event = "creating_causalmaskop_compute_pipeline", "Creating CausalMaskOp compute pipeline");
 
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("CausalMask Shader"),
@@ -121,7 +121,7 @@ impl CausalMaskOp {
         rows: u32,
         cols: u32,
     ) -> Result<()> {
-        tracing::debug!("CausalMaskOp::dispatch_causal_mask rows={} cols={}", rows, cols);
+        tracing::debug!(event = "causalmaskop_dispatch_causal_mask_rows_cols", "CausalMaskOp::dispatch_causal_mask rows={} cols={}", rows, cols);
 
         let params_data: [u32; 4] = [rows, cols, 0, 0];
 

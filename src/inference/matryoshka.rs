@@ -53,7 +53,7 @@ impl ElasticRagStore {
             DeviceProfile::MidRange => 256,
             DeviceProfile::HighEnd => self.matryoshka_dims.last().copied().unwrap_or(self.full_dim),
         };
-        tracing::info!("Matryoshka: set query_dim={} for profile {:?}", self.query_dim, profile);
+        tracing::info!(event = "matryoshka_set_query_dim_for_profile", "Matryoshka: set query_dim={} for profile {:?}", self.query_dim, profile);
     }
 
     /// Set query dimension explicitly.

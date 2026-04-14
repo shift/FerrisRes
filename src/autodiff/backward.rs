@@ -210,7 +210,7 @@ pub struct BackwardPass {
 
 impl BackwardPass {
     pub fn new(device: Arc<Device>, queue: Arc<Queue>) -> Self {
-        tracing::info!("Creating BackwardPass gradient pipelines");
+        tracing::info!(event = "creating_backwardpass_gradient_pipelines", "Creating BackwardPass gradient pipelines");
 
         let elementwise = ElementWiseOp::new(&device, &queue);
 
@@ -413,7 +413,7 @@ impl BackwardPass {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
-        tracing::info!("BackwardPass: all gradient pipelines created");
+        tracing::info!(event = "backwardpass_all_gradient_pipelines_created", "BackwardPass: all gradient pipelines created");
 
         Self {
             device,
@@ -440,7 +440,7 @@ impl BackwardPass {
         encoder: &mut wgpu::CommandEncoder,
         loss_id: NodeId,
     ) -> Result<()> {
-        tracing::info!("BackwardPass::run starting from loss node {:?}", loss_id);
+        tracing::info!(event = "backwardpass_run_starting_from_loss_node", "BackwardPass::run starting from loss node {:?}", loss_id);
 
         graph.zero_all_grads(encoder)?;
 
@@ -467,7 +467,7 @@ impl BackwardPass {
             self.backward_entry(graph, encoder, *output_id, op, inputs)?;
         }
 
-        tracing::info!("BackwardPass::run complete");
+        tracing::info!(event = "backwardpass_run_complete", "BackwardPass::run complete");
         Ok(())
     }
 
@@ -550,7 +550,7 @@ impl BackwardPass {
                 pass.dispatch_workgroups(wg_x_b, wg_y_b, 1);
                 drop(pass);
 
-                tracing::debug!("Backward: matmul grad done M={} K={} N={}", m, k, n);
+                tracing::debug!(event = "backward_matmul_grad_done_m_k", "Backward: matmul grad done M={} K={} N={}", m, k, n);
             }
 
             NodeKind::Add { numel } => {
@@ -568,7 +568,7 @@ impl BackwardPass {
                 self.elementwise.dispatch_add(encoder, &a_grad_ref, &grad_ref, &a_grad_ref, *numel)?;
                 self.elementwise.dispatch_add(encoder, &b_grad_ref, &grad_ref, &b_grad_ref, *numel)?;
 
-                tracing::debug!("Backward: add grad numel={}", numel);
+                tracing::debug!(event = "backward_add_grad_numel", "Backward: add grad numel={}", numel);
             }
 
             NodeKind::Scale { scale, numel } => {
@@ -584,7 +584,7 @@ impl BackwardPass {
                 self.elementwise.dispatch_scale(encoder, &grad_ref, &temp, *scale, *numel)?;
                 self.elementwise.dispatch_add(encoder, &input_grad_ref, &temp, &input_grad_ref, *numel)?;
 
-                tracing::debug!("Backward: scale grad scale={} numel={}", scale, numel);
+                tracing::debug!(event = "backward_scale_grad_scale_numel", "Backward: scale grad scale={} numel={}", scale, numel);
             }
 
             NodeKind::ReLU { numel } => {
@@ -619,7 +619,7 @@ impl BackwardPass {
                 pass.dispatch_workgroups(wg, 1, 1);
                 drop(pass);
 
-                tracing::debug!("Backward: relu grad numel={}", numel);
+                tracing::debug!(event = "backward_relu_grad_numel", "Backward: relu grad numel={}", numel);
             }
 
             NodeKind::Softmax { rows, cols } => {
@@ -656,7 +656,7 @@ impl BackwardPass {
                 pass.dispatch_workgroups(wg, 1, 1);
                 drop(pass);
 
-                tracing::debug!("Backward: softmax grad rows={} cols={}", rows, cols);
+                tracing::debug!(event = "backward_softmax_grad_rows_cols", "Backward: softmax grad rows={} cols={}", rows, cols);
             }
 
             NodeKind::RmsNorm { hidden_dim, eps: _ } => {
@@ -701,7 +701,7 @@ impl BackwardPass {
                 pass.dispatch_workgroups(wg, 1, 1);
                 drop(pass);
 
-                tracing::debug!("Backward: rmsnorm grad hidden_dim={}", hidden_dim);
+                tracing::debug!(event = "backward_rmsnorm_grad_hidden_dim", "Backward: rmsnorm grad hidden_dim={}", hidden_dim);
             }
 
             NodeKind::Linear { in_features, out_features, has_bias } => {
@@ -732,7 +732,7 @@ impl BackwardPass {
                     self.dispatch_bias_grad_sum(encoder, &grad_ref, &bias_grad_ref, batch_m, *out_features)?;
                 }
 
-                tracing::debug!("Backward: linear grad in={} out={} has_bias={}", in_features, out_features, has_bias);
+                tracing::debug!(event = "backward_linear_grad_in_out_has", "Backward: linear grad in={} out={} has_bias={}", in_features, out_features, has_bias);
             }
 
             NodeKind::Loss { batch_size, vocab_size } => {
@@ -775,7 +775,7 @@ impl BackwardPass {
                 pass.dispatch_workgroups(wg, 1, 1);
                 drop(pass);
 
-                tracing::debug!("Backward: loss grad batch={} vocab={}", batch_size, vocab_size);
+                tracing::debug!(event = "backward_loss_grad_batch_vocab", "Backward: loss grad batch={} vocab={}", batch_size, vocab_size);
             }
 
             NodeKind::Embedding { vocab_size, hidden_dim } => {
@@ -902,7 +902,7 @@ impl BackwardPass {
                 pass.dispatch_workgroups(wg, 1, 1);
                 drop(pass);
 
-                tracing::debug!("Backward: embedding grad vocab={} dim={} seq={}", vocab_size, hidden_dim, seq_len);
+                tracing::debug!(event = "backward_embedding_grad_vocab_dim_seq", "Backward: embedding grad vocab={} dim={} seq={}", vocab_size, hidden_dim, seq_len);
             }
 
             NodeKind::BlockSummaryCrossAttn { num_queries, hidden_dim, block_size } => {
@@ -999,11 +999,11 @@ impl BackwardPass {
                 )?;
                 self.queue.submit(std::iter::once(bs_encoder.finish()));
 
-                tracing::debug!("Backward: block_summary GPU dispatch nq={} hd={} bs={}", nq, hd, bs);
+                tracing::debug!(event = "backward_block_summary_gpu_dispatch_nq", "Backward: block_summary GPU dispatch nq={} hd={} bs={}", nq, hd, bs);
             }
 
             NodeKind::Parameter { .. } | NodeKind::Input { .. } => {
-                tracing::debug!("Backward: skipping leaf node");
+                tracing::debug!(event = "backward_skipping_leaf_node", "Backward: skipping leaf node");
             }
         }
 

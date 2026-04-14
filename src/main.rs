@@ -1034,7 +1034,9 @@ async fn cmd_distill(
 
         // Student forward (using cached frozen hidden states)
         let frozen_states = &frozen_states_per_chunk[chunk_idx];
+        eprintln!("[DIAG] step {} entering forward_from_frozen, frozen_states={} layers, seq={}", global_step, frozen_states.len(), actual_seq);
         let student_logits = student.forward_from_frozen(frozen_states);
+        eprintln!("[DIAG] step {} forward done, logits_len={}", global_step, student_logits.len());
 
         // KL divergence loss
         let loss = gemma_mapper::kl_divergence_loss(
@@ -1061,12 +1063,22 @@ async fn cmd_distill(
             }
         }
 
-        // Backprop through Block Summary layers
+        // Backprop through Block Summary layers using cached frozen hidden states
+        let frozen_states = &frozen_states_per_chunk[chunk_idx];
         let all_grads: Vec<(usize, gemma_mapper::BlockSummaryGradients)> = student.block_summaries.iter().enumerate()
             .filter(|(_, bs)| bs.trainable)
             .filter(|(si, _)| *si < optimizers.len())
             .map(|(si, bs)| {
-                let grads = gemma_mapper::backprop_block_summary(bs, &student.model.embed_tokens, &d_logits);
+                // Get the frozen hidden state at this injection point
+                // frozen_states[layer_idx + 1] = state after layer layer_idx
+                let layer_idx = injection_points.get(si).copied().unwrap_or(0);
+                let block_tokens = if layer_idx + 1 < frozen_states.len() {
+                    frozen_states[layer_idx + 1].as_slice()
+                } else {
+                    // Fallback: use embedding (should not happen)
+                    &student.model.embed_tokens[..seq_len * config.hidden_dim]
+                };
+                let grads = gemma_mapper::backprop_block_summary(bs, block_tokens, &d_logits);
                 (si, grads)
             })
             .collect();

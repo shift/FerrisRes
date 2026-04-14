@@ -76,7 +76,7 @@ pub struct TomeMergeOp {
 
 impl TomeMergeOp {
     pub fn new(device: &Arc<Device>, queue: &Arc<Queue>) -> Self {
-        tracing::debug!("Creating TomeMergeOp pipeline");
+        tracing::debug!(event = "creating_tomemergeop_pipeline", "Creating TomeMergeOp pipeline");
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ToMe Merge Shader"),
@@ -202,7 +202,7 @@ impl TomeMergeOp {
         pass.dispatch_workgroups(wg, 1, 1);
         drop(pass);
 
-        tracing::debug!("TomeMergeOp dispatched: n_out={} dim={} wg={}", n_out, dim, wg);
+        tracing::debug!(event = "tomemergeop_dispatched_n_out_dim_wg", "TomeMergeOp dispatched: n_out={} dim={} wg={}", n_out, dim, wg);
         Ok(())
     }
 }

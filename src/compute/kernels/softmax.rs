@@ -145,7 +145,7 @@ impl SoftmaxOp {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
-        tracing::debug!("SoftmaxOp pipeline created");
+        tracing::debug!(event = "softmaxop_pipeline_created", "SoftmaxOp pipeline created");
 
         Ok(Self {
             pipeline,
@@ -206,7 +206,7 @@ impl SoftmaxOp {
 
         drop(pass);
 
-        tracing::debug!("SoftmaxOp dispatched: rows={} cols={}", rows, cols);
+        tracing::debug!(event = "softmaxop_dispatched_rows_cols", "SoftmaxOp dispatched: rows={} cols={}", rows, cols);
 
         Ok(())
     }

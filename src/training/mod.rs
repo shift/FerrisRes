@@ -107,19 +107,19 @@ impl TrainingState {
         if loss < self.best_loss {
             self.best_loss = loss;
         }
-        tracing::debug!("TrainingState: recorded loss={:.6} best_loss={:.6}", loss, self.best_loss);
+        tracing::debug!(event = "trainingstate_recorded_loss_best_loss", "TrainingState: recorded loss={:.6} best_loss={:.6}", loss, self.best_loss);
     }
 
     pub fn next_step(&mut self) {
         self.step += 1;
-        tracing::debug!("TrainingState: step -> {}", self.step);
+        tracing::debug!(event = "trainingstate_step", "TrainingState: step -> {}", self.step);
     }
 
     pub fn next_epoch(&mut self) {
         self.epoch += 1;
         self.step = 0;
         self.total_loss = 0.0;
-        tracing::info!("TrainingState: epoch -> {}", self.epoch);
+        tracing::info!(event = "trainingstate_epoch", "TrainingState: epoch -> {}", self.epoch);
     }
 
     pub fn avg_loss(&self) -> f32 {

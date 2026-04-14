@@ -127,7 +127,7 @@ impl CheckpointStore {
         let dst = GpuBuffer::new(&self.device, src.size(), Some(&format!("ckpt_b{}_{}",block_idx, label)))?;
         encoder.copy_buffer_to_buffer(src.buffer(), 0, dst.buffer(), 0, src.size() as u64);
         self.saved.insert((block_idx, label), dst);
-        tracing::debug!("CheckpointStore: saved block={} label={} size={}", block_idx, label, src.size());
+        tracing::debug!(event = "checkpointstore_saved_block_label_size", "CheckpointStore: saved block={} label={} size={}", block_idx, label, src.size());
         Ok(())
     }
 
@@ -145,7 +145,7 @@ impl CheckpointStore {
     /// Drop all saved checkpoints to free GPU memory.
     pub fn clear(&mut self) {
         self.saved.clear();
-        tracing::debug!("CheckpointStore: cleared all checkpoints");
+        tracing::debug!(event = "checkpointstore_cleared_all_checkpoints", "CheckpointStore: cleared all checkpoints");
     }
 
     /// Recompute block activations by re-running the forward pass from
@@ -172,7 +172,7 @@ impl CheckpointStore {
                 format!("No saved checkpoint for block {} - was save() called during forward?", block_idx)
             ))?;
 
-        tracing::debug!("CheckpointStore: recomputing block {} from saved input", block_idx);
+        tracing::debug!(event = "checkpointstore_recomputing_block_from_saved_input", "CheckpointStore: recomputing block {} from saved input", block_idx);
 
         // Re-run forward pass to regenerate activations
         let output = forward_fn(encoder, &input, block_idx)?;
@@ -203,7 +203,7 @@ impl CheckpointStore {
                 format!("No saved checkpoint for block {}/{}", block_idx, sublayer_idx)
             ))?;
 
-        tracing::debug!("CheckpointStore: recomputing block {}/{}", block_idx, sublayer_idx);
+        tracing::debug!(event = "checkpointstore_recomputing_block", "CheckpointStore: recomputing block {}/{}", block_idx, sublayer_idx);
 
         let output = forward_fn(encoder, &input, block_idx, sublayer_idx)?;
 

@@ -81,7 +81,7 @@ impl BlockAttnResModel {
 
         let elementwise = ElementWiseOp::new(&device, &queue);
 
-        tracing::info!("BlockAttnResModel created with {} layers", total_layers);
+        tracing::info!(event = "blockattnresmodel_created_with_layers", "BlockAttnResModel created with {} layers", total_layers);
 
         Ok(Self {
             config,
@@ -136,7 +136,7 @@ impl BlockAttnResModel {
         let mut current_hidden = hidden;
 
         for block_n in 0..num_blocks {
-            tracing::debug!("Processing block {}", block_n);
+            tracing::debug!(event = "processing_block", "Processing block {}", block_n);
 
             let layer_start = block_n * block_size;
             let layer_end = layer_start + block_size;
@@ -227,7 +227,7 @@ impl BlockAttnResModel {
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        tracing::info!("BlockAttnResModel::forward complete");
+        tracing::info!(event = "blockattnresmodel_forward_complete", "BlockAttnResModel::forward complete");
         Ok(())
     }
 
@@ -352,7 +352,7 @@ impl BlockAttnResModel {
         );
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        tracing::info!("BlockAttnResModel::backward complete");
+        tracing::info!(event = "blockattnresmodel_backward_complete", "BlockAttnResModel::backward complete");
         Ok(grad_input)
     }
 }

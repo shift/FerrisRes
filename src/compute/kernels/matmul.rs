@@ -160,7 +160,7 @@ pub struct MatMulOp {
 
 impl MatMulOp {
     pub fn new(device: &Arc<Device>, queue: &Arc<Queue>) -> Self {
-        tracing::debug!("Creating MatMulOp compute pipeline");
+        tracing::debug!(event = "creating_matmulop_compute_pipeline", "Creating MatMulOp compute pipeline");
 
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("MatMul Tiled Shader"),
@@ -228,7 +228,7 @@ impl MatMulOp {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
-        tracing::debug!("MatMulOp pipeline created successfully");
+        tracing::debug!(event = "matmulop_pipeline_created_successfully", "MatMulOp pipeline created successfully");
         Self {
             pipeline,
             bind_group_layout,
@@ -397,7 +397,7 @@ pub struct MatMulDoubleBufferOp {
 
 impl MatMulDoubleBufferOp {
     pub fn new(device: &Arc<Device>, queue: &Arc<Queue>) -> Self {
-        tracing::debug!("Creating MatMulDoubleBufferOp compute pipeline");
+        tracing::debug!(event = "creating_matmuldoublebufferop_compute_pipeline", "Creating MatMulDoubleBufferOp compute pipeline");
 
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("MatMul Double-Buffer Shader"),
@@ -452,7 +452,7 @@ impl MatMulDoubleBufferOp {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
-        tracing::debug!("MatMulDoubleBufferOp pipeline created");
+        tracing::debug!(event = "matmuldoublebufferop_pipeline_created", "MatMulDoubleBufferOp pipeline created");
 
         Self {
             pipeline,
