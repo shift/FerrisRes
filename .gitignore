@@ -12,3 +12,11 @@ skills/
 
 # Raw paper PDFs (large binary files)
 papers_research/raw/*.pdf
+
+# Model weights (too large for git)
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.onnx
+*.safetensors.*

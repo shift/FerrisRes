@@ -366,6 +366,207 @@ impl LlmComputer {
     }
 }
 
+impl VmState {
+    /// Save VM state to binary bytes.
+    /// Format: [num_regs u32] [registers] [memory_size u32] [memory]
+    ///         [num_tables u32] [per table: num_entries u32] [entries]
+    ///         [pc u64] [halted u8] [steps u64]
+    pub fn save_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let write_u32 = |buf: &mut Vec<u8>, v: u32| { buf.extend_from_slice(&v.to_le_bytes()); };
+        let write_i32 = |buf: &mut Vec<u8>, v: i32| { buf.extend_from_slice(&v.to_le_bytes()); };
+        let write_u64 = |buf: &mut Vec<u8>, v: u64| { buf.extend_from_slice(&v.to_le_bytes()); };
+
+        write_u32(&mut buf, self.registers.len() as u32);
+        for &r in &self.registers { write_i32(&mut buf, r); }
+        write_u32(&mut buf, self.memory.len() as u32);
+        for &m in &self.memory { write_i32(&mut buf, m); }
+        write_u32(&mut buf, self.tables.len() as u32);
+        for table in &self.tables {
+            write_u32(&mut buf, table.len() as u32);
+            for &(k, v) in table {
+                write_i32(&mut buf, k);
+                write_i32(&mut buf, v);
+            }
+        }
+        write_u64(&mut buf, self.pc as u64);
+        buf.push(if self.halted { 1 } else { 0 });
+        write_u64(&mut buf, self.steps as u64);
+        buf
+    }
+
+    /// Load VM state from binary bytes.
+    pub fn load_bytes(data: &[u8]) -> Option<Self> {
+        let mut pos = 0usize;
+        let read_u32 = |data: &[u8], pos: &mut usize| -> Option<u32> {
+            if *pos + 4 > data.len() { return None; }
+            let v = u32::from_le_bytes([data[*pos], data[*pos+1], data[*pos+2], data[*pos+3]]);
+            *pos += 4; Some(v)
+        };
+        let read_i32 = |data: &[u8], pos: &mut usize| -> Option<i32> {
+            if *pos + 4 > data.len() { return None; }
+            let v = i32::from_le_bytes([data[*pos], data[*pos+1], data[*pos+2], data[*pos+3]]);
+            *pos += 4; Some(v)
+        };
+        let read_u64 = |data: &[u8], pos: &mut usize| -> Option<u64> {
+            if *pos + 8 > data.len() { return None; }
+            let v = u64::from_le_bytes(data[*pos..*pos+8].try_into().ok()?);
+            *pos += 8; Some(v)
+        };
+
+        let num_regs = read_u32(data, &mut pos)? as usize;
+        let mut registers = Vec::with_capacity(num_regs);
+        for _ in 0..num_regs { registers.push(read_i32(data, &mut pos)?); }
+
+        let mem_size = read_u32(data, &mut pos)? as usize;
+        let mut memory = Vec::with_capacity(mem_size);
+        for _ in 0..mem_size { memory.push(read_i32(data, &mut pos)?); }
+
+        let num_tables = read_u32(data, &mut pos)? as usize;
+        let mut tables = Vec::with_capacity(num_tables);
+        for _ in 0..num_tables {
+            let num_entries = read_u32(data, &mut pos)? as usize;
+            let mut table = Vec::with_capacity(num_entries);
+            for _ in 0..num_entries {
+                let k = read_i32(data, &mut pos)?;
+                let v = read_i32(data, &mut pos)?;
+                table.push((k, v));
+            }
+            tables.push(table);
+        }
+
+        let pc = read_u64(data, &mut pos)? as usize;
+        let halted = data.get(pos).copied()? != 0;
+        pos += 1;
+        let steps = read_u64(data, &mut pos)? as usize;
+
+        Some(Self { registers, memory, tables, pc, halted, steps, max_steps: steps * 10 + 1000 })
+    }
+
+    /// Save VM state to file.
+    pub fn save_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(path, &self.save_bytes())
+    }
+
+    /// Load VM state from file.
+    pub fn load_from_file(path: &std::path::Path) -> std::io::Result<Self> {
+        let data = std::fs::read(path)?;
+        Self::load_bytes(&data).ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::InvalidData, "Failed to parse VM state"))
+    }
+}
+
+/// Decode CALM instructions from a sequence of token IDs.
+/// Maps token IDs to CALM opcodes using a fixed vocabulary.
+/// This enables the model to "write its own tools" by generating
+/// token sequences that decode to executable bytecode.
+pub struct CalmDecoder {
+    /// Token ID → instruction mapping.
+    vocab: std::collections::HashMap<u32, CalmInstruction>,
+}
+
+impl CalmDecoder {
+    /// Create a decoder with standard token-to-instruction mapping.
+    /// Uses a fixed range of token IDs (e.g., 256000-256015) for CALM ops.
+    pub fn new(base_vocab_size: u32) -> Self {
+        let mut vocab = std::collections::HashMap::new();
+        let base = base_vocab_size;
+
+        // Core instructions (fixed opcodes)
+        vocab.insert(base,      CalmInstruction::Halt);
+        vocab.insert(base + 1,  CalmInstruction::LoadConst { value: 0, output_reg: 0 }); // Template
+        vocab.insert(base + 2,  CalmInstruction::Move { input_reg: 0, output_reg: 0 });
+        vocab.insert(base + 3,  CalmInstruction::Compute { op: CalmOp::Add, a_reg: 0, b_reg: 0, output_reg: 0 });
+        vocab.insert(base + 4,  CalmInstruction::Compute { op: CalmOp::Sub, a_reg: 0, b_reg: 0, output_reg: 0 });
+        vocab.insert(base + 5,  CalmInstruction::Compute { op: CalmOp::Mul, a_reg: 0, b_reg: 0, output_reg: 0 });
+        vocab.insert(base + 6,  CalmInstruction::Compute { op: CalmOp::Div, a_reg: 0, b_reg: 0, output_reg: 0 });
+        vocab.insert(base + 7,  CalmInstruction::Compute { op: CalmOp::Eq, a_reg: 0, b_reg: 0, output_reg: 0 });
+        vocab.insert(base + 8,  CalmInstruction::Compute { op: CalmOp::Lt, a_reg: 0, b_reg: 0, output_reg: 0 });
+        vocab.insert(base + 9,  CalmInstruction::Compute { op: CalmOp::Gt, a_reg: 0, b_reg: 0, output_reg: 0 });
+        vocab.insert(base + 10, CalmInstruction::Compute { op: CalmOp::And, a_reg: 0, b_reg: 0, output_reg: 0 });
+        vocab.insert(base + 11, CalmInstruction::Compute { op: CalmOp::Or, a_reg: 0, b_reg: 0, output_reg: 0 });
+        vocab.insert(base + 12, CalmInstruction::Compute { op: CalmOp::Xor, a_reg: 0, b_reg: 0, output_reg: 0 });
+        vocab.insert(base + 13, CalmInstruction::Compute { op: CalmOp::Ne, a_reg: 0, b_reg: 0, output_reg: 0 });
+        vocab.insert(base + 14, CalmInstruction::LookUp { table_id: 0, key_reg: 0, output_reg: 0 });
+        vocab.insert(base + 15, CalmInstruction::Append { addr_reg: 0, value_reg: 0 });
+        vocab.insert(base + 16, CalmInstruction::BranchIf { condition_reg: 0, target: 0 });
+
+        Self { vocab }
+    }
+
+    /// Decode a sequence of token IDs into CALM instructions.
+    /// Non-CALM tokens are skipped.
+    pub fn decode(&self, token_ids: &[u32]) -> Vec<CalmInstruction> {
+        token_ids.iter()
+            .filter_map(|&id| self.vocab.get(&id).cloned())
+            .collect()
+    }
+
+    /// Check if a token ID is a CALM instruction.
+    pub fn is_calm_token(&self, token_id: u32) -> bool {
+        self.vocab.contains_key(&token_id)
+    }
+
+    /// Get the base vocab size where CALM tokens start.
+    pub fn base_vocab_size(&self) -> u32 {
+        *self.vocab.keys().min().unwrap_or(&0)
+    }
+}
+
+/// Online distillation trigger.
+/// Monitors model confidence and triggers background distillation
+/// when the model's self-assessment indicates it needs improvement.
+pub struct OnlineDistillationTrigger {
+    /// Confidence threshold below which distillation is triggered.
+    confidence_threshold: f32,
+    /// Number of low-confidence events before triggering.
+    trigger_count: usize,
+    /// Current low-confidence event counter.
+    low_confidence_events: usize,
+    /// Whether distillation is currently running.
+    distilling: bool,
+}
+
+impl OnlineDistillationTrigger {
+    pub fn new(confidence_threshold: f32, trigger_count: usize) -> Self {
+        Self {
+            confidence_threshold,
+            trigger_count,
+            low_confidence_events: 0,
+            distilling: false,
+        }
+    }
+
+    /// Record a prediction and check if distillation should trigger.
+    /// `confidence` is max softmax probability of the model's output.
+    /// Returns true if distillation should be triggered.
+    pub fn record_prediction(&mut self, confidence: f32) -> bool {
+        if self.distilling { return false; }
+        if confidence < self.confidence_threshold {
+            self.low_confidence_events += 1;
+            if self.low_confidence_events >= self.trigger_count {
+                self.distilling = true;
+                return true;
+            }
+        } else {
+            // Reset on high confidence
+            self.low_confidence_events = 0;
+        }
+        false
+    }
+
+    /// Mark distillation as complete.
+    pub fn distillation_complete(&mut self) {
+        self.low_confidence_events = 0;
+        self.distilling = false;
+    }
+
+    /// Check if distillation is in progress.
+    pub fn is_distilling(&self) -> bool {
+        self.distilling
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,5 +737,70 @@ mod tests {
             // Just ensure no panic — value validation is in specific tests
             let _ = result;
         }
+    }
+
+    #[test]
+    fn test_vm_state_save_load() {
+        let config = LlmComputerConfig::default();
+        let mut state = VmState::new(&config);
+        state.write_reg(0, 42);
+        state.write_reg(1, 99);
+        state.write_mem(0, 7);
+        state.table_set(0, 10, 20);
+
+        let bytes = state.save_bytes();
+        let loaded = VmState::load_bytes(&bytes).unwrap();
+        assert_eq!(loaded.read_reg(0), 42);
+        assert_eq!(loaded.read_reg(1), 99);
+        assert_eq!(loaded.read_mem(0), 7);
+        assert_eq!(loaded.table_lookup(0, 10), 20);
+    }
+
+    #[test]
+    fn test_vm_state_file_roundtrip() {
+        let dir = std::env::temp_dir().join("ferrisres_vm_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vm_state.bin");
+
+        let config = LlmComputerConfig::default();
+        let mut state = VmState::new(&config);
+        state.write_reg(3, 12345);
+        state.save_to_file(&path).unwrap();
+
+        let loaded = VmState::load_from_file(&path).unwrap();
+        assert_eq!(loaded.read_reg(3), 12345);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_calm_decoder() {
+        let decoder = CalmDecoder::new(256000);
+        assert!(decoder.is_calm_token(256000)); // Halt
+        assert!(decoder.is_calm_token(256016)); // BranchIf
+        assert!(!decoder.is_calm_token(255999)); // Not CALM
+        assert!(!decoder.is_calm_token(256017)); // Past range
+
+        let program = decoder.decode(&[256000, 255999, 256003]); // Halt, skip, Add
+        assert_eq!(program.len(), 2); // Non-CALM token skipped
+    }
+
+    #[test]
+    fn test_online_distillation_trigger() {
+        let mut trigger = OnlineDistillationTrigger::new(0.3, 3);
+        assert!(!trigger.is_distilling());
+
+        // High confidence — no trigger
+        assert!(!trigger.record_prediction(0.9));
+        assert!(!trigger.record_prediction(0.8));
+
+        // Low confidence — accumulates
+        assert!(!trigger.record_prediction(0.1));
+        assert!(!trigger.record_prediction(0.2));
+        assert!(trigger.record_prediction(0.15)); // 3rd low → triggers
+        assert!(trigger.is_distilling());
+
+        // Complete
+        trigger.distillation_complete();
+        assert!(!trigger.is_distilling());
     }
 }

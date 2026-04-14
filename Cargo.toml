@@ -24,6 +24,7 @@ clap = { version = "4", features = ["derive"] }
 sysinfo = "0.33"
 image = "0.25"
 rand = "0.8"
+ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]
 assert_matches = "1"

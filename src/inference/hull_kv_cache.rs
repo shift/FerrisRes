@@ -208,6 +208,43 @@ impl HullKVCache {
         self.all_points.clear();
         self.dirty = false;
     }
+
+    /// Save cache to a binary file.
+    /// Format: [num_points u32] [per point: index u32 x f32 y f32]
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(self.all_points.len() as u32).to_le_bytes());
+        for p in &self.all_points {
+            buf.extend_from_slice(&(p.index as u32).to_le_bytes());
+            buf.extend_from_slice(&p.x.to_le_bytes());
+            buf.extend_from_slice(&p.y.to_le_bytes());
+        }
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(&buf)?;
+        Ok(())
+    }
+
+    /// Load cache from a binary file.
+    pub fn load(path: &std::path::Path, capacity: usize) -> std::io::Result<Self> {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        std::fs::File::open(path)?.read_to_end(&mut buf)?;
+        if buf.len() < 4 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too short")); }
+        let num_points = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let mut cache = Self::new(capacity);
+        let mut pos = 4usize;
+        for _ in 0..num_points {
+            if pos + 12 > buf.len() { break; }
+            let index = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]) as usize;
+            let x = f32::from_le_bytes([buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7]]);
+            let y = f32::from_le_bytes([buf[pos+8], buf[pos+9], buf[pos+10], buf[pos+11]]);
+            cache.insert(Point2D::new(x, y, index));
+            pos += 12;
+        }
+        cache.rebuild_hull();
+        Ok(cache)
+    }
 }
 
 /// 2D Attention head that projects attention keys to 2D coordinates
@@ -424,5 +461,27 @@ mod tests {
         cache.insert(Point2D::new(0.0, 1.0, 2));
         cache.insert(Point2D::new(5.0, 5.0, 3)); // Should be dropped
         assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn test_hull_kv_save_load() {
+        let dir = std::env::temp_dir().join("ferrisres_hullkv_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hull_cache.bin");
+
+        let mut cache = HullKVCache::new(100);
+        cache.insert(Point2D::new(1.0, 2.0, 0));
+        cache.insert(Point2D::new(3.0, 4.0, 1));
+        cache.insert(Point2D::new(5.0, 6.0, 2));
+        cache.rebuild_hull();
+
+        cache.save(&path).unwrap();
+        let loaded = HullKVCache::load(&path, 100).unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded.points()[0].x, 1.0);
+        assert_eq!(loaded.points()[1].y, 4.0);
+        assert_eq!(loaded.points()[2].index, 2);
+
+        let _ = std::fs::remove_file(&path);
     }
 }
