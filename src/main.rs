@@ -115,6 +115,14 @@ enum Commands {
         /// Save checkpoint every N steps.
         #[arg(long, default_value_t = 100)]
         checkpoint_every: usize,
+        /// Auto-stop when loss doesn't improve by this fraction for N steps.
+        /// E.g. --converge 0.001 means stop if loss doesn't drop by 0.1% for
+        /// --converge-patience steps. Set to 0 to disable (default).
+        #[arg(long, default_value_t = 0.0)]
+        converge: f64,
+        /// Number of steps with no improvement before stopping (requires --converge > 0).
+        #[arg(long, default_value_t = 50)]
+        converge_patience: usize,
         /// Use GPU for matmul acceleration.
         #[arg(long, default_value_t = false)]
         gpu: bool,
@@ -171,8 +179,8 @@ async fn main() -> anyhow::Result<()> {
         } => cmd_benchmark(hidden_dim, num_blocks, block_size, iterations).await,
         Commands::Distill {
             model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every,
-            resume, model_format, tokenizer, checkpoint_every, gpu,
-        } => cmd_distill(model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every, resume, model_format, tokenizer, checkpoint_every, gpu).await,
+            resume, model_format, tokenizer, checkpoint_every, converge, converge_patience, gpu,
+        } => cmd_distill(model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every, resume, model_format, tokenizer, checkpoint_every, converge, converge_patience, gpu).await,
         Commands::Evaluate {
             model_path, config, text,
         } => cmd_evaluate(model_path, config, text).await,
@@ -686,6 +694,8 @@ async fn cmd_distill(
     model_format: String,
     tokenizer_path: Option<String>,
     checkpoint_every: usize,
+    converge_threshold: f64,
+    converge_patience: usize,
     use_gpu: bool,
 ) -> anyhow::Result<()> {
     info!(event = "ferrisres_gemma_4_block_attnres_distillation", "=== FerrisRes Gemma 4 → Block AttnRes Distillation ===");
@@ -1021,6 +1031,8 @@ async fn cmd_distill(
     let mut prev_loss = f32::NAN;
     let mut loss_ema = f32::NAN; // Exponential moving average for smoothing
     let target_step = global_step + steps;
+    let mut converge_best_loss = f32::INFINITY;
+    let mut converge_steps_no_improve: usize = 0;
 
     while global_step < target_step {
         let step_start = std::time::Instant::now();
@@ -1178,6 +1190,28 @@ async fn cmd_distill(
         prev_loss = loss;
         global_step += 1;
         if loss < 1e-6 { break; }
+
+        // Convergence detection
+        if converge_threshold > 0.0 {
+            if loss < converge_best_loss * (1.0 - converge_threshold as f32) {
+                converge_best_loss = loss;
+                converge_steps_no_improve = 0;
+            } else {
+                converge_steps_no_improve += 1;
+                if converge_steps_no_improve >= converge_patience {
+                    info!(
+                        event = "converged",
+                        step = global_step,
+                        loss = format_args!("{:.6}", loss),
+                        best_loss = format_args!("{:.6}", converge_best_loss),
+                        patience = converge_patience,
+                        threshold = format_args!("{:.4}", converge_threshold),
+                        "loss converged — stopping early"
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     // Report results
