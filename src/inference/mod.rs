@@ -28,6 +28,7 @@ pub mod concept_memory;
 pub mod pdf_ingestion;
 pub mod acp;
 pub mod tts_stream;
+pub mod vla;
 
 pub use kv_cache::{LayerKVCache, ModelKVCache};
 pub use two_phase::{TwoPhaseConfig, TwoPhaseInference, KVCache, Sampler, GenerationState};
