@@ -245,7 +245,7 @@ impl GpuMatmulAccelerator {
 
     /// GPU matmul where both A and B are CPU slices uploaded JIT.
     /// No persistent GPU weight storage — avoids VRAM duplication.
-    fn gpu_matmul_cpu_b(&self, a_data: &[f32], b_data: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>> {
+    pub fn gpu_matmul_cpu_b(&self, a_data: &[f32], b_data: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>> {
         if m == 0 || k == 0 || n == 0 { return Ok(vec![0.0f32; m * n]); }
 
         let a_buf = GpuBuffer::new(&self.device, a_data.len() * 4, Some("a"))?;

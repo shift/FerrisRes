@@ -664,7 +664,7 @@ dependencies = [
 
 [[package]]
 name = "ferrisres"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "ash",
@@ -679,6 +679,7 @@ dependencies = [
  "pollster",
  "proptest",
  "rand 0.8.5",
+ "regex",
  "serde",
  "serde_json",
  "sysinfo",
