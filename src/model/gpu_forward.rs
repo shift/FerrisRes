@@ -120,6 +120,18 @@ impl GpuMatmulAccelerator {
 
     pub fn profile(&self) -> DeviceProfile { self.profile }
 
+    /// Max single buffer size in bytes (from device limits).
+    pub fn max_buffer_bytes(&self) -> u64 { self.max_buffer_bytes }
+
+    /// Estimate VRAM from device limits (uses max_buffer as proxy).
+    /// For accurate VRAM, use ash/sysfs on Linux, Metal on macOS.
+    pub fn estimated_vram_bytes(&self) -> u64 {
+        // wgpu doesn't expose total VRAM directly.
+        // Use max_buffer as a lower bound — the real VRAM is typically
+        // 4-16× larger than max_buffer_size.
+        self.max_buffer_bytes * 4
+    }
+
     /// Upload model weights to GPU. Call once after loading.
     /// Respects device limits — large tensors stay on CPU if they don't fit.
     /// Validate that the model can run on this GPU.
