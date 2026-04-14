@@ -54,14 +54,30 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## 5. Distill a model
 
-If you have a Gemma 4 safetensors file:
+Convert a standard transformer (Gemma 4, LLaMA, Mistral, etc.) to Block AttnRes:
 
 ```bash
+# Download a tokenizer from HuggingFace
+wget -O tokenizer.json \
+  https://huggingface.co/google/gemma-4-e2b-it/resolve/main/tokenizer.json
+
+# Distill with real data and auto-convergence
 cargo run --release -- distill \
   --model-path ./model.safetensors \
   --config e2b \
-  --steps 100 \
-  --gpu
+  --steps 1000 \
+  --tokenizer ./tokenizer.json \
+  --data training_data.txt \
+  --gpu \
+  --converge 0.001 \
+  --converge-patience 100
+
+# Resume from checkpoint if interrupted
+cargo run --release -- distill \
+  --model-path ./model.safetensors \
+  --config e2b \
+  --steps 1000 \
+  --resume distilled_model.bin.checkpoint.bin
 ```
 
 ## 6. Use as a library

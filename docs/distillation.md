@@ -271,7 +271,7 @@ Required:
 
 Options:
   --config <CONFIG>       Model config [default: e2b]
-                          Gemma:    e2b, e4b, 12b, 27b
+                          Gemma:    e2b, e4b, 12b, 27b, 27b-mm
                           LLaMA:    llama3-8b, llama3-70b
                           Mistral:  mistral-7b, mixtral-8x7b
                           Phi:      phi3-mini
@@ -281,12 +281,16 @@ Options:
   --steps <N>             Number of distillation steps [default: 1000]
   --lr <RATE>             Learning rate [default: 0.0001]
   --temperature <T>       KL divergence temperature [default: 2.0]
-  --data <PATH>           Training text file (one doc per line)
+  --data <PATH>           Training text file (plain text)
   --tokenizer <PATH>      Path to tokenizer.json (HuggingFace format)
   --output <PATH>         Output prefix [default: distilled_model]
-  --log-every <N>         Log every N steps [default: 10]
+  --log-every <N>         Log every N steps [default: 1]
   --resume <PATH>         Resume from checkpoint file
   --checkpoint-every <N>  Save checkpoint every N steps [default: 100]
+  --converge <FRAC>       Auto-stop when loss doesn't improve by this fraction
+                          for --converge-patience steps. 0 = disabled [default: 0]
+  --converge-patience <N> Steps with no improvement before stopping [default: 50]
+  --gpu                   Use GPU for matmul acceleration
 ```
 
 ### `evaluate`
@@ -431,7 +435,8 @@ hidden state vectors, independent of magnitude.
 ### Interpreting Bridge Weight
 
 ```
-bridge_weight = 0.0   →  Student = Teacher (no compression)
+bridge_weight = 0.0   →  Student ≈ Teacher (minimal compression)
+bridge_weight = 0.1   →  10% summary (initial value)
 bridge_weight = 0.3   →  30% summary, 70% raw hidden state
 bridge_weight = 0.5   →  Balanced compression
 bridge_weight = 0.7   →  Heavy compression (aggressive O(n))
@@ -569,14 +574,36 @@ cargo run -- distill \
   --model-path ./model.safetensors \
   --config e2b \
   --resume distilled_model.checkpoint.bin \
-  --steps 2000    # Total steps (not additional)
+  --steps 2000    # Additional steps from checkpoint
 ```
+
+The `--steps` value is **additive** — if the checkpoint was at step 100,
+`--steps 2000` runs steps 100 through 2100.
 
 The checkpoint preserves:
 - Block Summary trainable parameters
-- Adam optimizer state (first/second moments, timestep)
+- Adam optimizer state (first moment m, second moment v, timestep t)
 - Bridge weight values
 - Layer norm weights
+- Global step counter
+
+### Auto-Convergence
+
+Use `--converge` to stop training automatically when loss plateaus:
+
+```bash
+cargo run -- distill \
+  --model-path ./model.safetensors \
+  --config 27b-mm \
+  --steps 10000 \
+  --converge 0.001 \
+  --converge-patience 100 \
+  --gpu
+```
+
+This stops when the KL loss hasn't improved by 0.1% for 100 consecutive
+steps. You'll see `event="converged"` in the structured logs. Set
+`--converge 0` (default) to disable.
 
 ### Deploying the Distilled Model
 
@@ -662,7 +689,7 @@ query_proj      = identity_matrix;                       // Pass-through
 key_proj        = identity_matrix;
 value_proj      = identity_matrix;
 out_proj        = identity_matrix;
-bridge_weight   = 0.0;                                   // No contribution
+bridge_weight   = 0.1;                                   // Small initial contribution
 ```
 
 This ensures that at step 0, the student produces **exactly** the same
@@ -713,20 +740,21 @@ lm_head.weight                                         # [vocab × hidden]
 
 **Gemma 4:**
 
-| Parameter | E2B | E4B | 12B | 27B |
-|:----------|:----|:----|:----|:-----|
-| hidden_dim | 2048 | 2560 | 4096 | 4608 |
-| num_layers | 18 | 24 | 48 | 60 |
-| num_heads | 8 | 10 | 32 | 36 |
-| head_dim | 256 | 256 | 128 | 128 |
-| intermediate_dim | 8192 | 10240 | 14336 | 16384 |
-| num_experts | 1 (dense) | 16 | 128 | 128 |
-| top_k | 1 | 2 | 2 | 2 |
-| vocab_size | 256K | 256K | 256K | 256K |
-| max_positions | 32K | 32K | 131K | 131K |
-| sliding_window | 4096 | 4096 | 4096 | 4096 |
-| MoE layers | none | 6,12,18 | every other | every other |
-| FP16 size | ~4 GB | ~8 GB | ~24 GB | ~54 GB |
+| Parameter | E2B | E4B | 12B | 27B | 27B MM |
+|:----------|:----|:----|:----|:-----|:-------|
+| hidden_dim | 2048 | 2560 | 4096 | 4608 | 1536 |
+| num_layers | 18 | 24 | 48 | 60 | 35 |
+| num_heads | 8 | 10 | 32 | 36 | 8 |
+| num_kv_heads | 1 | 1 | 8 | 8 | 1 |
+| head_dim | 256 | 256 | 128 | 128 | 192 |
+| intermediate_dim | 8192 | 10240 | 14336 | 16384 | 6144 |
+| num_experts | 1 (dense) | 16 | 128 | 128 | 1 (dense) |
+| top_k | 1 | 2 | 2 | 2 | 1 |
+| vocab_size | 256K | 256K | 256K | 256K | 262K |
+| max_positions | 32K | 32K | 131K | 131K | 32K |
+| sliding_window | 4096 | 4096 | 4096 | 4096 | 4096 |
+| MoE layers | none | 6,12,18 | every other | every other | 4,9,14,19,24,29,34 |
+| FP16 size | ~4 GB | ~8 GB | ~24 GB | ~54 GB | ~10 GB |
 
 **Other supported architectures:**
 

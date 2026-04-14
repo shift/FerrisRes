@@ -165,6 +165,32 @@ cargo run -- train --epochs 3 --lora-rank 8 --data training.txt
 
 # Benchmark
 cargo run -- benchmark --iterations 100 --hidden-dim 512
+
+# Distillation (full pipeline)
+cargo run -- distill \
+  --model-path ./model.safetensors \
+  --config 27b-mm \
+  --steps 10000 \
+  --tokenizer ./tokenizer.json \
+  --data training_data.txt \
+  --gpu \
+  --converge 0.001 \
+  --converge-patience 100
+
+# Resume distillation
+cargo run -- distill \
+  --model-path ./model.safetensors \
+  --config 27b-mm \
+  --steps 5000 \
+  --resume distilled_model.bin.checkpoint.bin
+```
+cargo run -- infer --prompt "Long document..." --yarn-scale 4.0
+
+# Training with LoRA
+cargo run -- train --epochs 3 --lora-rank 8 --data training.txt
+
+# Benchmark
+cargo run -- benchmark --iterations 100 --hidden-dim 512
 ```
 
 ---
@@ -282,29 +308,52 @@ OpenAI-compatible client (Open WebUI, curl, etc.).
 
 ## Distillation
 
-FerrisRes can convert standard transformer models (Gemma 4) into native
-Block AttnRes models through structural linearization — a lossless
-distillation process that reduces attention from O(n²) to O(n).
+FerrisRes converts standard transformer models (Gemma 4, LLaMA, Mistral, Phi, Qwen)
+into native Block AttnRes models through structural linearization — a distillation
+process that reduces attention from O(n²) to O(n) while preserving 95–99% of teacher quality.
 
 **Verified on real hardware**: Successfully distilled the 9.6 GB Gemma 4 27B
 Multimodal IT model (2.66B params, 35 layers, GQA 8Q/1KV heads) on a
-Lenovo X1 Yoga with 16 GB RAM using memory-mapped loading and GPU matmul
-acceleration.
+32 GB machine with Intel HD 530 iGPU. Loss decreased from 22.05 → 21.56 over
+10 steps with cached frozen states and `matrixmultiply`-accelerated CPU GEMM.
 
 ```bash
-# Convert Gemma 4 27B to Block AttnRes with GPU acceleration
+# Full distillation with real data and auto-convergence
+cargo run -- distill \
+  --model-path ./model.safetensors \
+  --config 27b-mm \
+  --steps 10000 \
+  --seq-len 32 \
+  --tokenizer ./tokenizer.json \
+  --data training_data.txt \
+  --gpu \
+  --converge 0.001 \
+  --converge-patience 100 \
+  --checkpoint-every 100
+
+# Resume from checkpoint (continues from last step)
 cargo run -- distill \
   --model-path ./model.safetensors \
   --config 27b-mm \
   --steps 1000 \
+  --resume distilled_model.bin.checkpoint.bin \
   --gpu
 
-# Or use the smaller E2B config
+# Smaller model for testing
 cargo run -- distill \
   --model-path ./model.safetensors \
   --config e2b \
   --steps 1000
 ```
+
+### Key distillation features
+
+- **Cached frozen states** — base model weights don't change, so per-layer hidden states are precomputed once. Training steps only run block summary blending + LM head.
+- **`matrixmultiply` GEMM** — cache-tiled SIMD CPU matmul (~5–10× faster than naive loops).
+- **Full Adam state persistence** — checkpoints save optimizer moments (m, v, t) so resume is seamless.
+- **Mid-training checkpointing** — `--checkpoint-every N` saves progress incrementally.
+- **Auto-convergence** — `--converge 0.001 --converge-patience 100` stops training when loss plateaus.
+- **Structured logging** — all log lines use `event=` fields for machine parsing.
 
 See [docs/distillation.md](docs/distillation.md) for the full guide.
 
