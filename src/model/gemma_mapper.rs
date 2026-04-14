@@ -2196,6 +2196,178 @@ impl Gemma4Student {
         logits
     }
 
+    /// GPU-accelerated forward from frozen states.
+    ///
+    /// Same as `forward_from_frozen` but uses GPU matmul for all linear
+    /// projections. Falls back to CPU for attention scores (memory-bound).
+    pub fn forward_from_frozen_gpu(
+        &self,
+        frozen_states: &[Vec<f32>],
+        gpu: &crate::model::gpu_forward::GpuMatmulAccelerator,
+    ) -> Vec<f32> {
+        let config = &self.model.config;
+        let hd = config.hidden_dim;
+        let nh = config.num_heads;
+        let head_d = config.head_dim;
+        let vs = config.vocab_size;
+        let seq = frozen_states.first().map(|s| s.len() / hd).unwrap_or(0);
+        if seq == 0 { return vec![]; }
+
+        let injection_points = config.block_summary_injection_points();
+
+        // GPU matmul helper with CPU fallback
+        let gpu_mm = |a: &[f32], b: &[f32], m: usize, k: usize, n: usize| -> Vec<f32> {
+            match gpu.gpu_matmul_cpu_b(a, b, m, k, n) {
+                Ok(r) => r,
+                Err(_) => matmul(a, b, m, k, n),
+            }
+        };
+
+        let mut hidden = frozen_states[0].clone();
+        let mut summary_idx = 0;
+
+        for (layer_idx, layer) in self.model.layers.iter().enumerate() {
+            let is_injection = injection_points.contains(&layer_idx);
+
+            if is_injection {
+                hidden = if layer_idx < frozen_states.len() {
+                    frozen_states[layer_idx].clone()
+                } else {
+                    hidden.clone()
+                };
+            } else if summary_idx > 0 {
+                // Recompute this layer (post-injection) with GPU matmuls
+                hidden = self.recompute_layer_gpu(&gpu_mm, &hidden, layer, nh, config.num_kv_heads, head_d, seq, hd, config.intermediate_dim);
+                continue;
+            } else {
+                hidden = if layer_idx + 1 < frozen_states.len() {
+                    frozen_states[layer_idx + 1].clone()
+                } else {
+                    hidden.clone()
+                };
+                continue;
+            }
+
+            // At injection point: recompute + apply block summary
+            hidden = self.recompute_layer_gpu(&gpu_mm, &hidden, layer, nh, config.num_kv_heads, head_d, seq, hd, config.intermediate_dim);
+
+            if summary_idx < self.block_summaries.len() {
+                let bs = &self.block_summaries[summary_idx];
+                let block_tokens = hidden.clone();
+                let summary = bs.forward(&block_tokens);
+                if summary.len() >= hd {
+                    for t in 0..seq {
+                        for d in 0..hd {
+                            hidden[t * hd + d] = (1.0 - bs.bridge_weight) * hidden[t * hd + d]
+                                + bs.bridge_weight * summary[d];
+                        }
+                    }
+                }
+            }
+            summary_idx += 1;
+        }
+
+        // Final norm
+        hidden = rms_norm(&hidden, &self.model.final_norm, hd, 1e-6);
+
+        // LM head: GPU matmul (the biggest matmul: seq × hd × vocab)
+        gpu_mm(&hidden, &self.model.lm_head, seq, hd, vs)
+    }
+
+    /// Recompute a single transformer layer using GPU matmuls.
+    fn recompute_layer_gpu(
+        &self,
+        gpu_mm: &dyn Fn(&[f32], &[f32], usize, usize, usize) -> Vec<f32>,
+        hidden: &[f32],
+        layer: &Gemma4LayerWeights,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        seq: usize,
+        hd: usize,
+        intermediate_dim: usize,
+    ) -> Vec<f32> {
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        // Attention block
+        let residual = hidden.to_vec();
+        let normed = rms_norm(hidden, &layer.attn.input_norm, hd, 1e-6);
+
+        // Q/K/V projections on GPU
+        let q = gpu_mm(&normed, &layer.attn.q_proj, seq, hd, q_dim);
+        let k = gpu_mm(&normed, &layer.attn.k_proj, seq, hd, kv_dim);
+        let v = gpu_mm(&normed, &layer.attn.v_proj, seq, hd, kv_dim);
+
+        // RoPE on CPU
+        let mut q = q;
+        let mut k = k;
+        apply_rope(&mut q, seq, num_heads, head_dim, 0);
+        apply_rope_gqa(&mut k, seq, num_kv_heads, head_dim, 0);
+
+        // Attention scores on CPU (memory-bound, not compute-bound)
+        let heads_per_kv = num_heads / num_kv_heads;
+        let attn_scale = 1.0 / (head_dim as f32).sqrt();
+        let mut attn_out = vec![0.0f32; seq * q_dim];
+        for h in 0..num_heads {
+            let kv_h = h / heads_per_kv;
+            for t in 0..seq {
+                let mut max_score = f32::NEG_INFINITY;
+                let mut scores = vec![0.0f32; seq];
+                for s in 0..=t {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[t * q_dim + h * head_dim + d]
+                             * k[s * kv_dim + kv_h * head_dim + d];
+                    }
+                    scores[s] = dot * attn_scale;
+                    if scores[s] > max_score { max_score = scores[s]; }
+                }
+                let mut sum_exp = 0.0f32;
+                for s in 0..=t { scores[s] = (scores[s] - max_score).exp(); sum_exp += scores[s]; }
+                for s in 0..=t { scores[s] /= sum_exp; }
+                for d in 0..head_dim {
+                    let mut val = 0.0f32;
+                    for s in 0..=t { val += scores[s] * v[s * kv_dim + kv_h * head_dim + d]; }
+                    attn_out[t * q_dim + h * head_dim + d] = val;
+                }
+            }
+        }
+
+        // O projection on GPU
+        let o = gpu_mm(&attn_out, &layer.attn.o_proj, seq, q_dim, hd);
+
+        // Residual
+        let mut hidden: Vec<f32> = residual.iter().zip(o.iter()).map(|(&r, &o)| r + o).collect();
+
+        // FFN block
+        let residual2 = hidden.clone();
+        let normed2 = rms_norm(&hidden, &layer.attn.post_attn_norm, hd, 1e-6);
+
+        let ffn_out = match &layer.ffn {
+            Gemma4FfnWeights::Dense { gate_proj, up_proj, down_proj } => {
+                // SwiGLU with GPU matmuls
+                let gated = gpu_mm(&normed2, gate_proj, seq, hd, intermediate_dim);
+                let gated: Vec<f32> = gated.iter().map(|&x| x / (1.0 + (-x).exp())).collect();
+                let upped = gpu_mm(&normed2, up_proj, seq, hd, intermediate_dim);
+                let mut combined = vec![0.0f32; seq * intermediate_dim];
+                for i in 0..combined.len() { combined[i] = gated[i] * upped[i]; }
+                gpu_mm(&combined, down_proj, seq, intermediate_dim, hd)
+            }
+            Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs } => {
+                let mut moe = CpuMoELayer::new(hd, intermediate_dim, self.model.config.num_experts, self.model.config.top_k);
+                moe.gate_weights = router.clone();
+                moe.expert_gate = expert_gates.clone();
+                moe.expert_up = expert_ups.clone();
+                moe.expert_down = expert_downs.clone();
+                moe.forward(&normed2, seq)
+            }
+        };
+
+        for i in 0..hidden.len() { hidden[i] = residual2[i] + ffn_out[i]; }
+        hidden
+    }
+
     /// Fast forward using frozen hidden states: skip all layer recomputation.
     ///
     /// This only applies block summary blending at injection points (using the

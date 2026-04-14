@@ -1089,7 +1089,11 @@ async fn cmd_distill(
 
         // Student forward (using cached frozen hidden states)
         let frozen_states = &frozen_states_per_chunk[chunk_idx];
-        let student_logits = student.forward_from_frozen(frozen_states);
+        let student_logits = if let Some(ref gpu) = gpu_accel {
+            student.forward_from_frozen_gpu(frozen_states, gpu)
+        } else {
+            student.forward_from_frozen(frozen_states)
+        };
 
         // KL divergence loss
         let loss = gemma_mapper::kl_divergence_loss(
