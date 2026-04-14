@@ -30,6 +30,7 @@ pub mod acp;
 pub mod tts_stream;
 pub mod vla;
 pub mod scientific;
+pub mod tactile;
 
 pub use kv_cache::{LayerKVCache, ModelKVCache};
 pub use two_phase::{TwoPhaseConfig, TwoPhaseInference, KVCache, Sampler, GenerationState};
