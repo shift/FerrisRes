@@ -107,7 +107,7 @@ INFO ferrisres::model::gpu_forward: GPU initialized: NVIDIA RTX 4090 (vulkan), p
 ### Performance tuning
 
 - Set `FERRIS_DEVICE_PROFILE=high_end` to override auto-detection
-- Use `--gpu` for distillation to get 10-20x speedup
+- Use `for distillation to get 10-20x speedup
 - Adjust `--seq-len` based on available RAM (longer = more RAM)
 - Use TurboQuant 2-bit compression for 16x KV cache reduction
 

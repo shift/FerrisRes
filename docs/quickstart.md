@@ -68,7 +68,7 @@ cargo run --release -- distill \
   --steps 1000 \
   --tokenizer ./tokenizer.json \
   --data training_data.txt \
-  --gpu \
+  
   --converge 0.001 \
   --converge-patience 100
 
