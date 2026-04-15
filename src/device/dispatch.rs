@@ -58,6 +58,10 @@ pub struct DispatchPlan {
     pub per_sample_bytes: u64,
     /// Whether GPU is available at all.
     pub gpu_available: bool,
+    /// Whether ALL model weights can be uploaded to GPU once and kept resident.
+    /// True when model_bytes < vram_bytes * 0.7 (30% headroom for activations/gradients).
+    /// When true, skip JIT uploads — weights stay in VRAM for the entire session.
+    pub resident_mode: bool,
 }
 
 impl DispatchPlan {
@@ -159,6 +163,7 @@ impl DispatchPlan {
             batch_size,
             per_sample_bytes,
             gpu_available,
+            resident_mode: gpu_available && model_bytes < (vram_bytes as f64 * 0.7) as u64,
         }
     }
 
@@ -340,5 +345,55 @@ mod tests {
         assert_eq!(OpTarget::Cpu, OpTarget::Cpu);
         assert_ne!(OpTarget::Cpu, OpTarget::Gpu);
         assert_ne!(OpTarget::Gpu, OpTarget::GpuTiled);
+    }
+
+    #[test]
+    fn test_resident_mode_t4() {
+        // T4: 15GB VRAM, 4.6GB model — resident mode ON
+        let plan = DispatchPlan::new(
+            DeviceProfile::HighEnd,
+            4_600_000_000,  // 4.6GB E2B model
+            15_000_000_000, // 15GB T4 VRAM
+            4_293_000_000,  // 4.3GB max buffer
+            1536, 8, 256, 6144, 262144, 256, 1,
+        );
+        assert!(plan.resident_mode, "T4 with E2B should enable resident mode");
+    }
+
+    #[test]
+    fn test_resident_mode_lowend() {
+        // Intel HD 530: 256MB VRAM, 10GB model — resident mode OFF
+        let plan = DispatchPlan::new(
+            DeviceProfile::LowEnd,
+            10_000_000_000,
+            256 * 1024 * 1024,
+            256 * 1024 * 1024,
+            1536, 8, 256, 6144, 262144, 32, 1,
+        );
+        assert!(!plan.resident_mode, "LowEnd should NOT enable resident mode");
+    }
+
+    #[test]
+    fn test_resident_mode_threshold() {
+        // Exactly at 70% VRAM — resident mode OFF (no headroom)
+        let model_bytes = 7_000_000_000u64; // 7GB
+        let vram_bytes = 10_000_000_000u64; // 10GB (70% exactly)
+        let plan = DispatchPlan::new(
+            DeviceProfile::HighEnd,
+            model_bytes, vram_bytes,
+            2_000_000_000,
+            1536, 8, 256, 6144, 262144, 32, 1,
+        );
+        // 7GB == 10GB * 0.7, so NOT less than, should be false
+        assert!(!plan.resident_mode);
+
+        // Just under — should be true
+        let plan2 = DispatchPlan::new(
+            DeviceProfile::HighEnd,
+            6_999_999_999, vram_bytes,
+            2_000_000_000,
+            1536, 8, 256, 6144, 262144, 32, 1,
+        );
+        assert!(plan2.resident_mode);
     }
 }

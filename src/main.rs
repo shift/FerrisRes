@@ -842,8 +842,24 @@ async fn cmd_distill(
     let num_chunks = (token_ids.len() + seq_len - 1) / seq_len;
 
     if gpu_accel.is_some() && dispatch.attn_qkv_dispatch != ferrisres::device::OpTarget::Cpu {
-        // GPU-accelerated teacher forward (dispatch plan says GPU for QKV)
-        info!(event = "using_gpu_matmul_acceleration_for_teacher", "Using GPU matmul acceleration for teacher forward");
+        // GPU-accelerated teacher forward
+        let accel = gpu_accel.as_ref().unwrap();
+
+        // Check if we can use resident mode (all weights stay on GPU)
+        let weight_cache = if dispatch.resident_mode {
+            info!(event = "resident_mode", "Uploading all weights to GPU (resident mode)");
+            Some(accel.upload_weights_resident(teacher.model())
+                .map_err(|e| anyhow::anyhow!("Resident upload failed: {:?}", e))?)
+        } else {
+            info!(event = "jit_mode", "Using JIT uploads (model too large for VRAM)");
+            None
+        };
+
+        if weight_cache.is_some() {
+            info!(event = "using_gpu_resident_for_teacher", "Using GPU resident weights for teacher forward");
+        } else {
+            info!(event = "using_gpu_matmul_acceleration_for_teacher", "Using GPU matmul acceleration for teacher forward");
+        }
 
         let total_chunks = num_chunks.min(steps);
         let teacher_start = std::time::Instant::now();
@@ -853,8 +869,14 @@ async fn cmd_distill(
             let end = (start + seq_len).min(token_ids.len());
             let chunk: Vec<u32> = token_ids[start..end].to_vec();
             if chunk.len() < seq_len { break; }
-            let logits = gpu_accel.as_ref().unwrap().forward(teacher.model(), &chunk)
-                .map_err(|e| anyhow::anyhow!("GPU forward failed: {:?}", e))?;
+
+            let logits = if let Some(cache) = &weight_cache {
+                accel.forward_resident(cache, teacher.model(), &chunk)
+                    .map_err(|e| anyhow::anyhow!("GPU resident forward failed: {:?}", e))?
+            } else {
+                accel.forward(teacher.model(), &chunk)
+                    .map_err(|e| anyhow::anyhow!("GPU forward failed: {:?}", e))?
+            };
             teacher_logits_chunks.push(logits);
 
             let elapsed = teacher_start.elapsed().as_secs_f32();
