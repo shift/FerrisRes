@@ -528,45 +528,54 @@ impl Gemma4Config {
     /// Small enough to fit in ~4 GB VRAM. Ideal for verifying
     /// the distillation pipeline end-to-end before scaling up.
     /// Uses dense FFN (no MoE) for simplicity.
+    /// Gemma 4 E2B (dense, ~2.3B params, ~4 GB FP16).
+    /// Source: google/gemma-4-e2b-it config.json (verified 2026-04-15)
+    /// Dense, 35 layers, hidden=1536, GQA 8Q/1KV, sliding_window=512.
+    /// full_attention at layers [4, 9, 14, 19, 24, 29, 34] (Block Summary injection points).
+    /// Includes vision_tower and audio_tower (loaded separately).
     pub fn gemma4_e2b() -> Self {
         Self {
-            hidden_dim: 2048,
-            num_layers: 18,
+            hidden_dim: 1536,
+            num_layers: 35,
             num_heads: 8,
-            num_kv_heads: 8,
+            num_kv_heads: 1,        // GQA: 1 KV head
             head_dim: 256,
-            intermediate_dim: 8192,
-            num_experts: 1,      // Dense, no MoE
+            intermediate_dim: 6144, // 4×1536, use_double_wide_mlp
+            num_experts: 1,         // Dense
             top_k: 1,
-            vocab_size: 256000,
-            max_position_embeddings: 32768,
-            sliding_window: 4096,
-            moe_layers: vec![], // No MoE in E2B
+            vocab_size: 262144,
+            max_position_embeddings: 131072,
+            sliding_window: 512,
+            // Block Summary injection at full_attention layers
+            moe_layers: vec![4, 9, 14, 19, 24, 29, 34],
         }
     }
 
-    /// Gemma 4 E4B (efficient 4B) — small MoE for testing MoE distillation.
-    ///
-    /// ~8 GB VRAM. Introduces MoE routing with a small expert count
-    /// to verify expert weight mapping before scaling to 128 experts.
+    /// Gemma 4 E4B (dense, ~4.5B params, ~8 GB FP16).
+    /// Source: google/gemma-4-e4b-it config.json (verified 2026-04-15)
+    /// Dense, 42 layers, hidden=2560, GQA 8Q/2KV, sliding_window=512.
+    /// full_attention at layers [5, 11, 17, 23, 29, 35, 41].
     pub fn gemma4_e4b() -> Self {
         Self {
             hidden_dim: 2560,
-            num_layers: 24,
-            num_heads: 10,
-            num_kv_heads: 10,
+            num_layers: 42,
+            num_heads: 8,
+            num_kv_heads: 2,        // GQA: 2 KV heads
             head_dim: 256,
-            intermediate_dim: 10240,
-            num_experts: 16,     // Small MoE for testing
-            top_k: 2,
-            vocab_size: 256000,
-            max_position_embeddings: 32768,
-            sliding_window: 4096,
-            moe_layers: vec![6, 12, 18], // MoE every 6 layers
+            intermediate_dim: 10240, // 4×2560
+            num_experts: 1,          // Dense (enable_moe_block: false)
+            top_k: 1,
+            vocab_size: 262144,
+            max_position_embeddings: 131072,
+            sliding_window: 512,
+            // Block Summary injection at full_attention layers
+            moe_layers: vec![5, 11, 17, 23, 29, 35, 41],
         }
     }
 
-    /// Gemma 4 12B configuration (full production model).
+    /// Gemma 4 12B configuration.
+    /// UNVERIFIED: This model does not (yet) exist on HuggingFace.
+    /// Placeholder config for future release.
     pub fn gemma4_12b() -> Self {
         Self {
             hidden_dim: 4096,
@@ -577,14 +586,16 @@ impl Gemma4Config {
             intermediate_dim: 14336,
             num_experts: 128,
             top_k: 2,
-            vocab_size: 256000,
+            vocab_size: 262144,
             max_position_embeddings: 131072,
-            sliding_window: 4096,
-            moe_layers: (0..48).step_by(2).map(|i| i + 1).collect(), // Every other layer
+            sliding_window: 1024,
+            moe_layers: (1..48).step_by(2).collect(), // Placeholder
         }
     }
 
     /// Gemma 4 27B configuration.
+    /// UNVERIFIED: This model does not (yet) exist on HuggingFace.
+    /// Placeholder config — may have been renamed to 31B.
     pub fn gemma4_27b() -> Self {
         Self {
             hidden_dim: 4608,
@@ -595,34 +606,61 @@ impl Gemma4Config {
             intermediate_dim: 16384,
             num_experts: 128,
             top_k: 2,
-            vocab_size: 256000,
-            max_position_embeddings: 131072,
-            sliding_window: 4096,
-            moe_layers: (0..60).step_by(2).map(|i| i + 1).collect(),
+            vocab_size: 262144,
+            max_position_embeddings: 262144,
+            sliding_window: 1024,
+            moe_layers: (1..60).step_by(2).collect(), // Placeholder
         }
     }
 
-    /// Gemma 4 27B multimodal IT (instruction-tuned).
-    /// Dense language model with 35 layers, hidden=1536, GQA (8Q/1KV heads).
-    /// Also includes vision_tower and audio_tower (loaded separately).
+    /// Gemma 4 27B multimodal IT (backward-compatible alias).
+    /// This is identical to gemma4_e2b() — the E2B model IS multimodal.
+    /// Kept for backward compatibility with existing CLI commands.
     pub fn gemma4_27b_mm() -> Self {
+        Self::gemma4_e2b()
+    }
+
+    /// Gemma 4 26B A4B (MoE, 26B total / 4B active params).
+    /// Source: google/gemma-4-26b-a4b-it config.json (verified 2026-04-15)
+    /// MoE-128, top_k=8, 30 layers, hidden=2816, GQA 16Q/8KV, sliding_window=1024.
+    /// full_attention at layers [5, 11, 17, 23, 29].
+    pub fn gemma4_26b_a4b() -> Self {
         Self {
-            hidden_dim: 1536,
-            num_layers: 35,
-            num_heads: 8,       // 8 query heads
-            num_kv_heads: 1,    // GQA: 1 KV head (k_proj [256, 1536])
-            head_dim: 256,      // q_proj [2048, 1536] = 8*256
-            intermediate_dim: 6144, // 4×1536
-            num_experts: 1,     // Dense, no MoE
+            hidden_dim: 2816,
+            num_layers: 30,
+            num_heads: 16,
+            num_kv_heads: 8,        // GQA: 8 KV heads
+            head_dim: 256,
+            intermediate_dim: 2112, // expert_intermediate_size (not the usual 4×hidden)
+            num_experts: 128,
+            top_k: 8,
+            vocab_size: 262144,
+            max_position_embeddings: 262144,
+            sliding_window: 1024,
+            // Block Summary injection at full_attention layers
+            moe_layers: vec![5, 11, 17, 23, 29],
+        }
+    }
+
+    /// Gemma 4 31B (dense, 31B params).
+    /// Source: google/gemma-4-31b-it config.json (verified 2026-04-15)
+    /// Dense, 60 layers, hidden=5376, GQA 32Q/16KV, sliding_window=1024.
+    /// full_attention at layers [5, 11, 17, 23, 29, 35, 41, 47, 53, 59].
+    pub fn gemma4_31b() -> Self {
+        Self {
+            hidden_dim: 5376,
+            num_layers: 60,
+            num_heads: 32,
+            num_kv_heads: 16,       // GQA: 16 KV heads
+            head_dim: 256,
+            intermediate_dim: 21504, // 4×5376
+            num_experts: 1,          // Dense
             top_k: 1,
             vocab_size: 262144,
-            max_position_embeddings: 32768,
-            sliding_window: 4096,
-            // Inject a Block Summary after every 5th layer.
-            // 35 layers / 5 = 7 injection points.
-            // These are the layers where inter-block attention
-            // replaces intra-block, reducing O(n²) → O(n).
-            moe_layers: (4..35).step_by(5).collect(), // [4, 9, 14, 19, 24, 29, 34]
+            max_position_embeddings: 262144,
+            sliding_window: 1024,
+            // Block Summary injection at full_attention layers
+            moe_layers: vec![5, 11, 17, 23, 29, 35, 41, 47, 53, 59],
         }
     }
 
@@ -753,7 +791,7 @@ impl Gemma4Config {
             intermediate_dim: self.intermediate_dim,
             num_experts: self.num_experts,
             top_k: self.top_k,
-            use_moe: !self.moe_layers.is_empty(),
+            use_moe: self.num_experts > 1,
         }
     }
 
@@ -4046,30 +4084,79 @@ mod tests {
     #[test]
     fn test_gemma4_e2b_config() {
         let config = Gemma4Config::gemma4_e2b();
-        assert_eq!(config.hidden_dim, 2048);
-        assert_eq!(config.num_layers, 18);
+        // Verified against google/gemma-4-e2b-it config.json
+        assert_eq!(config.hidden_dim, 1536);
+        assert_eq!(config.num_layers, 35);
+        assert_eq!(config.num_heads, 8);
+        assert_eq!(config.num_kv_heads, 1); // GQA
+        assert_eq!(config.head_dim, 256);
+        assert_eq!(config.intermediate_dim, 6144);
         assert_eq!(config.num_experts, 1); // Dense
         assert_eq!(config.top_k, 1);
-        assert_eq!(config.sliding_window, 4096);
-        assert!(config.moe_layers.is_empty()); // No MoE
+        assert_eq!(config.vocab_size, 262144);
+        assert_eq!(config.max_position_embeddings, 131072);
+        assert_eq!(config.sliding_window, 512);
+        assert_eq!(config.moe_layers, vec![4, 9, 14, 19, 24, 29, 34]); // full_attention layers
     }
 
     #[test]
     fn test_gemma4_e4b_config() {
         let config = Gemma4Config::gemma4_e4b();
+        // Verified against google/gemma-4-e4b-it config.json
         assert_eq!(config.hidden_dim, 2560);
-        assert_eq!(config.num_layers, 24);
-        assert_eq!(config.num_experts, 16); // Small MoE
-        assert_eq!(config.top_k, 2);
-        assert_eq!(config.moe_layers, vec![6, 12, 18]);
+        assert_eq!(config.num_layers, 42);
+        assert_eq!(config.num_heads, 8);
+        assert_eq!(config.num_kv_heads, 2); // GQA
+        assert_eq!(config.head_dim, 256);
+        assert_eq!(config.intermediate_dim, 10240);
+        assert_eq!(config.num_experts, 1); // Dense
+        assert_eq!(config.top_k, 1);
+        assert_eq!(config.vocab_size, 262144);
+        assert_eq!(config.sliding_window, 512);
+        assert_eq!(config.moe_layers, vec![5, 11, 17, 23, 29, 35, 41]); // full_attention layers
+    }
+
+    #[test]
+    fn test_gemma4_26b_a4b_config() {
+        let config = Gemma4Config::gemma4_26b_a4b();
+        // Verified against google/gemma-4-26b-a4b-it config.json
+        assert_eq!(config.hidden_dim, 2816);
+        assert_eq!(config.num_layers, 30);
+        assert_eq!(config.num_heads, 16);
+        assert_eq!(config.num_kv_heads, 8);
+        assert_eq!(config.head_dim, 256);
+        assert_eq!(config.intermediate_dim, 2112);
+        assert_eq!(config.num_experts, 128);
+        assert_eq!(config.top_k, 8);
+        assert_eq!(config.vocab_size, 262144);
+        assert_eq!(config.max_position_embeddings, 262144);
+        assert_eq!(config.sliding_window, 1024);
+        assert_eq!(config.moe_layers, vec![5, 11, 17, 23, 29]); // full_attention layers
+    }
+
+    #[test]
+    fn test_gemma4_31b_config() {
+        let config = Gemma4Config::gemma4_31b();
+        // Verified against google/gemma-4-31b-it config.json
+        assert_eq!(config.hidden_dim, 5376);
+        assert_eq!(config.num_layers, 60);
+        assert_eq!(config.num_heads, 32);
+        assert_eq!(config.num_kv_heads, 16);
+        assert_eq!(config.head_dim, 256);
+        assert_eq!(config.intermediate_dim, 21504);
+        assert_eq!(config.num_experts, 1); // Dense
+        assert_eq!(config.top_k, 1);
+        assert_eq!(config.vocab_size, 262144);
+        assert_eq!(config.max_position_embeddings, 262144);
+        assert_eq!(config.sliding_window, 1024);
+        assert_eq!(config.moe_layers, vec![5, 11, 17, 23, 29, 35, 41, 47, 53, 59]);
     }
 
     #[test]
     fn test_gemma4_e2b_to_block_attnres() {
         let gemma = Gemma4Config::gemma4_e2b();
         let bar = gemma.to_block_attnres_config();
-        assert_eq!(bar.hidden_dim, 2048);
-        assert_eq!(bar.block_size, 4096);
+        assert_eq!(bar.hidden_dim, 1536);
         assert_eq!(bar.num_experts, 1);
         assert!(!bar.use_moe); // Dense
     }
@@ -4079,21 +4166,24 @@ mod tests {
         let gemma = Gemma4Config::gemma4_e4b();
         let bar = gemma.to_block_attnres_config();
         assert_eq!(bar.hidden_dim, 2560);
-        assert!(bar.use_moe); // Has MoE
+        assert!(!bar.use_moe); // Dense (E4B is NOT MoE)
     }
 
     #[test]
     fn test_e2b_weight_mapper() {
         let config = Gemma4Config::gemma4_e2b();
         let mapper = Gemma4WeightMapper::new(config);
-        let hd = 2048;
-        let q = vec![0.1f32; hd * hd];
-        let k = vec![0.1f32; hd * hd];
-        let v = vec![0.1f32; hd * hd];
-        let o = vec![0.1f32; hd * hd];
+        let hd = 1536;
+        let q_heads = 8;
+        let kv_heads = 1;
+        let head_dim = 256;
+        let q = vec![0.1f32; q_heads * head_dim * hd]; // [2048, 1536]
+        let k = vec![0.1f32; kv_heads * head_dim * hd]; // [256, 1536]
+        let v = vec![0.1f32; kv_heads * head_dim * hd]; // [256, 1536]
+        let o = vec![0.1f32; hd * q_heads * head_dim];   // [1536, 2048]
         let mapped = mapper.map_attention_weights(&q, &k, &v, &o, 0);
-        assert!(!mapped.is_global); // Layer 0 is local
-        assert_eq!(mapped.hidden_dim, 2048);
+        assert!(!mapped.is_global); // Layer 0 is sliding_attention
+        assert_eq!(mapped.hidden_dim, 1536);
     }
 
     #[test]
@@ -4101,15 +4191,15 @@ mod tests {
         let config = Gemma4Config::gemma4_e2b();
         let mapper = Gemma4WeightMapper::new(config);
         let _summaries = mapper.create_block_summary_layers();
-        // E2B has no MoE layers, so no injection points by default
-        // But we can still create block summaries manually
-        let bs = BlockSummaryLayer::new_identity(2048, 4096);
-        assert_eq!(bs.hidden_dim, 2048);
+        // E2B has Block Summary injection at full_attention layers
+        let bs = BlockSummaryLayer::new_identity(1536, 512);
+        assert_eq!(bs.hidden_dim, 1536);
         assert_eq!(bs.bridge_weight, 0.1);
     }
 
     #[test]
     fn test_e4b_moe_weight_mapping() {
+        // E4B is dense on HuggingFace, but test MoE mapping with synthetic config
         let mut config = Gemma4Config::gemma4_e4b();
         config.num_experts = 4;
         config.hidden_dim = 64;
@@ -4124,7 +4214,7 @@ mod tests {
         let router = vec![0.01; ne * hd];
         let moe = mapper.map_moe_experts(&gate, &up, &down, &router);
         assert_eq!(moe.num_experts, 4);
-        assert_eq!(moe.top_k, 2);
+        assert_eq!(moe.top_k, 1); // E4B dense has top_k=1
         assert!(moe.frozen);
     }
 
@@ -4189,17 +4279,19 @@ mod tests {
     #[test]
     fn test_gemma4_12b_config() {
         let config = Gemma4Config::gemma4_12b();
+        // UNVERIFIED: placeholder config
         assert_eq!(config.hidden_dim, 4096);
         assert_eq!(config.num_layers, 48);
         assert_eq!(config.num_experts, 128);
         assert_eq!(config.top_k, 2);
-        assert_eq!(config.sliding_window, 4096);
+        assert_eq!(config.sliding_window, 1024);
         assert!(!config.moe_layers.is_empty());
     }
 
     #[test]
     fn test_gemma4_27b_config() {
         let config = Gemma4Config::gemma4_27b();
+        // UNVERIFIED: placeholder config
         assert_eq!(config.hidden_dim, 4608);
         assert_eq!(config.num_layers, 60);
     }
@@ -4209,7 +4301,6 @@ mod tests {
         let gemma = Gemma4Config::gemma4_12b();
         let bar_config = gemma.to_block_attnres_config();
         assert_eq!(bar_config.hidden_dim, 4096);
-        assert_eq!(bar_config.block_size, 4096);
         assert_eq!(bar_config.num_experts, 128);
         assert_eq!(bar_config.top_k, 2);
         assert!(bar_config.use_moe);
@@ -4270,7 +4361,7 @@ mod tests {
         for s in &summaries {
             assert_eq!(s.bridge_weight, 0.1); // Starts at 0.1
             assert_eq!(s.hidden_dim, 4096);
-            assert_eq!(s.block_size, 4096);
+            assert_eq!(s.block_size, 1024); // 12B sliding_window=1024
         }
     }
 

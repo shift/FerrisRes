@@ -79,7 +79,7 @@ enum Commands {
         /// Path to Gemma 4 safetensors file.
         #[arg(long)]
         model_path: String,
-        /// Model config: e2b, e4b, 12b, 27b.
+        /// Model config: e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b, llama3-8b, llama3-70b, mistral-7b, mixtral-8x7b, phi3-mini, qwen2-7b.
         #[arg(long, default_value = "e2b")]
         config: String,
         /// Sequence length for training.
@@ -130,7 +130,7 @@ enum Commands {
         /// Path to Gemma 4 safetensors file.
         #[arg(long)]
         model_path: String,
-        /// Model config: e2b, e4b, 12b, 27b.
+        /// Model config: e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b.
         #[arg(long, default_value = "e2b")]
         config: String,
         /// Text to evaluate on.
@@ -709,6 +709,10 @@ async fn cmd_distill(
 
         "27b-mm" => { info!(event = "model_config_selected", config = "27b-mm", "Using Gemma 4 27B Multimodal IT config (dense, 35 layers, ~10 GB)"); Gemma4Config::gemma4_27b_mm() }
 
+        "26b-a4b" => { info!(event = "model_config_selected", config = "26b-a4b", "Using Gemma 4 26B A4B config (MoE-128, 30 layers)"); Gemma4Config::gemma4_26b_a4b() }
+
+        "31b" => { info!(event = "model_config_selected", config = "31b", "Using Gemma 4 31B config (dense, 60 layers, ~62 GB)"); Gemma4Config::gemma4_31b() }
+
         "llama3-8b" => { info!(event = "model_config_selected", config = "llama3-8b", "Using LLaMA 3.1 8B config"); Gemma4Config::llama3_8b() }
 
         "llama3-70b" => { info!(event = "model_config_selected", config = "llama3-70b", "Using LLaMA 3.1 70B config"); Gemma4Config::llama3_70b() }
@@ -721,7 +725,7 @@ async fn cmd_distill(
 
         "qwen2-7b" => { info!(event = "model_config_selected", config = "qwen2-7b", "Using Qwen 2.5 7B config"); Gemma4Config::qwen2_7b() }
 
-        other => anyhow::bail!("Unknown config '{}'. Use: e2b, e4b, 12b, 27b, llama3-8b, llama3-70b, mistral-7b, mixtral-8x7b, phi3-mini, qwen2-7b", other),
+        other => anyhow::bail!("Unknown config '{}'. Use: e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b, 31b, llama3-8b, llama3-70b, mistral-7b, mixtral-8x7b, phi3-mini, qwen2-7b", other),
     };
 
     info!(event = "model_config", hidden = config.hidden_dim, layers = config.num_layers, heads = config.num_heads, vocab = config.vocab_size, "model config");
@@ -1454,7 +1458,9 @@ async fn cmd_evaluate(
         "e2b" => Gemma4Config::gemma4_e2b(),
         "e4b" => Gemma4Config::gemma4_e4b(),
         "27b-mm" => Gemma4Config::gemma4_27b_mm(),
-        _ => anyhow::bail!("Use e2b, e4b, or 27b-mm for evaluation"),
+        "26b-a4b" => Gemma4Config::gemma4_26b_a4b(),
+        "31b" => Gemma4Config::gemma4_31b(),
+        _ => anyhow::bail!("Use e2b, e4b, 27b-mm, 26b-a4b, or 31b for evaluation"),
     };
 
     let path = std::path::Path::new(&model_path);
