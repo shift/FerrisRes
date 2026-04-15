@@ -935,12 +935,26 @@ async fn cmd_distill(
 
     // Resume from checkpoint if specified
     if let Some(ref ckpt_path) = resume_path {
-        let ckpt = DistillationCheckpoint::load(std::path::Path::new(ckpt_path))
-            .map_err(|e| anyhow::anyhow!("Failed to load checkpoint: {}", e))?;
-        global_step = ckpt.global_step;
-        info!(event = "resuming_from_checkpoint", step = global_step, "resuming from checkpoint");
-        optimizers = ckpt.apply(&mut student);
-        info!(event = "checkpoint_restored", layers = student.block_summaries.len(), "restored block summary layers and optimizer state");
+        match DistillationCheckpoint::load(std::path::Path::new(ckpt_path)) {
+            Ok(ckpt) => {
+                global_step = ckpt.global_step;
+                info!(event = "resuming_from_checkpoint", step = global_step, layers = ckpt.layer_checkpoints.len(), "resuming from checkpoint");
+                if ckpt.layer_checkpoints.len() == student.block_summaries.len() {
+                    optimizers = ckpt.apply(&mut student);
+                    info!(event = "checkpoint_restored", layers = student.block_summaries.len(), "restored block summary layers and optimizer state");
+                } else {
+                    tracing::warn!(
+                        event = "checkpoint_layer_mismatch",
+                        checkpoint_layers = ckpt.layer_checkpoints.len(),
+                        expected_layers = student.block_summaries.len(),
+                        "Checkpoint has wrong number of layers — starting fresh"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(event = "checkpoint_load_failed", error = %e, "Failed to load checkpoint — starting fresh: {}", e);
+            }
+        }
     }
 
     info!("");
@@ -957,28 +971,83 @@ async fn cmd_distill(
     let first_injection = injection_points.first().copied().unwrap_or(0);
     let mut frozen_states_per_chunk: Vec<Vec<Vec<f32>>> = Vec::new();
 
-    // GPU-aware matmul helper: uses GPU if available, falls back to CPU
-    let gpu_matmul = |a: &[f32], b: &[f32], m: usize, k: usize, n: usize| -> Vec<f32> {
-        if let Some(ref gpu) = gpu_accel {
-            match gpu.gpu_matmul_cpu_b(a, b, m, k, n) {
-                Ok(result) => return result,
-                Err(e) => {
-                    tracing::warn!(event = "gpu_matmul_fallback", error = ?e, "GPU matmul failed, falling back to CPU");
+    // GPU-aware matmul helper: consults DispatchPlan, does tiled GPU when needed
+    // For GpuTiled: chunks the B matrix into column tiles that fit in max_buffer
+    let gpu_matmul = |a: &[f32], b: &[f32], m: usize, k: usize, n: usize, dispatch: &ferrisres::device::DispatchPlan| -> Vec<f32> {
+        match dispatch.should_gpu_matmul(m as u64, k as u64, n as u64) {
+            ferrisres::device::OpTarget::Cpu => gemma_mapper::matmul(a, b, m, k, n),
+            ferrisres::device::OpTarget::Gpu => {
+                if let Some(ref gpu) = gpu_accel {
+                    match gpu.gpu_matmul_cpu_b(a, b, m, k, n) {
+                        Ok(result) => return result,
+                        Err(e) => {
+                            tracing::warn!(event = "gpu_matmul_fallback", error = ?e, m, k, n, "GPU matmul failed, falling back to CPU");
+                        }
+                    }
                 }
+                gemma_mapper::matmul(a, b, m, k, n)
+            }
+            ferrisres::device::OpTarget::GpuTiled => {
+                // B is too large for a single GPU buffer. Chunk it.
+                // C[m×n] = A[m×k] × B[k×n], process B in column tiles of tile_n columns.
+                if let Some(ref gpu) = gpu_accel {
+                    let max_cols = (dispatch.max_buffer_bytes as usize / (k * 4)).max(1);
+                    let tile_n = max_cols.min(n);
+                    if tile_n == n {
+                        // Actually fits after all — just do a regular GPU matmul
+                        match gpu.gpu_matmul_cpu_b(a, b, m, k, n) {
+                            Ok(result) => return result,
+                            Err(e) => {
+                                tracing::warn!(event = "gpu_matmul_fallback", error = ?e, "GPU tiled matmul fallback");
+                                return gemma_mapper::matmul(a, b, m, k, n);
+                            }
+                        }
+                    }
+                    // Tiled: process tile_n columns at a time
+                    let mut result = vec![0.0f32; m * n];
+                    let num_tiles = (n + tile_n - 1) / tile_n;
+                    for tile_idx in 0..num_tiles {
+                        let col_start = tile_idx * tile_n;
+                        let col_end = (col_start + tile_n).min(n);
+                        let cur_n = col_end - col_start;
+                        // Extract B tile: rows [0..k], cols [col_start..col_end]
+                        let mut b_tile = vec![0.0f32; k * cur_n];
+                        for r in 0..k {
+                            for c in 0..cur_n {
+                                b_tile[r * cur_n + c] = b[r * n + col_start + c];
+                            }
+                        }
+                        match gpu.gpu_matmul_cpu_b(a, &b_tile, m, k, cur_n) {
+                            Ok(tile_result) => {
+                                // Copy tile into result
+                                for t in 0..m {
+                                    for c in 0..cur_n {
+                                        result[t * n + col_start + c] = tile_result[t * cur_n + c];
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(event = "gpu_tile_fallback", tile = tile_idx, error = ?e, "GPU tile failed, falling entire matmul to CPU");
+                                return gemma_mapper::matmul(a, b, m, k, n);
+                            }
+                        }
+                    }
+                    return result;
+                }
+                gemma_mapper::matmul(a, b, m, k, n)
             }
         }
-        gemma_mapper::matmul(a, b, m, k, n)
     };
 
     // GPU-aware SwiGLU FFN
     let swiglu_ffn_gpu = |input: &[f32], gate: &[f32], up: &[f32], down: &[f32], hd: usize, id: usize| -> Vec<f32> {
         let seq = input.len() / hd;
-        let gated = gpu_matmul(input, gate, seq, hd, id);
+        let gated = gpu_matmul(input, gate, seq, hd, id, &dispatch);
         let gated: Vec<f32> = gated.iter().map(|&x| x / (1.0 + (-x).exp())).collect();
-        let upped = gpu_matmul(input, up, seq, hd, id);
+        let upped = gpu_matmul(input, up, seq, hd, id, &dispatch);
         let mut combined = vec![0.0f32; seq * id];
         for i in 0..combined.len() { combined[i] = gated[i] * upped[i]; }
-        gpu_matmul(&combined, down, seq, id, hd)
+        gpu_matmul(&combined, down, seq, id, hd, &dispatch)
     };
 
     info!(event = "precompute_frozen_states", chunks = teacher_logits_chunks.len(), first_injection = first_injection, dispatch = ?dispatch.attn_qkv_dispatch, "precomputing frozen base model hidden states");
@@ -1015,9 +1084,9 @@ async fn cmd_distill(
                 let normed = gemma_mapper::rms_norm(&hidden, &layer.attn.input_norm, hd, 1e-6);
                 let q_dim = config_ref.num_heads * config_ref.head_dim;
                 let kv_dim = config_ref.num_kv_heads * config_ref.head_dim;
-                let q = gpu_matmul(&normed, &layer.attn.q_proj, seq, hd, q_dim);
-                let k = gpu_matmul(&normed, &layer.attn.k_proj, seq, hd, kv_dim);
-                let v = gpu_matmul(&normed, &layer.attn.v_proj, seq, hd, kv_dim);
+                let q = gpu_matmul(&normed, &layer.attn.q_proj, seq, hd, q_dim, &dispatch);
+                let k = gpu_matmul(&normed, &layer.attn.k_proj, seq, hd, kv_dim, &dispatch);
+                let v = gpu_matmul(&normed, &layer.attn.v_proj, seq, hd, kv_dim, &dispatch);
                 let mut q = q; let mut k = k;
                 gemma_mapper::apply_rope(&mut q, seq, config_ref.num_heads, config_ref.head_dim, 0);
                 gemma_mapper::apply_rope_gqa(&mut k, seq, config_ref.num_kv_heads, config_ref.head_dim, 0);
@@ -1049,7 +1118,7 @@ async fn cmd_distill(
                         }
                     }
                 }
-                let attn_proj = gpu_matmul(&attn_out, &layer.attn.o_proj, seq, q_dim, hd);
+                let attn_proj = gpu_matmul(&attn_out, &layer.attn.o_proj, seq, q_dim, hd, &dispatch);
                 for i in 0..hidden.len() { hidden[i] = residual[i] + attn_proj[i]; }
                 let residual2 = hidden.clone();
                 let normed2 = gemma_mapper::rms_norm(&hidden, &layer.attn.post_attn_norm, hd, 1e-6);
@@ -1175,7 +1244,7 @@ async fn cmd_distill(
                 }
             }
             // d_hidden = d_logits [seq × vs] × lm_head_t [vs × hd] = [seq × hd]
-            gpu_matmul(&d_logits, &lm_head_t, actual_seq, vs, config.hidden_dim)
+            gpu_matmul(&d_logits, &lm_head_t, actual_seq, vs, config.hidden_dim, &dispatch)
         };
 
         // Backprop through Block Summary layers using cached frozen hidden states

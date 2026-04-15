@@ -2970,58 +2970,101 @@ impl DistillationCheckpoint {
     }
 
     /// Load checkpoint from a binary file.
+    /// Returns an error if the file is corrupt, truncated, or contains
+    /// implausibly large param counts (which would cause capacity overflow).
     pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
         use std::io::Read;
         let mut buf = Vec::new();
         std::fs::File::open(path)?.read_to_end(&mut buf)?;
+        let buf_len = buf.len();
         let mut pos = 0usize;
 
-        let read_u32 = |buf: &[u8], pos: &mut usize| -> u32 {
+        // Sanity limit: no single param vector should exceed 1 billion floats (~4GB)
+        const MAX_PARAM_COUNT: usize = 1_000_000_000;
+
+        let read_u32 = |buf: &[u8], pos: &mut usize, buf_len: usize| -> std::io::Result<u32> {
+            if *pos + 4 > buf_len {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof,
+                    format!("Unexpected EOF reading u32 at offset {} (buf len {})", *pos, buf_len)));
+            }
             let v = u32::from_le_bytes(buf[*pos..*pos+4].try_into().unwrap());
-            *pos += 4; v
+            *pos += 4; Ok(v)
         };
-        let read_u64 = |buf: &[u8], pos: &mut usize| -> u64 {
+        let read_u64 = |buf: &[u8], pos: &mut usize, buf_len: usize| -> std::io::Result<u64> {
+            if *pos + 8 > buf_len {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof,
+                    format!("Unexpected EOF reading u64 at offset {} (buf len {})", *pos, buf_len)));
+            }
             let v = u64::from_le_bytes(buf[*pos..*pos+8].try_into().unwrap());
-            *pos += 8; v
+            *pos += 8; Ok(v)
         };
-        let read_f32 = |buf: &[u8], pos: &mut usize| -> f32 {
+        let read_f32 = |buf: &[u8], pos: &mut usize, buf_len: usize| -> std::io::Result<f32> {
+            if *pos + 4 > buf_len {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof,
+                    format!("Unexpected EOF reading f32 at offset {} (buf len {})", *pos, buf_len)));
+            }
             let v = f32::from_le_bytes(buf[*pos..*pos+4].try_into().unwrap());
-            *pos += 4; v
+            *pos += 4; Ok(v)
         };
-        let read_vec_f32 = |buf: &[u8], pos: &mut usize, n: usize| -> Vec<f32> {
+        let read_vec_f32 = |buf: &[u8], pos: &mut usize, n: usize, buf_len: usize| -> std::io::Result<Vec<f32>> {
+            let needed = n.checked_mul(4).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData,
+                    format!("Param count {} overflows when multiplied by 4 (byte size)", n))
+            })?;
+            if n > MAX_PARAM_COUNT {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                    format!("Param count {} exceeds sanity limit {} — corrupt checkpoint?", n, MAX_PARAM_COUNT)));
+            }
+            if *pos + needed > buf_len {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof,
+                    format!("Unexpected EOF reading {} f32s at offset {} (buf len {}, need {} bytes)",
+                            n, *pos, buf_len, needed)));
+            }
             let mut v = Vec::with_capacity(n);
-            for _ in 0..n { v.push(read_f32(buf, pos)); }
-            v
+            for _ in 0..n { v.push(f32::from_le_bytes(buf[*pos..*pos+4].try_into().unwrap())); *pos += 4; }
+            Ok(v)
         };
 
-        let version = read_u32(&buf, &mut pos);
+        let version = read_u32(&buf, &mut pos, buf_len)?;
         if version != Self::FORMAT_VERSION {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
                 format!("Checkpoint version {} does not match expected {}", version, Self::FORMAT_VERSION)));
         }
 
-        let global_step = read_u64(&buf, &mut pos) as usize;
-        let num_layers = read_u32(&buf, &mut pos) as usize;
+        let global_step = read_u64(&buf, &mut pos, buf_len)? as usize;
+        let num_layers = read_u32(&buf, &mut pos, buf_len)? as usize;
+
+        // Sanity: num_layers should be reasonable (< 1000)
+        if num_layers > 1000 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                format!("num_layers {} exceeds sanity limit 1000 — corrupt checkpoint?", num_layers)));
+        }
 
         let mut layer_checkpoints = Vec::with_capacity(num_layers);
-        for _ in 0..num_layers {
-            let pc = read_u64(&buf, &mut pos) as usize;
-            let params = read_vec_f32(&buf, &mut pos, pc);
-            let adam_m = read_vec_f32(&buf, &mut pos, pc);
-            let adam_v = read_vec_f32(&buf, &mut pos, pc);
-            let adam_t = read_u64(&buf, &mut pos) as usize;
-            let bridge_weight = read_f32(&buf, &mut pos);
-            let bw_m = read_f32(&buf, &mut pos);
-            let bw_v = read_f32(&buf, &mut pos);
-            let nwc = read_u64(&buf, &mut pos) as usize;
-            let norm_weight = read_vec_f32(&buf, &mut pos, nwc);
-            let norm_bias = read_vec_f32(&buf, &mut pos, nwc);
+        for _layer_i in 0..num_layers {
+            let pc = read_u64(&buf, &mut pos, buf_len)? as usize;
+            let params = read_vec_f32(&buf, &mut pos, pc, buf_len)?;
+            let adam_m = read_vec_f32(&buf, &mut pos, pc, buf_len)?;
+            let adam_v = read_vec_f32(&buf, &mut pos, pc, buf_len)?;
+            let adam_t = read_u64(&buf, &mut pos, buf_len)? as usize;
+            let bridge_weight = read_f32(&buf, &mut pos, buf_len)?;
+            let bw_m = read_f32(&buf, &mut pos, buf_len)?;
+            let bw_v = read_f32(&buf, &mut pos, buf_len)?;
+            let nwc = read_u64(&buf, &mut pos, buf_len)? as usize;
+            let norm_weight = read_vec_f32(&buf, &mut pos, nwc, buf_len)?;
+            let norm_bias = read_vec_f32(&buf, &mut pos, nwc, buf_len)?;
 
             layer_checkpoints.push(BlockSummaryCheckpoint {
                 params, adam_m, adam_v, adam_t,
                 bridge_weight, bw_m, bw_v,
                 norm_weight, norm_bias,
             });
+        }
+
+        // Check for trailing data (mild warning, not an error)
+        if pos < buf_len {
+            tracing::info!(event = "checkpoint_trailing_data", bytes_remaining = buf_len - pos,
+                           "Checkpoint has {} bytes of trailing data", buf_len - pos);
         }
 
         Ok(Self { version, global_step, layer_checkpoints })
