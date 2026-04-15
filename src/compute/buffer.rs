@@ -56,8 +56,8 @@ impl GpuBuffer {
         enc.copy_buffer_to_buffer(&staging, 0, &dest, 0, size as u64);
         queue.submit(std::iter::once(enc.finish()));
 
-        // Poll to free staging buffer immediately
-        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        // Drop staging — freed when GPU processes the copy
+        drop(staging);
 
         Ok(Self { buffer: dest, size })
     }
