@@ -1362,6 +1362,53 @@ impl MappedGemma4Model {
         Self::build_from_getter_mm(config, get)
     }
 
+    /// Skeleton model: only embed_tokens, final_norm, lm_head, and per-layer norms.
+    /// Projection weights (q/k/v/o/gate/up/down) are empty Vecs — they'll live on GPU.
+    /// Saves ~3.3GB RAM vs full model. Use when system RAM is tight.
+    pub fn from_mmap_mm_skeleton(
+        config: Gemma4Config,
+        mmaped: &crate::model::safetensors::MmapedSafetensors,
+    ) -> Result<Self, String> {
+        let get = |name: &str| -> Option<Vec<f32>> {
+            mmaped.get_tensor_f32(name).ok()
+        };
+
+        let embed_tokens = get(Gemma4MmTensorNames::embed_tokens())
+            .ok_or_else(|| "Missing embed_tokens".to_string())?;
+        let lm_head = get(Gemma4MmTensorNames::lm_head())
+            .unwrap_or_else(|| embed_tokens.clone());
+        let final_norm = get(Gemma4MmTensorNames::final_norm())
+            .ok_or_else(|| "Missing final_norm".to_string())?;
+
+        // Load only norms per layer (tiny ~6KB each), skip projections
+        let mut layers = Vec::with_capacity(config.num_layers);
+        for layer_idx in 0..config.num_layers {
+            let inorm = get(&Gemma4MmTensorNames::input_norm(layer_idx))
+                .ok_or_else(|| format!("Missing input_norm for layer {}", layer_idx))?;
+            let pnorm = get(&Gemma4MmTensorNames::post_attn_norm(layer_idx))
+                .ok_or_else(|| format!("Missing post_attn_norm for layer {}", layer_idx))?;
+
+            let attn = Gemma4AttnWeights {
+                q_proj: Vec::new(), // Empty — GPU has these
+                k_proj: Vec::new(),
+                v_proj: Vec::new(),
+                o_proj: Vec::new(),
+                input_norm: inorm,
+                post_attn_norm: pnorm,
+            };
+
+            let ffn = Gemma4FfnWeights::Dense {
+                gate_proj: Vec::new(),
+                up_proj: Vec::new(),
+                down_proj: Vec::new(),
+            };
+
+            layers.push(Gemma4LayerWeights { attn, ffn });
+        }
+
+        Ok(Self { config, embed_tokens, layers, final_norm, lm_head })
+    }
+
     /// Load from a safetensors LoadedWeights object.
     /// Uses E2B/E4B/12B/27B config to know the naming convention.
     pub fn from_loaded_weights(
