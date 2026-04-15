@@ -2,7 +2,7 @@
 
 FerrisRes is a Rust-native AI inference and training engine built around **Block AttnRes** — a novel linear-time transformer architecture that replaces the quadratic attention bottleneck of standard transformers. It runs on any GPU or iGPU via [wgpu](https://github.com/gfx-rs/wgpu) (Vulkan, Metal, DX12, WebGPU), adapts automatically to the hardware it finds, and is written entirely in safe Rust with no Python dependency.
 
-> ⚠️ **v0.2.1 — near-production grade, not yet 1.0.** FerrisRes has 843 passing tests, a full self-improvement loop, a verified Gemma 4 distillation pipeline, five output modalities (vision, speech, tactile, robotics, scientific), and a 4-layer security proxy (FerrisRes Armor). The Block AttnRes architecture is losslessly distilled from established models but still benefits from further field testing at scale. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0. Suitable for research, high-performance prototyping, and early-adopter production workloads.
+> ⚠️ **v0.2.1 — near-production grade, not yet 1.0.** FerrisRes has 951 passing tests, a full self-improvement loop, a verified Gemma 4 distillation pipeline (tested on real 27B model with Intel HD 530 iGPU), five output modalities (vision, speech, tactile, robotics, scientific), a 4-layer security proxy (FerrisRes Armor), and profile-driven GPU dispatch that automatically adapts from Intel iGPUs to H100s. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0. Suitable for research, high-performance prototyping, and early-adopter production workloads.
 
 ---
 
@@ -112,6 +112,9 @@ The `TokenGenerator` orchestrates both phases and exposes `generate_stream` for 
 - **CPU/Async gradient offload** — CPU-side accumulation and async GPU→CPU transfer for iGPUs
 - **Tile-based gradient accumulation** — split batch into GPU-sized tiles, accumulate partials
 - **Partial backpropagation** — layer freeze, selective backward, gradual unfreezing, LoRA integration
+- **Profile-driven dispatch** — `DispatchPlan` computes per-op CPU/GPU decisions from model size + GPU limits. No manual `--gpu` flag.
+- **Intel iGPU detection** — Gen9/Gen11 iGPUs that misreport buffer limits are auto-detected and capped.
+- **GPU matmul auto-tiling** — large weight matrices (LM head) are automatically chunked into GPU-buffer-sized column tiles.
 
 ### Tokenizers
 
@@ -159,12 +162,22 @@ The `TokenGenerator` orchestrates both phases and exposes `generate_stream` for 
 
 ### Hardware Adaptation
 
+FerrisRes uses a **profile-driven dispatch** system. At startup, `DispatchPlan` queries the model size, GPU VRAM, and max buffer size to compute per-op CPU/GPU decisions. No manual `--gpu` flag needed.
+
 | Profile | VRAM | Default batch | KV cache |
 |---|---|---|---|
 | `Integrated` | shared / iGPU | 1 | 2 GB |
 | `LowEnd` | < 4 GB | 2 | 4 GB |
 | `MidRange` | 4–8 GB | 4 | 8 GB |
 | `HighEnd` | > 8 GB | 8 | 16 GB |
+
+**Per-op dispatch** — small matmuls (QKV, O, FFN) go to GPU even on iGPUs; large ops (LM head) auto-tile into GPU-buffer-sized chunks. Intel Gen9/Gen11 iGPUs that misreport their buffer limits are detected and capped automatically.
+
+```
+DispatchPlan: profile=LowEnd model=10.2GB vram=1.1GB max_buf=268MB
+  embed=CPU qkv=GPU attn=CPU o=GPU ffn=GPU lm_head=GPU*T grad=CPU
+  batch=2 per_sample=1.0MB gpu_available=true
+```
 
 Auto-detects at startup. Override via `FERRIS_DEVICE_PROFILE=integrated cargo run`.
 
@@ -188,14 +201,13 @@ cargo run -- train --epochs 3 --lora-rank 8 --data training.txt
 # Benchmark
 cargo run -- benchmark --iterations 100 --hidden-dim 512
 
-# Distillation (full pipeline)
+# Distillation (full pipeline — GPU auto-detected)
 cargo run -- distill \
   --model-path ./model.safetensors \
   --config 27b-mm \
   --steps 10000 \
   --tokenizer ./tokenizer.json \
   --data training_data.txt \
-  --gpu \
   --converge 0.001 \
   --converge-patience 100
 
@@ -206,14 +218,8 @@ cargo run -- distill \
   --steps 5000 \
   --resume distilled_model.bin.checkpoint.bin
 ```
-cargo run -- infer --prompt "Long document..." --yarn-scale 4.0
 
-# Training with LoRA
-cargo run -- train --epochs 3 --lora-rank 8 --data training.txt
-
-# Benchmark
-cargo run -- benchmark --iterations 100 --hidden-dim 512
-```
+---
 
 ---
 
@@ -225,7 +231,7 @@ Add FerrisRes to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ferrisres = { git = "https://github.com/shift/FerrisRes", tag = "v0.2.0" }
+ferrisres = { git = "https://github.com/shift/FerrisRes", tag = "v0.2.1" }
 ```
 
 ### Minimal inference example
@@ -336,8 +342,10 @@ process that reduces attention from O(n²) to O(n) while preserving 95–99% of 
 
 **Verified on real hardware**: Successfully distilled the 9.6 GB Gemma 4 27B
 Multimodal IT model (2.66B params, 35 layers, GQA 8Q/1KV heads) on a
-32 GB machine with Intel HD 530 iGPU. Loss decreased from 22.05 → 21.56 over
-10 steps with cached frozen states and `matrixmultiply`-accelerated CPU GEMM.
+32 GB machine with Intel HD 530 iGPU. Loss decreased from 21.57 → 21.34 over
+10 steps with real TinyStories training data, cached frozen states, profile-driven
+GPU dispatch with auto-tiled LM head (13 tiles × 21845 columns), and
+`matrixmultiply`-accelerated CPU GEMM.
 
 ```bash
 # Full distillation with real data and auto-convergence
@@ -348,7 +356,6 @@ cargo run -- distill \
   --seq-len 32 \
   --tokenizer ./tokenizer.json \
   --data training_data.txt \
-  --gpu \
   --converge 0.001 \
   --converge-patience 100 \
   --checkpoint-every 100
@@ -358,8 +365,7 @@ cargo run -- distill \
   --model-path ./model.safetensors \
   --config 27b-mm \
   --steps 1000 \
-  --resume distilled_model.bin.checkpoint.bin \
-  --gpu
+  --resume distilled_model.bin.checkpoint.bin
 
 # Smaller model for testing
 cargo run -- distill \
@@ -370,12 +376,16 @@ cargo run -- distill \
 
 ### Key distillation features
 
+- **Profile-driven dispatch** — `DispatchPlan` queries model size + GPU limits to decide per-op CPU/GPU routing. No `--gpu` flag needed.
+- **GPU matmul auto-tiling** — weight matrices that exceed GPU buffer limits (e.g., LM head 1.6GB on 256MB iGPU) are automatically chunked into column tiles.
+- **Intel iGPU detection** — Gen9/Gen11 iGPUs that misreport `max_buffer_size` are detected and capped at the real limit.
 - **Cached frozen states** — base model weights don't change, so per-layer hidden states are precomputed once. Training steps only run block summary blending + LM head.
 - **`matrixmultiply` GEMM** — cache-tiled SIMD CPU matmul (~5–10× faster than naive loops).
 - **Full Adam state persistence** — checkpoints save optimizer moments (m, v, t) so resume is seamless.
 - **Mid-training checkpointing** — `--checkpoint-every N` saves progress incrementally.
 - **Auto-convergence** — `--converge 0.001 --converge-patience 100` stops training when loss plateaus.
 - **Structured logging** — all log lines use `event=` fields for machine parsing.
+- **Checkpoint corruption resilience** — corrupt/empty checkpoint files are handled gracefully (warn + start fresh).
 
 See [docs/distillation.md](docs/distillation.md) for the full guide.
 
@@ -417,7 +427,7 @@ FerrisRes requires a working Vulkan driver. On Linux the recommended path is thr
 ```bash
 nix develop          # enters the dev shell with Rust + Vulkan layers
 cargo build
-cargo test            # 759 tests
+cargo test            # 951 tests
 cargo bench
 ```
 
@@ -443,7 +453,10 @@ src/
 │   ├── distributed.rs    # Tensor/pipeline parallelism, weight sharding
 │   ├── hardware.rs       # Cloud GPU, ANE/NPU, RDMA/DirectGPU
 │   └── async_pipeline.rs # FA3 double-buffer dispatch
-├── device/               # GPU detection + DeviceProfile + hardware tuning
+├── device/
+│   ├── profile.rs        # DeviceProfile (Integrated/LowEnd/MidRange/HighEnd)
+│   ├── capability.rs     # GPU capability detection
+│   └── dispatch.rs       # DispatchPlan: model-size-aware per-op CPU/GPU decisions
 ├── inference/
 │   ├── generator.rs      # TokenGenerator (generate/stream/rag/tools)
 │   ├── unified_generator # UnifiedTokenGenerator (AnyModel)
@@ -477,7 +490,7 @@ src/
 │   ├── standard_transformer.rs  # O(n²) compatibility mode
 │   ├── dispatcher.rs     # Architecture auto-detection (AnyModel)
 │   ├── gemma_mapper.rs   # Gemma 4 weight mapper, GQA, distillation training
-│   ├── gpu_forward.rs     # GPU-accelerated forward pass (DeviceProfile-aware)
+│   ├── gpu_forward.rs     # GPU-accelerated forward pass with auto-tiling + Intel iGPU detection
 │   ├── safetensors.rs     # Safetensors + MmapedSafetensors loader
 │   ├── gguf.rs           # GGUF v2/v3 loader
 │   ├── tokenizer.rs      # BPE + DomainVocabulary
@@ -526,8 +539,10 @@ src/
 | 12 | ✅ Done | v0.2.0: benchmarking, API stabilisation, quickstart/architecture/deployment docs |
 | 13 | ✅ Done | Output modalities: VisionHead, SpeechHead, VideoHead, TTS stream, VLA ActionHead, Scientific (SMILES/Mesh/GCode), TactileHead |
 | 14 | ✅ Done | FerrisRes Armor: L0 regex+bloom, L1 neural scanner, L2 RepE probe, L3 sanitizer, GPU-accelerated distillation |
+| 15 | ✅ Done | Profile-driven dispatch: `DispatchPlan` per-op CPU/GPU, Intel iGPU detection, auto-tiling, `--gpu` flag removed |
+| 16 | ✅ Done | Real distillation verified: Gemma 4 27B on Intel HD 530, 27M tokens, checkpoint resilience |
 
-**All tasks complete — 843 tests passing.**
+**All tasks complete — 951 tests passing.**
 
 See [ROADMAP.md](ROADMAP.md) for full technical details.
 

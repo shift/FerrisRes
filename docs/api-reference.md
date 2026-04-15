@@ -122,7 +122,7 @@ Distill options:
   --seq-len <N>          Sequence length
   --learning-rate <F>    Learning rate
   --temperature <F>      Distillation temperature
-  --gpu                  Enable GPU acceleration
+  nable GPU acceleration
   --resume <PATH>        Resume from checkpoint
 
 Serve options:

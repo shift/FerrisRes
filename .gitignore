@@ -23,3 +23,4 @@ papers_research/raw/*.pdf
 *.block_summary_*.bin
 *.checkpoint.bin
 *.loss_curve.csv
+training_data.txt

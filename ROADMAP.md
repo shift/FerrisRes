@@ -244,5 +244,9 @@
 | 10 | ✅ Done | Gemma 4 distillation pipeline, GPU forward pass, mmap loader, GQA, teacher-student memory optimization |
 | 11 | ✅ Done | Self-improvement loop: WASM sandbox, LSP-as-Oracle, Mirror Test, Speculative Block Decoding, Concept Memory, host tools |
 | 12 | ✅ Done | v0.2.0: Block AttnRes edge-case benchmarks, API stabilisation, quickstart/architecture/deployment/API-reference docs |
+| 13 | ✅ Done | Output modalities: VisionHead, SpeechHead, VideoHead, TTS stream, VLA ActionHead, Scientific (SMILES/Mesh/GCode), TactileHead |
+| 14 | ✅ Done | FerrisRes Armor: L0 regex+bloom, L1 neural scanner, L2 RepE probe, L3 sanitizer, GPU-accelerated distillation |
+| 15 | ✅ Done | Profile-driven dispatch: DispatchPlan per-op CPU/GPU, Intel iGPU detection, auto-tiling, --gpu flag removed |
+| 16 | ✅ Done | Real distillation verified: Gemma 4 27B on Intel HD 530, 27M tokens, checkpoint resilience |
 
-**All tasks complete — 759 tests passing, 0 failures.**
+**All tasks complete — 951 tests passing, 0 failures.**

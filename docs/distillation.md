@@ -290,7 +290,7 @@ Options:
   --converge <FRAC>       Auto-stop when loss doesn't improve by this fraction
                           for --converge-patience steps. 0 = disabled [default: 0]
   --converge-patience <N> Steps with no improvement before stopping [default: 50]
-  --gpu                   Use GPU for matmul acceleration
+  se GPU for matmul acceleration
 ```
 
 ### `evaluate`
@@ -598,7 +598,7 @@ cargo run -- distill \
   --steps 10000 \
   --converge 0.001 \
   --converge-patience 100 \
-  --gpu
+  
 ```
 
 This stops when the KL loss hasn't improved by 0.1% for 100 consecutive
@@ -838,13 +838,13 @@ learning rate or increase temperature.
 
 ## GPU Acceleration
 
-FerrisRes supports GPU-accelerated distillation via `--gpu`:
+FerrisRes automatically detects and uses the GPU when available. No `--gpu` flag is needed.
 
 ```bash
-cargo run -- distill --model-path ./model.safetensors --config 27b-mm --gpu --steps 100
+cargo run -- distill --model-path ./model.safetensors --config 27b-mm --steps 100
 ```
 
-The GPU forward pass uses a **DeviceProfile-aware JIT strategy**:
+The GPU forward pass uses a **profile-driven dispatch** system:
 - Queries `device.limits().max_buffer_size` at startup
 - Per-layer weights are uploaded to GPU just-in-time for each matmul (~12ms/layer on PCIe 3.0)
 - Large tensors (embed_tokens, lm_head) stay on CPU
