@@ -737,15 +737,36 @@ async fn cmd_distill(
         anyhow::bail!("Model file not found: {}", model_path);
     }
 
-    let load_model = |p: &std::path::Path| -> Result<gemma_mapper::MappedGemma4Model, String> {
-        match model_format.as_str() {
-            "gguf" => load_gemma4_model_gguf(p, config.clone()),
-            _ => load_gemma4_model_mmap(p, config.clone()),
-        }
+    // Check RAM BEFORE loading — decide skeleton vs full
+    let model_file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let available_ram = ferrisres::device::dispatch::DispatchPlan::available_ram_bytes();
+    // Layer weights are ~48% of model file. Need available RAM > that + overhead.
+    let layer_weights_ram = (model_file_bytes as f64 * 0.48) as u64;
+    let use_skeleton = available_ram > 0 && available_ram < layer_weights_ram * 3;
+
+    let model1 = if use_skeleton {
+        info!(
+            event = "skeleton_mode",
+            available_ram_gb = available_ram as f64 / 1e9,
+            model_gb = model_file_bytes as f64 / 1e9,
+            "Loading skeleton model (projections skipped, GPU streaming later)"
+        );
+        // Open mmap for skeleton loading
+        let mmaped = ferrisres::model::safetensors::MmapedSafetensors::open(path)
+            .map_err(|e| anyhow::anyhow!("Failed to mmap model: {}", e))?;
+        gemma_mapper::MappedGemma4Model::from_mmap_mm_skeleton(config.clone(), &mmaped)
+            .map_err(|e| anyhow::anyhow!("Failed to load skeleton model: {}", e))?
+    } else {
+        let load_model = |p: &std::path::Path| -> Result<gemma_mapper::MappedGemma4Model, String> {
+            match model_format.as_str() {
+                "gguf" => load_gemma4_model_gguf(p, config.clone()),
+                _ => load_gemma4_model_mmap(p, config.clone()),
+            }
+        };
+        load_model(path)
+            .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?
     };
 
-    let model1 = load_model(path)
-        .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
     let total_params = model1.embed_tokens.len() + model1.layers.iter().map(|l| {
             let attn = l.attn.q_proj.len() + l.attn.k_proj.len() + l.attn.v_proj.len() + l.attn.o_proj.len();
             let ffn = match &l.ffn {
@@ -758,7 +779,7 @@ async fn cmd_distill(
             };
             attn + ffn
         }).sum::<usize>() + model1.final_norm.len() + model1.lm_head.len();
-    info!(event = "model_loaded", layers = model1.layers.len(), params = total_params, "model loaded");
+    info!(event = "model_loaded", layers = model1.layers.len(), params = total_params, skeleton = use_skeleton, "model loaded");
 
     // Create teacher (frozen) — compute logits, then free weights
     let teacher = Gemma4Teacher::new(model1);
@@ -796,7 +817,6 @@ async fn cmd_distill(
     // === DispatchPlan: model-size-aware CPU/GPU delegation ===
     // No more --gpu flag. We detect GPU, measure model size, and compute
     // per-op dispatch decisions.
-    let model_file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     info!(event = "model_file_size", bytes = model_file_bytes, size_gb = format!("{:.2}", model_file_bytes as f64 / 1e9));
 
     let gpu_accel: Option<ferrisres::model::gpu_forward::GpuMatmulAccelerator> =
@@ -845,30 +865,14 @@ async fn cmd_distill(
         // GPU-accelerated teacher forward
         let accel = gpu_accel.as_ref().unwrap();
 
-    // Check if we can use resident mode (weights stay on GPU)
-        // Two paths: (1) enough RAM -> upload from MappedGemma4Model, (2) tight RAM -> stream from mmap
+        // Determine upload strategy: skeleton model MUST stream, full model can upload directly
         let weight_cache = if dispatch.resident_mode {
-            let available_ram = ferrisres::device::dispatch::DispatchPlan::available_ram_bytes();
-            let model_ram_estimate = model_file_bytes * 3;
-            let can_hold_in_ram = available_ram > model_ram_estimate || available_ram == 0;
-
-            if can_hold_in_ram {
-                info!(event = "resident_mode", "Uploading weights to GPU from loaded model (resident mode)");
-                match accel.upload_weights_resident(teacher.model()) {
-                    Ok(cache) => Some(cache),
-                    Err(e) => {
-                        tracing::warn!(event = "resident_upload_failed", error = ?e, "Resident upload failed, falling back to JIT");
-                        None
-                    }
-                }
-            } else {
+            if use_skeleton {
+                // Skeleton model: projection weights aren't in RAM, must stream from mmap
                 info!(
                     event = "resident_streaming_mode",
-                    available_ram_gb = available_ram as f64 / 1e9,
-                    model_gb = model_file_bytes as f64 / 1e9,
-                    "Streaming weights from mmap to GPU (low RAM)"
+                    "Streaming weights from mmap to GPU (skeleton model, low RAM)"
                 );
-                // Re-open mmap for streaming (file already on disk, mmap is cheap)
                 match ferrisres::model::safetensors::MmapedSafetensors::open(path) {
                     Ok(mmap) => match accel.upload_weights_resident_streaming(
                         &teacher.model().config,
@@ -882,6 +886,16 @@ async fn cmd_distill(
                     },
                     Err(e) => {
                         tracing::warn!(event = "mmap_reopen_failed", error = ?e, "Re-opening mmap failed, falling back to JIT");
+                        None
+                    }
+                }
+            } else {
+                // Full model in RAM: upload directly
+                info!(event = "resident_mode", "Uploading weights to GPU from loaded model (resident mode)");
+                match accel.upload_weights_resident(teacher.model()) {
+                    Ok(cache) => Some(cache),
+                    Err(e) => {
+                        tracing::warn!(event = "resident_upload_failed", error = ?e, "Resident upload failed, falling back to JIT");
                         None
                     }
                 }
@@ -909,6 +923,8 @@ async fn cmd_distill(
             let logits = if let Some(cache) = &weight_cache {
                 accel.forward_resident(cache, teacher.model(), &chunk)
                     .map_err(|e| anyhow::anyhow!("GPU resident forward failed: {:?}", e))?
+            } else if use_skeleton {
+                anyhow::bail!("Skeleton model requires GPU resident weights but upload failed. Not enough RAM for JIT fallback.");
             } else {
                 accel.forward(teacher.model(), &chunk)
                     .map_err(|e| anyhow::anyhow!("GPU forward failed: {:?}", e))?
@@ -931,6 +947,8 @@ async fn cmd_distill(
                 "teacher forward"
             );
         }
+    } else if use_skeleton {
+        anyhow::bail!("Skeleton model requires GPU for layer weights but no GPU available. Increase system RAM or use a GPU machine.");
     } else {
         // CPU teacher forward
         let total_chunks = num_chunks.min(steps);
@@ -968,7 +986,15 @@ async fn cmd_distill(
     info!(event = "teacher_freed", "teacher weights freed");
 
     // Re-load model for student (single copy in memory now)
-    let model2 = load_model(path)
+    // Always load full model — teacher was dropped, RAM is available.
+    // Skeleton model is only for the teacher (pre-compute) phase.
+    let load_model_full = |p: &std::path::Path| -> Result<gemma_mapper::MappedGemma4Model, String> {
+        match model_format.as_str() {
+            "gguf" => load_gemma4_model_gguf(p, config.clone()),
+            _ => load_gemma4_model_mmap(p, config.clone()),
+        }
+    };
+    let model2 = load_model_full(path)
         .map_err(|e| anyhow::anyhow!("Failed to reload model for student: {}", e))?;
     info!(event = "student_model_loaded", "Student model loaded");
 
