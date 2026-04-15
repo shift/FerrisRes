@@ -865,39 +865,41 @@ async fn cmd_distill(
         // GPU-accelerated teacher forward
         let accel = gpu_accel.as_ref().unwrap();
 
-        // Determine upload strategy: skeleton model MUST stream, full model can upload directly
-        let weight_cache = if dispatch.resident_mode {
-            if use_skeleton {
-                // Skeleton model: projection weights aren't in RAM, must stream from mmap
-                info!(
-                    event = "resident_streaming_mode",
-                    "Streaming weights from mmap to GPU (skeleton model, low RAM)"
-                );
-                match ferrisres::model::safetensors::MmapedSafetensors::open(path) {
-                    Ok(mmap) => match accel.upload_weights_resident_streaming(
-                        &teacher.model().config,
-                        &mmap,
-                    ) {
-                        Ok(cache) => Some(cache),
-                        Err(e) => {
-                            tracing::warn!(event = "streaming_upload_failed", error = ?e, "Streaming upload failed, falling back to JIT");
-                            None
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!(event = "mmap_reopen_failed", error = ?e, "Re-opening mmap failed, falling back to JIT");
-                        None
-                    }
-                }
-            } else {
-                // Full model in RAM: upload directly
-                info!(event = "resident_mode", "Uploading weights to GPU from loaded model (resident mode)");
-                match accel.upload_weights_resident(teacher.model()) {
+        // Determine upload strategy:
+        // - Skeleton model: MUST stream to GPU (no layer weights in RAM)
+        // - Full model + resident mode: upload from RAM
+        // - Full model + no resident: JIT per-matmul
+        let weight_cache = if use_skeleton {
+            // Skeleton model: projection weights aren't in RAM, must stream from mmap to GPU
+            // This works even if DispatchPlan says resident_mode=false — skeleton REQUIRES GPU.
+            info!(
+                event = "resident_streaming_mode",
+                "Streaming weights from mmap to GPU (skeleton model, low RAM)"
+            );
+            match ferrisres::model::safetensors::MmapedSafetensors::open(path) {
+                Ok(mmap) => match accel.upload_weights_resident_streaming(
+                    &teacher.model().config,
+                    &mmap,
+                ) {
                     Ok(cache) => Some(cache),
                     Err(e) => {
-                        tracing::warn!(event = "resident_upload_failed", error = ?e, "Resident upload failed, falling back to JIT");
+                        tracing::warn!(event = "streaming_upload_failed", error = ?e, "Streaming upload failed");
                         None
                     }
+                },
+                Err(e) => {
+                    tracing::warn!(event = "mmap_reopen_failed", error = ?e, "Re-opening mmap failed");
+                    None
+                }
+            }
+        } else if dispatch.resident_mode {
+            // Full model in RAM + VRAM fits: upload directly
+            info!(event = "resident_mode", "Uploading weights to GPU from loaded model (resident mode)");
+            match accel.upload_weights_resident(teacher.model()) {
+                Ok(cache) => Some(cache),
+                Err(e) => {
+                    tracing::warn!(event = "resident_upload_failed", error = ?e, "Resident upload failed, falling back to JIT");
+                    None
                 }
             }
         } else {
