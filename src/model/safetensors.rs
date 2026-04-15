@@ -1059,3 +1059,78 @@ impl MmapedSafetensors {
         })
     }
 }
+
+/// File-backed safetensors reader — NO mmap.
+/// Reads individual tensors via seek+read. Peak RAM = 1 tensor (~141MB).
+/// Use this on low-RAM machines where mmap page faults would OOM
+/// (e.g., Colab T4 with 12.7GB RAM and 10.25GB model).
+pub struct FileSafetensors {
+    file: File,
+    tensor_meta: HashMap<String, (String, Vec<usize>, usize, usize)>,
+    data_offset: usize,
+}
+
+impl FileSafetensors {
+    /// Open a safetensors file for direct I/O (no mmap).
+    pub fn open(path: &Path) -> Result<Self> {
+        let mut file = File::open(path)
+            .map_err(|e| FerrisResError::Shape(format!("Cannot open {}: {}", path.display(), e)))?;
+
+        let mut header_len_buf = [0u8; 8];
+        use std::io::Read;
+        file.read_exact(&mut header_len_buf)
+            .map_err(|e| FerrisResError::Shape(format!("Failed to read header length: {}", e)))?;
+        let header_len = u64::from_le_bytes(header_len_buf) as usize;
+
+        let mut header_buf = vec![0u8; header_len];
+        file.read_exact(&mut header_buf)
+            .map_err(|e| FerrisResError::Shape(format!("Failed to read header: {}", e)))?;
+
+        let header_json: HashMap<String, serde_json::Value> = serde_json::from_slice(&header_buf)
+            .map_err(|e| FerrisResError::Shape(format!("Invalid safetensors JSON: {}", e)))?;
+
+        let data_offset = 8 + header_len;
+        let mut tensor_meta = HashMap::new();
+
+        for (name, value) in &header_json {
+            if name == "__metadata__" { continue; }
+            let obj = value.as_object()
+                .ok_or_else(|| FerrisResError::Shape(format!("Invalid tensor entry: {}", name)))?;
+            let dtype = obj.get("dtype").and_then(|v| v.as_str()).unwrap_or("F32").to_string();
+            let shape: Vec<usize> = obj.get("shape")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+                .unwrap_or_default();
+            let offsets = obj.get("data_offsets")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect::<Vec<_>>())
+                .unwrap_or_default();
+            if offsets.len() >= 2 {
+                tensor_meta.insert(name.clone(), (dtype, shape, offsets[0], offsets[1]));
+            }
+        }
+
+        tracing::info!(
+            "Opened file-backed safetensors: {} tensors from {} (data_offset={})",
+            tensor_meta.len(), path.display(), data_offset
+        );
+
+        Ok(Self { file, tensor_meta, data_offset })
+    }
+
+    /// Read a single tensor as Vec<f32> via seek+read. No mmap.
+    pub fn get_tensor_f32(&mut self, name: &str) -> Result<Vec<f32>> {
+        let (dtype, _shape, start, end) = self.tensor_meta.get(name)
+            .ok_or_else(|| FerrisResError::Shape(format!("Tensor '{}' not found", name)))?;
+        let abs_start = self.data_offset + start;
+        let byte_len = end - start;
+        use std::io::{Seek, SeekFrom};
+        self.file.seek(SeekFrom::Start(abs_start as u64))
+            .map_err(|e| FerrisResError::Shape(format!("Seek failed for '{}': {}", name, e)))?;
+        let mut buf = vec![0u8; byte_len];
+        use std::io::Read;
+        self.file.read_exact(&mut buf)
+            .map_err(|e| FerrisResError::Shape(format!("Read failed for '{}': {}", name, e)))?;
+        bytes_to_f32(&buf, dtype)
+    }
+}

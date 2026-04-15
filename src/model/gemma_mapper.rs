@@ -1373,6 +1373,51 @@ impl MappedGemma4Model {
             mmaped.get_tensor_f32(name).ok()
         };
 
+        Self::build_skeleton_mm(config, get)
+    }
+
+    /// Skeleton model from file-backed reader (no mmap page faults).
+    pub fn from_file_skeleton(
+        config: Gemma4Config,
+        file_st: &mut crate::model::safetensors::FileSafetensors,
+    ) -> Result<Self, String> {
+        let embed_tokens = file_st.get_tensor_f32(Gemma4MmTensorNames::embed_tokens())
+            .map_err(|e| format!("embed_tokens: {:?}", e))?;
+        let lm_head = file_st.get_tensor_f32(Gemma4MmTensorNames::lm_head())
+            .unwrap_or_else(|_| embed_tokens.clone());
+        let final_norm = file_st.get_tensor_f32(Gemma4MmTensorNames::final_norm())
+            .map_err(|e| format!("final_norm: {:?}", e))?;
+
+        let mut layers = Vec::with_capacity(config.num_layers);
+        for layer_idx in 0..config.num_layers {
+            let inorm = file_st.get_tensor_f32(&Gemma4MmTensorNames::input_norm(layer_idx))
+                .map_err(|e| format!("input_norm {}: {:?}", layer_idx, e))?;
+            let pnorm = file_st.get_tensor_f32(&Gemma4MmTensorNames::post_attn_norm(layer_idx))
+                .map_err(|e| format!("post_attn_norm {}: {:?}", layer_idx, e))?;
+
+            let attn = Gemma4AttnWeights {
+                q_proj: Vec::new(),
+                k_proj: Vec::new(),
+                v_proj: Vec::new(),
+                o_proj: Vec::new(),
+                input_norm: inorm,
+                post_attn_norm: pnorm,
+            };
+            let ffn = Gemma4FfnWeights::Dense {
+                gate_proj: Vec::new(),
+                up_proj: Vec::new(),
+                down_proj: Vec::new(),
+            };
+            layers.push(Gemma4LayerWeights { attn, ffn });
+        }
+
+        Ok(Self { config, embed_tokens, layers, final_norm, lm_head })
+    }
+
+    fn build_skeleton_mm<
+        F: Fn(&str) -> Option<Vec<f32>>,
+    >(config: Gemma4Config, get: F) -> Result<Self, String> {
+
         let embed_tokens = get(Gemma4MmTensorNames::embed_tokens())
             .ok_or_else(|| "Missing embed_tokens".to_string())?;
         let lm_head = get(Gemma4MmTensorNames::lm_head())

@@ -454,7 +454,7 @@ impl GpuMatmulAccelerator {
     pub fn upload_weights_resident_streaming(
         &self,
         config: &crate::model::gemma_mapper::Gemma4Config,
-        mmaped: &crate::model::safetensors::MmapedSafetensors,
+        file_st: &mut crate::model::safetensors::FileSafetensors,
     ) -> Result<GpuWeightCache> {
         let hd = config.hidden_dim;
         let nh = config.num_heads;
@@ -466,10 +466,6 @@ impl GpuMatmulAccelerator {
             let buf = GpuBuffer::new(&self.device, data.len() * 4, Some(label))?;
             self.queue.write_buffer(buf.buffer(), 0, bytemuck::cast_slice(data));
             Ok(buf)
-        };
-
-        let get = |name: &str| -> Option<Vec<f32>> {
-            mmaped.get_tensor_f32(name).ok()
         };
 
         tracing::info!(
@@ -496,15 +492,15 @@ impl GpuMatmulAccelerator {
             let down_name = format!("model.language_model.layers.{}.mlp.down_proj.weight", layer_idx);
 
             // Load one layer from mmap (peaks at ~141MB)
-            let q = get(&q_name).ok_or_else(|| format!("Missing {}", q_name))?;
-            let k = get(&k_name).ok_or_else(|| format!("Missing {}", k_name))?;
-            let v = get(&v_name).ok_or_else(|| format!("Missing {}", v_name))?;
-            let o = get(&o_name).ok_or_else(|| format!("Missing {}", o_name))?;
-            let inorm = get(&in_name).ok_or_else(|| format!("Missing {}", in_name))?;
-            let pnorm = get(&pn_name).ok_or_else(|| format!("Missing {}", pn_name))?;
-            let gate = get(&gate_name).ok_or_else(|| format!("Missing {}", gate_name))?;
-            let up = get(&up_name).ok_or_else(|| format!("Missing {}", up_name))?;
-            let down = get(&down_name).ok_or_else(|| format!("Missing {}", down_name))?;
+            let q = file_st.get_tensor_f32(&q_name).map_err(|e| format!("Missing {}: {:?}", q_name, e))?;
+            let k = file_st.get_tensor_f32(&k_name).map_err(|e| format!("Missing {}: {:?}", k_name, e))?;
+            let v = file_st.get_tensor_f32(&v_name).map_err(|e| format!("Missing {}: {:?}", v_name, e))?;
+            let o = file_st.get_tensor_f32(&o_name).map_err(|e| format!("Missing {}: {:?}", o_name, e))?;
+            let inorm = file_st.get_tensor_f32(&in_name).map_err(|e| format!("Missing {}: {:?}", in_name, e))?;
+            let pnorm = file_st.get_tensor_f32(&pn_name).map_err(|e| format!("Missing {}: {:?}", pn_name, e))?;
+            let gate = file_st.get_tensor_f32(&gate_name).map_err(|e| format!("Missing {}: {:?}", gate_name, e))?;
+            let up = file_st.get_tensor_f32(&up_name).map_err(|e| format!("Missing {}: {:?}", up_name, e))?;
+            let down = file_st.get_tensor_f32(&down_name).map_err(|e| format!("Missing {}: {:?}", down_name, e))?;
 
             // Upload to GPU
             let q_proj = upload(&q, &format!("q_{}", layer_idx))?;
@@ -522,6 +518,10 @@ impl GpuMatmulAccelerator {
             // Free CPU copies immediately
             drop(q); drop(k); drop(v); drop(o);
             drop(gate); drop(up); drop(down);
+
+            // Flush GPU staging buffers — write_buffer creates internal staging
+            // that accumulates. Poll after each layer to free ~134MB of staging VRAM.
+            self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
 
             let lw = ResidentLayerWeights {
                 q_proj, k_proj, v_proj, o_proj,
