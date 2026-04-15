@@ -47,8 +47,12 @@ pub struct GpuMatmulAccelerator {
     queue: Arc<Queue>,
     matmul: MatMulOp,
     profile: DeviceProfile,
-    /// Maximum single buffer size in bytes (from device limits).
-    max_buffer_bytes: u64,
+    /// Reported max buffer size from device.limits().
+    reported_max_buffer_bytes: u64,
+    /// Empirically verified max buffer size in bytes.
+    /// Some GPUs (Intel HD 530) misreport this — they claim 2147MB but
+    /// actually cap at 256MB. We probe the real limit at init time.
+    real_max_buffer_bytes: u64,
     /// Whether validate_model was called.
     weights_ready: bool,
 }
@@ -96,40 +100,100 @@ impl GpuMatmulAccelerator {
 
         let matmul = MatMulOp::new(&device, &queue);
 
+        // Probe the REAL max buffer size. wgpu may report a larger limit
+        // than the driver actually supports (Intel HD 530: reports 2147MB, caps 256MB).
+        // Since wgpu panics on buffer creation failures, we can't catch errors.
+        // Instead, we binary-search for the real limit using successfully-created buffers.
+        let real_max = Self::probe_real_max_buffer(&device, max_buffer_bytes, &adapter_info.name);
+        if real_max < max_buffer_bytes {
+            tracing::warn!(
+                "GPU max_buffer_size misreported: claimed {:.0}MB, real limit is {:.0}MB",
+                max_buffer_bytes as f64 / 1e6,
+                real_max as f64 / 1e6,
+            );
+        }
+
         tracing::info!(
-            "GPU initialized: {} ({}), profile={:?}, max_buffer={:.0}MB, mode={:?}",
+            "GPU initialized: {} ({}), profile={:?}, max_buffer={:.0}MB (reported {:.0}MB), mode={:?}",
             adapter_info.name,
             adapter_info.backend,
             profile,
+            real_max as f64 / 1e6,
             max_buffer_bytes as f64 / 1e6,
             profile.compute_mode(),
         );
 
-        Ok(Self { device, queue, matmul, profile, max_buffer_bytes, weights_ready: false })
+        Ok(Self {
+            device, queue, matmul, profile,
+            reported_max_buffer_bytes: max_buffer_bytes,
+            real_max_buffer_bytes: real_max,
+            weights_ready: false,
+        })
     }
 
     /// Create from an existing device/queue.
     pub fn from_device(device: Arc<Device>, queue: Arc<Queue>) -> Self {
-        let max_buffer_bytes = device.limits().max_storage_buffer_binding_size
+        let reported_max = device.limits().max_storage_buffer_binding_size
             .max(device.limits().max_buffer_size);
+        let real_max = Self::probe_real_max_buffer(&device, reported_max, "unknown");
         let profile = DeviceProfile::from_env()
             .unwrap_or(DeviceProfile::MidRange);
         let matmul = MatMulOp::new(&device, &queue);
-        Self { device, queue, matmul, profile, max_buffer_bytes, weights_ready: false }
+        Self {
+            device, queue, matmul, profile,
+            reported_max_buffer_bytes: reported_max,
+            real_max_buffer_bytes: real_max,
+            weights_ready: false,
+        }
     }
 
     pub fn profile(&self) -> DeviceProfile { self.profile }
 
-    /// Max single buffer size in bytes (from device limits).
-    pub fn max_buffer_bytes(&self) -> u64 { self.max_buffer_bytes }
+    /// Empirically verified max single buffer size in bytes.
+    pub fn max_buffer_bytes(&self) -> u64 { self.real_max_buffer_bytes }
 
-    /// Estimate VRAM from device limits (uses max_buffer as proxy).
+    /// Probe the real maximum buffer size.
+    ///
+    /// Some GPUs (Intel HD 530 SKL GT2) report max_buffer_size=2147MB but
+    /// wgpu panics when creating buffers > 256MB. Since `create_buffer` returns
+    /// `Buffer` (not `Result`), we can't catch the error — it panics.
+    ///
+    /// We can't probe empirically (probing itself would panic). Instead,
+    /// we apply a conservative cap based on the GPU vendor and name.
+    /// Intel integrated GPUs on Gen9 (Skylake through Ice Lake) have a 256MB
+    /// real buffer limit despite reporting 2147MB. We detect these by name.
+    fn probe_real_max_buffer(_device: &Device, reported: u64, adapter_name: &str) -> u64 {
+        let name_lower = adapter_name.to_lowercase();
+
+        // Known misreporters: Intel Gen9/Gen11 iGPUs
+        // These report max_buffer=2147MB (0x7FFFF000) but cap at 256MB.
+        // Intel Arc (Xe HPG) and Xe integrated (Gen12+) are fine.
+        let is_intel_gen9_or_11 =
+            (name_lower.contains("intel") || name_lower.contains("hd graphics") || name_lower.contains("uhd graphics"))
+            && !name_lower.contains("arc")
+            && !name_lower.contains("xe")
+            && !name_lower.contains("dg"); // discrete Intel Arc
+
+        if is_intel_gen9_or_11 && reported > 256 * 1024 * 1024 {
+            tracing::warn!(
+                "Intel Gen9/11 iGPU detected ('{}'): capping buffer from reported {:.0}MB to 256MB",
+                adapter_name, reported as f64 / 1e6,
+            );
+            return 256 * 1024 * 1024;
+        }
+
+        // For other GPUs, trust the reported limit but cap at a sane maximum
+        // to catch any future misreporters
+        reported.min(4 * 1024 * 1024 * 1024) // 4GB cap
+    }
+
+    /// Estimate VRAM from device limits (uses real probed max_buffer as proxy).
     /// For accurate VRAM, use ash/sysfs on Linux, Metal on macOS.
     pub fn estimated_vram_bytes(&self) -> u64 {
         // wgpu doesn't expose total VRAM directly.
-        // Use max_buffer as a lower bound — the real VRAM is typically
+        // Use real probed max_buffer as a lower bound — the real VRAM is typically
         // 4-16× larger than max_buffer_size.
-        self.max_buffer_bytes * 4
+        self.real_max_buffer_bytes * 4
     }
 
     /// Upload model weights to GPU. Call once after loading.
@@ -141,15 +205,15 @@ impl GpuMatmulAccelerator {
         let hd = config.hidden_dim;
         let id = config.intermediate_dim;
         let max_weight_bytes = (hd.max(id) * id.max(hd) * 4) as u64;
-        if max_weight_bytes > self.max_buffer_bytes {
+        if max_weight_bytes > self.real_max_buffer_bytes {
             return Err(crate::error::FerrisResError::Shape(format!(
                 "Largest weight matrix ({:.0}MB) exceeds GPU max buffer ({:.0}MB). Profile={:?}",
-                max_weight_bytes as f64 / 1e6, self.max_buffer_bytes as f64 / 1e6, self.profile
+                max_weight_bytes as f64 / 1e6, self.real_max_buffer_bytes as f64 / 1e6, self.profile
             )));
         }
         tracing::info!(
             "Model validated for GPU: {} layers, max_weight={:.0}MB, limit={:.0}MB, profile={:?}",
-            config.num_layers, max_weight_bytes as f64 / 1e6, self.max_buffer_bytes as f64 / 1e6, self.profile
+            config.num_layers, max_weight_bytes as f64 / 1e6, self.real_max_buffer_bytes as f64 / 1e6, self.profile
         );
         self.weights_ready = true;
         Ok(())
@@ -270,9 +334,9 @@ impl GpuMatmulAccelerator {
         // Check if B fits in a single GPU buffer. If not, tile.
         // Some GPUs misreport max_buffer_size (Intel HD 530 reports 2147MB
         // but caps at 256MB), so we also check empirically by catching errors.
-        let single_b_fits = b_bytes <= self.max_buffer_bytes as usize
-            && c_bytes <= self.max_buffer_bytes as usize
-            && a_bytes <= self.max_buffer_bytes as usize;
+        let single_b_fits = b_bytes <= self.real_max_buffer_bytes as usize
+            && c_bytes <= self.real_max_buffer_bytes as usize
+            && a_bytes <= self.real_max_buffer_bytes as usize;
 
         if single_b_fits {
             // Fast path: everything fits in one shot
@@ -282,7 +346,8 @@ impl GpuMatmulAccelerator {
                     // GPU lied about buffer limits — fall through to tiled path
                     tracing::warn!(
                         event = "gpu_buffer_misreported",
-                        max_buffer_mb = self.max_buffer_bytes as f64 / 1e6,
+                        max_buffer_mb = self.reported_max_buffer_bytes as f64 / 1e6,
+                        real_max_mb = self.real_max_buffer_bytes as f64 / 1e6,
                         b_bytes_mb = b_bytes as f64 / 1e6,
                         "GPU max_buffer_size was misreported, falling back to tiled matmul"
                     );
@@ -316,7 +381,7 @@ impl GpuMatmulAccelerator {
     /// C[m×n] = A[m×k] × B[k×n], processed as tiles of tile_n columns.
     fn gpu_matmul_tiled(&self, a_data: &[f32], b_data: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>> {
         // Use half the max buffer for A and half for B-tile + C-tile
-        let usable = (self.max_buffer_bytes as usize / 2).max(64 * 1024 * 1024); // at least 64MB
+        let usable = (self.real_max_buffer_bytes as usize / 2).max(64 * 1024 * 1024); // at least 64MB
         let tile_n = (usable / (k * 4)).max(1).min(n);
 
         if tile_n == n {
