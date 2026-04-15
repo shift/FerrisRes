@@ -25,6 +25,52 @@ use crate::error::Result;
 use super::gemma_mapper::{MappedGemma4Model, Gemma4FfnWeights};
 
 // ---------------------------------------------------------------------------
+// Persistent GPU weight cache (resident mode)
+// ---------------------------------------------------------------------------
+
+/// Persistent GPU buffers for a single transformer layer's weights.
+/// Created once by `upload_weights_resident()`, kept alive for the entire session.
+pub struct ResidentLayerWeights {
+    pub q_proj: GpuBuffer,
+    pub k_proj: GpuBuffer,
+    pub v_proj: GpuBuffer,
+    pub o_proj: GpuBuffer,
+    pub gate_proj: GpuBuffer,
+    pub up_proj: GpuBuffer,
+    pub down_proj: GpuBuffer,
+}
+
+impl ResidentLayerWeights {
+    pub fn total_bytes(&self) -> u64 {
+        let bufs: [&GpuBuffer; 7] = [
+            &self.q_proj, &self.k_proj, &self.v_proj, &self.o_proj,
+            &self.gate_proj, &self.up_proj, &self.down_proj,
+        ];
+        bufs.iter().map(|b| b.size() as u64).sum()
+    }
+}
+
+/// All model weights resident on GPU. Created when `DispatchPlan::resident_mode` is true.
+/// Keeps GPU buffers alive so they're not re-uploaded per forward pass.
+///
+/// Note: embed_tokens and lm_head stay on CPU (embedding is a gather op,
+/// lm_head is huge and benefits from existing tiled CPU path). Only the
+/// per-layer projection weights (Q/K/V/O/FFN) are cached on GPU — those
+/// are the 6 matmuls × 35 layers = 210 uploads that dominate runtime.
+pub struct GpuWeightCache {
+    pub layer_weights: Vec<ResidentLayerWeights>,
+    // Small weights kept on CPU (RMSNorm params — ~6KB per layer)
+    pub input_norms: Vec<Vec<f32>>,
+    pub post_attn_norms: Vec<Vec<f32>>,
+    // Config dims for forward
+    pub hidden_dim: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_dim: usize,
+}
+
+// ---------------------------------------------------------------------------
 // GPU weight storage
 // ---------------------------------------------------------------------------
 
@@ -317,6 +363,190 @@ impl GpuMatmulAccelerator {
 
     // -----------------------------------------------------------------------
     // Internal: GPU dispatch
+    // -----------------------------------------------------------------------
+    // Resident mode: persistent GPU weight cache
+    // -----------------------------------------------------------------------
+
+    /// Upload ALL model weights to GPU buffers, returning a cache that keeps
+    /// them resident for the entire session. Only call when `resident_mode = true`
+    /// (model fits in VRAM with 30% headroom).
+    ///
+    /// This eliminates per-forward-pass upload overhead (~12ms/layer on PCIe 3.0).
+    /// On T4 (15GB VRAM, 4.6GB model): expected speedup from 1.5 → 50-100 tok/s.
+    pub fn upload_weights_resident(&self, model: &MappedGemma4Model) -> Result<GpuWeightCache> {
+        let config = &model.config;
+        let hd = config.hidden_dim;
+        let nh = config.num_heads;
+        let nkv = config.num_kv_heads;
+        let head_d = config.head_dim;
+        let id = config.intermediate_dim;
+        let _ = (nh * head_d, nkv * head_d, config.vocab_size); // dims used for buffer sizing
+
+        let upload = |data: &[f32], label: &str| -> Result<GpuBuffer> {
+            let buf = GpuBuffer::new(&self.device, data.len() * 4, Some(label))?;
+            self.queue.write_buffer(buf.buffer(), 0, bytemuck::cast_slice(data));
+            Ok(buf)
+        };
+
+        tracing::info!(event = "uploading_resident_weights", layers = model.layers.len(), "Uploading per-layer weights to GPU (resident mode)...");
+        let start = std::time::Instant::now();
+
+        // NOTE: embed_tokens and lm_head stay on CPU. The bottleneck is
+        // the 6 per-layer matmuls × 35 layers = 210 uploads per forward pass.
+        // Embedding is a gather (not matmul), lm_head uses existing CPU tiled path.
+
+        // Per-layer weights
+        let mut layer_weights = Vec::with_capacity(model.layers.len());
+        for (i, layer) in model.layers.iter().enumerate() {
+            let q_proj = upload(&layer.attn.q_proj, &format!("q_{}", i))?;
+            let k_proj = upload(&layer.attn.k_proj, &format!("k_{}", i))?;
+            let v_proj = upload(&layer.attn.v_proj, &format!("v_{}", i))?;
+            let o_proj = upload(&layer.attn.o_proj, &format!("o_{}", i))?;
+
+            let (gate_proj, up_proj, down_proj) = match &layer.ffn {
+                Gemma4FfnWeights::Dense { gate_proj, up_proj, down_proj } => {
+                    (upload(gate_proj, &format!("gate_{}", i))?,
+                     upload(up_proj, &format!("up_{}", i))?,
+                     upload(down_proj, &format!("down_{}", i))?)
+                }
+                Gemma4FfnWeights::Moe { .. } => {
+                    // MoE layers upload expert 0 as placeholder for resident mode
+                    // (full MoE residency is a future optimization)
+                    return Err(crate::error::FerrisResError::Shape(
+                        "Resident mode not yet supported for MoE layers".into()
+                    ));
+                }
+            };
+
+            layer_weights.push(ResidentLayerWeights {
+                q_proj, k_proj, v_proj, o_proj,
+                gate_proj, up_proj, down_proj,
+            });
+        }
+
+        // LM head stays on CPU (uses existing tiled path)
+
+        let total_bytes: u64 = layer_weights.iter().map(|l| l.total_bytes()).sum();
+
+        tracing::info!(
+            event = "resident_weights_uploaded",
+            total_mb = total_bytes as f64 / 1e6,
+            elapsed_ms = start.elapsed().as_millis(),
+            layers = layer_weights.len(),
+            "Per-layer weights resident on GPU (embed + lm_head on CPU)"
+        );
+
+        Ok(GpuWeightCache {
+            layer_weights,
+            input_norms: model.layers.iter().map(|l| l.attn.input_norm.clone()).collect(),
+            post_attn_norms: model.layers.iter().map(|l| l.attn.post_attn_norm.clone()).collect(),
+            hidden_dim: hd,
+            num_heads: nh,
+            num_kv_heads: nkv,
+            head_dim: head_d,
+            intermediate_dim: id,
+        })
+    }
+
+    /// Forward pass using resident GPU weights (no JIT uploads for layer projections).
+    /// embed_tokens and lm_head are read from CPU (embedding is a gather, lm_head uses tiled path).
+    pub fn forward_resident(&self, cache: &GpuWeightCache, model: &MappedGemma4Model, token_ids: &[u32]) -> Result<Vec<f32>> {
+        let hd = cache.hidden_dim;
+        let nh = cache.num_heads;
+        let nkv = cache.num_kv_heads;
+        let head_d = cache.head_dim;
+        let seq = token_ids.len();
+        let id = cache.intermediate_dim;
+        let q_dim = nh * head_d;
+        let kv_dim = nkv * head_d;
+        let vs = model.config.vocab_size;
+
+        // 1. Embedding (CPU gather — not a matmul, no GPU benefit)
+        let scale = (hd as f32).sqrt();
+        let mut hidden = vec![0.0f32; seq * hd];
+        for (t, &tid) in token_ids.iter().enumerate() {
+            let idx = tid as usize;
+            if idx * hd + hd <= model.embed_tokens.len() {
+                for d in 0..hd {
+                    hidden[t * hd + d] = model.embed_tokens[idx * hd + d] * scale;
+                }
+            }
+        }
+
+        // 2. Per-layer transformer — GPU matmuls with RESIDENT weights
+        for (layer_idx, lw) in cache.layer_weights.iter().enumerate() {
+            let residual = hidden.clone();
+
+            // Input RMSNorm (CPU — tiny)
+            let normed = rms_norm_cpu(&hidden, &cache.input_norms[layer_idx], hd, 1e-6);
+
+            // Q/K/V projections — A uploaded, B already resident on GPU
+            let q = self.gpu_matmul_resident_a(&normed, &lw.q_proj, seq, hd, q_dim)?;
+            let k = self.gpu_matmul_resident_a(&normed, &lw.k_proj, seq, hd, kv_dim)?;
+            let v = self.gpu_matmul_resident_a(&normed, &lw.v_proj, seq, hd, kv_dim)?;
+
+            // RoPE (CPU)
+            let mut q = q;
+            let mut k = k;
+            super::gemma_mapper::apply_rope(&mut q, seq, nh, head_d, 0);
+            super::gemma_mapper::apply_rope_gqa(&mut k, seq, nkv, head_d, 0);
+
+            // Attention (CPU — causal + GQA)
+            let attn_out = attention_gqa(&q, &k, &v, seq, nh, nkv, head_d, q_dim, kv_dim);
+
+            // O projection
+            let o = self.gpu_matmul_resident_a(&attn_out, &lw.o_proj, seq, q_dim, hd)?;
+
+            // Residual
+            for i in 0..hidden.len() { hidden[i] = residual[i] + o[i]; }
+
+            let residual2 = hidden.clone();
+
+            // Post-attn RMSNorm
+            let normed2 = rms_norm_cpu(&hidden, &cache.post_attn_norms[layer_idx], hd, 1e-6);
+
+            // FFN (gate + up + down with resident weights)
+            let gated = self.gpu_matmul_resident_a(&normed2, &lw.gate_proj, seq, hd, id)?;
+            let gated_silu: Vec<f32> = gated.iter().map(|&x| x / (1.0 + (-x).exp())).collect();
+            let upped = self.gpu_matmul_resident_a(&normed2, &lw.up_proj, seq, hd, id)?;
+
+            let mut combined = vec![0.0f32; seq * id];
+            for i in 0..combined.len() { combined[i] = gated_silu[i] * upped[i]; }
+
+            let ffn_out = self.gpu_matmul_resident_a(&combined, &lw.down_proj, seq, id, hd)?;
+
+            // Residual
+            for i in 0..hidden.len() { hidden[i] = residual2[i] + ffn_out[i]; }
+        }
+
+        // 3. Final RMSNorm (CPU)
+        hidden = rms_norm_cpu(&hidden, &model.final_norm, hd, 1e-6);
+
+        // 4. LM head (CPU tiled — vocab is huge, existing path works well)
+        let logits = cpu_lm_head(&hidden, &model.lm_head, seq, hd, vs);
+
+        Ok(logits)
+    }
+
+    /// GPU matmul where A is uploaded JIT but B is already resident on GPU.
+    fn gpu_matmul_resident_a(&self, a_data: &[f32], b_buf: &GpuBuffer, m: usize, k: usize, n: usize) -> Result<Vec<f32>> {
+        if m == 0 || k == 0 || n == 0 { return Ok(vec![0.0f32; m * n]); }
+
+        let a_buf = GpuBuffer::new(&self.device, a_data.len() * 4, Some("a_res"))?;
+        self.queue.write_buffer(a_buf.buffer(), 0, bytemuck::cast_slice(a_data));
+
+        let c_buf = GpuBuffer::new(&self.device, m * n * 4, Some("c_res"))?;
+
+        let mut enc = self.device.create_command_encoder(&CommandEncoderDescriptor { label: Some("matmul_res") });
+        self.matmul.dispatch(&mut enc, &a_buf, b_buf, &c_buf, m as u32, k as u32, n as u32)?;
+        self.queue.submit(std::iter::once(enc.finish()));
+        self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+
+        read_back_f32(&self.device, &self.queue, &c_buf, m * n)
+    }
+
+    // -----------------------------------------------------------------------
+    // JIT mode (original): per-call uploads
     // -----------------------------------------------------------------------
 
     /// GPU matmul where both A and B are CPU slices uploaded JIT.
