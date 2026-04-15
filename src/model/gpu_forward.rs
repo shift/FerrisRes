@@ -463,9 +463,12 @@ impl GpuMatmulAccelerator {
         let id = config.intermediate_dim;
 
         let upload = |data: &[f32], label: &str| -> Result<GpuBuffer> {
-            let buf = GpuBuffer::new(&self.device, data.len() * 4, Some(label))?;
-            self.queue.write_buffer(buf.buffer(), 0, bytemuck::cast_slice(data));
-            Ok(buf)
+            GpuBuffer::new_device_local(
+                &self.device,
+                &self.queue,
+                bytemuck::cast_slice(data),
+                Some(label),
+            )
         };
 
         tracing::info!(
@@ -518,10 +521,6 @@ impl GpuMatmulAccelerator {
             // Free CPU copies immediately
             drop(q); drop(k); drop(v); drop(o);
             drop(gate); drop(up); drop(down);
-
-            // Flush GPU staging buffers — write_buffer creates internal staging
-            // that accumulates. Poll after each layer to free ~134MB of staging VRAM.
-            self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
 
             let lw = ResidentLayerWeights {
                 q_proj, k_proj, v_proj, o_proj,
