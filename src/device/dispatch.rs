@@ -168,6 +168,34 @@ impl DispatchPlan {
         }
     }
 
+    /// Create a DispatchPlan with a known available RAM value (for testing).
+    pub fn with_ram(
+        profile: DeviceProfile,
+        model_bytes: u64,
+        vram_bytes: u64,
+        max_buffer_bytes: u64,
+        hidden_dim: u64,
+        num_heads: u64,
+        head_dim: u64,
+        intermediate_dim: u64,
+        vocab_size: u64,
+        seq_len: u64,
+        num_kv_heads: u64,
+        available_ram: u64,
+    ) -> Self {
+        let mut plan = Self::new(
+            profile, model_bytes, vram_bytes, max_buffer_bytes,
+            hidden_dim, num_heads, head_dim, intermediate_dim,
+            vocab_size, seq_len, num_kv_heads,
+        );
+        // Override resident_mode with explicit RAM check (ignore system RAM)
+        let gpu_avail = vram_bytes > 0 && max_buffer_bytes > 0;
+        plan.resident_mode = gpu_avail
+            && model_bytes < (vram_bytes as f64 * 0.7) as u64
+            && (available_ram > model_bytes * 3 || available_ram == 0);
+        plan
+    }
+
     /// Check if there's enough RAM for resident mode.
     /// Resident mode needs: mmap'd model + loaded weights + GPU staging buffers.
     /// That's roughly model_bytes × 2.5. If available RAM < model_bytes × 3, skip resident.
@@ -186,7 +214,7 @@ impl DispatchPlan {
     pub fn available_ram_bytes() -> u64 {
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
-        sys.available_memory() * 1024 // sysinfo returns KB
+        sys.available_memory() // sysinfo 0.33+ returns bytes
     }
 
     /// Create a CPU-only plan (no GPU available).
@@ -371,13 +399,14 @@ mod tests {
 
     #[test]
     fn test_resident_mode_t4() {
-        // T4: 15GB VRAM, 4.6GB model — resident mode ON
-        let plan = DispatchPlan::new(
+        // T4: 15GB VRAM, 4.6GB model, 64GB RAM — resident mode ON
+        let plan = DispatchPlan::with_ram(
             DeviceProfile::HighEnd,
             4_600_000_000,  // 4.6GB E2B model
             15_000_000_000, // 15GB T4 VRAM
             4_293_000_000,  // 4.3GB max buffer
             1536, 8, 256, 6144, 262144, 256, 1,
+            64_000_000_000, // 64GB RAM
         );
         assert!(plan.resident_mode, "T4 with E2B should enable resident mode");
     }
@@ -396,25 +425,43 @@ mod tests {
     }
 
     #[test]
+    fn test_resident_mode_colab_t4_low_ram() {
+        // Colab T4: 15GB VRAM, 10.25GB model, 12.7GB RAM — resident OFF (RAM too tight)
+        let plan = DispatchPlan::with_ram(
+            DeviceProfile::HighEnd,
+            10_250_000_000,  // 10.25GB model
+            15_000_000_000,  // 15GB T4 VRAM
+            4_293_000_000,   // 4.3GB max buffer
+            1536, 8, 256, 6144, 262144, 256, 1,
+            12_700_000_000,  // 12.7GB RAM
+        );
+        // 10.25GB * 3 = 30.75GB > 12.7GB → resident_mode=false (RAM check fails)
+        // but VRAM check passes (10.25GB < 10.5GB = 15GB * 0.7)
+        assert!(!plan.resident_mode, "Colab T4 with 12.7GB RAM should NOT enable resident mode");
+    }
+
+    #[test]
     fn test_resident_mode_threshold() {
         // Exactly at 70% VRAM — resident mode OFF (no headroom)
         let model_bytes = 7_000_000_000u64; // 7GB
         let vram_bytes = 10_000_000_000u64; // 10GB (70% exactly)
-        let plan = DispatchPlan::new(
+        let plan = DispatchPlan::with_ram(
             DeviceProfile::HighEnd,
             model_bytes, vram_bytes,
             2_000_000_000,
             1536, 8, 256, 6144, 262144, 32, 1,
+            64_000_000_000, // plenty of RAM
         );
         // 7GB == 10GB * 0.7, so NOT less than, should be false
         assert!(!plan.resident_mode);
 
         // Just under — should be true
-        let plan2 = DispatchPlan::new(
+        let plan2 = DispatchPlan::with_ram(
             DeviceProfile::HighEnd,
             6_999_999_999, vram_bytes,
             2_000_000_000,
             1536, 8, 256, 6144, 262144, 32, 1,
+            64_000_000_000,
         );
         assert!(plan2.resident_mode);
     }
