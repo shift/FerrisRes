@@ -845,11 +845,47 @@ async fn cmd_distill(
         // GPU-accelerated teacher forward
         let accel = gpu_accel.as_ref().unwrap();
 
-        // Check if we can use resident mode (all weights stay on GPU)
+    // Check if we can use resident mode (weights stay on GPU)
+        // Two paths: (1) enough RAM -> upload from MappedGemma4Model, (2) tight RAM -> stream from mmap
         let weight_cache = if dispatch.resident_mode {
-            info!(event = "resident_mode", "Uploading all weights to GPU (resident mode)");
-            Some(accel.upload_weights_resident(teacher.model())
-                .map_err(|e| anyhow::anyhow!("Resident upload failed: {:?}", e))?)
+            let available_ram = ferrisres::device::dispatch::DispatchPlan::available_ram_bytes();
+            let model_ram_estimate = model_file_bytes * 3;
+            let can_hold_in_ram = available_ram > model_ram_estimate || available_ram == 0;
+
+            if can_hold_in_ram {
+                info!(event = "resident_mode", "Uploading weights to GPU from loaded model (resident mode)");
+                match accel.upload_weights_resident(teacher.model()) {
+                    Ok(cache) => Some(cache),
+                    Err(e) => {
+                        tracing::warn!(event = "resident_upload_failed", error = ?e, "Resident upload failed, falling back to JIT");
+                        None
+                    }
+                }
+            } else {
+                info!(
+                    event = "resident_streaming_mode",
+                    available_ram_gb = available_ram as f64 / 1e9,
+                    model_gb = model_file_bytes as f64 / 1e9,
+                    "Streaming weights from mmap to GPU (low RAM)"
+                );
+                // Re-open mmap for streaming (file already on disk, mmap is cheap)
+                match ferrisres::model::safetensors::MmapedSafetensors::open(path) {
+                    Ok(mmap) => match accel.upload_weights_resident_streaming(
+                        &teacher.model().config,
+                        &mmap,
+                    ) {
+                        Ok(cache) => Some(cache),
+                        Err(e) => {
+                            tracing::warn!(event = "streaming_upload_failed", error = ?e, "Streaming upload failed, falling back to JIT");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(event = "mmap_reopen_failed", error = ?e, "Re-opening mmap failed, falling back to JIT");
+                        None
+                    }
+                }
+            }
         } else {
             info!(event = "jit_mode", "Using JIT uploads (model too large for VRAM)");
             None

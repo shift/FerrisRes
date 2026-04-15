@@ -193,11 +193,44 @@ jobs:
       - name: Run clippy
         run: cargo clippy --no-default-features --features vulkan -- -W clippy::correctness -W clippy::suspicious
 
+  # ── Build .deb package for Colab/cloud ──────────────────────────────
+  deb:
+    name: Build .deb package
+    runs-on: ubuntu-22.04
+    needs: [build, test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config dpkg-dev
+
+      - name: Build release binary
+        run: cargo build --release --no-default-features --features vulkan
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build .deb package
+        run: ./packaging/build-deb.sh ${{ steps.version.outputs.version }}
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferrisres-colab-amd64
+          path: target/deb/ferrisres_${{ steps.version.outputs.version }}_amd64.deb
+          retention-days: 5
+
   # ── Create GitHub Release ─────────────────────────────────────────
   release:
     name: Create GitHub Release
     runs-on: ubuntu-22.04
-    needs: [build, test]
+    needs: [build, test, deb]
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Checkout
@@ -231,6 +264,7 @@ jobs:
           | macOS Apple Silicon | `ferrisres-aarch64-macos.tar.gz` | M1/M2/M3/M4 Macs |
           | macOS Intel | `ferrisres-x86_64-macos.tar.gz` | Older Intel Macs |
           | Windows x86_64 | `ferrisres-x86_64-windows.zip` | Windows 10/11 |
+          | **Colab/Cloud** | `ferrisres_X.X.X_amd64.deb` | **apt install, GPU ready** |
 
           ### Quick Start
 

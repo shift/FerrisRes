@@ -448,6 +448,119 @@ impl GpuMatmulAccelerator {
         })
     }
 
+    /// Stream layer weights from mmap directly to GPU, one layer at a time.
+    /// Peak RAM = mmap (already mapped) + 1 layer (~141MB). Never holds all layers in RAM.
+    /// Use this when system RAM < model_weights * 2 (Colab T4 with 12.7GB RAM).
+    pub fn upload_weights_resident_streaming(
+        &self,
+        config: &crate::model::gemma_mapper::Gemma4Config,
+        mmaped: &crate::model::safetensors::MmapedSafetensors,
+    ) -> Result<GpuWeightCache> {
+        let hd = config.hidden_dim;
+        let nh = config.num_heads;
+        let nkv = config.num_kv_heads;
+        let head_d = config.head_dim;
+        let id = config.intermediate_dim;
+
+        let upload = |data: &[f32], label: &str| -> Result<GpuBuffer> {
+            let buf = GpuBuffer::new(&self.device, data.len() * 4, Some(label))?;
+            self.queue.write_buffer(buf.buffer(), 0, bytemuck::cast_slice(data));
+            Ok(buf)
+        };
+
+        let get = |name: &str| -> Option<Vec<f32>> {
+            mmaped.get_tensor_f32(name).ok()
+        };
+
+        tracing::info!(
+            event = "streaming_resident_upload",
+            layers = config.num_layers,
+            "Streaming layers from mmap to GPU (one at a time, low RAM)"
+        );
+        let start = std::time::Instant::now();
+
+        let mut input_norms = Vec::with_capacity(config.num_layers);
+        let mut post_attn_norms = Vec::with_capacity(config.num_layers);
+        let mut layer_weights = Vec::with_capacity(config.num_layers);
+        let mut total_bytes: u64 = 0;
+
+        for layer_idx in 0..config.num_layers {
+            let q_name = format!("model.language_model.layers.{}.self_attn.q_proj.weight", layer_idx);
+            let k_name = format!("model.language_model.layers.{}.self_attn.k_proj.weight", layer_idx);
+            let v_name = format!("model.language_model.layers.{}.self_attn.v_proj.weight", layer_idx);
+            let o_name = format!("model.language_model.layers.{}.self_attn.o_proj.weight", layer_idx);
+            let in_name = format!("model.language_model.layers.{}.input_layernorm.weight", layer_idx);
+            let pn_name = format!("model.language_model.layers.{}.post_attention_layernorm.weight", layer_idx);
+            let gate_name = format!("model.language_model.layers.{}.mlp.gate_proj.weight", layer_idx);
+            let up_name = format!("model.language_model.layers.{}.mlp.up_proj.weight", layer_idx);
+            let down_name = format!("model.language_model.layers.{}.mlp.down_proj.weight", layer_idx);
+
+            // Load one layer from mmap (peaks at ~141MB)
+            let q = get(&q_name).ok_or_else(|| format!("Missing {}", q_name))?;
+            let k = get(&k_name).ok_or_else(|| format!("Missing {}", k_name))?;
+            let v = get(&v_name).ok_or_else(|| format!("Missing {}", v_name))?;
+            let o = get(&o_name).ok_or_else(|| format!("Missing {}", o_name))?;
+            let inorm = get(&in_name).ok_or_else(|| format!("Missing {}", in_name))?;
+            let pnorm = get(&pn_name).ok_or_else(|| format!("Missing {}", pn_name))?;
+            let gate = get(&gate_name).ok_or_else(|| format!("Missing {}", gate_name))?;
+            let up = get(&up_name).ok_or_else(|| format!("Missing {}", up_name))?;
+            let down = get(&down_name).ok_or_else(|| format!("Missing {}", down_name))?;
+
+            // Upload to GPU
+            let q_proj = upload(&q, &format!("q_{}", layer_idx))?;
+            let k_proj = upload(&k, &format!("k_{}", layer_idx))?;
+            let v_proj = upload(&v, &format!("v_{}", layer_idx))?;
+            let o_proj = upload(&o, &format!("o_{}", layer_idx))?;
+            let gate_proj = upload(&gate, &format!("gate_{}", layer_idx))?;
+            let up_proj = upload(&up, &format!("up_{}", layer_idx))?;
+            let down_proj = upload(&down, &format!("down_{}", layer_idx))?;
+
+            // Keep norms on CPU (tiny, ~6KB each)
+            input_norms.push(inorm);
+            post_attn_norms.push(pnorm);
+
+            // Free CPU copies immediately
+            drop(q); drop(k); drop(v); drop(o);
+            drop(gate); drop(up); drop(down);
+
+            let lw = ResidentLayerWeights {
+                q_proj, k_proj, v_proj, o_proj,
+                gate_proj, up_proj, down_proj,
+            };
+            total_bytes += lw.total_bytes();
+            layer_weights.push(lw);
+
+            if (layer_idx + 1) % 5 == 0 || layer_idx == config.num_layers - 1 {
+                tracing::info!(
+                    event = "streaming_upload_progress",
+                    layer = layer_idx + 1,
+                    total = config.num_layers,
+                    gpu_mb = total_bytes as f64 / 1e6,
+                    "Layers streamed to GPU"
+                );
+            }
+        }
+
+        tracing::info!(
+            event = "resident_weights_uploaded",
+            total_mb = total_bytes as f64 / 1e6,
+            elapsed_ms = start.elapsed().as_millis(),
+            layers = layer_weights.len(),
+            "All layers resident on GPU (streamed from mmap, low RAM)"
+        );
+
+        Ok(GpuWeightCache {
+            layer_weights,
+            input_norms,
+            post_attn_norms,
+            hidden_dim: hd,
+            num_heads: nh,
+            num_kv_heads: nkv,
+            head_dim: head_d,
+            intermediate_dim: id,
+        })
+    }
+
     /// Forward pass using resident GPU weights (no JIT uploads for layer projections).
     /// embed_tokens and lm_head are read from CPU (embedding is a gather, lm_head uses tiled path).
     pub fn forward_resident(&self, cache: &GpuWeightCache, model: &MappedGemma4Model, token_ids: &[u32]) -> Result<Vec<f32>> {
