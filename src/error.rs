@@ -27,4 +27,10 @@ impl From<std::io::Error> for FerrisResError {
     }
 }
 
+impl From<String> for FerrisResError {
+    fn from(e: String) -> Self {
+        FerrisResError::Shape(e)
+    }
+}
+
 pub type Result<T> = std::result::Result<T, FerrisResError>;

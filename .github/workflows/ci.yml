@@ -23,7 +23,7 @@ jobs:
       - name: Install Linux deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libssl-dev
+          sudo apt-get install -y build-essential pkg-config
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -41,5 +41,41 @@ jobs:
       - name: Tests
         run: cargo test --lib --no-default-features --features vulkan
 
-      - name: Build release
+  # ── Build .deb for Colab/cloud GPU instances ────────────────────
+  deb:
+    name: Build .deb package
+    runs-on: ubuntu-22.04
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config dpkg-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: deb-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: deb-cargo-
+
+      - name: Build release binary
         run: cargo build --release --no-default-features --features vulkan
+
+      - name: Build .deb package
+        run: ./packaging/build-deb.sh 0.2.1
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferrisres-colab-amd64
+          path: target/deb/ferrisres_0.2.1_amd64.deb
+          retention-days: 30

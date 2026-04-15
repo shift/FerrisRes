@@ -163,8 +163,30 @@ impl DispatchPlan {
             batch_size,
             per_sample_bytes,
             gpu_available,
-            resident_mode: gpu_available && model_bytes < (vram_bytes as f64 * 0.7) as u64,
+            resident_mode: gpu_available && model_bytes < (vram_bytes as f64 * 0.7) as u64
+                && Self::resident_ram_safe(model_bytes),
         }
+    }
+
+    /// Check if there's enough RAM for resident mode.
+    /// Resident mode needs: mmap'd model + loaded weights + GPU staging buffers.
+    /// That's roughly model_bytes × 2.5. If available RAM < model_bytes × 3, skip resident.
+    fn resident_ram_safe(model_bytes: u64) -> bool {
+        let available_bytes = Self::available_ram_bytes();
+        let required = model_bytes * 3; // 3x safety margin
+        if available_bytes > 0 {
+            available_bytes > required
+        } else {
+            // Can't determine — be conservative, skip resident
+            false
+        }
+    }
+
+    /// Get available system RAM in bytes.
+    pub fn available_ram_bytes() -> u64 {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        sys.available_memory() * 1024 // sysinfo returns KB
     }
 
     /// Create a CPU-only plan (no GPU available).
