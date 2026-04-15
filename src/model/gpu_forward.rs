@@ -592,10 +592,8 @@ impl GpuMatmulAccelerator {
             // Input RMSNorm (CPU — tiny)
             let normed = rms_norm_cpu(&hidden, &cache.input_norms[layer_idx], hd, 1e-6);
 
-            // Q/K/V projections — A uploaded, B already resident on GPU
-            let q = self.gpu_matmul_resident_a(&normed, &lw.q_proj, seq, hd, q_dim)?;
-            let k = self.gpu_matmul_resident_a(&normed, &lw.k_proj, seq, hd, kv_dim)?;
-            let v = self.gpu_matmul_resident_a(&normed, &lw.v_proj, seq, hd, kv_dim)?;
+            // Q/K/V projections — batched (1 sync instead of 3)
+            let (q, k, v) = self.batched_resident_matmul_3(&normed, &lw.q_proj, &lw.k_proj, &lw.v_proj, seq, hd, q_dim, kv_dim, kv_dim)?;
 
             // RoPE (CPU)
             let mut q = q;
@@ -617,10 +615,10 @@ impl GpuMatmulAccelerator {
             // Post-attn RMSNorm
             let normed2 = rms_norm_cpu(&hidden, &cache.post_attn_norms[layer_idx], hd, 1e-6);
 
-            // FFN (gate + up + down with resident weights)
-            let gated = self.gpu_matmul_resident_a(&normed2, &lw.gate_proj, seq, hd, id)?;
+            // gate + up projections — batched (1 sync instead of 2)
+            let (gated, upped) = self.batched_resident_matmul_2(&normed2, &lw.gate_proj, &lw.up_proj, seq, hd, id, id)?;
+
             let gated_silu: Vec<f32> = gated.iter().map(|&x| x / (1.0 + (-x).exp())).collect();
-            let upped = self.gpu_matmul_resident_a(&normed2, &lw.up_proj, seq, hd, id)?;
 
             let mut combined = vec![0.0f32; seq * id];
             for i in 0..combined.len() { combined[i] = gated_silu[i] * upped[i]; }
@@ -655,6 +653,60 @@ impl GpuMatmulAccelerator {
         self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
 
         read_back_f32(&self.device, &self.queue, &c_buf, m * n)
+    }
+
+    /// Batched: 2 parallel matmuls with same A, different B's (resident).
+    /// One encoder, one submit, one sync = 3x fewer round-trips.
+    fn batched_resident_matmul_2(
+        &self, a_data: &[f32],
+        b1: &GpuBuffer, b2: &GpuBuffer,
+        m: usize, k: usize, n1: usize, n2: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        if m == 0 || k == 0 { return Ok((vec![], vec![])); }
+
+        let a_buf = GpuBuffer::new(&self.device, a_data.len() * 4, Some("a_batch"))?;
+        self.queue.write_buffer(a_buf.buffer(), 0, bytemuck::cast_slice(a_data));
+
+        let c1 = GpuBuffer::new(&self.device, m * n1 * 4, Some("c1_batch"))?;
+        let c2 = GpuBuffer::new(&self.device, m * n2 * 4, Some("c2_batch"))?;
+
+        let mut enc = self.device.create_command_encoder(&CommandEncoderDescriptor { label: Some("batch2") });
+        self.matmul.dispatch(&mut enc, &a_buf, b1, &c1, m as u32, k as u32, n1 as u32)?;
+        self.matmul.dispatch(&mut enc, &a_buf, b2, &c2, m as u32, k as u32, n2 as u32)?;
+        self.queue.submit(std::iter::once(enc.finish()));
+        self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+
+        let r1 = read_back_f32(&self.device, &self.queue, &c1, m * n1)?;
+        let r2 = read_back_f32(&self.device, &self.queue, &c2, m * n2)?;
+        Ok((r1, r2))
+    }
+
+    /// Batched: 3 parallel matmuls with same A, different B's (resident).
+    fn batched_resident_matmul_3(
+        &self, a_data: &[f32],
+        b1: &GpuBuffer, b2: &GpuBuffer, b3: &GpuBuffer,
+        m: usize, k: usize, n1: usize, n2: usize, n3: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        if m == 0 || k == 0 { return Ok((vec![], vec![], vec![])); }
+
+        let a_buf = GpuBuffer::new(&self.device, a_data.len() * 4, Some("a_batch3"))?;
+        self.queue.write_buffer(a_buf.buffer(), 0, bytemuck::cast_slice(a_data));
+
+        let c1 = GpuBuffer::new(&self.device, m * n1 * 4, Some("c1_batch3"))?;
+        let c2 = GpuBuffer::new(&self.device, m * n2 * 4, Some("c2_batch3"))?;
+        let c3 = GpuBuffer::new(&self.device, m * n3 * 4, Some("c3_batch3"))?;
+
+        let mut enc = self.device.create_command_encoder(&CommandEncoderDescriptor { label: Some("batch3") });
+        self.matmul.dispatch(&mut enc, &a_buf, b1, &c1, m as u32, k as u32, n1 as u32)?;
+        self.matmul.dispatch(&mut enc, &a_buf, b2, &c2, m as u32, k as u32, n2 as u32)?;
+        self.matmul.dispatch(&mut enc, &a_buf, b3, &c3, m as u32, k as u32, n3 as u32)?;
+        self.queue.submit(std::iter::once(enc.finish()));
+        self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+
+        let r1 = read_back_f32(&self.device, &self.queue, &c1, m * n1)?;
+        let r2 = read_back_f32(&self.device, &self.queue, &c2, m * n2)?;
+        let r3 = read_back_f32(&self.device, &self.queue, &c3, m * n3)?;
+        Ok((r1, r2, r3))
     }
 
     // -----------------------------------------------------------------------
