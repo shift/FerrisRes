@@ -257,9 +257,45 @@ impl GpuMatmulAccelerator {
 
     /// GPU matmul where both A and B are CPU slices uploaded JIT.
     /// No persistent GPU weight storage — avoids VRAM duplication.
+    ///
+    /// If B doesn't fit in a single GPU buffer, automatically tiles
+    /// along the N dimension (column chunks of B).
     pub fn gpu_matmul_cpu_b(&self, a_data: &[f32], b_data: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>> {
         if m == 0 || k == 0 || n == 0 { return Ok(vec![0.0f32; m * n]); }
 
+        let b_bytes = b_data.len() * 4;
+        let c_bytes = m * n * 4;
+        let a_bytes = a_data.len() * 4;
+
+        // Check if B fits in a single GPU buffer. If not, tile.
+        // Some GPUs misreport max_buffer_size (Intel HD 530 reports 2147MB
+        // but caps at 256MB), so we also check empirically by catching errors.
+        let single_b_fits = b_bytes <= self.max_buffer_bytes as usize
+            && c_bytes <= self.max_buffer_bytes as usize
+            && a_bytes <= self.max_buffer_bytes as usize;
+
+        if single_b_fits {
+            // Fast path: everything fits in one shot
+            match self.gpu_matmul_single(a_data, b_data, m, k, n) {
+                Ok(result) => return Ok(result),
+                Err(_) => {
+                    // GPU lied about buffer limits — fall through to tiled path
+                    tracing::warn!(
+                        event = "gpu_buffer_misreported",
+                        max_buffer_mb = self.max_buffer_bytes as f64 / 1e6,
+                        b_bytes_mb = b_bytes as f64 / 1e6,
+                        "GPU max_buffer_size was misreported, falling back to tiled matmul"
+                    );
+                }
+            }
+        }
+
+        // Tiled path: chunk B into column tiles that fit in max_buffer
+        self.gpu_matmul_tiled(a_data, b_data, m, k, n)
+    }
+
+    /// Single-shot GPU matmul (all buffers fit).
+    fn gpu_matmul_single(&self, a_data: &[f32], b_data: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>> {
         let a_buf = GpuBuffer::new(&self.device, a_data.len() * 4, Some("a"))?;
         self.queue.write_buffer(a_buf.buffer(), 0, bytemuck::cast_slice(a_data));
 
@@ -274,6 +310,70 @@ impl GpuMatmulAccelerator {
         self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
 
         read_back_f32(&self.device, &self.queue, &c_buf, m * n)
+    }
+
+    /// Tiled GPU matmul: chunks B into column tiles that each fit in max_buffer.
+    /// C[m×n] = A[m×k] × B[k×n], processed as tiles of tile_n columns.
+    fn gpu_matmul_tiled(&self, a_data: &[f32], b_data: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>> {
+        // Use half the max buffer for A and half for B-tile + C-tile
+        let usable = (self.max_buffer_bytes as usize / 2).max(64 * 1024 * 1024); // at least 64MB
+        let tile_n = (usable / (k * 4)).max(1).min(n);
+
+        if tile_n == n {
+            // Actually fits — try single shot
+            return self.gpu_matmul_single(a_data, b_data, m, k, n);
+        }
+
+        let num_tiles = (n + tile_n - 1) / tile_n;
+        tracing::info!(
+            event = "gpu_matmul_tiled",
+            m, k, n, tile_n, num_tiles,
+            "Tiling GPU matmul: {num_tiles} tiles of {tile_n} columns"
+        );
+
+        let mut result = vec![0.0f32; m * n];
+
+        // Upload A once (it's reused for every tile)
+        let a_buf = GpuBuffer::new(&self.device, a_data.len() * 4, Some("a_tiled"))?;
+        self.queue.write_buffer(a_buf.buffer(), 0, bytemuck::cast_slice(a_data));
+
+        for tile_idx in 0..num_tiles {
+            let col_start = tile_idx * tile_n;
+            let col_end = (col_start + tile_n).min(n);
+            let cur_n = col_end - col_start;
+
+            // Extract B tile: rows [0..k], cols [col_start..col_end]
+            let mut b_tile = vec![0.0f32; k * cur_n];
+            for r in 0..k {
+                for c in 0..cur_n {
+                    b_tile[r * cur_n + c] = b_data[r * n + col_start + c];
+                }
+            }
+
+            // Upload B tile and compute
+            let b_buf = GpuBuffer::new(&self.device, b_tile.len() * 4, Some("b_tile"))?;
+            self.queue.write_buffer(b_buf.buffer(), 0, bytemuck::cast_slice(&b_tile));
+
+            let c_buf = GpuBuffer::new(&self.device, m * cur_n * 4, Some("c_tile"))?;
+
+            let mut enc = self.device.create_command_encoder(
+                &CommandEncoderDescriptor { label: Some("matmul_tile") }
+            );
+            self.matmul.dispatch(&mut enc, &a_buf, &b_buf, &c_buf, m as u32, k as u32, cur_n as u32)?;
+            self.queue.submit(std::iter::once(enc.finish()));
+            self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+
+            let tile_result = read_back_f32(&self.device, &self.queue, &c_buf, m * cur_n)?;
+
+            // Scatter tile result into full result
+            for t in 0..m {
+                for c in 0..cur_n {
+                    result[t * n + col_start + c] = tile_result[t * cur_n + c];
+                }
+            }
+        }
+
+        Ok(result)
     }
 }
 
