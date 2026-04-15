@@ -41,5 +41,49 @@ jobs:
       - name: Tests
         run: cargo test --lib --no-default-features --features vulkan
 
-      - name: Build release
+  # ── Colab binary: built on every merge to main ──────────────────
+  colab-binary:
+    name: Colab T4 Binary (Linux x86_64)
+    runs-on: ubuntu-22.04
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: colab-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: colab-x86_64-cargo-
+
+      - name: Build release binary
         run: cargo build --release --no-default-features --features vulkan
+
+      - name: Package
+        run: |
+          cp target/release/ferrisres ferrisres-colab-x86_64
+          strip ferrisres-colab-x86_64 2>/dev/null || true
+          tar czf ferrisres-colab-x86_64.tar.gz ferrisres-colab-x86_64
+          sha256sum ferrisres-colab-x86_64.tar.gz > ferrisres-colab-x86_64.tar.gz.sha256
+          ls -lh ferrisres-colab-x86_64.tar.gz
+          cat ferrisres-colab-x86_64.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferrisres-colab-x86_64
+          path: |
+            ferrisres-colab-x86_64.tar.gz
+            ferrisres-colab-x86_64.tar.gz.sha256
+          retention-days: 30
