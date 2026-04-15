@@ -749,12 +749,11 @@ async fn cmd_distill(
             event = "skeleton_mode",
             available_ram_gb = available_ram as f64 / 1e9,
             model_gb = model_file_bytes as f64 / 1e9,
-            "Loading skeleton model (projections skipped, GPU streaming later)"
+            "Loading skeleton model via file I/O (no mmap, low RAM)"
         );
-        // Open mmap for skeleton loading
-        let mmaped = ferrisres::model::safetensors::MmapedSafetensors::open(path)
-            .map_err(|e| anyhow::anyhow!("Failed to mmap model: {}", e))?;
-        gemma_mapper::MappedGemma4Model::from_mmap_mm_skeleton(config.clone(), &mmaped)
+        let mut file_st = ferrisres::model::safetensors::FileSafetensors::open(path)
+            .map_err(|e| anyhow::anyhow!("Failed to open model file: {}", e))?;
+        gemma_mapper::MappedGemma4Model::from_file_skeleton(config.clone(), &mut file_st)
             .map_err(|e| anyhow::anyhow!("Failed to load skeleton model: {}", e))?
     } else {
         let load_model = |p: &std::path::Path| -> Result<gemma_mapper::MappedGemma4Model, String> {
@@ -874,12 +873,12 @@ async fn cmd_distill(
             // This works even if DispatchPlan says resident_mode=false — skeleton REQUIRES GPU.
             info!(
                 event = "resident_streaming_mode",
-                "Streaming weights from mmap to GPU (skeleton model, low RAM)"
+                "Streaming weights from disk to GPU via file I/O (skeleton model, low RAM)"
             );
-            match ferrisres::model::safetensors::MmapedSafetensors::open(path) {
-                Ok(mmap) => match accel.upload_weights_resident_streaming(
+            match ferrisres::model::safetensors::FileSafetensors::open(path) {
+                Ok(mut file_st) => match accel.upload_weights_resident_streaming(
                     &teacher.model().config,
-                    &mmap,
+                    &mut file_st,
                 ) {
                     Ok(cache) => Some(cache),
                     Err(e) => {
@@ -888,7 +887,7 @@ async fn cmd_distill(
                     }
                 },
                 Err(e) => {
-                    tracing::warn!(event = "mmap_reopen_failed", error = ?e, "Re-opening mmap failed");
+                    tracing::warn!(event = "file_open_failed", error = ?e, "Opening file for streaming failed");
                     None
                 }
             }
