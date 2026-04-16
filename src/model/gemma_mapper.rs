@@ -2335,6 +2335,10 @@ impl Gemma4Student {
         frozen_states: &[Vec<f32>],
         gpu: &crate::model::gpu_forward::GpuMatmulAccelerator,
     ) -> Vec<f32> {
+        // GPU transformer pipeline is available if gpu.transformer_pipeline() returns Some
+        // For now we use per-layer GPU path, but this enables single-sync later
+        let _ = gpu.transformer_pipeline();
+        
         let config = &self.model.config;
         let hd = config.hidden_dim;
         let nh = config.num_heads;
@@ -2353,6 +2357,9 @@ impl Gemma4Student {
             }
         };
 
+        // GPU attention/RoPE helper (if transformer pipeline available)
+        let pipeline = gpu.transformer_pipeline();
+
         let mut hidden = frozen_states[0].clone();
         let mut summary_idx = 0;
 
@@ -2367,7 +2374,8 @@ impl Gemma4Student {
                 };
             } else if summary_idx > 0 {
                 // Recompute this layer (post-injection) with GPU matmuls
-                hidden = self.recompute_layer_gpu(&gpu_mm, &hidden, layer, nh, config.num_kv_heads, head_d, seq, hd, config.intermediate_dim);
+                // Pass pipeline for GPU attention/RoPE
+                hidden = self.recompute_layer_gpu(&gpu_mm, pipeline, Some(gpu), &hidden, layer, nh, config.num_kv_heads, head_d, seq, hd, config.intermediate_dim);
                 continue;
             } else {
                 hidden = if layer_idx + 1 < frozen_states.len() {
@@ -2379,7 +2387,7 @@ impl Gemma4Student {
             }
 
             // At injection point: recompute + apply block summary
-            hidden = self.recompute_layer_gpu(&gpu_mm, &hidden, layer, nh, config.num_kv_heads, head_d, seq, hd, config.intermediate_dim);
+            hidden = self.recompute_layer_gpu(&gpu_mm, pipeline, Some(gpu), &hidden, layer, nh, config.num_kv_heads, head_d, seq, hd, config.intermediate_dim);
 
             if summary_idx < self.block_summaries.len() {
                 let bs = &self.block_summaries[summary_idx];
@@ -2405,9 +2413,12 @@ impl Gemma4Student {
     }
 
     /// Recompute a single transformer layer using GPU matmuls.
+    /// Optionally uses GPU transformer pipeline for attention/RoPE if available.
     fn recompute_layer_gpu(
         &self,
         gpu_mm: &dyn Fn(&[f32], &[f32], usize, usize, usize) -> Vec<f32>,
+        pipeline: Option<&crate::compute::kernels::gpu_transformer::GpuTransformerPipeline>,
+        gpu: Option<&crate::model::gpu_forward::GpuMatmulAccelerator>,
         hidden: &[f32],
         layer: &Gemma4LayerWeights,
         num_heads: usize,
@@ -2429,40 +2440,31 @@ impl Gemma4Student {
         let k = gpu_mm(&normed, &layer.attn.k_proj, seq, hd, kv_dim);
         let v = gpu_mm(&normed, &layer.attn.v_proj, seq, hd, kv_dim);
 
-        // RoPE on CPU
+        // RoPE: GPU if pipeline available, else CPU
+        // TODO: Implement GPU RoPE (need to upload Q/K to GPU)
         let mut q = q;
         let mut k = k;
-        apply_rope(&mut q, seq, num_heads, head_dim, 0);
-        apply_rope_gqa(&mut k, seq, num_kv_heads, head_dim, 0);
+        if let Some(_p) = pipeline {
+            apply_rope(&mut q, seq, num_heads, head_dim, 0);
+            apply_rope_gqa(&mut k, seq, num_kv_heads, head_dim, 0);
+        } else {
+            apply_rope(&mut q, seq, num_heads, head_dim, 0);
+            apply_rope_gqa(&mut k, seq, num_kv_heads, head_dim, 0);
+        }
 
-        // Attention scores on CPU (memory-bound, not compute-bound)
-        let heads_per_kv = num_heads / num_kv_heads;
-        let attn_scale = 1.0 / (head_dim as f32).sqrt();
-        let mut attn_out = vec![0.0f32; seq * q_dim];
-        for h in 0..num_heads {
-            let kv_h = h / heads_per_kv;
-            for t in 0..seq {
-                let mut max_score = f32::NEG_INFINITY;
-                let mut scores = vec![0.0f32; seq];
-                for s in 0..=t {
-                    let mut dot = 0.0f32;
-                    for d in 0..head_dim {
-                        dot += q[t * q_dim + h * head_dim + d]
-                             * k[s * kv_dim + kv_h * head_dim + d];
-                    }
-                    scores[s] = dot * attn_scale;
-                    if scores[s] > max_score { max_score = scores[s]; }
-                }
-                let mut sum_exp = 0.0f32;
-                for s in 0..=t { scores[s] = (scores[s] - max_score).exp(); sum_exp += scores[s]; }
-                for s in 0..=t { scores[s] /= sum_exp; }
-                for d in 0..head_dim {
-                    let mut val = 0.0f32;
-                    for s in 0..=t { val += scores[s] * v[s * kv_dim + kv_h * head_dim + d]; }
-                    attn_out[t * q_dim + h * head_dim + d] = val;
+        // Attention: GPU if pipeline available
+        let attn_out = if let (Some(p), Some(g)) = (pipeline, gpu) {
+            // Try GPU attention
+            match self.gpu_attention(&p, g.device(), g.queue(), &q, &k, &v, num_heads, num_kv_heads, head_dim, seq, q_dim, kv_dim) {
+                Ok(out) => out,
+                Err(e) => {
+                    tracing::warn!(event = "gpu_attention_failed", error = ?e, "falling back to CPU");
+                    self.cpu_attention(&q, &k, &v, num_heads, num_kv_heads, head_dim, seq, q_dim, kv_dim)
                 }
             }
-        }
+        } else {
+            self.cpu_attention(&q, &k, &v, num_heads, num_kv_heads, head_dim, seq, q_dim, kv_dim)
+        };
 
         // O projection on GPU
         let o = gpu_mm(&attn_out, &layer.attn.o_proj, seq, q_dim, hd);
@@ -2626,6 +2628,89 @@ impl Gemma4Student {
         }
 
         matmul(&attn_out, &attn.o_proj, seq_len, q_dim, hidden_dim)
+    }
+
+    /// CPU attention helper (extracted for potential GPU path later).
+    fn cpu_attention(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        seq: usize,
+        q_dim: usize,
+        kv_dim: usize,
+    ) -> Vec<f32> {
+        let heads_per_kv = num_heads / num_kv_heads;
+        let attn_scale = 1.0 / (head_dim as f32).sqrt();
+        let mut attn_out = vec![0.0f32; seq * q_dim];
+
+        for h in 0..num_heads {
+            let kv_h = h / heads_per_kv;
+            for t in 0..seq {
+                let mut max_score = f32::NEG_INFINITY;
+                let mut scores = vec![0.0f32; seq];
+                for s in 0..=t {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[t * q_dim + h * head_dim + d]
+                             * k[s * kv_dim + kv_h * head_dim + d];
+                    }
+                    scores[s] = dot * attn_scale;
+                    if scores[s] > max_score { max_score = scores[s]; }
+                }
+                let mut sum_exp = 0.0f32;
+                for s in 0..=t { scores[s] = (scores[s] - max_score).exp(); sum_exp += scores[s]; }
+                for s in 0..=t { scores[s] /= sum_exp; }
+                for d in 0..head_dim {
+                    let mut val = 0.0f32;
+                    for s in 0..=t { val += scores[s] * v[s * kv_dim + kv_h * head_dim + d]; }
+                    attn_out[t * q_dim + h * head_dim + d] = val;
+                }
+            }
+        }
+        attn_out
+    }
+
+    /// GPU attention using transformer pipeline.
+    #[allow(unused_variables)]
+    fn gpu_attention(
+        &self,
+        pipeline: &crate::compute::kernels::gpu_transformer::GpuTransformerPipeline,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        seq: usize,
+        q_dim: usize,
+        _kv_dim: usize,
+    ) -> std::result::Result<Vec<f32>, crate::error::FerrisResError> {
+        use crate::compute::GpuBuffer;
+        
+        // Upload Q, K, V to GPU
+        let q_buf = GpuBuffer::new_device_local(device, queue, bytemuck::cast_slice(q), Some("attn_q"))?;
+        let k_buf = GpuBuffer::new_device_local(device, queue, bytemuck::cast_slice(k), Some("attn_k"))?;
+        let v_buf = GpuBuffer::new_device_local(device, queue, bytemuck::cast_slice(v), Some("attn_v"))?;
+        let out_buf = GpuBuffer::new(device, seq * q_dim * 4, Some("attn_out"))?;
+
+        // Create encoder and dispatch
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("attn") });
+        pipeline.dispatch_attention(device, queue, &mut enc, &q_buf, &k_buf, &v_buf, &out_buf, 
+            seq as u32, num_heads as u32, num_kv_heads as u32, head_dim as u32)?;
+        
+        queue.submit(std::iter::once(enc.finish()));
+        
+        // Read back result
+        let mut result = vec![0.0f32; seq * q_dim];
+        out_buf.read(device, queue, bytemuck::cast_slice_mut(&mut result))?;
+        
+        Ok(result)
     }
 }
 

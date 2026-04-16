@@ -115,6 +115,28 @@ pub struct GpuMatmulAccelerator {
 }
 
 impl GpuMatmulAccelerator {
+    /// Get the transformer pipeline reference
+    pub fn transformer_pipeline(&self) -> Option<&crate::compute::kernels::gpu_transformer::GpuTransformerPipeline> {
+        self.transformer_pipeline.as_ref()
+    }
+
+    /// Get the GPU device (for buffer allocation)
+    pub fn device(&self) -> &Arc<Device> { &self.device }
+    
+    /// Get the GPU queue (for buffer writes)
+    pub fn queue(&self) -> &Arc<Queue> { &self.queue }
+
+    /// Create a GPU buffer for attention (avoids repeated CPU→GPU copies)
+    pub fn create_buffer(&self, size: usize, label: &str) -> Result<crate::compute::GpuBuffer> {
+        crate::compute::GpuBuffer::new(&self.device, size, Some(label))
+    }
+
+    /// Create a GPU buffer with initial data
+    pub fn create_buffer_with_data(&self, data: &[f32], label: &str) -> Result<crate::compute::GpuBuffer> {
+        crate::compute::GpuBuffer::new_device_local(
+            &self.device, &self.queue, bytemuck::cast_slice(data), Some(label),
+        )
+    }
     /// Create a new accelerator using the default GPU device.
     /// Auto-detects profile from adapter VRAM and limits.
     pub fn new() -> Result<Self> {
