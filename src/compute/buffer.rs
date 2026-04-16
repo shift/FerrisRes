@@ -89,4 +89,37 @@ impl GpuBuffer {
     pub fn from_existing(buffer: wgpu::Buffer, size: usize) -> Self {
         Self { buffer, size }
     }
+
+    /// Read buffer contents from GPU to CPU.
+    /// Uses a staging buffer approach.
+    pub fn read(&self, device: &wgpu::Device, queue: &wgpu::Queue, output: &mut [u8]) -> Result<()> {
+        // Create staging buffer (host-visible, can be read after map)
+        let staging = device.create_buffer(&BufferDescriptor {
+            label: Some("read_staging"),
+            size: self.size as u64,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Copy GPU buffer → staging
+        let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("read_copy"),
+        });
+        enc.copy_buffer_to_buffer(&self.buffer, 0, &staging, 0, self.size as u64);
+        queue.submit(std::iter::once(enc.finish()));
+
+        // Map and read
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let _ = rx.recv().map_err(|_| crate::error::FerrisResError::Device("read failed".into()))?;
+
+        let data = slice.get_mapped_range();
+        output.copy_from_slice(&data);
+        drop(data);
+        staging.unmap();
+
+        Ok(())
+    }
 }
