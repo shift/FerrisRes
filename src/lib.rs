@@ -22,3 +22,10 @@ pub use training::{CrossEntropyLoss, AdamOptimizer, SgdOptimizer};
 pub use training::lora::{LoraConfig, LoraLayer, LoraManager};
 pub mod server;
 pub mod security;
+pub use security::{
+    armor::ArmorLayer, 
+    armor::ArmorConfig, 
+    armor::SecurityVerdict,
+    armor::ViolationRecord,
+    armor::ViolationSource,
+};

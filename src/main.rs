@@ -61,6 +61,9 @@ enum Commands {
         yarn_scale: Option<f32>,
         #[arg(long)]
         image: Option<String>,
+        /// Enable FerrisRes Armor (security filtering).
+        #[arg(long)]
+        armor: bool,
     },
 
     Benchmark {
@@ -106,6 +109,12 @@ enum Commands {
         /// Resume from checkpoint.
         #[arg(long)]
         resume: Option<String>,
+        /// Enable FerrisRes Armor (security filtering).
+        #[arg(long)]
+        armor: bool,
+        /// Armor config file path (default: armor.toml).
+        #[arg(long)]
+        armor_config: Option<String>,
         /// Model file format: safetensors or gguf.
         #[arg(long, default_value = "safetensors")]
         model_format: String,
@@ -123,6 +132,12 @@ enum Commands {
         /// Number of steps with no improvement before stopping (requires --converge > 0).
         #[arg(long, default_value_t = 50)]
         converge_patience: usize,
+        /// Enable FerrisRes Armor (security filtering).
+        #[arg(long)]
+        armor: bool,
+        /// Armor config file path (default: armor.toml).
+        #[arg(long)]
+        armor_config: Option<String>,
     },
 
     /// Evaluate teacher/student perplexity.
@@ -167,7 +182,8 @@ async fn main() -> anyhow::Result<()> {
             template,
             yarn_scale,
             image,
-        } => cmd_infer(hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale, image).await,
+            armor,
+        } => cmd_infer(hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale, image, armor).await,
         Commands::Benchmark {
             hidden_dim,
             num_blocks,
@@ -422,8 +438,30 @@ async fn cmd_infer(
     template: Option<String>,
     yarn_scale: Option<f32>,
     image: Option<String>,
+    armor: bool,
 ) -> anyhow::Result<()> {
     info!(event = "initializing_inference_pipeline", "Initializing inference pipeline");
+
+    // Initialize Armor if enabled
+    let armor_layer = if armor {
+        info!(event = "armor_enabled", "FerrisRes Armor security enabled");
+        Some(ferrisres::ArmorLayer::new())
+    } else {
+        None
+    };
+    
+    // Check prompt with Armor before generation
+    if let Some(ref layer) = armor_layer {
+        match layer.verify_input(&prompt) {
+            ferrisres::SecurityVerdict::Block(reason) => {
+                anyhow::bail!("Input blocked by Armor: {}", reason);
+            }
+            ferrisres::SecurityVerdict::Redact(cleaned) => {
+                info!(event = "armor_redacted", "Input sanitized");
+            }
+            _ => {}
+        }
+    }
 
     let compute = WgpuCompute::new().await?;
     let _capability = compute.detect_capability();
@@ -544,9 +582,23 @@ async fn cmd_infer(
     
     // Decode and print
     let decoded = tokenizer.decode(&output_tokens);
+    
+    // Sanitize output with Armor if enabled
+    let final_output = if let Some(ref layer) = armor_layer {
+        match layer.sanitize_output(&decoded) {
+            ferrisres::SecurityVerdict::Redact(sanitized) => {
+                info!(event = "armor_output_redacted", "Output sanitized by Armor");
+                sanitized
+            }
+            _ => decoded.clone(),
+        }
+    } else {
+        decoded.clone()
+    };
+
     info!(event = "generation_complete", "generated {} tokens{}", output_tokens.len(),
         if image_patch_count > 0 { format!(" (with {} image patches)", image_patch_count) } else { String::new() });
-    println!("{}", decoded);
+    println!("{}", final_output);
 
     Ok(())
 }
