@@ -916,7 +916,11 @@ async fn cmd_distill(
             info!(event = "using_gpu_matmul_acceleration_for_teacher", "Using GPU matmul acceleration for teacher forward");
         }
 
-        let total_chunks = num_chunks.min(steps);
+        // Limit pre-computed chunks to avoid OOM on Colab (12GB RAM limit)
+        // Each chunk: teacher logits (134MB) + frozen states (27MB) ≈ 160MB
+        // Limit to 30 chunks ≈ 4.8GB
+        let max_precomputed_chunks = 30;
+        let total_chunks = num_chunks.min(steps).min(max_precomputed_chunks);
         let teacher_start = std::time::Instant::now();
         for chunk_idx in 0..total_chunks {
             let chunk_start = std::time::Instant::now();
@@ -956,7 +960,9 @@ async fn cmd_distill(
         anyhow::bail!("Skeleton model requires GPU for layer weights but no GPU available. Increase system RAM or use a GPU machine.");
     } else {
         // CPU teacher forward
-        let total_chunks = num_chunks.min(steps);
+        // Limit pre-computed chunks to avoid OOM
+        let max_precomputed_chunks = 30;
+        let total_chunks = num_chunks.min(steps).min(max_precomputed_chunks);
         let teacher_start = std::time::Instant::now();
         for chunk_idx in 0..total_chunks {
             let chunk_start = std::time::Instant::now();
