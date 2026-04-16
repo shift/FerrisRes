@@ -132,12 +132,6 @@ enum Commands {
         /// Number of steps with no improvement before stopping (requires --converge > 0).
         #[arg(long, default_value_t = 50)]
         converge_patience: usize,
-        /// Enable FerrisRes Armor (security filtering).
-        #[arg(long)]
-        armor: bool,
-        /// Armor config file path (default: armor.toml).
-        #[arg(long)]
-        armor_config: Option<String>,
     },
 
     /// Evaluate teacher/student perplexity.
@@ -193,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Distill {
             model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every,
             resume, model_format, tokenizer, checkpoint_every, converge, converge_patience,
+            armor: _, armor_config: _,
         } => cmd_distill(model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every, resume, model_format, tokenizer, checkpoint_every, converge, converge_patience).await,
         Commands::Evaluate {
             model_path, config, text,
@@ -443,7 +438,7 @@ async fn cmd_infer(
     info!(event = "initializing_inference_pipeline", "Initializing inference pipeline");
 
     // Initialize Armor if enabled
-    let armor_layer = if armor {
+    let mut armor_layer = if armor {
         info!(event = "armor_enabled", "FerrisRes Armor security enabled");
         Some(ferrisres::ArmorLayer::new())
     } else {
@@ -451,12 +446,12 @@ async fn cmd_infer(
     };
     
     // Check prompt with Armor before generation
-    if let Some(ref layer) = armor_layer {
+    if let Some(ref mut layer) = armor_layer {
         match layer.verify_input(&prompt) {
             ferrisres::SecurityVerdict::Block(reason) => {
                 anyhow::bail!("Input blocked by Armor: {}", reason);
             }
-            ferrisres::SecurityVerdict::Redact(cleaned) => {
+            ferrisres::SecurityVerdict::Redact(_cleaned) => {
                 info!(event = "armor_redacted", "Input sanitized");
             }
             _ => {}
@@ -584,7 +579,7 @@ async fn cmd_infer(
     let decoded = tokenizer.decode(&output_tokens);
     
     // Sanitize output with Armor if enabled
-    let final_output = if let Some(ref layer) = armor_layer {
+    let final_output = if let Some(ref mut layer) = armor_layer {
         match layer.sanitize_output(&decoded) {
             ferrisres::SecurityVerdict::Redact(sanitized) => {
                 info!(event = "armor_output_redacted", "Output sanitized by Armor");
