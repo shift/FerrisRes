@@ -1019,6 +1019,21 @@ async fn cmd_distill(
 
     let mut student = Gemma4Student::new(model2, block_summaries, distill_config.clone());
 
+    // Cache transposed lm_head for backward pass (d_logits → d_hidden)
+    // Transposed once instead of every step: 400M ops saved per step
+    let lm_head_t: Vec<f32> = {
+        let lm_head = &student.model.lm_head;
+        let hd = config.hidden_dim;
+        let vs = config.vocab_size;
+        let mut t = vec![0.0f32; vs * hd];
+        for d in 0..hd {
+            for v in 0..vs {
+                t[v * hd + d] = lm_head.get(d * vs + v).copied().unwrap_or(0.0);
+            }
+        }
+        t
+    };
+
     // Initialize optimizers (fresh or from checkpoint)
     let mut global_step: usize = 0;
     let mut optimizers: Vec<gemma_mapper::BlockSummaryAdam> = student.block_summaries.iter()
@@ -1327,16 +1342,8 @@ async fn cmd_distill(
 
         // Project d_logits [seq × vocab] back through LM head to get d_hidden [seq × hd]
         // d_hidden = d_logits × lm_head^T  (lm_head is [hd × vs], transposed to [vs × hd])
+        // Use pre-cached transposed lm_head (computed once at setup)
         let d_hidden: Vec<f32> = {
-            // Transpose lm_head from [hd × vs] to [vs × hd] for matmul
-            let lm_head = &student.model.lm_head;
-            let mut lm_head_t = vec![0.0f32; vs * config.hidden_dim];
-            for d in 0..config.hidden_dim {
-                for v in 0..vs {
-                    lm_head_t[v * config.hidden_dim + d] = lm_head.get(d * vs + v).copied().unwrap_or(0.0);
-                }
-            }
-            // d_hidden = d_logits [seq × vs] × lm_head_t [vs × hd] = [seq × hd]
             gpu_matmul(&d_logits, &lm_head_t, actual_seq, vs, config.hidden_dim, &dispatch)
         };
 
