@@ -922,7 +922,7 @@ async fn cmd_distill(
             if chunk.len() < seq_len { break; }
 
             let logits = if let Some(cache) = &weight_cache {
-                accel.forward_resident(cache, teacher.model(), &chunk)
+                accel.forward_resident_gpu(cache, teacher.model(), &chunk)
                     .map_err(|e| anyhow::anyhow!("GPU resident forward failed: {:?}", e))?
             } else if use_skeleton {
                 anyhow::bail!("Skeleton model requires GPU resident weights but upload failed. Not enough RAM for JIT fallback.");

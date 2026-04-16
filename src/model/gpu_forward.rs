@@ -104,6 +104,8 @@ pub struct GpuMatmulAccelerator {
     real_max_buffer_bytes: u64,
     /// Whether validate_model was called.
     weights_ready: bool,
+    /// Full transformer pipeline (RMSNorm, RoPE, attention, etc.)
+    transformer_pipeline: Option<crate::compute::kernels::gpu_transformer::GpuTransformerPipeline>,
 }
 
 impl GpuMatmulAccelerator {
@@ -172,11 +174,14 @@ impl GpuMatmulAccelerator {
             profile.compute_mode(),
         );
 
+        let transformer_pipeline = crate::compute::kernels::gpu_transformer::GpuTransformerPipeline::new(&device).ok();
+
         Ok(Self {
             device, queue, matmul, profile,
             reported_max_buffer_bytes: max_buffer_bytes,
             real_max_buffer_bytes: real_max,
             weights_ready: false,
+            transformer_pipeline,
         })
     }
 
@@ -188,11 +193,13 @@ impl GpuMatmulAccelerator {
         let profile = DeviceProfile::from_env()
             .unwrap_or(DeviceProfile::MidRange);
         let matmul = MatMulOp::new(&device, &queue);
+        let transformer_pipeline = crate::compute::kernels::gpu_transformer::GpuTransformerPipeline::new(&device).ok();
         Self {
             device, queue, matmul, profile,
             reported_max_buffer_bytes: reported_max,
             real_max_buffer_bytes: real_max,
             weights_ready: false,
+            transformer_pipeline,
         }
     }
 
@@ -650,6 +657,111 @@ impl GpuMatmulAccelerator {
         // 4. LM head (CPU tiled — vocab is huge, existing path works well)
         let logits = cpu_lm_head(&hidden, &model.lm_head, seq, hd, vs);
 
+        Ok(logits)
+    }
+
+    /// Full GPU forward pass — ALL operations on GPU, single sync at end.
+    pub fn forward_resident_gpu(
+        &self,
+        cache: &GpuWeightCache,
+        model: &MappedGemma4Model,
+        token_ids: &[u32],
+    ) -> Result<Vec<f32>> {
+        let pipeline = match &self.transformer_pipeline {
+            Some(p) => p,
+            None => return self.forward_resident(cache, model, token_ids),
+        };
+        let hd = cache.hidden_dim;
+        let nh = cache.num_heads;
+        let nkv = cache.num_kv_heads;
+        let head_d = cache.head_dim;
+        let seq = token_ids.len();
+        let id = cache.intermediate_dim;
+        let q_dim = nh * head_d;
+        let kv_dim = nkv * head_d;
+        let vs = model.config.vocab_size;
+        let hs = seq * hd; // hidden_size
+
+        // 1. Embedding (CPU gather)
+        let scale = (hd as f32).sqrt();
+        let mut hidden = vec![0.0f32; hs];
+        for (t, &tid) in token_ids.iter().enumerate() {
+            let idx = tid as usize;
+            if idx * hd + hd <= model.embed_tokens.len() {
+                for d in 0..hd { hidden[t * hd + d] = model.embed_tokens[idx * hd + d] * scale; }
+            }
+        }
+
+        // Allocate persistent GPU buffers for the forward pass
+        let hidden_buf = GpuBuffer::new_device_local(&self.device, &self.queue, bytemuck::cast_slice(&hidden), Some("hidden"))?;
+        let residual_buf = GpuBuffer::new(&self.device, hs * 4, Some("residual"))?;
+        let normed_buf = GpuBuffer::new(&self.device, hs * 4, Some("normed"))?;
+        let q_buf = GpuBuffer::new(&self.device, seq * q_dim * 4, Some("q"))?;
+        let k_buf = GpuBuffer::new(&self.device, seq * kv_dim * 4, Some("k"))?;
+        let v_buf = GpuBuffer::new(&self.device, seq * kv_dim * 4, Some("v"))?;
+        let attn_out_buf = GpuBuffer::new(&self.device, seq * q_dim * 4, Some("attn_out"))?;
+        let o_buf = GpuBuffer::new(&self.device, hs * 4, Some("o"))?;
+        let gate_buf = GpuBuffer::new(&self.device, seq * id * 4, Some("gate"))?;
+        let up_buf = GpuBuffer::new(&self.device, seq * id * 4, Some("up"))?;
+        let combined_buf = GpuBuffer::new(&self.device, seq * id * 4, Some("combined"))?;
+        let ffn_buf = GpuBuffer::new(&self.device, hs * 4, Some("ffn"))?;
+
+        // Single command encoder for entire forward pass
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("full_gpu") });
+
+        for (layer_idx, lw) in cache.layer_weights.iter().enumerate() {
+            // Residual save
+            enc.copy_buffer_to_buffer(hidden_buf.buffer(), 0, residual_buf.buffer(), 0, (hs * 4) as u64);
+
+            // RMSNorm
+            pipeline.dispatch_rmsnorm(&self.device, &self.queue, &mut enc, &hidden_buf, &normed_buf, &cache.input_norms_bufs[layer_idx], seq as u32, hd as u32)?;
+
+            // Q/K/V matmuls
+            self.matmul.dispatch(&mut enc, &normed_buf, &lw.q_proj, &q_buf, seq as u32, hd as u32, q_dim as u32)?;
+            self.matmul.dispatch(&mut enc, &normed_buf, &lw.k_proj, &k_buf, seq as u32, hd as u32, kv_dim as u32)?;
+            self.matmul.dispatch(&mut enc, &normed_buf, &lw.v_proj, &v_buf, seq as u32, hd as u32, kv_dim as u32)?;
+
+            // RoPE (in-place)
+            pipeline.dispatch_rope(&self.device, &self.queue, &mut enc, &q_buf, seq as u32, nh as u32, head_d as u32)?;
+            pipeline.dispatch_rope(&self.device, &self.queue, &mut enc, &k_buf, seq as u32, nkv as u32, head_d as u32)?;
+
+            // Causal attention with GQA
+            pipeline.dispatch_attention(&self.device, &self.queue, &mut enc, &q_buf, &k_buf, &v_buf, &attn_out_buf, seq as u32, nh as u32, nkv as u32, head_d as u32)?;
+
+            // O projection
+            self.matmul.dispatch(&mut enc, &attn_out_buf, &lw.o_proj, &o_buf, seq as u32, q_dim as u32, hd as u32)?;
+
+            // Residual: hidden = residual + o
+            pipeline.dispatch_residual_add(&self.device, &self.queue, &mut enc, &residual_buf, &o_buf, &hidden_buf, hs as u32)?;
+
+            // Residual2 save
+            enc.copy_buffer_to_buffer(hidden_buf.buffer(), 0, residual_buf.buffer(), 0, (hs * 4) as u64);
+
+            // Post-attn RMSNorm
+            pipeline.dispatch_rmsnorm(&self.device, &self.queue, &mut enc, &hidden_buf, &normed_buf, &cache.post_attn_norms_bufs[layer_idx], seq as u32, hd as u32)?;
+
+            // Gate + Up matmuls
+            self.matmul.dispatch(&mut enc, &normed_buf, &lw.gate_proj, &gate_buf, seq as u32, hd as u32, id as u32)?;
+            self.matmul.dispatch(&mut enc, &normed_buf, &lw.up_proj, &up_buf, seq as u32, hd as u32, id as u32)?;
+
+            // SiLU(gate) * up → combined
+            pipeline.dispatch_silu_multiply(&self.device, &self.queue, &mut enc, &gate_buf, &up_buf, &combined_buf, (seq * id) as u32)?;
+
+            // Down projection
+            self.matmul.dispatch(&mut enc, &combined_buf, &lw.down_proj, &ffn_buf, seq as u32, id as u32, hd as u32)?;
+
+            // Residual: hidden = residual2 + ffn
+            pipeline.dispatch_residual_add(&self.device, &self.queue, &mut enc, &residual_buf, &ffn_buf, &hidden_buf, hs as u32)?;
+        }
+
+        // ONE SUBMIT, ONE SYNC for entire forward pass
+        self.queue.submit(std::iter::once(enc.finish()));
+        self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+
+        // Read back for final norm + lm_head (CPU)
+        let hidden_final = crate::model::gpu_forward::read_back_f32(&self.device, &self.queue, &hidden_buf, hs)?;
+        let hidden_normed = rms_norm_cpu(&hidden_final, &model.final_norm, hd, 1e-6);
+        let logits = cpu_lm_head(&hidden_normed, &model.lm_head, seq, hd, vs);
         Ok(logits)
     }
 
