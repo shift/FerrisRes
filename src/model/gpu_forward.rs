@@ -62,6 +62,12 @@ pub struct GpuWeightCache {
     // RMSNorm weights on GPU (for full-GPU forward)
     pub input_norms_bufs: Vec<GpuBuffer>,
     pub post_attn_norms_bufs: Vec<GpuBuffer>,
+    // LM head weight tiles on GPU (vs/4096 tiles of [hd × 4096])
+    pub lm_head_tiles: Vec<GpuBuffer>,
+    pub lm_head_vocab_size: usize,
+    pub lm_head_tile_cols: usize,
+    // Final norm on GPU
+    pub final_norm_buf: Option<GpuBuffer>,
     // Small weights kept on CPU (fallback)
     pub input_norms: Vec<Vec<f32>>,
     pub post_attn_norms: Vec<Vec<f32>>,
@@ -204,6 +210,75 @@ impl GpuMatmulAccelerator {
     }
 
     pub fn profile(&self) -> DeviceProfile { self.profile }
+
+    /// Upload lm_head + final_norm to GPU and add to existing cache.
+    /// Call after creating the cache, before forward_resident_gpu().
+    pub fn enrich_cache_with_lm_head(
+        &self,
+        cache: &mut GpuWeightCache,
+        lm_head: &[f32],
+        final_norm: &[f32],
+    ) -> Result<()> {
+        let hd = cache.hidden_dim;
+        let vs = lm_head.len() / hd;
+        let tile_cols = 4096;
+
+        cache.lm_head_tiles = self.upload_lm_head_tiles(lm_head, hd, vs, tile_cols)?;
+        cache.lm_head_vocab_size = vs;
+        cache.lm_head_tile_cols = tile_cols;
+        cache.final_norm_buf = Some(GpuBuffer::new_device_local(
+            &self.device,
+            &self.queue,
+            bytemuck::cast_slice(final_norm),
+            Some("final_norm"),
+        )?);
+
+        tracing::info!(
+            event = "cache_enriched",
+            vocab_size = vs,
+            lm_head_tiles = cache.lm_head_tiles.len(),
+            "LM head + final norm uploaded to GPU"
+        );
+        Ok(())
+    }
+
+    /// Upload lm_head weight as GPU tiles. Returns tile buffers.
+    /// Tiled because lm_head is ~1.6GB (262144 × 1536 × fp32) — too big for one buffer.
+    /// Split into chunks of `tile_cols` columns, each [hd × tile_cols] = ~25MB.
+    pub fn upload_lm_head_tiles(
+        &self,
+        lm_head: &[f32],
+        hd: usize,
+        vs: usize,
+        tile_cols: usize,
+    ) -> Result<Vec<GpuBuffer>> {
+        let mut tiles = Vec::with_capacity((vs + tile_cols - 1) / tile_cols);
+        for v_start in (0..vs).step_by(tile_cols) {
+            let v_end = (v_start + tile_cols).min(vs);
+            let cols = v_end - v_start;
+            // Extract tile: [hd × cols] from [vs × hd] row-major
+            let mut tile_data = vec![0.0f32; hd * cols];
+            for v in 0..cols {
+                for d in 0..hd {
+                    tile_data[v * hd + d] = lm_head[(v_start + v) * hd + d];
+                }
+            }
+            let buf = GpuBuffer::new_device_local(
+                &self.device,
+                &self.queue,
+                bytemuck::cast_slice(&tile_data),
+                Some(&format!("lm_head_tile_{}", v_start / tile_cols)),
+            )?;
+            tiles.push(buf);
+        }
+        tracing::info!(
+            event = "lm_head_tiles_uploaded",
+            tiles = tiles.len(),
+            tile_cols = tile_cols,
+            "LM head weight uploaded to GPU in tiles"
+        );
+        Ok(tiles)
+    }
 
     /// Empirically verified max single buffer size in bytes.
     pub fn max_buffer_bytes(&self) -> u64 { self.real_max_buffer_bytes }
@@ -448,8 +523,12 @@ impl GpuMatmulAccelerator {
 
         Ok(GpuWeightCache {
             layer_weights,
-            input_norms_bufs: vec![], // populated by full-GPU pipeline
+            input_norms_bufs: vec![], // populated by enrich_cache_with_lm_head
             post_attn_norms_bufs: vec![],
+            lm_head_tiles: vec![],
+            lm_head_vocab_size: 0,
+            lm_head_tile_cols: 0,
+            final_norm_buf: None,
             input_norms: model.layers.iter().map(|l| l.attn.input_norm.clone()).collect(),
             post_attn_norms: model.layers.iter().map(|l| l.attn.post_attn_norm.clone()).collect(),
             hidden_dim: hd,
@@ -572,6 +651,10 @@ impl GpuMatmulAccelerator {
             layer_weights,
             input_norms_bufs,
             post_attn_norms_bufs,
+            lm_head_tiles: vec![],
+            lm_head_vocab_size: 0,
+            lm_head_tile_cols: 0,
+            final_norm_buf: None,
             input_norms,
             post_attn_norms,
             hidden_dim: hd,
@@ -754,14 +837,73 @@ impl GpuMatmulAccelerator {
             pipeline.dispatch_residual_add(&self.device, &self.queue, &mut enc, &residual_buf, &ffn_buf, &hidden_buf, hs as u32)?;
         }
 
-        // ONE SUBMIT, ONE SYNC for entire forward pass
+        // Final RMSNorm (GPU, same encoder)
+        let final_buf = GpuBuffer::new(&self.device, hs * 4, Some("final_hidden"))?;
+        if let Some(ref final_norm_buf) = cache.final_norm_buf {
+            pipeline.dispatch_rmsnorm(&self.device, &self.queue, &mut enc, &hidden_buf, &final_buf, final_norm_buf, seq as u32, hd as u32)?;
+        } else {
+            // No GPU norm — just copy hidden to final_buf
+            enc.copy_buffer_to_buffer(hidden_buf.buffer(), 0, final_buf.buffer(), 0, (hs * 4) as u64);
+        }
+
+        // ONE SUBMIT, ONE SYNC for entire forward pass (layers + final norm)
         self.queue.submit(std::iter::once(enc.finish()));
         self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
 
-        // Read back for final norm + lm_head (CPU)
-        let hidden_final = crate::model::gpu_forward::read_back_f32(&self.device, &self.queue, &hidden_buf, hs)?;
-        let hidden_normed = rms_norm_cpu(&hidden_final, &model.final_norm, hd, 1e-6);
-        let logits = cpu_lm_head(&hidden_normed, &model.lm_head, seq, hd, vs);
+        // GPU tiled LM head
+        let logits = if !cache.lm_head_tiles.is_empty() {
+            self.gpu_lm_head_tiled(&final_buf, &cache.lm_head_tiles, seq, hd, vs, cache.lm_head_tile_cols)?
+        } else {
+            // CPU fallback
+            let hidden_final = crate::model::gpu_forward::read_back_f32(&self.device, &self.queue, &final_buf, hs)?;
+            let hidden_normed = rms_norm_cpu(&hidden_final, &model.final_norm, hd, 1e-6);
+            cpu_lm_head(&hidden_normed, &model.lm_head, seq, hd, vs)
+        };
+        Ok(logits)
+    }
+
+    /// GPU-tiled LM head: [seq × hd] × [hd × vs] → [seq × vs]
+    /// lm_head is split into `tiles` GPU buffers of [hd × tile_cols].
+    /// Each tile matmul is dispatched to GPU, results concatenated on CPU.
+    /// 64 tiles × 25MB = 1.6GB total, but only one tile in flight at a time.
+    pub fn gpu_lm_head_tiled(
+        &self,
+        hidden_buf: &GpuBuffer,
+        lm_head_tiles: &[GpuBuffer],
+        seq: usize,
+        hd: usize,
+        vs: usize,
+        tile_cols: usize,
+    ) -> Result<Vec<f32>> {
+        let mut logits = vec![0.0f32; seq * vs];
+
+        // Batch all tile matmuls in a single encoder
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("lm_head_tiled"),
+        });
+
+        let mut result_bufs = Vec::with_capacity(lm_head_tiles.len());
+        for (tile_idx, tile_buf) in lm_head_tiles.iter().enumerate() {
+            let v_start = tile_idx * tile_cols;
+            let cols = (tile_cols).min(vs - v_start);
+            let c_buf = GpuBuffer::new(&self.device, seq * cols * 4, Some(&format!("lm_tile_{}", tile_idx)))?;
+            self.matmul.dispatch(&mut enc, hidden_buf, tile_buf, &c_buf, seq as u32, hd as u32, cols as u32)?;
+            result_bufs.push((c_buf, v_start, cols));
+        }
+
+        self.queue.submit(std::iter::once(enc.finish()));
+        self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+
+        // Read back all tiles and stitch into full logits
+        for (c_buf, v_start, cols) in &result_bufs {
+            let tile_logits = crate::model::gpu_forward::read_back_f32(&self.device, &self.queue, &c_buf, seq * cols)?;
+            for t in 0..seq {
+                for v in 0..*cols {
+                    logits[t * vs + v_start + v] = tile_logits[t * cols + v];
+                }
+            }
+        }
+
         Ok(logits)
     }
 
