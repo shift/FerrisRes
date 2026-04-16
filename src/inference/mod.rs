@@ -33,6 +33,7 @@ pub mod scientific;
 pub mod tactile;
 pub mod ee;
 pub mod science2;
+pub mod cognitive_pipeline;
 
 pub use kv_cache::{LayerKVCache, ModelKVCache};
 pub use two_phase::{TwoPhaseConfig, TwoPhaseInference, KVCache, Sampler, GenerationState};
@@ -49,3 +50,4 @@ pub use sampling::{sample_argmax, sample_temperature, sample_top_k, sample_top_p
 pub use token_merging::{ToMeMerger, ToMeConfig, TokenSizes, cosine_sim};
 pub use matryoshka::ElasticRagStore;
 pub use paca::{PacaEngine, PacaConfig, ClusterMethod, ClusterAssignment};
+pub use cognitive_pipeline::{CognitivePipeline, CognitivePipelineConfig, CognitiveGenerationResult, ToolExecutionResult, CalmResult};
