@@ -1,0 +1,26 @@
+# FerrisRes Armor Configuration
+# Enable/disable security layers and customize thresholds
+
+# Layer enables
+[l0]
+enabled = true  # L0: regex + bloom filters
+
+[l1]
+enabled = true  # L1: neural scanner
+threshold = 0.7  # injection score threshold
+
+[l2] 
+enabled = true  # L2: representation probe
+threshold = 0.7
+
+[l3]
+enabled = true  # L3: PII redaction
+
+# Self-learning feedback
+[feedback]
+max_history = 1000
+
+# Custom patterns (regex for L0)
+[custom_patterns]
+# Add domain-specific blocked patterns here
+blocked = []

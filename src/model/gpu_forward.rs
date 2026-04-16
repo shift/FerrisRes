@@ -149,7 +149,8 @@ impl GpuMatmulAccelerator {
         });
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
+            // Use LowPower for iGPU compatibility, HighPerformance can misreport limits on Intel HD
+            power_preference: wgpu::PowerPreference::LowPower,
             force_fallback_adapter: false,
             compatible_surface: None,
         })).map_err(|e| crate::error::FerrisResError::Shape(format!("No GPU adapter: {:?}", e)))?;
@@ -360,10 +361,21 @@ impl GpuMatmulAccelerator {
         let max_weight_bytes = (hd.max(id) * id.max(hd) * 4) as u64;
         if max_weight_bytes > self.real_max_buffer_bytes {
             return Err(crate::error::FerrisResError::Shape(format!(
-                "Largest weight matrix ({:.0}MB) exceeds GPU max buffer ({:.0}MB). Profile={:?}",
+                "Largest weight matrix ({:.0}MB) exceeds GPU max buffer ({:.0}MB). Profile={:?}. \
+                Hint: On Intel iGPU with small max buffer, use CPU-only mode (no GPU acceleration).",
                 max_weight_bytes as f64 / 1e6, self.real_max_buffer_bytes as f64 / 1e6, self.profile
             )));
         }
+        
+        // Intel iGPU warning: max buffer ~256MB is too small for efficient GPU matmul
+        if self.real_max_buffer_bytes < 512 * 1024 * 1024 {  // < 512MB
+            tracing::warn!(
+                "Intel iGPU detected: max_buffer={:.0}MB is very small. \
+                GPU matmul may be unstable. Consider running with CPU-only mode (no --gpu flag).",
+                self.real_max_buffer_bytes as f64 / 1e6
+            );
+        }
+        
         tracing::info!(
             "Model validated for GPU: {} layers, max_weight={:.0}MB, limit={:.0}MB, profile={:?}",
             config.num_layers, max_weight_bytes as f64 / 1e6, self.real_max_buffer_bytes as f64 / 1e6, self.profile

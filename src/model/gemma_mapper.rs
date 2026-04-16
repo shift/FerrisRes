@@ -3163,6 +3163,12 @@ impl DistillationCheckpoint {
         buf.extend_from_slice(&(self.global_step as u64).to_le_bytes());
         buf.extend_from_slice(&(self.layer_checkpoints.len() as u32).to_le_bytes());
 
+        // Early exit if no layers (empty checkpoint)
+        if self.layer_checkpoints.is_empty() {
+            tracing::warn!("Skipping empty checkpoint save");
+            return Ok(());
+        }
+
         for lc in &self.layer_checkpoints {
             let pc = lc.params.len() as u64;
             buf.extend_from_slice(&pc.to_le_bytes());
@@ -3179,8 +3185,17 @@ impl DistillationCheckpoint {
             for &v in &lc.norm_bias { buf.extend_from_slice(&v.to_le_bytes()); }
         }
 
-        let mut file = std::fs::File::create(path)?;
-        file.write_all(&buf)?;
+        // Write to temp file first, then rename (atomic)
+        let mut temp_path = path.to_path_buf();
+        temp_path.push(".tmp");
+        {
+            let mut file = std::fs::File::create(&temp_path)?;
+            file.write_all(&buf)?;
+            file.flush()?;
+        }
+        // Atomic rename
+        std::fs::rename(&temp_path, path)?;
+        tracing::info!(event = "checkpoint_saved", bytes = buf.len(), "Checkpoint saved");
         Ok(())
     }
 
@@ -3192,6 +3207,12 @@ impl DistillationCheckpoint {
         let mut buf = Vec::new();
         std::fs::File::open(path)?.read_to_end(&mut buf)?;
         let buf_len = buf.len();
+        
+        // Empty or truncated file check
+        if buf_len < 12 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                format!("Checkpoint file too small ({} bytes) - corrupt or empty", buf_len)));
+        }
         let mut pos = 0usize;
 
         // Sanity limit: no single param vector should exceed 1 billion floats (~4GB)
