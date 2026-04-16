@@ -3186,8 +3186,7 @@ impl DistillationCheckpoint {
         }
 
         // Write to temp file first, then rename (atomic)
-        let mut temp_path = path.to_path_buf();
-        temp_path.push(".tmp");
+        let temp_path = std::path::PathBuf::from(format!("{}.tmp", path.display()));
         {
             let mut file = std::fs::File::create(&temp_path)?;
             file.write_all(&buf)?;

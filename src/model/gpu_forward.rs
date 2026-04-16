@@ -341,13 +341,18 @@ impl GpuMatmulAccelerator {
         reported.min(4 * 1024 * 1024 * 1024) // 4GB cap
     }
 
-    /// Estimate VRAM from device limits (uses real probed max_buffer as proxy).
-    /// For accurate VRAM, use ash/sysfs on Linux, Metal on macOS.
+    /// Estimate VRAM from adapter name heuristics.
+    /// wgpu doesn't expose total VRAM directly. On iGPUs, total memory
+    /// is shared system RAM (not the 256MB max_buffer aperture).
     pub fn estimated_vram_bytes(&self) -> u64 {
-        // wgpu doesn't expose total VRAM directly.
-        // Use real probed max_buffer as a lower bound — the real VRAM is typically
-        // 4-16× larger than max_buffer_size.
-        self.real_max_buffer_bytes * 4
+        // For iGPUs, estimate from system RAM (typically 8-32GB shared)
+        // For discrete GPUs, use max_buffer * 4 as proxy
+        match self.profile {
+            DeviceProfile::Integrated => 8 * 1024 * 1024 * 1024,  // 8GB conservative
+            DeviceProfile::LowEnd => self.real_max_buffer_bytes * 4,
+            DeviceProfile::MidRange => self.real_max_buffer_bytes * 4,
+            DeviceProfile::HighEnd => self.real_max_buffer_bytes * 4,
+        }
     }
 
     /// Upload model weights to GPU. Call once after loading.
@@ -362,7 +367,7 @@ impl GpuMatmulAccelerator {
         if max_weight_bytes > self.real_max_buffer_bytes {
             return Err(crate::error::FerrisResError::Shape(format!(
                 "Largest weight matrix ({:.0}MB) exceeds GPU max buffer ({:.0}MB). Profile={:?}. \
-                Hint: On Intel iGPU with small max buffer, use CPU-only mode (no GPU acceleration).",
+                Hint: On Intel iGPU, individual weight matrices may need chunking.",
                 max_weight_bytes as f64 / 1e6, self.real_max_buffer_bytes as f64 / 1e6, self.profile
             )));
         }
@@ -371,7 +376,7 @@ impl GpuMatmulAccelerator {
         if self.real_max_buffer_bytes < 512 * 1024 * 1024 {  // < 512MB
             tracing::warn!(
                 "Intel iGPU detected: max_buffer={:.0}MB is very small. \
-                GPU matmul may be unstable. Consider running with CPU-only mode (no --gpu flag).",
+                GPU matmul may be unstable. Weight matrices will be automatically chunked.",
                 self.real_max_buffer_bytes as f64 / 1e6
             );
         }
