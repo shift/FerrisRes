@@ -868,7 +868,7 @@ async fn cmd_distill(
         // - Skeleton model: MUST stream to GPU (no layer weights in RAM)
         // - Full model + resident mode: upload from RAM
         // - Full model + no resident: JIT per-matmul
-        let weight_cache = if use_skeleton {
+        let mut weight_cache = if use_skeleton {
             // Skeleton model: projection weights aren't in RAM, must stream from mmap to GPU
             // This works even if DispatchPlan says resident_mode=false — skeleton REQUIRES GPU.
             info!(
@@ -906,8 +906,12 @@ async fn cmd_distill(
             None
         };
 
-        if weight_cache.is_some() {
-            info!(event = "using_gpu_resident_for_teacher", "Using GPU resident weights for teacher forward");
+        if let Some(ref mut cache) = weight_cache {
+            // Upload lm_head + final_norm to GPU for full-GPU forward
+            if let Err(e) = accel.enrich_cache_with_lm_head(cache, &teacher.model().lm_head, &teacher.model().final_norm) {
+                tracing::warn!(event = "lm_head_upload_failed", error = ?e, "LM head upload failed, will use CPU fallback");
+            }
+            info!(event = "using_gpu_resident_for_teacher", "Using GPU resident weights for teacher forward (full GPU pipeline)");
         } else {
             info!(event = "using_gpu_matmul_acceleration_for_teacher", "Using GPU matmul acceleration for teacher forward");
         }
