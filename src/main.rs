@@ -589,7 +589,7 @@ async fn cmd_infer(
         use ferrisres::inference::cognitive_pipeline::{CognitivePipeline, CognitivePipelineConfig};
         let cp_config = CognitivePipelineConfig {
             concepts_enabled: true,
-            concepts_path: concepts_path.map(|p| p.into()),
+            concepts_path: concepts_path.clone().map(|p| p.into()),
             concepts_embedding_dim: 64,
             concepts_max: 10000,
             kv_persist_enabled: persist_kv,
@@ -603,6 +603,13 @@ async fn cmd_infer(
             mirror_max_retries: 2,
             wasm_sandbox_enabled: false,
             self_correction_enabled: true,
+            episodic_memory_enabled: true,
+            episodic_memory_path: concepts_path.as_ref().map(|p| {
+                let mut path: std::path::PathBuf = p.clone().into();
+                path.set_file_name("episodes.json");
+                path
+            }),
+            episodic_config: None,
         };
         info!(event = "cognitive_pipeline_enabled", "Cognitive pipeline enabled: concepts={}, llm_computer={}, mirror_test={}",
             cp_config.concepts_enabled, cp_config.llm_computer_enabled, cp_config.mirror_test_enabled);

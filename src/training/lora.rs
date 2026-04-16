@@ -229,9 +229,34 @@ impl LoraLayer {
         &self.lora_a
     }
 
+    /// Get mutable LoRA A matrix.
+    pub fn lora_a_mut(&mut self) -> &mut [f32] {
+        &mut self.lora_a
+    }
+
     /// Get LoRA B matrix.
     pub fn lora_b(&self) -> &[f32] {
         &self.lora_b
+    }
+
+    /// Get mutable LoRA B matrix.
+    pub fn lora_b_mut(&mut self) -> &mut [f32] {
+        &mut self.lora_b
+    }
+
+    /// Get input dimension.
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+
+    /// Get output dimension.
+    pub fn out_features(&self) -> usize {
+        self.out_features
+    }
+
+    /// Get scaling factor.
+    pub fn scaling(&self) -> f32 {
+        self.scaling
     }
 
     /// Get mutable reference to gradients.
