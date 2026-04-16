@@ -64,6 +64,18 @@ enum Commands {
         /// Enable FerrisRes Armor (security filtering).
         #[arg(long)]
         armor: bool,
+        /// Enable cognitive pipeline (concept memory + self-evaluation + LLM-Computer).
+        #[arg(long)]
+        cognitive: bool,
+        /// Path to persist concept memory.
+        #[arg(long)]
+        concepts_path: Option<String>,
+        /// Enable Hull-KV cache persistence.
+        #[arg(long)]
+        persist_kv: bool,
+        /// Path to persist KV cache.
+        #[arg(long)]
+        kv_path: Option<String>,
     },
 
     Benchmark {
@@ -177,7 +189,11 @@ async fn main() -> anyhow::Result<()> {
             yarn_scale,
             image,
             armor,
-        } => cmd_infer(hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale, image, armor).await,
+            cognitive,
+            concepts_path,
+            persist_kv,
+            kv_path,
+        } => cmd_infer(hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale, image, armor, cognitive, concepts_path, persist_kv, kv_path).await,
         Commands::Benchmark {
             hidden_dim,
             num_blocks,
@@ -434,6 +450,10 @@ async fn cmd_infer(
     yarn_scale: Option<f32>,
     image: Option<String>,
     armor: bool,
+    cognitive: bool,
+    concepts_path: Option<String>,
+    persist_kv: bool,
+    kv_path: Option<String>,
 ) -> anyhow::Result<()> {
     info!(event = "initializing_inference_pipeline", "Initializing inference pipeline");
 
@@ -564,36 +584,82 @@ async fn cmd_infer(
         2048, // max_seq_len
     )?;
     
+    // Initialize cognitive pipeline if requested
+    let cognitive_pipeline = if cognitive {
+        use ferrisres::inference::cognitive_pipeline::{CognitivePipeline, CognitivePipelineConfig};
+        let cp_config = CognitivePipelineConfig {
+            concepts_enabled: true,
+            concepts_path: concepts_path.map(|p| p.into()),
+            concepts_embedding_dim: 64,
+            concepts_max: 10000,
+            kv_persist_enabled: persist_kv,
+            kv_persist_path: kv_path.map(|p| p.into()),
+            kv_capacity: 4096,
+            llm_computer_enabled: true,
+            llm_computer_max_program: 256,
+            llm_computer_max_steps: 1024,
+            mirror_test_enabled: true,
+            mirror_quality_threshold: 0.5,
+            mirror_max_retries: 2,
+            wasm_sandbox_enabled: false,
+            self_correction_enabled: true,
+        };
+        info!(event = "cognitive_pipeline_enabled", "Cognitive pipeline enabled: concepts={}, llm_computer={}, mirror_test={}",
+            cp_config.concepts_enabled, cp_config.llm_computer_enabled, cp_config.mirror_test_enabled);
+        Some(std::sync::Arc::new(std::sync::Mutex::new(CognitivePipeline::new(cp_config))))
+    } else {
+        None
+    };
+
     let gen_config = ferrisres::inference::generator::GenerateConfig {
         temperature: temperature as f32,
         max_tokens,
         context_extension: yarn_scale.map(|scale| {
             ferrisres::inference::context_extension::ContextExtensionConfig::yarn(4096, (4096.0 * scale) as usize)
         }),
+        cognitive_pipeline,
         ..Default::default()
     };
     
-    let output_tokens = generator.generate(&tokens, &gen_config)?;
-    
-    // Decode and print
-    let decoded = tokenizer.decode(&output_tokens);
+    let final_output = if let Some(ref pipeline_arc) = gen_config.cognitive_pipeline {
+        // Use cognitive pipeline for full augmented generation
+        let mut pipeline = pipeline_arc.lock().unwrap();
+        let result = pipeline.process_generation(&formatted_prompt, |augmented_prompt| {
+            let aug_tokens = tokenizer.encode(augmented_prompt);
+            match generator.generate(&aug_tokens, &ferrisres::inference::generator::GenerateConfig {
+                temperature: temperature as f32,
+                max_tokens,
+                ..Default::default()
+            }) {
+                Ok(tokens) => tokenizer.decode(&tokens),
+                Err(_) => "[generation error]".to_string(),
+            }
+        });
+        info!(event = "cognitive_generation_complete",
+            "cognitive: concepts_retrieved={}, concepts_stored={}, tool_called={}, mirror_quality={:?}, retries={}",
+            result.concepts_retrieved, result.concepts_stored, result.tool_called, result.mirror_quality, result.retries);
+        result.output
+    } else {
+        let output_tokens = generator.generate(&tokens, &gen_config)?;
+        tokenizer.decode(&output_tokens)
+    };
     
     // Sanitize output with Armor if enabled
-    let final_output = if let Some(ref mut layer) = armor_layer {
-        match layer.sanitize_output(&decoded) {
+    let display_output = if let Some(ref mut layer) = armor_layer {
+        match layer.sanitize_output(&final_output) {
             ferrisres::SecurityVerdict::Redact(sanitized) => {
                 info!(event = "armor_output_redacted", "Output sanitized by Armor");
                 sanitized
             }
-            _ => decoded.clone(),
+            _ => final_output.clone(),
         }
     } else {
-        decoded.clone()
+        final_output.clone()
     };
 
-    info!(event = "generation_complete", "generated {} tokens{}", output_tokens.len(),
+    info!(event = "generation_complete", "generated output{}",
         if image_patch_count > 0 { format!(" (with {} image patches)", image_patch_count) } else { String::new() });
-    println!("{}", final_output);
+    println!("{}", display_output);
 
     Ok(())
 }

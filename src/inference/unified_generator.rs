@@ -37,6 +37,8 @@ pub struct UnifiedGenerateConfig {
     pub context_extension: Option<crate::inference::context_extension::ContextExtensionConfig>,
     pub rag_config: Option<crate::inference::rag::RagConfig>,
     pub tool_registry: Option<std::sync::Arc<crate::inference::tool_search::ToolRegistry>>,
+    /// Optional cognitive pipeline: concept memory, self-evaluation, LLM-Computer, KV persistence.
+    pub cognitive_pipeline: Option<std::sync::Arc<std::sync::Mutex<crate::inference::cognitive_pipeline::CognitivePipeline>>>,
 }
 
 impl Default for UnifiedGenerateConfig {
@@ -55,6 +57,7 @@ impl Default for UnifiedGenerateConfig {
             context_extension: None,
             rag_config: None,
             tool_registry: None,
+            cognitive_pipeline: None,
         }
     }
 }

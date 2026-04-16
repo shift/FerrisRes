@@ -35,6 +35,9 @@ pub struct GenerateConfig {
     pub rag_config: Option<crate::inference::rag::RagConfig>,
     /// Optional tool registry: if set, enables agentic tool-calling during generation.
     pub tool_registry: Option<crate::inference::tool_search::ToolRegistry>,
+    /// Optional cognitive pipeline: if set, enables concept memory, self-evaluation,
+    /// LLM-Computer tools, and KV persistence during generation.
+    pub cognitive_pipeline: Option<std::sync::Arc<std::sync::Mutex<crate::inference::cognitive_pipeline::CognitivePipeline>>>,
 }
 
 impl Default for GenerateConfig {
@@ -53,6 +56,7 @@ impl Default for GenerateConfig {
             context_extension: None,
             rag_config: None,
             tool_registry: None,
+            cognitive_pipeline: None,
         }
     }
 }
