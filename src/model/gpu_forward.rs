@@ -59,7 +59,10 @@ impl ResidentLayerWeights {
 /// are the 6 matmuls × 35 layers = 210 uploads that dominate runtime.
 pub struct GpuWeightCache {
     pub layer_weights: Vec<ResidentLayerWeights>,
-    // Small weights kept on CPU (RMSNorm params — ~6KB per layer)
+    // RMSNorm weights on GPU (for full-GPU forward)
+    pub input_norms_bufs: Vec<GpuBuffer>,
+    pub post_attn_norms_bufs: Vec<GpuBuffer>,
+    // Small weights kept on CPU (fallback)
     pub input_norms: Vec<Vec<f32>>,
     pub post_attn_norms: Vec<Vec<f32>>,
     // Config dims for forward
@@ -438,6 +441,8 @@ impl GpuMatmulAccelerator {
 
         Ok(GpuWeightCache {
             layer_weights,
+            input_norms_bufs: vec![], // populated by full-GPU pipeline
+            post_attn_norms_bufs: vec![],
             input_norms: model.layers.iter().map(|l| l.attn.input_norm.clone()).collect(),
             post_attn_norms: model.layers.iter().map(|l| l.attn.post_attn_norm.clone()).collect(),
             hidden_dim: hd,
@@ -548,8 +553,18 @@ impl GpuMatmulAccelerator {
             "All layers resident on GPU (streamed from mmap, low RAM)"
         );
 
+        // Upload norm weights to GPU too
+        let input_norms_bufs: Vec<GpuBuffer> = input_norms.iter().map(|n| {
+            GpuBuffer::new_device_local(&self.device, &self.queue, bytemuck::cast_slice(n), Some("inorm")).unwrap()
+        }).collect();
+        let post_attn_norms_bufs: Vec<GpuBuffer> = post_attn_norms.iter().map(|n| {
+            GpuBuffer::new_device_local(&self.device, &self.queue, bytemuck::cast_slice(n), Some("pnorm")).unwrap()
+        }).collect();
+
         Ok(GpuWeightCache {
             layer_weights,
+            input_norms_bufs,
+            post_attn_norms_bufs,
             input_norms,
             post_attn_norms,
             hidden_dim: hd,
