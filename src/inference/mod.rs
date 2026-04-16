@@ -39,6 +39,9 @@ pub mod cognitive_pipeline;
 pub mod tool_creation;
 pub mod plan_executor;
 pub mod tool_usage_tracker;
+pub mod abstraction_engine;
+pub mod intrinsic_motivation;
+pub mod proactive_controller;
 
 pub use kv_cache::{LayerKVCache, ModelKVCache};
 pub use two_phase::{TwoPhaseConfig, TwoPhaseInference, KVCache, Sampler, GenerationState};
