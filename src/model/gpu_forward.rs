@@ -435,8 +435,8 @@ impl GpuMatmulAccelerator {
             // RoPE (CPU)
             let mut q = q;
             let mut k = k;
-            super::gemma_mapper::apply_rope(&mut q, seq, nh, head_d, 0);
-            super::gemma_mapper::apply_rope_gqa(&mut k, seq, nkv, head_d, 0);
+            super::gemma_mapper::apply_rope(&mut q, seq, nh, head_d, 0, 10000.0, 1.0);
+            super::gemma_mapper::apply_rope_gqa(&mut k, seq, nkv, head_d, 0, 10000.0, 1.0);
 
             // Attention (CPU — causal + GQA)
             let attn_out = attention_gqa(&q, &k, &v, seq, nh, nkv, head_d, q_dim, kv_dim);
@@ -742,8 +742,8 @@ impl GpuMatmulAccelerator {
             // RoPE (CPU)
             let mut q = q;
             let mut k = k;
-            super::gemma_mapper::apply_rope(&mut q, seq, nh, head_d, 0);
-            super::gemma_mapper::apply_rope_gqa(&mut k, seq, nkv, head_d, 0);
+            super::gemma_mapper::apply_rope(&mut q, seq, nh, head_d, 0, 10000.0, 1.0);
+            super::gemma_mapper::apply_rope_gqa(&mut k, seq, nkv, head_d, 0, 10000.0, 1.0);
 
             // Attention (CPU — causal + GQA)
             let attn_out = attention_gqa(&q, &k, &v, seq, nh, nkv, head_d, q_dim, kv_dim);

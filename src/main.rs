@@ -53,6 +53,10 @@ enum Commands {
         /// Required when using --model-path. Ignored for skeleton models.
         #[arg(long, default_value = "e2b")]
         config: String,
+        /// Path to model config.json (HuggingFace format). When provided, overrides --config preset
+        /// with the actual model config, including per-layer parameters.
+        #[arg(long)]
+        config_path: Option<String>,
         /// Model file format: safetensors or gguf. Only used with --model-path.
         #[arg(long, default_value = "safetensors")]
         model_format: String,
@@ -230,11 +234,11 @@ async fn main() -> anyhow::Result<()> {
             lora_rank,
         } => cmd_train(hidden_dim, num_blocks, block_size, epochs, batch_size, learning_rate, data, lora_rank).await,
         Commands::Infer {
-            model_path, config, model_format, tokenizer,
+            model_path, config, config_path, model_format, tokenizer,
             hidden_dim, num_blocks, block_size, prompt,
             max_tokens, temperature, template, yarn_scale, image,
             armor, cognitive, concepts_path, persist_kv, kv_path,
-        } => cmd_infer(model_path, config, model_format, tokenizer, hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale, image, armor, cognitive, concepts_path, persist_kv, kv_path).await,
+        } => cmd_infer(model_path, config, config_path, model_format, tokenizer, hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale, image, armor, cognitive, concepts_path, persist_kv, kv_path).await,
         Commands::Benchmark {
             hidden_dim,
             num_blocks,
@@ -487,6 +491,7 @@ async fn cmd_train(
 async fn cmd_infer(
     model_path: Option<String>,
     config_name: String,
+    config_path: Option<String>,
     model_format: String,
     tokenizer_path: Option<String>,
     hidden_dim: usize,
@@ -534,7 +539,13 @@ async fn cmd_infer(
     if let Some(ref path) = model_path {
         info!(event = "cpu_inference_path", "Loading model from {} for CPU inference", path);
 
-        let gemma_config = resolve_model_config(&config_name)?;
+        let gemma_config = if let Some(ref cp) = config_path {
+            info!(event = "loading_config", "Loading config from {}", cp);
+            gemma_mapper::Gemma4Config::from_config_file(std::path::Path::new(cp))
+                .map_err(|e| anyhow::anyhow!("Config load failed: {}", e))?
+        } else {
+            resolve_model_config(&config_name)?
+        };
         let model_path = std::path::Path::new(path);
 
         // Tokenize
@@ -1572,8 +1583,8 @@ async fn cmd_distill(
                 let k = gpu_matmul(&normed, &layer.attn.k_proj, seq, hd, kv_dim, &dispatch);
                 let v = gpu_matmul(&normed, &layer.attn.v_proj, seq, hd, kv_dim, &dispatch);
                 let mut q = q; let mut k = k;
-                gemma_mapper::apply_rope(&mut q, seq, config_ref.num_heads, config_ref.head_dim, 0);
-                gemma_mapper::apply_rope_gqa(&mut k, seq, config_ref.num_kv_heads, config_ref.head_dim, 0);
+                gemma_mapper::apply_rope(&mut q, seq, config_ref.num_heads, config_ref.head_dim, 0, 10000.0, 1.0);
+                gemma_mapper::apply_rope_gqa(&mut k, seq, config_ref.num_kv_heads, config_ref.head_dim, 0, 10000.0, 1.0);
                 let heads_per_kv = config_ref.num_heads / config_ref.num_kv_heads;
                 let attn_scale = 1.0 / (config_ref.head_dim as f32).sqrt();
                 let mut attn_out = vec![0.0f32; seq * q_dim];

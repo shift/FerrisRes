@@ -963,6 +963,9 @@ impl GgufFile {
             // Gemma 4 extras
             map.insert(format!("{}post_attention_norm.weight", prefix), format!("layers.{}.post_attn_norm.weight", i));
             map.insert(format!("{}post_ffw_norm.weight", prefix), format!("layers.{}.post_ff_norm.weight", i));
+            map.insert(format!("{}pre_ffw_norm.weight", prefix), format!("layers.{}.pre_ff_norm.weight", i));
+            map.insert(format!("{}attn_q_norm.weight", prefix), format!("layers.{}.q_norm.weight", i));
+            map.insert(format!("{}attn_k_norm.weight", prefix), format!("layers.{}.k_norm.weight", i));
         }
 
         map

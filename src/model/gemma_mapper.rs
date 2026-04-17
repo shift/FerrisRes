@@ -524,6 +524,128 @@ pub struct Gemma4Config {
     pub hidden_size_per_layer_input: Option<usize>,
     /// Final logit softcapping value (Gemma 4). None = disabled.
     pub final_logit_softcapping: Option<f32>,
+
+    // --- Per-layer config (loaded from config.json) ---
+    /// Per-layer types: "sliding_attention" or "full_attention".
+    /// Empty = assume all sliding (backward compat with hardcoded presets).
+    pub layer_types: Vec<String>,
+    /// Head dimension for full_attention layers (global_head_dim in config.json).
+    pub global_head_dim: usize,
+    /// RoPE theta for sliding attention layers.
+    pub rope_theta_sliding: f64,
+    /// RoPE theta for full attention layers.
+    pub rope_theta_full: f64,
+    /// Partial rotary factor for full attention layers (0.25 = only 25% of dims get RoPE).
+    pub partial_rotary_factor_full: f32,
+}
+
+impl Gemma4Config {
+    /// Load config from a Gemma 4 config.json file.
+    /// This is the preferred way to create a config — it reads all per-layer
+    /// parameters instead of relying on hardcoded presets.
+    pub fn from_config_file(path: &std::path::Path) -> Result<Self, String> {
+        let json_str = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read config.json: {}", e))?;
+        let val: serde_json::Value = serde_json::from_str(&json_str)
+            .map_err(|e| format!("Failed to parse config.json: {}", e))?;
+
+        let tc = val.get("text_config")
+            .ok_or_else(|| "config.json missing 'text_config'".to_string())?;
+
+        let layer_types = tc.get("layer_types")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        // RoPE parameters — may be nested under rope_parameters
+        let rope_params = tc.get("rope_parameters");
+        let sliding_rope = rope_params.and_then(|r| r.get("sliding_attention"));
+        let full_rope = rope_params.and_then(|r| r.get("full_attention"));
+
+        let rope_theta_sliding = sliding_rope
+            .and_then(|r| r.get("rope_theta"))
+            .and_then(|v| v.as_f64())
+            .or_else(|| tc.get("rope_theta").and_then(|v| v.as_f64()))
+            .unwrap_or(10000.0);
+
+        let rope_theta_full = full_rope
+            .and_then(|r| r.get("rope_theta"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(rope_theta_sliding);
+
+        let partial_rotary_factor_full = full_rope
+            .and_then(|r| r.get("partial_rotary_factor"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0) as f32;
+
+        let global_head_dim = tc.get("global_head_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(|| {
+                tc.get("head_dim").and_then(|v| v.as_u64()).unwrap_or(256)
+            }) as usize;
+
+        let hidden_size = tc.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(1536) as usize;
+        let head_dim = tc.get("head_dim").and_then(|v| v.as_u64()).unwrap_or(256) as usize;
+        let num_heads = tc.get("num_attention_heads").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
+        let num_kv_heads = tc.get("num_key_value_heads").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+        let num_layers = tc.get("num_hidden_layers").and_then(|v| v.as_u64()).unwrap_or(35) as usize;
+        let vocab_size = tc.get("vocab_size").and_then(|v| v.as_u64()).unwrap_or(262144) as usize;
+        let intermediate_dim = tc.get("intermediate_size").and_then(|v| v.as_u64()).unwrap_or(6144) as usize;
+        let sliding_window = tc.get("sliding_window").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
+        let max_pos = tc.get("max_position_embeddings").and_then(|v| v.as_u64()).unwrap_or(131072) as usize;
+        let final_logit_softcapping = tc.get("final_logit_softcapping").and_then(|v| v.as_f64()).map(|v| v as f32);
+        let hidden_size_per_layer_input = tc.get("hidden_size_per_layer_input").and_then(|v| v.as_u64()).map(|v| v as usize);
+        let enable_moe = tc.get("enable_moe_block").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let moe_layers = if enable_moe {
+            // If MoE enabled, collect layer indices (would need expert config)
+            vec![]
+        } else {
+            vec![]
+        };
+
+        Ok(Self {
+            hidden_dim: hidden_size,
+            num_layers,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            intermediate_dim,
+            num_experts: 1,
+            top_k: 1,
+            vocab_size,
+            max_position_embeddings: max_pos,
+            sliding_window,
+            moe_layers,
+            hidden_size_per_layer_input,
+            final_logit_softcapping,
+            layer_types,
+            global_head_dim,
+            rope_theta_sliding,
+            rope_theta_full,
+            partial_rotary_factor_full,
+        })
+    }
+
+    /// Returns true if the given layer uses full_attention.
+    pub fn is_full_attention(&self, layer_idx: usize) -> bool {
+        self.layer_types.get(layer_idx).map(|s| s == "full_attention").unwrap_or(false)
+    }
+
+    /// Returns the head_dim for a given layer.
+    pub fn layer_head_dim(&self, layer_idx: usize) -> usize {
+        if self.is_full_attention(layer_idx) { self.global_head_dim } else { self.head_dim }
+    }
+
+    /// Returns the RoPE theta for a given layer.
+    pub fn layer_rope_theta(&self, layer_idx: usize) -> f64 {
+        if self.is_full_attention(layer_idx) { self.rope_theta_full } else { self.rope_theta_sliding }
+    }
+
+    /// Returns the partial rotary factor for a given layer.
+    pub fn layer_partial_rotary_factor(&self, layer_idx: usize) -> f32 {
+        if self.is_full_attention(layer_idx) { self.partial_rotary_factor_full } else { 1.0 }
+    }
 }
 
 impl Gemma4Config {
@@ -556,6 +678,11 @@ impl Gemma4Config {
             hidden_size_per_layer_input: Some(256),
             // Logit softcapping at 30.0
             final_logit_softcapping: Some(30.0),
+            layer_types: vec![],  // empty = fallback to all sliding
+            global_head_dim: 256,  // same as head_dim for backward compat
+            rope_theta_sliding: 10000.0,
+            rope_theta_full: 1000000.0,
+            partial_rotary_factor_full: 0.25,
         }
     }
 
@@ -580,6 +707,11 @@ impl Gemma4Config {
             moe_layers: vec![5, 11, 17, 23, 29, 35, 41],
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
+            layer_types: vec![],
+            global_head_dim: 256,
+            rope_theta_sliding: 10000.0,
+            rope_theta_full: 1000000.0,
+            partial_rotary_factor_full: 0.25,
         }
     }
 
@@ -602,6 +734,11 @@ impl Gemma4Config {
             moe_layers: (1..48).step_by(2).collect(), // Placeholder
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
+            layer_types: vec![],
+            global_head_dim: 256,
+            rope_theta_sliding: 10000.0,
+            rope_theta_full: 1000000.0,
+            partial_rotary_factor_full: 0.25,
         }
     }
 
@@ -624,6 +761,11 @@ impl Gemma4Config {
             moe_layers: (1..60).step_by(2).collect(), // Placeholder
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
+            layer_types: vec![],
+            global_head_dim: 256,
+            rope_theta_sliding: 10000.0,
+            rope_theta_full: 1000000.0,
+            partial_rotary_factor_full: 0.25,
         }
     }
 
@@ -655,6 +797,11 @@ impl Gemma4Config {
             moe_layers: vec![5, 11, 17, 23, 29],
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
+            layer_types: vec![],
+            global_head_dim: 256,
+            rope_theta_sliding: 10000.0,
+            rope_theta_full: 1000000.0,
+            partial_rotary_factor_full: 0.25,
         }
     }
 
@@ -679,6 +826,11 @@ impl Gemma4Config {
             moe_layers: vec![5, 11, 17, 23, 29, 35, 41, 47, 53, 59],
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
+            layer_types: vec![],
+            global_head_dim: 256,
+            rope_theta_sliding: 10000.0,
+            rope_theta_full: 1000000.0,
+            partial_rotary_factor_full: 0.25,
         }
     }
 
@@ -699,6 +851,11 @@ impl Gemma4Config {
             moe_layers: vec![],
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
+            layer_types: vec![],
+            global_head_dim: 256,
+            rope_theta_sliding: 10000.0,
+            rope_theta_full: 1000000.0,
+            partial_rotary_factor_full: 0.25,
         }
     }
 
@@ -719,6 +876,11 @@ impl Gemma4Config {
             moe_layers: vec![],
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
+            layer_types: vec![],
+            global_head_dim: 256,
+            rope_theta_sliding: 10000.0,
+            rope_theta_full: 1000000.0,
+            partial_rotary_factor_full: 0.25,
         }
     }
 
@@ -739,6 +901,11 @@ impl Gemma4Config {
             moe_layers: vec![],
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
+            layer_types: vec![],
+            global_head_dim: 256,
+            rope_theta_sliding: 10000.0,
+            rope_theta_full: 1000000.0,
+            partial_rotary_factor_full: 0.25,
         }
     }
 
@@ -759,6 +926,11 @@ impl Gemma4Config {
             moe_layers: (0..32).step_by(2).collect(),
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
+            layer_types: vec![],
+            global_head_dim: 256,
+            rope_theta_sliding: 10000.0,
+            rope_theta_full: 1000000.0,
+            partial_rotary_factor_full: 0.25,
         }
     }
 
@@ -779,6 +951,11 @@ impl Gemma4Config {
             moe_layers: vec![],
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
+            layer_types: vec![],
+            global_head_dim: 256,
+            rope_theta_sliding: 10000.0,
+            rope_theta_full: 1000000.0,
+            partial_rotary_factor_full: 0.25,
         }
     }
 
@@ -799,6 +976,11 @@ impl Gemma4Config {
             moe_layers: vec![],
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
+            layer_types: vec![],
+            global_head_dim: 256,
+            rope_theta_sliding: 10000.0,
+            rope_theta_full: 1000000.0,
+            partial_rotary_factor_full: 0.25,
         }
     }
 
@@ -1334,6 +1516,12 @@ pub struct Gemma4AttnWeights {
     pub q_norm: Vec<f32>,
     /// Per-head RMSNorm on K (head_dim elements).
     pub k_norm: Vec<f32>,
+    /// Per-layer head dimension (varies: 256 for sliding, 512 for full attention).
+    pub head_dim: usize,
+    /// Per-layer total Q dimension (num_heads * head_dim).
+    pub q_dim: usize,
+    /// Per-layer total KV dimension (num_kv_heads * head_dim).
+    pub kv_dim: usize,
 }
 
 /// Per-layer FFN weights (either dense or MoE).
@@ -1369,6 +1557,12 @@ pub struct Gemma4LayerWeights {
     pub per_layer_projection: Option<Vec<f32>>,
     /// Per-layer projection norm (hidden_size elements).
     pub post_per_layer_input_norm: Option<Vec<f32>>,
+    /// Per-layer RoPE theta.
+    pub rope_theta: f64,
+    /// Per-layer partial rotary factor (1.0 = all dims, 0.25 = only first quarter).
+    pub partial_rotary_factor: f32,
+    /// Per-layer FFN intermediate dimension.
+    pub intermediate_dim: usize,
 }
 
 /// Full Gemma 4 model weights loaded and organized.
@@ -1379,6 +1573,9 @@ pub struct MappedGemma4Model {
     pub layers: Vec<Gemma4LayerWeights>,
     pub final_norm: Vec<f32>,
     pub lm_head: Vec<f32>,      // [vocab_size × hidden_dim] (may be tied)
+    /// Per-layer token embedding table [vocab_size × (num_layers × ple_dim)].
+    /// Used by PLE (Per-Layer Embeddings) for per-token, per-layer learned embeddings.
+    pub embed_tokens_per_layer: Option<Vec<f32>>,
 }
 
 impl MappedGemma4Model {
@@ -1460,6 +1657,9 @@ impl MappedGemma4Model {
                 post_attn_norm: pnorm,
                 q_norm: vec![1.0f32; config.head_dim],
                 k_norm: vec![1.0f32; config.head_dim],
+                head_dim: config.head_dim,
+                q_dim: config.num_heads * config.head_dim,
+                kv_dim: config.num_kv_heads * config.head_dim,
             };
             let ffn = Gemma4FfnWeights::Dense {
                 gate_proj: Vec::new(),
@@ -1474,10 +1674,13 @@ impl MappedGemma4Model {
                 per_layer_input_gate: None,
                 per_layer_projection: None,
                 post_per_layer_input_norm: None,
+                rope_theta: config.layer_rope_theta(layer_idx),
+                partial_rotary_factor: config.layer_partial_rotary_factor(layer_idx),
+                intermediate_dim: config.intermediate_dim,
             });
         }
 
-        Ok(Self { config, embed_tokens, layers, final_norm, lm_head })
+        Ok(Self { config, embed_tokens, layers, final_norm, lm_head, embed_tokens_per_layer: None })
     }
 
     fn build_skeleton_mm<
@@ -1508,6 +1711,9 @@ impl MappedGemma4Model {
                 post_attn_norm: pnorm,
                 q_norm: vec![1.0f32; config.head_dim],
                 k_norm: vec![1.0f32; config.head_dim],
+                head_dim: config.head_dim,
+                q_dim: config.num_heads * config.head_dim,
+                kv_dim: config.num_kv_heads * config.head_dim,
             };
 
             let ffn = Gemma4FfnWeights::Dense {
@@ -1524,10 +1730,13 @@ impl MappedGemma4Model {
                 per_layer_input_gate: None,
                 per_layer_projection: None,
                 post_per_layer_input_norm: None,
+                rope_theta: config.layer_rope_theta(layer_idx),
+                partial_rotary_factor: config.layer_partial_rotary_factor(layer_idx),
+                intermediate_dim: config.intermediate_dim,
             });
         }
 
-        Ok(Self { config, embed_tokens, layers, final_norm, lm_head })
+        Ok(Self { config, embed_tokens, layers, final_norm, lm_head, embed_tokens_per_layer: None })
     }
 
     /// Load from a safetensors LoadedWeights object.
@@ -1594,6 +1803,9 @@ impl MappedGemma4Model {
                 post_attn_norm: pnorm,
                 q_norm: vec![1.0f32; config.head_dim],
                 k_norm: vec![1.0f32; config.head_dim],
+                head_dim: config.head_dim,
+                q_dim: config.num_heads * config.head_dim,
+                kv_dim: config.num_kv_heads * config.head_dim,
             };
 
             // FFN: MoE or dense?
@@ -1649,13 +1861,18 @@ impl MappedGemma4Model {
                 per_layer_input_gate: None,
                 per_layer_projection: None,
                 post_per_layer_input_norm: None,
+                rope_theta: config.layer_rope_theta(layer_idx),
+                partial_rotary_factor: config.layer_partial_rotary_factor(layer_idx),
+                intermediate_dim: config.intermediate_dim,
             });
         }
 
-        Ok(Self { config, embed_tokens, layers, final_norm, lm_head })
+        Ok(Self { config, embed_tokens, layers, final_norm, lm_head, embed_tokens_per_layer: None })
     }
 
     /// Build model using multimodal naming convention (model.language_model.layers.N.*).
+    /// Infers per-layer head_dim and intermediate_dim from actual tensor shapes,
+    /// so it works correctly with any Gemma 4 variant.
     fn build_from_getter_mm<F: Fn(&str) -> Option<Vec<f32>>>(
         config: Gemma4Config,
         get: F,
@@ -1663,10 +1880,6 @@ impl MappedGemma4Model {
         let hd = config.hidden_dim;
         let nh = config.num_heads;
         let nkv = config.num_kv_heads;
-        let hdim = config.head_dim;
-        let q_dim = nh * hdim;
-        let kv_dim = nkv * hdim;
-        let idim = config.intermediate_dim;
         let ple_dim = config.hidden_size_per_layer_input.unwrap_or(0);
 
         let embed_tokens = get(Gemma4MmTensorNames::embed_tokens())
@@ -1679,26 +1892,46 @@ impl MappedGemma4Model {
         let final_norm = get(Gemma4MmTensorNames::final_norm())
             .ok_or_else(|| "Missing final norm".to_string())?;
 
+        // Load per-layer token embeddings for PLE if present
+        let embed_tokens_per_layer = get("model.language_model.embed_tokens_per_layer.weight");
+
         let mut layers = Vec::new();
         for layer_idx in 0..config.num_layers {
-            let q = transpose(&get(&Gemma4MmTensorNames::q_proj(layer_idx))
-                .ok_or_else(|| format!("Missing q_proj for layer {}", layer_idx))?, q_dim, hd);
+            // --- Infer per-layer dimensions from actual tensor shapes ---
+            // q_proj is stored as [q_dim, hidden_dim] in safetensors.
+            // We need to know the actual q_dim to read the weight correctly.
+            let q_raw = get(&Gemma4MmTensorNames::q_proj(layer_idx))
+                .ok_or_else(|| format!("Missing q_proj for layer {}", layer_idx))?;
+            let layer_q_dim = q_raw.len() / hd;
+            let layer_head_dim = layer_q_dim / nh;
+            let layer_kv_dim = nkv * layer_head_dim;
+
+            // gate_proj is [intermediate_dim, hidden_dim]
+            let gate_raw = get(&Gemma4MmTensorNames::gate_proj(layer_idx))
+                .ok_or_else(|| format!("Missing gate_proj for layer {}", layer_idx))?;
+            let layer_inter_dim = gate_raw.len() / hd;
+
+            // Per-layer rope config from config
+            let rope_theta = config.layer_rope_theta(layer_idx);
+            let partial_rotary_factor = config.layer_partial_rotary_factor(layer_idx);
+
+            let q = transpose(&q_raw, layer_q_dim, hd);
             let k = transpose(&get(&Gemma4MmTensorNames::k_proj(layer_idx))
-                .ok_or_else(|| format!("Missing k_proj for layer {}", layer_idx))?, kv_dim, hd);
+                .ok_or_else(|| format!("Missing k_proj for layer {}", layer_idx))?, layer_kv_dim, hd);
             let v = transpose(&get(&Gemma4MmTensorNames::v_proj(layer_idx))
-                .ok_or_else(|| format!("Missing v_proj for layer {}", layer_idx))?, kv_dim, hd);
+                .ok_or_else(|| format!("Missing v_proj for layer {}", layer_idx))?, layer_kv_dim, hd);
             let o = transpose(&get(&Gemma4MmTensorNames::o_proj(layer_idx))
-                .ok_or_else(|| format!("Missing o_proj for layer {}", layer_idx))?, hd, q_dim);
+                .ok_or_else(|| format!("Missing o_proj for layer {}", layer_idx))?, hd, layer_q_dim);
             let inorm = get(&Gemma4MmTensorNames::input_norm(layer_idx))
                 .ok_or_else(|| format!("Missing input_norm for layer {}", layer_idx))?;
             let pnorm = get(&Gemma4MmTensorNames::post_attn_norm(layer_idx))
                 .ok_or_else(|| format!("Missing post_attn_norm for layer {}", layer_idx))?;
 
-            // Q/K per-head RMSNorm — Gemma 4 applies these after projection
+            // Q/K per-head RMSNorm — shape matches per-layer head_dim
             let q_norm = get(&Gemma4MmTensorNames::q_norm(layer_idx))
-                .unwrap_or_else(|| vec![1.0f32; hdim]);
+                .unwrap_or_else(|| vec![1.0f32; layer_head_dim]);
             let k_norm = get(&Gemma4MmTensorNames::k_norm(layer_idx))
-                .unwrap_or_else(|| vec![1.0f32; hdim]);
+                .unwrap_or_else(|| vec![1.0f32; layer_head_dim]);
 
             let attn = Gemma4AttnWeights {
                 q_proj: q, k_proj: k, v_proj: v, o_proj: o,
@@ -1706,14 +1939,16 @@ impl MappedGemma4Model {
                 post_attn_norm: pnorm,
                 q_norm,
                 k_norm,
+                head_dim: layer_head_dim,
+                q_dim: layer_q_dim,
+                kv_dim: layer_kv_dim,
             };
 
-            let gate = transpose(&get(&Gemma4MmTensorNames::gate_proj(layer_idx))
-                .ok_or_else(|| format!("Missing gate_proj for layer {}", layer_idx))?, idim, hd);
+            let gate = transpose(&gate_raw, layer_inter_dim, hd);
             let up = transpose(&get(&Gemma4MmTensorNames::up_proj(layer_idx))
-                .ok_or_else(|| format!("Missing up_proj for layer {}", layer_idx))?, idim, hd);
+                .ok_or_else(|| format!("Missing up_proj for layer {}", layer_idx))?, layer_inter_dim, hd);
             let down = transpose(&get(&Gemma4MmTensorNames::down_proj(layer_idx))
-                .ok_or_else(|| format!("Missing down_proj for layer {}", layer_idx))?, hd, idim);
+                .ok_or_else(|| format!("Missing down_proj for layer {}", layer_idx))?, hd, layer_inter_dim);
 
             let ffn = Gemma4FfnWeights::Dense {
                 gate_proj: gate,
@@ -1727,8 +1962,8 @@ impl MappedGemma4Model {
             let post_ffn_norm = get(&Gemma4MmTensorNames::post_ffn_norm(layer_idx))
                 .unwrap_or_else(|| vec![1.0f32; hd]);
 
-            // Per-layer scalar
-            let layer_scalar = get(&format!("model.language_model.layers.{}.layer_scalar.weight", layer_idx))
+            // Per-layer scalar — NO .weight suffix in the actual tensor name
+            let layer_scalar = get(&format!("model.language_model.layers.{}.layer_scalar", layer_idx))
                 .and_then(|v| v.first().copied())
                 .unwrap_or(1.0f32);
 
@@ -1755,11 +1990,18 @@ impl MappedGemma4Model {
                 attn, ffn,
                 pre_ffn_norm, post_ffn_norm, layer_scalar,
                 per_layer_input_gate, per_layer_projection, post_per_layer_input_norm,
+                rope_theta,
+                partial_rotary_factor,
+                intermediate_dim: layer_inter_dim,
             });
-            tracing::info!(event = "loaded_layer", "Loaded layer {}/{}", layer_idx + 1, config.num_layers);
+            tracing::info!(
+                event = "loaded_layer",
+                "Loaded layer {}/{}: head_dim={}, inter_dim={}, rope_theta={}, scalar={:.4}",
+                layer_idx + 1, config.num_layers, layer_head_dim, layer_inter_dim, rope_theta, layer_scalar,
+            );
         }
 
-        Ok(Self { config, embed_tokens, layers, final_norm, lm_head })
+        Ok(Self { config, embed_tokens, layers, final_norm, lm_head, embed_tokens_per_layer })
     }
 }
 
@@ -1818,16 +2060,21 @@ pub fn rms_norm(input: &[f32], weight: &[f32], dim: usize, eps: f32) -> Vec<f32>
 }
 
 /// Rotary position embedding (RoPE) for attention.
-pub fn apply_rope(x: &mut [f32], seq_len: usize, num_heads: usize, head_dim: usize, offset: usize) {
-    let half = head_dim / 2;
+/// Rotary position embedding (RoPE) for attention.
+/// `partial_rotary_factor` controls what fraction of dimensions get RoPE.
+/// For standard RoPE: partial_rotary_factor=1.0 (all dims).
+/// For Gemma 4 full attention: partial_rotary_factor=0.25 (first 25% of dims).
+pub fn apply_rope(x: &mut [f32], seq_len: usize, num_heads: usize, head_dim: usize, offset: usize, theta: f64, partial_rotary_factor: f32) {
+    let rotary_dims = ((head_dim as f32 * partial_rotary_factor) as usize).next_power_of_two();
+    let half = rotary_dims / 2;
     for t in 0..seq_len {
-        let pos = (t + offset) as f32;
+        let pos = (t + offset) as f64;
         for h in 0..num_heads {
             for d in 0..half {
-                let freq = 1.0 / 10000.0f32.powf(d as f32 / half as f32);
+                let freq = 1.0 / theta.powf(d as f64 / half as f64);
                 let angle = pos * freq;
-                let cos_a = angle.cos();
-                let sin_a = angle.sin();
+                let cos_a = angle.cos() as f32;
+                let sin_a = angle.sin() as f32;
 
                 let base = t * num_heads * head_dim + h * head_dim;
                 let x0 = x[base + d];
@@ -1841,17 +2088,18 @@ pub fn apply_rope(x: &mut [f32], seq_len: usize, num_heads: usize, head_dim: usi
 }
 
 /// RoPE for GQA KV heads (fewer heads than Q).
-pub fn apply_rope_gqa(x: &mut [f32], seq_len: usize, num_kv_heads: usize, head_dim: usize, offset: usize) {
-    let half = head_dim / 2;
+pub fn apply_rope_gqa(x: &mut [f32], seq_len: usize, num_kv_heads: usize, head_dim: usize, offset: usize, theta: f64, partial_rotary_factor: f32) {
+    let rotary_dims = ((head_dim as f32 * partial_rotary_factor) as usize).next_power_of_two();
+    let half = rotary_dims / 2;
     let kv_dim = num_kv_heads * head_dim;
     for t in 0..seq_len {
-        let pos = (t + offset) as f32;
+        let pos = (t + offset) as f64;
         for h in 0..num_kv_heads {
             for d in 0..half {
-                let freq = 1.0 / 10000.0f32.powf(d as f32 / half as f32);
+                let freq = 1.0 / theta.powf(d as f64 / half as f64);
                 let angle = pos * freq;
-                let cos_a = angle.cos();
-                let sin_a = angle.sin();
+                let cos_a = angle.cos() as f32;
+                let sin_a = angle.sin() as f32;
 
                 let base = t * kv_dim + h * head_dim;
                 let x0 = x[base + d];
@@ -1889,7 +2137,6 @@ impl Gemma4Teacher {
         let config = &self.model.config;
         let hd = config.hidden_dim;
         let nh = config.num_heads;
-        let head_d = config.head_dim;
         let seq = token_ids.len();
         let vs = config.vocab_size;
 
@@ -1925,23 +2172,43 @@ impl Gemma4Teacher {
         //    hidden = per_layer_input_gate + per_layer_projection (PLE)
         //    hidden *= layer_scalar
         for (layer_idx, layer) in self.model.layers.iter().enumerate() {
+            // Per-layer head_dim and dimensions (varies: 256 for sliding, 512 for full attention)
+            let layer_head_dim = layer.attn.head_dim;
+            let layer_q_dim = layer.attn.q_dim;
+            let layer_kv_dim = layer.attn.kv_dim;
+            let layer_inter_dim = layer.intermediate_dim;
+
             let residual = hidden.clone();
 
             // Input RMSNorm
             let normed = rms_norm(&hidden, &layer.attn.input_norm, hd, 1e-6);
 
-            // GQA Attention (with Q/K norms)
+            // GQA Attention (with Q/K norms) — uses per-layer head_dim
             let attn_out = self.attention_forward(
-                &normed, &layer.attn, nh, config.num_kv_heads, head_d, seq, hd,
-                config.sliding_window, layer_idx,
+                &normed, &layer.attn, nh, config.num_kv_heads, layer_head_dim,
+                layer_q_dim, layer_kv_dim, seq, hd,
+                layer.rope_theta, layer.partial_rotary_factor,
             );
 
             // Post-attention RMSNorm (applied TO attn output, before residual)
+            let attn_out_raw_l2 = if layer_idx == 0 {
+                let n: f32 = attn_out.iter().take(hd).map(|x| x * x).sum::<f32>().sqrt();
+                Some(n)
+            } else { None };
             let attn_out = rms_norm(&attn_out, &layer.attn.post_attn_norm, hd, 1e-6);
+            if let Some(raw) = attn_out_raw_l2 {
+                let post: f32 = attn_out.iter().take(hd).map(|x| x * x).sum::<f32>().sqrt();
+                tracing::info!(event = "substep", step = "attn_raw_vs_normed", layer = 0, raw_l2 = raw, normed_l2 = post);
+            }
 
             // Residual connection
             for i in 0..hidden.len() {
                 hidden[i] = residual[i] + attn_out[i];
+            }
+
+            if layer_idx == 0 {
+                let n: f32 = hidden.iter().take(hd).map(|x| x * x).sum::<f32>().sqrt();
+                tracing::info!(event = "substep", step = "after_attn_residual", layer = 0, l2 = n);
             }
 
             let residual2 = hidden.clone();
@@ -1952,11 +2219,11 @@ impl Gemma4Teacher {
             // FFN: GeLU(gate(x)) * up(x), NOT SwiGLU
             let ffn_out = match &layer.ffn {
                 Gemma4FfnWeights::Dense { gate_proj, up_proj, down_proj } => {
-                    self.dense_ffn_gelu(&normed2, gate_proj, up_proj, down_proj, hd, config.intermediate_dim)
+                    self.dense_ffn_gelu(&normed2, gate_proj, up_proj, down_proj, hd, layer_inter_dim)
                 }
                 Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs } => {
                     self.moe_ffn(&normed2, router, expert_gates, expert_ups, expert_downs,
-                                 hd, config.intermediate_dim, config.num_experts, config.top_k)
+                                 hd, layer_inter_dim, config.num_experts, config.top_k)
                 }
             };
 
@@ -1968,21 +2235,12 @@ impl Gemma4Teacher {
                 hidden[i] = residual2[i] + ffn_out[i];
             }
 
-            // Per-Layer Embeddings (PLE) — learned input modulation
-            if let (Some(gate_w), Some(proj_w)) = (&layer.per_layer_input_gate, &layer.per_layer_projection) {
-                let ple_dim = gate_w.len() / hd;
-                let residual3 = hidden.clone();
-                // gate: sigmoid-like activation → element-wise multiply with per-layer embedding
-                let gated = matmul(&hidden, gate_w, seq, hd, ple_dim);
-                let gated: Vec<f32> = gated.iter().map(|&x| gelu_tanh(x)).collect();
-                let proj = matmul(&gated, proj_w, seq, ple_dim, hd);
-                let proj = match &layer.post_per_layer_input_norm {
-                    Some(norm) => rms_norm(&proj, norm, hd, 1e-6),
-                    None => proj,
-                };
-                for i in 0..hidden.len() {
-                    hidden[i] = residual3[i] + proj[i];
-                }
+            // Per-Layer Embeddings (PLE) — DISABLED: requires model-level per_layer_input
+            // which is computed from embed_tokens_per_layer + per_layer_model_projection.
+            // Without it, PLE adds untrained noise to the residual stream.
+            // TODO: Load model-level weights and re-enable.
+            {
+                let _ = (&layer.per_layer_input_gate, &layer.per_layer_projection, &layer.post_per_layer_input_norm);
             }
 
             // Layer scalar
@@ -2030,14 +2288,13 @@ impl Gemma4Teacher {
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        q_dim: usize,
+        kv_dim: usize,
         seq_len: usize,
         hidden_dim: usize,
-        _sliding_window: usize,
-        _layer_idx: usize,
+        rope_theta: f64,
+        partial_rotary_factor: f32,
     ) -> Vec<f32> {
-        let kv_dim = num_kv_heads * head_dim; // Total K/V dimension
-        let q_dim = num_heads * head_dim;     // Total Q dimension
-
         // Q projection: [seq × hd] × [hd × q_dim] → [seq × q_dim]
         let mut q = matmul(input, &attn.q_proj, seq_len, hidden_dim, q_dim);
         // K projection: [seq × hd] × [hd × kv_dim] → [seq × kv_dim]
@@ -2046,13 +2303,19 @@ impl Gemma4Teacher {
         let v = matmul(input, &attn.v_proj, seq_len, hidden_dim, kv_dim);
 
         // Gemma 4: per-head RMSNorm on Q and K (AFTER projection, BEFORE RoPE)
-        // Q norm: reshape to [seq × num_heads × head_dim], norm per head
         q = per_head_rms_norm(&q, &attn.q_norm, seq_len, num_heads, head_dim);
         k = per_head_rms_norm(&k, &attn.k_norm, seq_len, num_kv_heads, head_dim);
 
-        // Apply RoPE to Q and K
-        apply_rope(&mut q, seq_len, num_heads, head_dim, 0);
-        apply_rope_gqa(&mut k, seq_len, num_kv_heads, head_dim, 0);
+        // Apply RoPE to Q and K — per-layer theta and partial_rotary_factor
+        // For full_attention layers: partial_rotary_factor < 1 means only first
+        // (partial_rotary_factor * head_dim) dimensions get rotation.
+        // q_norm/k_norm are already per-layer head_dim sized.
+        let _ = (q_dim, kv_dim); // used below
+
+        // Apply RoPE with per-layer theta and partial_rotary_factor
+        // (Values are passed in from the layer struct)
+        apply_rope(&mut q, seq_len, num_heads, head_dim, 0, rope_theta, partial_rotary_factor);
+        apply_rope_gqa(&mut k, seq_len, num_kv_heads, head_dim, 0, rope_theta, partial_rotary_factor);
 
         // Number of Q heads per KV head
         let heads_per_kv = num_heads / num_kv_heads;
@@ -2242,7 +2505,11 @@ impl Gemma4Teacher {
         for (layer_idx, layer) in self.model.layers.iter().enumerate() {
             let residual = hidden.clone();
             let normed = rms_norm(&hidden, &layer.attn.input_norm, hd, 1e-6);
-            let attn_out = self.attention_forward(&normed, &layer.attn, nh, config.num_kv_heads, head_d, seq, hd, config.sliding_window, layer_idx);
+            let attn_out = self.attention_forward(
+                &normed, &layer.attn, nh, config.num_kv_heads, layer.attn.head_dim,
+                layer.attn.q_dim, layer.attn.kv_dim, seq, hd,
+                layer.rope_theta, layer.partial_rotary_factor,
+            );
             for i in 0..hidden.len() { hidden[i] = residual[i] + attn_out[i]; }
             let residual2 = hidden.clone();
             let normed2 = rms_norm(&hidden, &layer.attn.post_attn_norm, hd, 1e-6);
@@ -2734,11 +3001,11 @@ impl Gemma4Student {
         let mut q = q;
         let mut k = k;
         if let Some(_p) = pipeline {
-            apply_rope(&mut q, seq, num_heads, head_dim, 0);
-            apply_rope_gqa(&mut k, seq, num_kv_heads, head_dim, 0);
+            apply_rope(&mut q, seq, num_heads, head_dim, 0, 10000.0, 1.0);
+            apply_rope_gqa(&mut k, seq, num_kv_heads, head_dim, 0, 10000.0, 1.0);
         } else {
-            apply_rope(&mut q, seq, num_heads, head_dim, 0);
-            apply_rope_gqa(&mut k, seq, num_kv_heads, head_dim, 0);
+            apply_rope(&mut q, seq, num_heads, head_dim, 0, 10000.0, 1.0);
+            apply_rope_gqa(&mut k, seq, num_kv_heads, head_dim, 0, 10000.0, 1.0);
         }
 
         // Attention: GPU if pipeline available
@@ -2879,8 +3146,8 @@ impl Gemma4Student {
 
         let mut q = q;
         let mut k = k;
-        apply_rope(&mut q, seq_len, num_heads, head_dim, 0);
-        apply_rope_gqa(&mut k, seq_len, num_kv_heads, head_dim, 0);
+        apply_rope(&mut q, seq_len, num_heads, head_dim, 0, 10000.0, 1.0);
+        apply_rope_gqa(&mut k, seq_len, num_kv_heads, head_dim, 0, 10000.0, 1.0);
 
         let heads_per_kv = num_heads / num_kv_heads;
         let scale = 1.0f32 / (head_dim as f32); // Gemma 4: 1/head_dim after Q/K RMSNorm
@@ -4370,6 +4637,8 @@ use std::collections::HashMap;
 
 impl MappedGemma4Model {
     /// Build model from a raw weight map (used by GGUF and LLaMA loaders).
+    /// Infers per-layer dimensions from actual tensor shapes so it works
+    /// correctly with any Gemma 4 variant (mixed sliding/full attention).
     pub fn from_raw_weights(
         config: Gemma4Config,
         weights: &RawWeights,
@@ -4377,6 +4646,8 @@ impl MappedGemma4Model {
         let get = |name: &str| -> Option<Vec<f32>> {
             weights.get(name)
         };
+
+        let hd = config.hidden_dim;
 
         // Embedding — try multiple naming conventions
         let embed_tokens = get("model.embed_tokens.weight")
@@ -4394,7 +4665,7 @@ impl MappedGemma4Model {
             .or_else(|| get("output_norm.weight"))
             .ok_or_else(|| "Missing final norm".to_string())?;
 
-        // Per-layer weights — try both Gemma and standard LLaMA naming
+        // Per-layer weights — infer dimensions from actual tensor shapes
         let mut layers = Vec::new();
         for layer_idx in 0..config.num_layers {
             let q = get(&format!("model.layers.{}.self_attn.q_proj.weight", layer_idx))
@@ -4416,13 +4687,35 @@ impl MappedGemma4Model {
                 .or_else(|| get(&format!("layers.{}.ff_norm.weight", layer_idx)))
                 .ok_or_else(|| format!("Missing post_attn_norm for layer {}", layer_idx))?;
 
+            // Infer per-layer head dimensions from q_proj shape
+            // q_proj is stored as [q_dim, hidden_dim] → len = q_dim * hidden_dim
+            let layer_q_dim = q.len() / hd;
+            let layer_head_dim = layer_q_dim / config.num_heads;
+            let layer_kv_dim = k.len() / hd;
+
+            // Q/K norms — try per-layer names, fallback to identity
+            let q_norm = get(&format!("model.layers.{}.self_attn.q_norm.weight", layer_idx))
+                .or_else(|| get(&format!("layers.{}.q_norm.weight", layer_idx)))
+                .unwrap_or_else(|| vec![1.0f32; layer_head_dim]);
+            let k_norm = get(&format!("model.layers.{}.self_attn.k_norm.weight", layer_idx))
+                .or_else(|| get(&format!("layers.{}.k_norm.weight", layer_idx)))
+                .unwrap_or_else(|| vec![1.0f32; layer_head_dim]);
+
             let attn = Gemma4AttnWeights {
                 q_proj: q, k_proj: k, v_proj: v, o_proj: o,
                 input_norm: inorm,
                 post_attn_norm: pnorm,
-                q_norm: vec![1.0f32; config.head_dim],
-                k_norm: vec![1.0f32; config.head_dim],
+                q_norm,
+                k_norm,
+                head_dim: layer_head_dim,
+                q_dim: layer_q_dim,
+                kv_dim: layer_kv_dim,
             };
+
+            // Infer per-layer intermediate dim from gate_proj shape
+            let gate_raw = get(&format!("model.layers.{}.mlp.gate_proj.weight", layer_idx))
+                .or_else(|| get(&format!("layers.{}.ff_gate.weight", layer_idx)));
+            let layer_inter_dim = gate_raw.as_ref().map(|g| g.len() / hd).unwrap_or(config.intermediate_dim);
 
             let ffn = if config.moe_layers.contains(&layer_idx) {
                 let router = get(&format!("model.layers.{}.block_sparse_moe.gate.weight", layer_idx))
@@ -4450,8 +4743,7 @@ impl MappedGemma4Model {
 
                 Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs }
             } else {
-                let gate = get(&format!("model.layers.{}.mlp.gate_proj.weight", layer_idx))
-                    .or_else(|| get(&format!("layers.{}.ff_gate.weight", layer_idx)))
+                let gate = gate_raw
                     .ok_or_else(|| format!("Missing gate_proj for layer {}", layer_idx))?;
                 let up = get(&format!("model.layers.{}.mlp.up_proj.weight", layer_idx))
                     .or_else(|| get(&format!("layers.{}.ff_up.weight", layer_idx)))
@@ -4463,18 +4755,39 @@ impl MappedGemma4Model {
                 Gemma4FfnWeights::Dense { gate_proj: gate, up_proj: up, down_proj: down }
             };
 
+            // Pre/post FFN norms
+            let pre_ffn_norm = get(&format!("model.layers.{}.pre_feedforward_layernorm.weight", layer_idx))
+                .or_else(|| get(&format!("layers.{}.pre_ff_norm.weight", layer_idx)))
+                .unwrap_or_else(|| vec![1.0f32; hd]);
+            let post_ffn_norm = get(&format!("model.layers.{}.post_feedforward_layernorm.weight", layer_idx))
+                .or_else(|| get(&format!("layers.{}.post_ff_norm.weight", layer_idx)))
+                .unwrap_or_else(|| vec![1.0f32; hd]);
+
+            // Layer scalar — try multiple names
+            let layer_scalar = get(&format!("model.layers.{}.layer_scalar", layer_idx))
+                .or_else(|| get(&format!("layers.{}.layer_scalar", layer_idx)))
+                .and_then(|v| v.first().copied())
+                .unwrap_or(1.0f32);
+
             layers.push(Gemma4LayerWeights {
                 attn, ffn,
-                pre_ffn_norm: vec![1.0f32; config.hidden_dim],
-                post_ffn_norm: vec![1.0f32; config.hidden_dim],
-                layer_scalar: 1.0,
+                pre_ffn_norm, post_ffn_norm, layer_scalar,
                 per_layer_input_gate: None,
                 per_layer_projection: None,
                 post_per_layer_input_norm: None,
+                rope_theta: config.layer_rope_theta(layer_idx),
+                partial_rotary_factor: config.layer_partial_rotary_factor(layer_idx),
+                intermediate_dim: layer_inter_dim,
             });
+            tracing::info!(
+                event = "loaded_layer",
+                "Loaded layer {}/{}: head_dim={}, inter_dim={}, rope_theta={}, scalar={:.4}",
+                layer_idx + 1, config.num_layers, layer_head_dim, layer_inter_dim,
+                config.layer_rope_theta(layer_idx), layer_scalar,
+            );
         }
 
-        Ok(Self { config, embed_tokens, layers, final_norm, lm_head })
+        Ok(Self { config, embed_tokens, layers, final_norm, lm_head, embed_tokens_per_layer: None })
     }
 }
 // ---------------------------------------------------------------------------
@@ -4971,7 +5284,7 @@ mod tests {
     #[test]
     fn test_apply_rope() {
         let mut x = vec![1.0f32, 0.0, 0.0, 1.0]; // 1 token, 1 head, head_dim=4
-        apply_rope(&mut x, 1, 1, 4, 0);
+        apply_rope(&mut x, 1, 1, 4, 0, 10000.0, 1.0);
         // After RoPE, values should be rotated but non-zero
         assert!(x.iter().any(|&v| v != 0.0));
     }
@@ -5007,6 +5320,9 @@ mod tests {
             post_attn_norm: vec![1.0; 8],
             q_norm: vec![1.0; 8],
             k_norm: vec![1.0; 8],
+            head_dim: 8,
+            q_dim: 64,
+            kv_dim: 64,
         };
         assert_eq!(aw.q_proj.len(), 64);
     }
@@ -5203,6 +5519,11 @@ mod tests {
             moe_layers: vec![], // Dense only
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
+            layer_types: vec![],
+            global_head_dim: 256,
+            rope_theta_sliding: 10000.0,
+            rope_theta_full: 1000000.0,
+            partial_rotary_factor_full: 0.25,
         }
     }
 
