@@ -610,9 +610,18 @@ async fn cmd_infer(
                 path
             }),
             episodic_config: None,
+            tool_creation_enabled: true,
+            plan_execution_enabled: true,
+            tool_usage_tracking_enabled: true,
+            tool_usage_path: concepts_path.as_ref().map(|p| {
+                let mut path: std::path::PathBuf = p.clone().into();
+                path.set_file_name("tool_usage.json");
+                path
+            }),
         };
-        info!(event = "cognitive_pipeline_enabled", "Cognitive pipeline enabled: concepts={}, llm_computer={}, mirror_test={}",
-            cp_config.concepts_enabled, cp_config.llm_computer_enabled, cp_config.mirror_test_enabled);
+        info!(event = "cognitive_pipeline_enabled", "Cognitive pipeline enabled: concepts={}, llm_computer={}, mirror_test={}, tool_creation={}, plans={}, usage_tracking={}",
+            cp_config.concepts_enabled, cp_config.llm_computer_enabled, cp_config.mirror_test_enabled,
+            cp_config.tool_creation_enabled, cp_config.plan_execution_enabled, cp_config.tool_usage_tracking_enabled);
         Some(std::sync::Arc::new(std::sync::Mutex::new(CognitivePipeline::new(cp_config))))
     } else {
         None
