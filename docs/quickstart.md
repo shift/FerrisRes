@@ -84,7 +84,7 @@ cargo run --release -- distill \
 
 ```toml
 [dependencies]
-ferrisres = { git = "https://github.com/shift/FerrisRes", tag = "v0.2.0" }
+ferrisres = { git = "https://github.com/shift/FerrisRes", tag = "v0.2.2" }
 ```
 
 ```rust
@@ -101,3 +101,19 @@ println!("Generated token: {}", token_id);
 - [Distillation guide](distillation.md)
 - [API reference](api-reference.md)
 - [Deployment guide](deployment.md)
+
+## Cognitive Architecture
+
+Enable self-improving inference with `--cognitive`:
+
+```bash
+# Inference with full cognitive augmentation
+cargo run -- infer --prompt "Explain transformers" --cognitive --concepts-path ./concepts
+```
+
+The cognitive architecture adds:
+- **Episodic memory**: stores and retrieves past experiences
+- **Tool creation**: model generates its own tools
+- **Planning**: multi-step tool chaining
+- **Self-improvement**: abstraction, practice, proactive behavior
+- **Emergence measurement**: quantitative metrics across 6 categories
