@@ -1968,15 +1968,23 @@ impl MappedGemma4Model {
                 .unwrap_or(1.0f32);
 
             // Per-layer embeddings (PLE)
+            // Gate: raw [ple_dim, hd] → transposed to [hd, ple_dim] for matmul(ple, gate)
             let per_layer_input_gate = if ple_dim > 0 {
                 get(&format!("model.language_model.layers.{}.per_layer_input_gate.weight", layer_idx))
-                    .map(|w| transpose(&w, ple_dim, hd))
+                    .map(|w| {
+                        tracing::info!(event = "ple_gate_shape", layer = layer_idx, raw_len = w.len(), ple_dim, hd, "PLE gate weight");
+                        transpose(&w, ple_dim, hd)
+                    })
             } else {
                 None
             };
+            // Projection: raw [hd, ple_dim] → transposed to [ple_dim, hd] for matmul(ple, proj)
             let per_layer_projection = if ple_dim > 0 {
                 get(&format!("model.language_model.layers.{}.per_layer_projection.weight", layer_idx))
-                    .map(|w| transpose(&w, hd, ple_dim))
+                    .map(|w| {
+                        tracing::info!(event = "ple_proj_shape", layer = layer_idx, raw_len = w.len(), ple_dim, hd, "PLE proj weight");
+                        transpose(&w, hd, ple_dim)
+                    })
             } else {
                 None
             };
@@ -2235,12 +2243,51 @@ impl Gemma4Teacher {
                 hidden[i] = residual2[i] + ffn_out[i];
             }
 
-            // Per-Layer Embeddings (PLE) — DISABLED: requires model-level per_layer_input
-            // which is computed from embed_tokens_per_layer + per_layer_model_projection.
-            // Without it, PLE adds untrained noise to the residual stream.
-            // TODO: Load model-level weights and re-enable.
+            // Per-Layer Embeddings (PLE) — Gemma 4 critical architecture component.
+            // Each layer gets a learned per-token embedding from embed_tokens_per_layer,
+            // gated and projected into the residual stream.
+            if let (Some(ref gate_w), Some(ref proj_w), Some(ref post_norm)) =
+                (&layer.per_layer_input_gate, &layer.per_layer_projection, &layer.post_per_layer_input_norm)
             {
-                let _ = (&layer.per_layer_input_gate, &layer.per_layer_projection, &layer.post_per_layer_input_norm);
+                if let Some(ref ple_table) = self.model.embed_tokens_per_layer {
+                    let ple_dim = config.hidden_size_per_layer_input.unwrap_or(0);
+                    if ple_dim > 0 {
+                        let ple_total = ple_dim * config.num_layers;
+                        let layer_offset = layer_idx * ple_dim;
+
+                        // Extract per-layer PLE slice for each token
+                        let mut ple_slice = vec![0.0f32; seq * ple_dim];
+                        for t in 0..seq {
+                            let tid = token_ids[t] as usize;
+                            let src_row = tid * ple_total + layer_offset;
+                            let dst_row = t * ple_dim;
+                            if src_row + ple_dim <= ple_table.len() {
+                                for d in 0..ple_dim {
+                                    ple_slice[dst_row + d] = ple_table[src_row + d];
+                                }
+                            }
+                        }
+
+                        // Gate: PLE slice → hidden dim (with sigmoid)
+                        let gate_out = matmul(&ple_slice, gate_w, seq, ple_dim, hd);
+                        let gate_sig: Vec<f32> = gate_out.iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect();
+
+                        // Projection: PLE slice → hidden dim
+                        let proj_out = matmul(&ple_slice, proj_w, seq, ple_dim, hd);
+
+                        // Gated projection + norm
+                        let mut ple_hidden = vec![0.0f32; seq * hd];
+                        for i in 0..seq * hd {
+                            ple_hidden[i] = gate_sig[i] * proj_out[i];
+                        }
+                        let ple_normed = rms_norm(&ple_hidden, post_norm, hd, 1e-6);
+
+                        // Add to residual
+                        for i in 0..hidden.len() {
+                            hidden[i] += ple_normed[i];
+                        }
+                    }
+                }
             }
 
             // Layer scalar
@@ -4662,6 +4709,14 @@ impl MappedGemma4Model {
             .unwrap_or_else(|| embed_tokens.clone());
         let lm_head = transpose(&lm_head_raw, config.vocab_size, hd);
 
+        // Per-layer token embeddings (PLE) — try standard names
+        let embed_tokens_per_layer = get("model.language_model.embed_tokens_per_layer.weight")
+            .or_else(|| get("model.embed_tokens_per_layer.weight"))
+            .or_else(|| get("token_embd_per_layer.weight"));
+        if embed_tokens_per_layer.is_some() {
+            tracing::info!(event = "ple_loaded", len = embed_tokens_per_layer.as_ref().unwrap().len(), "Loaded PLE embedding table");
+        }
+
         // Final norm
         let final_norm = get("model.norm.weight")
             .or_else(|| get("final_norm.weight"))
@@ -4788,12 +4843,30 @@ impl MappedGemma4Model {
                 .and_then(|v| v.first().copied())
                 .unwrap_or(1.0f32);
 
+            // Per-layer embeddings (PLE) — try standard HuggingFace names
+            let ple_dim = config.hidden_size_per_layer_input.unwrap_or(0);
+            let per_layer_input_gate = if ple_dim > 0 {
+                get(&format!("model.layers.{}.per_layer_input_gate.weight", layer_idx))
+                    .map(|w| {
+                        tracing::info!(event = "ple_gate_shape", layer = layer_idx, raw_len = w.len(), ple_dim, hd);
+                        transpose(&w, ple_dim, hd)
+                    })
+            } else { None };
+            let per_layer_projection = if ple_dim > 0 {
+                get(&format!("model.layers.{}.per_layer_projection.weight", layer_idx))
+                    .map(|w| {
+                        tracing::info!(event = "ple_proj_shape", layer = layer_idx, raw_len = w.len(), ple_dim, hd);
+                        transpose(&w, hd, ple_dim)
+                    })
+            } else { None };
+            let post_per_layer_input_norm = if ple_dim > 0 {
+                get(&format!("model.layers.{}.post_per_layer_input_norm.weight", layer_idx))
+            } else { None };
+
             layers.push(Gemma4LayerWeights {
                 attn, ffn,
                 pre_ffn_norm, post_ffn_norm, layer_scalar,
-                per_layer_input_gate: None,
-                per_layer_projection: None,
-                post_per_layer_input_norm: None,
+                per_layer_input_gate, per_layer_projection, post_per_layer_input_norm,
                 rope_theta: config.layer_rope_theta(layer_idx),
                 partial_rotary_factor: config.layer_partial_rotary_factor(layer_idx),
                 intermediate_dim: layer_inter_dim,
@@ -4806,7 +4879,7 @@ impl MappedGemma4Model {
             );
         }
 
-        Ok(Self { config, embed_tokens, layers, final_norm, lm_head, embed_tokens_per_layer: None })
+        Ok(Self { config, embed_tokens, layers, final_norm, lm_head, embed_tokens_per_layer })
     }
 }
 // ---------------------------------------------------------------------------

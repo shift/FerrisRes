@@ -970,7 +970,15 @@ impl GgufFile {
             map.insert(format!("{}pre_ffw_norm.weight", prefix), format!("layers.{}.pre_ff_norm.weight", i));
             map.insert(format!("{}attn_q_norm.weight", prefix), format!("layers.{}.q_norm.weight", i));
             map.insert(format!("{}attn_k_norm.weight", prefix), format!("layers.{}.k_norm.weight", i));
+
+            // Gemma 4 PLE (Per-Layer Embeddings)
+            map.insert(format!("{}per_layer_input_gate.weight", prefix), format!("model.layers.{}.per_layer_input_gate.weight", i));
+            map.insert(format!("{}per_layer_projection.weight", prefix), format!("model.layers.{}.per_layer_projection.weight", i));
+            map.insert(format!("{}post_per_layer_input_norm.weight", prefix), format!("model.layers.{}.post_per_layer_input_norm.weight", i));
         }
+
+        // PLE embedding table
+        map.insert("token_embd_per_layer.weight".into(), "model.language_model.embed_tokens_per_layer.weight".into());
 
         map
     }
