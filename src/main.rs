@@ -621,6 +621,12 @@ async fn cmd_infer(
             abstraction_enabled: true,
             intrinsic_motivation_enabled: true,
             proactive_controller_enabled: true,
+            emergence_benchmark_enabled: true,
+            emergence_benchmark_path: concepts_path.as_ref().map(|p| {
+                let mut path: std::path::PathBuf = p.clone().into();
+                path.set_file_name("emergence.json");
+                path
+            }),
         };
         info!(event = "cognitive_pipeline_enabled", "Cognitive pipeline enabled: concepts={}, llm_computer={}, mirror_test={}, tool_creation={}, plans={}, usage_tracking={}",
             cp_config.concepts_enabled, cp_config.llm_computer_enabled, cp_config.mirror_test_enabled,

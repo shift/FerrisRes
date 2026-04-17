@@ -42,6 +42,7 @@ pub mod tool_usage_tracker;
 pub mod abstraction_engine;
 pub mod intrinsic_motivation;
 pub mod proactive_controller;
+pub mod emergence_benchmark;
 
 pub use kv_cache::{LayerKVCache, ModelKVCache};
 pub use two_phase::{TwoPhaseConfig, TwoPhaseInference, KVCache, Sampler, GenerationState};

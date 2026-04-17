@@ -26,6 +26,7 @@ use crate::inference::tool_usage_tracker::ToolUsageTracker;
 use crate::inference::abstraction_engine::AbstractionEngine;
 use crate::inference::intrinsic_motivation::IntrinsicMotivation;
 use crate::inference::proactive_controller::ProactiveController;
+use crate::inference::emergence_benchmark::EmergenceBenchmark;
 use crate::inference::hull_kv_cache::HullKVCache;
 use crate::inference::llm_computer::{LlmComputer, LlmComputerConfig};
 use crate::inference::mirror_test::MirrorTestRunner;
@@ -98,6 +99,10 @@ pub struct CognitivePipelineConfig {
     pub intrinsic_motivation_enabled: bool,
     /// Enable proactive controller.
     pub proactive_controller_enabled: bool,
+    /// Enable emergence benchmark.
+    pub emergence_benchmark_enabled: bool,
+    /// Path to persist emergence benchmark data.
+    pub emergence_benchmark_path: Option<PathBuf>,
 }
 
 impl Default for CognitivePipelineConfig {
@@ -128,6 +133,8 @@ impl Default for CognitivePipelineConfig {
             abstraction_enabled: false,
             intrinsic_motivation_enabled: false,
             proactive_controller_enabled: false,
+            emergence_benchmark_enabled: false,
+            emergence_benchmark_path: None,
         }
     }
 }
@@ -163,6 +170,8 @@ pub struct CognitivePipeline {
     intrinsic_motivation: Option<IntrinsicMotivation>,
     /// Proactive controller — bounded autonomous behavior.
     proactive_controller: Option<ProactiveController>,
+    /// Emergence benchmark — quantitative emergence measurement.
+    emergence_benchmark: Option<EmergenceBenchmark>,
     /// Tool registry — augmented with cognitive tools.
     tool_registry: ToolRegistry,
 }
@@ -365,6 +374,30 @@ impl CognitivePipeline {
             None
         };
 
+        // Emergence benchmark
+        let emergence_benchmark = if config.emergence_benchmark_enabled {
+            if let Some(ref path) = config.emergence_benchmark_path {
+                if path.exists() {
+                    match EmergenceBenchmark::load(path) {
+                        Ok(b) => {
+                            tracing::info!(event = "emergence_loaded", "Loaded emergence benchmark with {} measurements", b.total_measurements());
+                            Some(b)
+                        }
+                        Err(e) => {
+                            tracing::warn!(event = "emergence_load_error", "Failed to load benchmark: {}", e);
+                            Some(EmergenceBenchmark::default_benchmark())
+                        }
+                    }
+                } else {
+                    Some(EmergenceBenchmark::default_benchmark())
+                }
+            } else {
+                Some(EmergenceBenchmark::default_benchmark())
+            }
+        } else {
+            None
+        };
+
         // Build augmented tool registry
         let mut tool_registry = ToolRegistry::new(ToolSearchConfig::default());
 
@@ -406,6 +439,7 @@ impl CognitivePipeline {
             abstraction_engine,
             intrinsic_motivation,
             proactive_controller,
+            emergence_benchmark,
             tool_registry,
         }
     }
@@ -726,6 +760,14 @@ impl CognitivePipeline {
             tracing::info!(event = "usage_tracker_saved", "Saved usage tracker ({} events) to {}", tracker.total_events(), path.display());
         }
 
+        if let (Some(ref benchmark), Some(ref path)) = (&self.emergence_benchmark, &self.config.emergence_benchmark_path) {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            benchmark.save(path)?;
+            tracing::info!(event = "emergence_saved", "Saved emergence benchmark ({} measurements) to {}", benchmark.total_measurements(), path.display());
+        }
+
         Ok(())
     }
 
@@ -832,6 +874,16 @@ impl CognitivePipeline {
     /// Access the proactive controller mutably.
     pub fn proactive_controller_mut(&mut self) -> Option<&mut ProactiveController> {
         self.proactive_controller.as_mut()
+    }
+
+    /// Access the emergence benchmark.
+    pub fn emergence_benchmark(&self) -> Option<&EmergenceBenchmark> {
+        self.emergence_benchmark.as_ref()
+    }
+
+    /// Access the emergence benchmark mutably.
+    pub fn emergence_benchmark_mut(&mut self) -> Option<&mut EmergenceBenchmark> {
+        self.emergence_benchmark.as_mut()
     }
 
     /// Get the configuration.
@@ -1184,6 +1236,8 @@ mod tests {
             abstraction_enabled: false,
             intrinsic_motivation_enabled: false,
             proactive_controller_enabled: false,
+            emergence_benchmark_enabled: false,
+            emergence_benchmark_path: None,
         };
 
         let pipeline = CognitivePipeline::new(config);

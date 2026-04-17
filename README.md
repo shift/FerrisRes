@@ -2,7 +2,7 @@
 
 FerrisRes is a Rust-native AI inference and training engine built around **Block AttnRes** — a novel linear-time transformer architecture that replaces the quadratic attention bottleneck of standard transformers. It runs on any GPU or iGPU via [wgpu](https://github.com/gfx-rs/wgpu) (Vulkan, Metal, DX12, WebGPU), adapts automatically to the hardware it finds, and is written entirely in safe Rust with no Python dependency.
 
-> ⚠️ **v0.2.2 — near-production grade, not yet 1.0.** FerrisRes has 1189 passing tests, a full cognitive architecture with 6 layers (pipeline wiring, memory & learning, autonomy, self-improvement, with emergence measurement planned), a verified Gemma 4 distillation pipeline (tested on real 27B model with Intel HD 530 iGPU), five output modalities (vision, speech, tactile, robotics, scientific), a 4-layer security proxy (FerrisRes Armor), and profile-driven GPU dispatch that automatically adapts from Intel iGPUs to H100s. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0. Suitable for research, high-performance prototyping, and early-adopter production workloads.
+> ⚠️ **v0.2.2 — near-production grade, not yet 1.0.** FerrisRes has 1216 passing tests, a full cognitive architecture with 5 layers (pipeline wiring, memory & learning, autonomy, self-improvement, emergence measurement), a verified Gemma 4 distillation pipeline (tested on real 27B model with Intel HD 530 iGPU), five output modalities (vision, speech, tactile, robotics, scientific), a 4-layer security proxy (FerrisRes Armor), and profile-driven GPU dispatch that automatically adapts from Intel iGPUs to H100s. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0. Suitable for research, high-performance prototyping, and early-adopter production workloads.
 
 ---
 
@@ -80,6 +80,7 @@ FerrisRes includes a full cognitive architecture for self-improving AI:
 - **AbstractionEngine** — concept compression via cluster detection and generalization
 - **IntrinsicMotivation** — self-directed learning with Zone of Proximal Development goal selection
 - **ProactiveController** — bounded autonomous behavior with 4-level autonomy
+- **EmergenceBenchmark** — quantitative emergence measurement across 6 categories (skill acquisition, self-correction, self-extension, scaffolding, planning, abstraction)
 
 ### Multimodal
 
@@ -441,7 +442,7 @@ FerrisRes requires a working Vulkan driver. On Linux the recommended path is thr
 ```bash
 nix develop          # enters the dev shell with Rust + Vulkan layers
 cargo build
-cargo test            # 1189 tests
+cargo test            # 1216 tests
 cargo bench
 ```
 
@@ -500,6 +501,7 @@ src/
 │   ├── abstraction_engine.rs # Concept compression & generalization
 │   ├── intrinsic_motivation.rs # Self-directed learning
 │   ├── proactive_controller.rs # Bounded autonomous behavior
+│   ├── emergence_benchmark.rs  # Quantitative emergence measurement
 │   ├── pdf_ingestion.rs   # Raw PDF text extraction
 │   ├── acp.rs             # Agent Capability Protocol router
 │   ├── tts_stream.rs      # Streaming TTS with overlap-add reconstruction
@@ -565,9 +567,9 @@ src/
 | 14 | ✅ Done | FerrisRes Armor: L0 regex+bloom, L1 neural scanner, L2 RepE probe, L3 sanitizer, GPU-accelerated distillation |
 | 15 | ✅ Done | Profile-driven dispatch: `DispatchPlan` per-op CPU/GPU, Intel iGPU detection, auto-tiling, `--gpu` flag removed |
 | 16 | ✅ Done | Real distillation verified: Gemma 4 27B on Intel HD 530, 27M tokens, checkpoint resilience |
-| 17 | ✅ Done | Cognitive architecture: Layer 0-3 (pipeline wiring, memory & learning, autonomy, self-improvement) |
+| 17 | ✅ Done | Cognitive architecture: Layer 0-4 (pipeline wiring, memory & learning, autonomy, self-improvement, emergence measurement) |
 
-**All tasks complete — 1189 tests passing.**
+**All tasks complete — 1216 tests passing.**
 
 See [ROADMAP.md](ROADMAP.md) for full technical details.
 
