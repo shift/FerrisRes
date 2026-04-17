@@ -1667,7 +1667,7 @@ impl MappedGemma4Model {
         let q_dim = nh * hdim;
         let kv_dim = nkv * hdim;
         let idim = config.intermediate_dim;
-        let ple_dim = 0; // PLE disabled — requires model-level weights
+        let ple_dim = config.hidden_size_per_layer_input.unwrap_or(0);
 
         let embed_tokens = get(Gemma4MmTensorNames::embed_tokens())
             .ok_or_else(|| "Missing embed_tokens".to_string())?;
@@ -2039,8 +2039,9 @@ impl Gemma4Teacher {
         let heads_per_kv = num_heads / num_kv_heads;
 
         // Scaled dot-product attention with causal mask
-        // Gemma 4 uses scaling=1.0 because Q norm normalizes to unit scale
-        let scale = 1.0f32;
+        // Gemma 4: Q/K are per-head RMSNorm'd (unit scale), so dot product ≈ head_dim.
+        // query_pre_attn_scalar = head_dim → scale = 1/head_dim to keep logits in reasonable range.
+        let scale = 1.0f32 / (head_dim as f32);
         let mut attn_out = vec![0.0f32; seq_len * q_dim];
 
         for h in 0..num_heads {
@@ -2863,7 +2864,7 @@ impl Gemma4Student {
         apply_rope_gqa(&mut k, seq_len, num_kv_heads, head_dim, 0);
 
         let heads_per_kv = num_heads / num_kv_heads;
-        let scale = 1.0 / (head_dim as f32).sqrt();
+        let scale = 1.0f32 / (head_dim as f32); // Gemma 4: 1/head_dim after Q/K RMSNorm
         let mut attn_out = vec![0.0f32; seq_len * q_dim];
 
         for h in 0..num_heads {
@@ -2913,7 +2914,7 @@ impl Gemma4Student {
         kv_dim: usize,
     ) -> Vec<f32> {
         let heads_per_kv = num_heads / num_kv_heads;
-        let attn_scale = 1.0 / (head_dim as f32).sqrt();
+        let attn_scale = 1.0f32 / (head_dim as f32); // Gemma 4: 1/head_dim after Q/K RMSNorm
         let mut attn_out = vec![0.0f32; seq * q_dim];
 
         for h in 0..num_heads {
