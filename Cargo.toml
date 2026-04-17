@@ -1,6 +1,6 @@
 [package]
 name = "ferrisres"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Block AttnRes runtime for distributed SLM/LLM training and inference"
 license = "AGPL-3.0-or-later"

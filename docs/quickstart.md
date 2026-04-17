@@ -28,8 +28,15 @@ cargo test --lib           # 742 tests
 ## 3. Run inference
 
 ```bash
-# Basic text generation
+# Skeleton model (random weights, for testing)
 cargo run --release -- infer --prompt "Explain transformers" --max-tokens 64
+
+# Real model from GGUF (actual CPU inference)
+cargo run --release -- infer \
+  --model-path gemma-4-E2B-it-Q4_K_M.gguf \
+  --model-format gguf \
+  --config e2b \
+  --prompt "Explain transformers"
 
 # With a template
 cargo run --release -- infer --prompt "What is attention?" --template chatml
@@ -41,6 +48,14 @@ cargo run --release -- infer --prompt "Describe this" --image photo.jpg
 ## 4. Start the API server
 
 ```bash
+# With a real model (serves actual generation)
+cargo run --release -- serve \
+  --model-path gemma-4-E2B-it-Q4_K_M.gguf \
+  --model-format gguf \
+  --config e2b \
+  --port 8080
+
+# Without a model (placeholder responses)
 cargo run --release -- serve --port 8080
 ```
 
@@ -84,7 +99,7 @@ cargo run --release -- distill \
 
 ```toml
 [dependencies]
-ferrisres = { git = "https://github.com/shift/FerrisRes", tag = "v0.2.2" }
+ferrisres = { git = "https://github.com/shift/FerrisRes", tag = "v0.2.3" }
 ```
 
 ```rust

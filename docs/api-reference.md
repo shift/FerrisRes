@@ -8,7 +8,7 @@
 |---|---|---|
 | **Stable** | `inference::sampling`, `inference::prompt_templates`, `model::config` | No breaking changes |
 | **Beta** | `inference::generator`, `inference::rag`, `model::block_attn_res`, `model::safetensors` | Minor breaking changes possible |
-| **Unstable** | `compute::*`, `device::*`, `model::gpu_forward`, `training::*`, `inference::cognitive_pipeline`, `inference::episodic_memory`, `inference::diff_llm_computer`, `inference::tool_creation`, `inference::plan_executor`, `inference::tool_usage_tracker`, `inference::abstraction_engine`, `inference::intrinsic_motivation`, `inference::proactive_controller`, `inference::emergence_benchmark` | May change any time |
+| **Unstable** | `compute::*`, `device::*`, `model::gpu_forward`, `training::*`, `inference::cognitive_pipeline`, `inference::episodic_memory`, `inference::diff_llm_computer`, `inference::tool_creation`, `inference::plan_executor`, `inference::tool_usage_tracker`, `inference::abstraction_engine`, `inference::intrinsic_motivation`, `inference::proactive_controller`, `inference::emergence_benchmark`, `inference::consolidation` | May change any time |
 
 ## Core Types
 
@@ -122,13 +122,20 @@ Distill options:
   --seq-len <N>          Sequence length
   --learning-rate <F>    Learning rate
   --temperature <F>      Distillation temperature
-  nable GPU acceleration
   --resume <PATH>        Resume from checkpoint
 
 Serve options:
+  --model-path <PATH>    Path to GGUF or safetensors model (enables real generation)
+  --model-format <FMT>   Model format: gguf or safetensors
+  --config <CONFIG>      Model config preset
+  --tokenizer <PATH>     Path to tokenizer.json
+  --host <HOST>          Host to bind to (default: 0.0.0.0)
   --port <PORT>          Server port (default: 8080)
+  --model-name <NAME>    Model name for API responses
+  --cognitive            Enable cognitive pipeline
+  --armor                Enable FerrisRes Armor security
 
-Cognitive options (with --cognitive):
+Cognitive options (with --cognitive or --cognitive on infer):
   --concepts-path <PATH>  Path to concept store
   --persist-kv             Persist KV cache
   --kv-path <PATH>        Path for KV cache

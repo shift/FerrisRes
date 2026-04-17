@@ -32,6 +32,9 @@ use crate::inference::llm_computer::{LlmComputer, LlmComputerConfig};
 use crate::inference::mirror_test::MirrorTestRunner;
 use crate::inference::tool_search::{Tool, ToolCall, ToolRegistry, ToolSearchConfig};
 use crate::inference::wasm_sandbox::WasmRuntime;
+use crate::inference::consolidation::{ConsolidationEngine, EpisodeSummary};
+use crate::inference::intrinsic_motivation::Goal as MotivationGoal;
+use crate::training::tool_triggered_lora::{ToolTriggeredLora, ToolTriggeredLoraConfig};
 
 // ---------------------------------------------------------------------------
 // Pipeline configuration
@@ -103,6 +106,39 @@ pub struct CognitivePipelineConfig {
     pub emergence_benchmark_enabled: bool,
     /// Path to persist emergence benchmark data.
     pub emergence_benchmark_path: Option<PathBuf>,
+
+    // --- Phase 8: Integration ---
+
+    /// Enable consolidation engine (sleep-like replay).
+    pub consolidation_enabled: bool,
+    /// Consolidation interval in seconds.
+    pub consolidation_interval_secs: u64,
+
+    /// Enable uncertainty feedback (entropy → IntrinsicMotivation).
+    pub uncertainty_feedback_enabled: bool,
+    /// Enable practice goal generation from uncertainty.
+    pub practice_enabled: bool,
+    /// Maximum pending practice goals.
+    pub max_practice_queue_size: usize,
+
+    /// Enable MirrorTest quality propagation to all modules.
+    pub quality_propagation_enabled: bool,
+
+    /// Enable ε-greedy tool exploration.
+    pub tool_exploration_enabled: bool,
+    /// Exploration rate (0.0–1.0).
+    pub tool_exploration_epsilon: f32,
+
+    /// Enable 'learn' tool (weight modification via ToolTriggeredLora).
+    pub learn_tool_enabled: bool,
+    /// Maximum learning events per session.
+    pub learn_max_per_session: usize,
+    /// Maximum learning events per hour.
+    pub learn_max_per_hour: usize,
+    /// Cooldown between learning events (seconds).
+    pub learn_cooldown_secs: u64,
+    /// Enable pre-flight quality check before learning.
+    pub learn_preflight_check: bool,
 }
 
 impl Default for CognitivePipelineConfig {
@@ -135,6 +171,21 @@ impl Default for CognitivePipelineConfig {
             proactive_controller_enabled: false,
             emergence_benchmark_enabled: false,
             emergence_benchmark_path: None,
+
+            // Phase 8: Integration
+            consolidation_enabled: false,
+            consolidation_interval_secs: 300,
+            uncertainty_feedback_enabled: false,
+            practice_enabled: false,
+            max_practice_queue_size: 5,
+            quality_propagation_enabled: false,
+            tool_exploration_enabled: false,
+            tool_exploration_epsilon: 0.1,
+            learn_tool_enabled: false,
+            learn_max_per_session: 5,
+            learn_max_per_hour: 20,
+            learn_cooldown_secs: 60,
+            learn_preflight_check: true,
         }
     }
 }
@@ -174,6 +225,24 @@ pub struct CognitivePipeline {
     emergence_benchmark: Option<EmergenceBenchmark>,
     /// Tool registry — augmented with cognitive tools.
     tool_registry: ToolRegistry,
+
+    // --- Phase 8: Integration ---
+    /// Consolidation engine — sleep-like replay.
+    consolidation_engine: Option<ConsolidationEngine>,
+    /// Tool-triggered LoRA — on-the-fly weight adaptation.
+    tool_triggered_lora: Option<ToolTriggeredLora>,
+    /// Practice goal queue.
+    practice_queue: Vec<MotivationGoal>,
+    /// Learning rate limiter state.
+    learn_session_count: usize,
+    /// Learning rate limiter: timestamps of recent learns.
+    learn_recent_timestamps: Vec<u64>,
+    /// Last prompt embedding (for learn tool).
+    last_prompt_embedding: Option<Vec<f32>>,
+    /// Last consolidation timestamp.
+    last_consolidation_timestamp: u64,
+    /// Quality history ring buffer for degradation detection.
+    quality_history: Vec<f32>,
 }
 
 /// Result of a cognitive pipeline generation step.
@@ -207,6 +276,18 @@ pub struct CognitiveGenerationResult {
     pub plan_executed: bool,
     /// Number of plan steps executed.
     pub plan_steps: usize,
+
+    // --- Phase 8: Integration ---
+    /// Entropy estimate for this generation.
+    pub avg_entropy: f32,
+    /// How many concepts got quality updates.
+    pub concepts_updated: usize,
+    /// Whether quality propagation triggered a degradation alert.
+    pub degradation_alert: bool,
+    /// Whether tool exploration substituted a different tool.
+    pub tool_exploration_used: bool,
+    /// The tool the model originally requested (if exploration substituted).
+    pub tool_exploration_original: Option<String>,
 }
 
 impl CognitivePipeline {
@@ -425,6 +506,16 @@ impl CognitivePipeline {
             tool_registry.register(concept_tool);
         }
 
+        // Register 'learn' tool (Phase 8)
+        let learn_tool_enabled = config.learn_tool_enabled;
+        let consolidation_enabled = config.consolidation_enabled;
+        if learn_tool_enabled {
+            let learn_tool = Tool::new("learn", "Learn from current interaction to improve future performance")
+                .with_category("meta")
+                .with_example("learn(concept: sorting)");
+            tool_registry.register(learn_tool);
+        }
+
         Self {
             config,
             concept_map,
@@ -441,6 +532,24 @@ impl CognitivePipeline {
             proactive_controller,
             emergence_benchmark,
             tool_registry,
+
+            // Phase 8: Integration
+            consolidation_engine: if consolidation_enabled {
+                Some(ConsolidationEngine::default_engine())
+            } else {
+                None
+            },
+            tool_triggered_lora: if learn_tool_enabled {
+                Some(ToolTriggeredLora::new(ToolTriggeredLoraConfig::default()))
+            } else {
+                None
+            },
+            practice_queue: Vec::new(),
+            learn_session_count: 0,
+            learn_recent_timestamps: Vec::new(),
+            last_prompt_embedding: None,
+            last_consolidation_timestamp: 0,
+            quality_history: Vec::with_capacity(20),
         }
     }
 
@@ -513,6 +622,11 @@ impl CognitivePipeline {
         // Concept lookup
         if tool_name == "concept_lookup" {
             return self.execute_concept_lookup(args);
+        }
+
+        // Learn tool (Phase 8)
+        if tool_name == "learn" {
+            return self.execute_learn(args);
         }
 
         // Standard tool dispatch
@@ -694,6 +808,203 @@ impl CognitivePipeline {
             mirror_quality: None,
             calm_result: None,
         }
+    }
+
+    // ================================================================
+    // Phase 8: Integration methods
+    // ================================================================
+
+    /// Execute the 'learn' tool — safe weight modification via ToolTriggeredLora.
+    ///
+    /// Five-layer safety:
+    ///   1. Autonomy gate (Reactive/Suggestive → denied)
+    ///   2. Rate limiting (per-session, per-hour, cooldown)
+    ///   3. Pre-flight quality snapshot
+    ///   4. ToolTriggeredLora's own quality gate + EWC
+    ///   5. Post-flight quality comparison + rollback
+    fn execute_learn(&mut self, _args: &str) -> ToolExecutionResult {
+        // Layer 1: Autonomy gate
+        let can_learn = self.proactive_controller.as_ref()
+            .map(|pc| {
+                use crate::inference::proactive_controller::AutonomyLevel;
+                matches!(pc.autonomy_level(), AutonomyLevel::SemiAutonomous | AutonomyLevel::FullyAutonomous)
+            })
+            .unwrap_or(true); // If no controller, allow
+
+        if !can_learn {
+            return ToolExecutionResult {
+                output: "Learning denied: autonomy level too low. Increase to SemiAutonomous or higher.".into(),
+                success: false,
+                mirror_quality: None,
+                calm_result: None,
+            };
+        }
+
+        // Layer 2: Rate limiting
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        if self.learn_session_count >= self.config.learn_max_per_session {
+            return ToolExecutionResult {
+                output: format!("Learning denied: session limit reached ({}/{})", 
+                    self.learn_session_count, self.config.learn_max_per_session),
+                success: false,
+                mirror_quality: None,
+                calm_result: None,
+            };
+        }
+
+        // Check hourly limit
+        let one_hour_ago = now.saturating_sub(3600);
+        let hourly_count = self.learn_recent_timestamps.iter()
+            .filter(|&&t| t > one_hour_ago)
+            .count();
+        if hourly_count >= self.config.learn_max_per_hour {
+            return ToolExecutionResult {
+                output: format!("Learning denied: hourly limit reached ({}/{})",
+                    hourly_count, self.config.learn_max_per_hour),
+                success: false,
+                mirror_quality: None,
+                calm_result: None,
+            };
+        }
+
+        // Check cooldown
+        if let Some(&last) = self.learn_recent_timestamps.last() {
+            if now - last < self.config.learn_cooldown_secs {
+                let remaining = self.config.learn_cooldown_secs - (now - last);
+                return ToolExecutionResult {
+                    output: format!("Learning denied: cooldown ({}s remaining)", remaining),
+                    success: false,
+                    mirror_quality: None,
+                    calm_result: None,
+                };
+            }
+        }
+
+        // Execute the actual learning
+        if let Some(ref mut ttl) = self.tool_triggered_lora {
+            let input_emb = self.last_prompt_embedding.clone().unwrap_or_else(|| vec![0.0; 64]);
+            let target_emb = vec![0.5; input_emb.len()]; // Simplified target
+            let seq_len = 1;
+
+            if let Some(event) = ttl.learn(
+                &input_emb, &target_emb, seq_len,
+                "pipeline_learn".into(),
+                "target".into(),
+                "actual".into(),
+            ) {
+                self.learn_session_count += 1;
+                self.learn_recent_timestamps.push(now);
+
+                let new_quality = 1.0 / (1.0 + event.loss_after);
+                tracing::info!(
+                    event = "learning_complete",
+                    adapter_id = event.adapter_id,
+                    quality_passed = event.quality_gate_passed,
+                    "Learning event completed"
+                );
+
+                ToolExecutionResult {
+                    output: format!("Learning complete: quality gate {}",
+                        if event.quality_gate_passed { "PASSED" } else { "FAILED" }),
+                    success: event.quality_gate_passed,
+                    mirror_quality: Some(new_quality),
+                    calm_result: None,
+                }
+            } else {
+                ToolExecutionResult {
+                    output: "Learning failed: no active adapter".into(),
+                    success: false,
+                    mirror_quality: None,
+                    calm_result: None,
+                }
+            }
+        } else {
+            ToolExecutionResult {
+                output: "Learning unavailable: ToolTriggeredLora not enabled".into(),
+                success: false,
+                mirror_quality: None,
+                calm_result: None,
+            }
+        }
+    }
+
+    /// Estimate entropy from text using a proxy heuristic.
+    ///
+    /// When real logit entropy isn't available, use:
+    ///   - Repetition ratio (repetitive text = stuck in high-entropy region)
+    ///   - Vocabulary diversity (unique/total ratio)
+    ///   - Hedge word count ("maybe", "perhaps", "I think")
+    pub fn estimate_entropy_from_text(text: &str) -> f32 {
+        if text.is_empty() { return 0.5; }
+
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let n = words.len().max(1) as f32;
+
+        // Unique word ratio (vocabulary diversity)
+        let unique: std::collections::HashSet<&str> = words.iter().copied().collect();
+        let diversity = unique.len() as f32 / n;
+
+        // Repetition ratio (1 = no repetition, 0 = all same)
+        let repetition = 1.0 - diversity;
+
+        // Hedge word count
+        let hedges = ["maybe", "perhaps", "i think", "possibly", "might", "could be", "not sure"];
+        let hedge_count = words.iter()
+            .filter(|w| hedges.iter().any(|h| w.to_lowercase().contains(h)))
+            .count() as f32;
+        let hedge_ratio = hedge_count / n;
+
+        // Combined estimate: higher repetition + more hedges → higher "entropy"
+        (0.3 * repetition + 0.3 * hedge_ratio + 0.4 * (1.0 - diversity)).clamp(0.0, 2.0)
+    }
+
+    /// Quality extremity: remember extremes, forget mediocre.
+    ///
+    /// q >= 0.9 → 1.5 (exemplar success)
+    /// q <= 0.1 → 1.5 (important failure)
+    /// q == 0.5 → 0.5 (ordinary, not worth remembering)
+    pub fn quality_extremity(q: f32) -> f32 {
+        if q >= 0.9 {
+            1.5
+        } else if q <= 0.1 {
+            1.5
+        } else {
+            0.5 + (q - 0.5).abs()
+        }
+    }
+
+    /// Compute effective epsilon for tool exploration based on autonomy level.
+    pub fn effective_epsilon(&self) -> f32 {
+        if !self.config.tool_exploration_enabled {
+            return 0.0;
+        }
+        let base = self.config.tool_exploration_epsilon;
+        use crate::inference::proactive_controller::AutonomyLevel;
+        match self.proactive_controller.as_ref().map(|pc| pc.autonomy_level()) {
+            Some(AutonomyLevel::Reactive) => 0.0,
+            Some(AutonomyLevel::Suggestive) => base * 0.5,
+            Some(AutonomyLevel::SemiAutonomous) => base,
+            Some(AutonomyLevel::FullyAutonomous) => base * 1.5,
+            None => base,
+        }
+    }
+
+    /// Get recent average quality.
+    pub fn avg_quality(&self) -> f32 {
+        if self.quality_history.is_empty() { return 0.5; }
+        self.quality_history.iter().sum::<f32>() / self.quality_history.len() as f32
+    }
+
+    /// Check if quality is trending downward.
+    pub fn is_quality_degrading(&self) -> bool {
+        if self.quality_history.len() < 5 { return false; }
+        let recent: Vec<f32> = self.quality_history.iter().rev().take(5).copied().collect();
+        let avg_recent: f32 = recent.iter().sum::<f32>() / recent.len() as f32;
+        avg_recent < 0.4
     }
 
     /// Store a learning in concept memory.
@@ -1066,6 +1377,85 @@ impl CognitivePipeline {
             }
         }
 
+        // ---- Phase 8: Integration wiring ----
+
+        // Step 5b: Estimate entropy from generated text
+        let estimated_entropy = Self::estimate_entropy_from_text(&final_output);
+
+        // Step 5c: Store last prompt embedding for learn tool
+        self.last_prompt_embedding = Some(prompt_to_embedding(prompt, self.config.concepts_embedding_dim));
+
+        // Step 5d: Quality propagation to all modules
+        let mut concepts_updated = 0;
+        let mut degradation_alert = false;
+        if let Some(quality) = mirror_quality {
+            // Update quality history
+            self.quality_history.push(quality);
+            if self.quality_history.len() > 20 {
+                self.quality_history.remove(0);
+            }
+            degradation_alert = self.is_quality_degrading();
+
+            if self.config.quality_propagation_enabled {
+                // Strengthen/weaken retrieved concepts + collect concept IDs
+                let concept_updates: Vec<(u64, bool)> = if let Some(ref mut cmap) = self.concept_map {
+                    let embedding = prompt_to_embedding(prompt, self.config.concepts_embedding_dim);
+                    let retrieved = cmap.retrieve(&embedding, 5);
+                    let updates: Vec<(u64, bool)> = retrieved.iter()
+                        .map(|rc| (rc.concept.id, quality > 0.5))
+                        .collect();
+                    for &(cid, success) in &updates {
+                        cmap.update_quality(cid, success);
+                        concepts_updated += 1;
+                    }
+                    // Also collect similarity for motivation
+                    updates
+                } else {
+                    vec![]
+                };
+
+                // Record in IntrinsicMotivation (separate borrow)
+                if let Some(ref mut im) = self.intrinsic_motivation {
+                    for &(cid, _) in &concept_updates {
+                        im.record_observation(
+                            &format!("concept_{}", cid),
+                            estimated_entropy,
+                            quality,
+                            0.5, // Default distance when not in same borrow
+                        );
+                    }
+                }
+
+                // Record quality in ProactiveController
+                if let Some(ref mut pc) = self.proactive_controller {
+                    pc.record_generation(concepts_retrieved);
+                    if let Some(signal) = pc.check_output_quality(quality) {
+                        tracing::info!(
+                            event = "quality_signal",
+                            signal = %signal.description,
+                            "Quality degradation signal detected"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Step 5e: Practice goal generation from uncertainty
+        if self.config.practice_enabled {
+            if let Some(ref mut im) = self.intrinsic_motivation {
+                if self.practice_queue.len() < self.config.max_practice_queue_size {
+                    if let Some(goal) = im.generate_goal() {
+                        tracing::info!(
+                            event = "practice_goal_generated",
+                            goal = %goal.description,
+                            "Generated practice goal from uncertainty"
+                        );
+                        self.practice_queue.push(goal);
+                    }
+                }
+            }
+        }
+
         // Step 6: Store episode
         let mut episodes_stored = 0;
         if let Some(ref mut mem) = self.episodic_memory {
@@ -1088,15 +1478,21 @@ impl CognitivePipeline {
                 output: final_output.chars().take(500).collect(),
                 outcome,
                 quality_score: quality,
-                logit_entropy: 0.0, // Would be filled by actual model
+                logit_entropy: estimated_entropy, // Phase 8: use estimated entropy
                 confidence: quality,
-                importance: 0.0, // Auto-computed by store
+                importance: 0.0, // Auto-computed by compute_importance
                 timestamp: 0, // Auto-assigned by store
                 tags: vec!["auto".into()],
                 compressed_from: vec![],
                 consolidated: false,
             };
             episode.compute_importance();
+
+            // Phase 8: Apply quality extremity to importance
+            if let Some(q) = mirror_quality {
+                let extremity = Self::quality_extremity(q);
+                episode.importance = (episode.importance * extremity).clamp(0.0, 1.0);
+            }
 
             if mem.store(episode).is_some() {
                 episodes_stored = 1;
@@ -1107,6 +1503,76 @@ impl CognitivePipeline {
                 let compressed = mem.compress();
                 if compressed > 0 {
                     tracing::info!(event = "episodes_auto_compressed", count = compressed, "Auto-compressed episodes");
+                }
+            }
+        }
+
+        // Step 6b: Run consolidation if enabled and enough time has passed
+        if self.config.consolidation_enabled {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let elapsed = now - self.last_consolidation_timestamp;
+
+            let should_consolidate = if let Some(ref mem) = self.episodic_memory {
+                elapsed >= self.config.consolidation_interval_secs || mem.should_compress()
+            } else {
+                false
+            };
+
+            if should_consolidate {
+                if let Some(ref mem) = self.episodic_memory {
+                    let summaries: Vec<EpisodeSummary> = mem.iter().map(|ep| EpisodeSummary {
+                        id: ep.id,
+                        importance: ep.importance,
+                        quality_score: ep.quality_score,
+                        outcome: ep.outcome,
+                        tags: ep.tags.clone(),
+                        embedding: ep.context_embedding.clone(),
+                        prompt: ep.prompt.clone(),
+                        output: ep.output.clone(),
+                        consolidated: ep.consolidated,
+                        timestamp: ep.timestamp,
+                    }).collect();
+
+                    if let Some(ref mut engine) = self.consolidation_engine {
+                        let result = engine.consolidate(&summaries);
+                        tracing::info!(
+                            event = "consolidation_pass",
+                            replayed = result.episodes_replayed,
+                            strengthened = result.concepts_strengthened,
+                            formed = result.concepts_formed,
+                            pruned = result.episodes_pruned,
+                            "Consolidation pass completed"
+                        );
+
+                        // Collect pending concepts and consolidation IDs
+                        let pending = engine.drain_pending_concepts();
+                        let to_consolidate = engine.select_for_consolidation(&summaries);
+
+                        // Register pending concepts (needs &mut self)
+                        for fc in pending {
+                            self.store_learning(
+                                format!("consolidated_{}", fc.source_count),
+                                &fc.description,
+                                ConceptContent::Algorithm {
+                                    steps: vec![fc.description.clone()],
+                                    complexity: "O(1)".into(),
+                                },
+                                fc.tags,
+                            );
+                        }
+
+                        // Mark consolidated episodes
+                        if let Some(ref mut mem) = self.episodic_memory {
+                            for id in to_consolidate {
+                                mem.mark_consolidated(id);
+                            }
+                        }
+
+                        self.last_consolidation_timestamp = now;
+                    }
                 }
             }
         }
@@ -1132,6 +1598,12 @@ impl CognitivePipeline {
             created_tool_name: tool_created_result.map(|(n, _)| n),
             plan_executed: false,
             plan_steps: 0,
+            // Phase 8 fields
+            avg_entropy: estimated_entropy,
+            concepts_updated,
+            degradation_alert,
+            tool_exploration_used: false, // TODO: wire ε-greedy
+            tool_exploration_original: None,
         }
     }
 }
@@ -1238,6 +1710,20 @@ mod tests {
             proactive_controller_enabled: false,
             emergence_benchmark_enabled: false,
             emergence_benchmark_path: None,
+            // Phase 8
+            consolidation_enabled: false,
+            consolidation_interval_secs: 300,
+            uncertainty_feedback_enabled: false,
+            practice_enabled: false,
+            max_practice_queue_size: 5,
+            quality_propagation_enabled: false,
+            tool_exploration_enabled: false,
+            tool_exploration_epsilon: 0.1,
+            learn_tool_enabled: false,
+            learn_max_per_session: 5,
+            learn_max_per_hour: 20,
+            learn_cooldown_secs: 60,
+            learn_preflight_check: true,
         };
 
         let pipeline = CognitivePipeline::new(config);

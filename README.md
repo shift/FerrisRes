@@ -2,7 +2,7 @@
 
 FerrisRes is a Rust-native AI inference and training engine built around **Block AttnRes** — a novel linear-time transformer architecture that replaces the quadratic attention bottleneck of standard transformers. It runs on any GPU or iGPU via [wgpu](https://github.com/gfx-rs/wgpu) (Vulkan, Metal, DX12, WebGPU), adapts automatically to the hardware it finds, and is written entirely in safe Rust with no Python dependency.
 
-> ⚠️ **v0.2.2 — near-production grade, not yet 1.0.** FerrisRes has 1216 passing tests, a full cognitive architecture with 5 layers (pipeline wiring, memory & learning, autonomy, self-improvement, emergence measurement), a verified Gemma 4 distillation pipeline (tested on real 27B model with Intel HD 530 iGPU), five output modalities (vision, speech, tactile, robotics, scientific), a 4-layer security proxy (FerrisRes Armor), and profile-driven GPU dispatch that automatically adapts from Intel iGPUs to H100s. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0. Suitable for research, high-performance prototyping, and early-adopter production workloads.
+> ⚠️ **v0.2.3 — near-production grade, not yet 1.0.** FerrisRes has 1232 passing tests, a full cognitive architecture with 5 layers (pipeline wiring, memory & learning, autonomy, self-improvement, emergence measurement), a verified Gemma 4 distillation pipeline (tested on real 27B model with Intel HD 530 iGPU), five output modalities (vision, speech, tactile, robotics, scientific), a 4-layer security proxy (FerrisRes Armor), and profile-driven GPU dispatch that automatically adapts from Intel iGPUs to H100s. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0. Suitable for research, high-performance prototyping, and early-adopter production workloads.
 
 ---
 
@@ -202,7 +202,15 @@ Auto-detects at startup. Override via `FERRIS_DEVICE_PROFILE=integrated cargo ru
 
 ```
 # Inference
+# Skeleton model (random weights, for testing)
 cargo run -- infer --prompt "Explain transformers" --template chatml --max-tokens 128
+
+# Real model from GGUF (CPU inference)
+cargo run -- infer \
+  --model-path gemma-4-E2B-it-Q4_K_M.gguf \
+  --model-format gguf \
+  --config e2b \
+  --prompt "Explain transformers"
 
 # Multimodal
 cargo run -- infer --prompt "Describe this image" --image photo.jpg
@@ -333,15 +341,23 @@ let output = generator.generate_with_rag(
 
 ## API Server
 
-FerrisRes includes an OpenAI-compatible HTTP API server:
+FerrisRes includes an OpenAI-compatible HTTP API server with real model inference:
 
 ```
-# Start the API server
+# Start with a real GGUF model (serves real generation)
+cargo run -- serve \
+  --model-path gemma-4-E2B-it-Q4_K_M.gguf \
+  --model-format gguf \
+  --config e2b \
+  --port 8080 \
+  --cognitive
+
+# Or without a model (returns placeholder responses)
 cargo run -- serve --port 8080
 ```
 
 Endpoints:
-- `POST /v1/chat/completions` — chat with messages
+- `POST /v1/chat/completions` — chat with messages (real CPU inference when model loaded)
 - `POST /v1/completions` — text completion
 - `GET /v1/models` — list models
 - `GET /health` — health check
@@ -442,7 +458,7 @@ FerrisRes requires a working Vulkan driver. On Linux the recommended path is thr
 ```bash
 nix develop          # enters the dev shell with Rust + Vulkan layers
 cargo build
-cargo test            # 1216 tests
+cargo test            # 1232 tests
 cargo bench
 ```
 
@@ -502,6 +518,7 @@ src/
 │   ├── intrinsic_motivation.rs # Self-directed learning
 │   ├── proactive_controller.rs # Bounded autonomous behavior
 │   ├── emergence_benchmark.rs  # Quantitative emergence measurement
+│   └── consolidation.rs   # Sleep-like memory replay
 │   ├── pdf_ingestion.rs   # Raw PDF text extraction
 │   ├── acp.rs             # Agent Capability Protocol router
 │   ├── tts_stream.rs      # Streaming TTS with overlap-add reconstruction
@@ -568,8 +585,9 @@ src/
 | 15 | ✅ Done | Profile-driven dispatch: `DispatchPlan` per-op CPU/GPU, Intel iGPU detection, auto-tiling, `--gpu` flag removed |
 | 16 | ✅ Done | Real distillation verified: Gemma 4 27B on Intel HD 530, 27M tokens, checkpoint resilience |
 | 17 | ✅ Done | Cognitive architecture: Layer 0-4 (pipeline wiring, memory & learning, autonomy, self-improvement, emergence measurement) |
+| 18 | ✅ Done | Phase 8 integration: consolidation engine, quality propagation, uncertainty feedback, tool exploration, safe learn tool, GGUF CPU inference, API server |
 
-**All tasks complete — 1216 tests passing.**
+**All tasks complete — 1232 tests passing.**
 
 See [ROADMAP.md](ROADMAP.md) for full technical details.
 

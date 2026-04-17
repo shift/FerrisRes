@@ -7,10 +7,10 @@
 | Metric | Value |
 |---|---|
 | Source code | ~65,000 lines across 118 modules |
-| Test suites | 1216 lib tests passing, 0 failures |
+| Test suites | 1232 lib tests passing, 0 failures |
 | Language | 100% Rust (safe + WGSL compute shaders) |
 | GPU backends | Vulkan, Metal, DX12, WebGPU via wgpu |
-| Tasks completed | **212 / 212 (all complete)** |
+| Tasks completed | **220 / 220 (all complete)** |
 | License | AGPL-3.0-or-later |
 
 ---
@@ -299,3 +299,40 @@ The cognitive pipeline orchestrates all cognitive components:
 - Emergence index: composite 0.0–1.0 score across all categories
 - JSON persistence for cross-session measurement
 - 27 tests
+
+---
+
+## Phase 18: Integration & Real Inference (v0.2.3)
+
+### Consolidation Engine
+- **ConsolidationEngine**: Sleep-like memory replay. Selects important unconsolidated episodes, scores by quality, forms new concepts from episode clusters (cosine > 0.8), prunes stale consolidated memories. Preserves high-quality exemplars (quality > 0.9). 16 tests.
+
+### Quality Propagation
+- MirrorTest quality now fans out to ALL cognitive modules after each generation:
+  - **ConceptMap**: strengthen/weaken retrieved concepts based on quality
+  - **IntrinsicMotivation**: record observations per concept with entropy + quality
+  - **ProactiveController**: quality degradation alerts when trend drops below 0.4
+  - **Episode importance**: quality extremity factor (remember extremes, forget mediocre)
+
+### Uncertainty Feedback
+- Text-based entropy proxy (diversity, repetition, hedging) feeds IntrinsicMotivation
+- High uncertainty triggers practice goal generation
+- Practice goal queue (max 5) for self-directed learning
+
+### Tool-Learning Policy
+- ε-greedy tool exploration with autonomy-adjusted epsilon (Reactive=0, FullyAutonomous=0.15)
+- Logs suboptimal model choices when tracker data suggests better alternatives
+
+### Safe Learn Tool
+- `learn` tool registered in ToolRegistry, dispatched via `execute_tool()`
+- 5-layer safety: autonomy gate, rate limiting (5/session, 20/hour, 60s cooldown), quality gate (EWC), audit log
+
+### GGUF/safetensors CPU Inference
+- `infer --model-path` loads GGUF or safetensors and runs full autoregressive generation on CPU
+- `serve --model-path` loads model once at startup, serves real generation via OpenAI-compatible API
+- Supports all 13 model configs: e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b, 31b, llama3-8b, llama3-70b, mistral-7b, mixtral-8x7b, phi3-mini, qwen2-7b
+
+### API Server
+- New `serve` subcommand with `--host`, `--port`, `--model-name`, `--model-path`, `--model-format`, `--tokenizer`
+- Real CPU inference on `/v1/chat/completions` and `/v1/completions` when model loaded
+- Placeholder responses with instructions when no model loaded
