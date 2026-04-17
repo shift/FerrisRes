@@ -546,8 +546,8 @@ impl Gemma4Config {
             vocab_size: 262144,
             max_position_embeddings: 131072,
             sliding_window: 512,
-            // Block Summary injection at full_attention layers
-            moe_layers: vec![4, 9, 14, 19, 24, 29, 34],
+            // Gemma 4 E2B is all-dense (no MoE)
+            moe_layers: vec![],
         }
     }
 
@@ -4303,7 +4303,7 @@ mod tests {
         assert_eq!(config.vocab_size, 262144);
         assert_eq!(config.max_position_embeddings, 131072);
         assert_eq!(config.sliding_window, 512);
-        assert_eq!(config.moe_layers, vec![4, 9, 14, 19, 24, 29, 34]); // full_attention layers
+        assert_eq!(config.moe_layers, Vec::<usize>::new()); // Dense model, no MoE layers
     }
 
     #[test]

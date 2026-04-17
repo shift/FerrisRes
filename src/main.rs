@@ -555,20 +555,35 @@ async fn cmd_infer(
             prompt.clone()
         };
 
-        let tokens = if let Some(ref tok_path) = tokenizer_path {
+        // Tokenize — save the tokenizer for decoding later
+        let (tokens, decoder): (Vec<u32>, Box<dyn Fn(&[u32]) -> String>) = if let Some(ref tok_path) = tokenizer_path {
             match ferrisres::model::tokenizer::HfTokenizer::from_tokenizer_json(std::path::Path::new(tok_path)) {
                 Ok(hf_tok) => {
                     info!(event = "tokenizer_loaded", vocab_size = hf_tok.vocab_size(), "Loaded HfTokenizer");
-                    hf_tok.encode(&formatted_prompt)
+                    let enc = hf_tok.encode(&formatted_prompt);
+                    let dec = Box::new(move |ids: &[u32]| -> String {
+                        hf_tok.decode(ids)
+                    });
+                    (enc, dec)
                 }
                 Err(e) => {
                     warn!(event = "tokenizer_fallback", "Failed to load tokenizer: {}", e);
-                    SimpleTokenizer::new().encode(&formatted_prompt)
+                    let tok = SimpleTokenizer::new();
+                    let enc = tok.encode(&formatted_prompt);
+                    let dec: Box<dyn Fn(&[u32]) -> String> = Box::new(|ids: &[u32]| {
+                        SimpleTokenizer::new().decode(ids)
+                    });
+                    (enc, dec)
                 }
             }
         } else {
             info!(event = "using_simple_tokenizer", "No --tokenizer provided, using SimpleTokenizer");
-            SimpleTokenizer::new().encode(&formatted_prompt)
+            let tok = SimpleTokenizer::new();
+            let enc = tok.encode(&formatted_prompt);
+            let dec: Box<dyn Fn(&[u32]) -> String> = Box::new(|ids: &[u32]| {
+                SimpleTokenizer::new().decode(ids)
+            });
+            (enc, dec)
         };
 
         let loaded_model = match model_format.as_str() {
@@ -595,9 +610,8 @@ async fn cmd_infer(
         // Autoregressive generation on CPU
         let gen_tokens = generate_cpu(&teacher, &tokens, max_tokens, temperature as f32, None);
 
-        // Decode generated tokens
-        let simple_tok = SimpleTokenizer::new();
-        let output_text = simple_tok.decode(&gen_tokens);
+        // Decode generated tokens using the same tokenizer that encoded the prompt
+        let output_text = decoder(&gen_tokens);
 
         // Armor check
         let display_output = if let Some(ref mut layer) = armor_layer {
