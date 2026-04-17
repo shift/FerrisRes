@@ -2486,7 +2486,6 @@ impl Gemma4Teacher {
         let config = &self.model.config;
         let hd = config.hidden_dim;
         let nh = config.num_heads;
-        let head_d = config.head_dim;
         let seq = token_ids.len();
         let mut layer_states = Vec::new();
 
@@ -2502,7 +2501,7 @@ impl Gemma4Teacher {
         for h in hidden.iter_mut() { *h *= scale; }
         layer_states.push(hidden.clone()); // Embedding state
 
-        for (layer_idx, layer) in self.model.layers.iter().enumerate() {
+        for (_layer_idx, layer) in self.model.layers.iter().enumerate() {
             let residual = hidden.clone();
             let normed = rms_norm(&hidden, &layer.attn.input_norm, hd, 1e-6);
             let attn_out = self.attention_forward(
