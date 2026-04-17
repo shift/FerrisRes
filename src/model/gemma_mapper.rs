@@ -1484,14 +1484,22 @@ impl MappedGemma4Model {
         config: Gemma4Config,
         get: F,
     ) -> Result<Self, String> {
+        let hd = config.hidden_dim;
+        let nh = config.num_heads;
+        let nkv = config.num_kv_heads;
+        let hdim = config.head_dim;
+        let q_dim = nh * hdim;
+        let kv_dim = nkv * hdim;
+        let idim = config.intermediate_dim;
 
-        // Embedding
+        // Embedding — NOT transposed (used as lookup table: embed[tid * hd + d])
         let embed_tokens = get(Gemma4TensorNames::embed_tokens())
             .ok_or_else(|| "Missing embed_tokens".to_string())?;
 
-        // LM head (may be tied to embedding)
-        let lm_head = get(Gemma4TensorNames::lm_head())
+        // LM head — stored as [vocab_size × hd], transpose to [hd × vocab_size]
+        let lm_head_raw = get(Gemma4TensorNames::lm_head())
             .unwrap_or_else(|| embed_tokens.clone());
+        let lm_head = transpose(&lm_head_raw, config.vocab_size, hd);
 
         // Final norm
         let final_norm = get(Gemma4TensorNames::final_norm())
@@ -1500,14 +1508,15 @@ impl MappedGemma4Model {
         // Per-layer weights
         let mut layers = Vec::new();
         for layer_idx in 0..config.num_layers {
-            let q = get(&Gemma4TensorNames::q_proj(layer_idx))
-                .ok_or_else(|| format!("Missing q_proj for layer {}", layer_idx))?;
-            let k = get(&Gemma4TensorNames::k_proj(layer_idx))
-                .ok_or_else(|| format!("Missing k_proj for layer {}", layer_idx))?;
-            let v = get(&Gemma4TensorNames::v_proj(layer_idx))
-                .ok_or_else(|| format!("Missing v_proj for layer {}", layer_idx))?;
-            let o = get(&Gemma4TensorNames::o_proj(layer_idx))
-                .ok_or_else(|| format!("Missing o_proj for layer {}", layer_idx))?;
+            // Attention: safetensors stores [out × in], transpose to [in × out]
+            let q = transpose(&get(&Gemma4TensorNames::q_proj(layer_idx))
+                .ok_or_else(|| format!("Missing q_proj for layer {}", layer_idx))?, q_dim, hd);
+            let k = transpose(&get(&Gemma4TensorNames::k_proj(layer_idx))
+                .ok_or_else(|| format!("Missing k_proj for layer {}", layer_idx))?, kv_dim, hd);
+            let v = transpose(&get(&Gemma4TensorNames::v_proj(layer_idx))
+                .ok_or_else(|| format!("Missing v_proj for layer {}", layer_idx))?, kv_dim, hd);
+            let o = transpose(&get(&Gemma4TensorNames::o_proj(layer_idx))
+                .ok_or_else(|| format!("Missing o_proj for layer {}", layer_idx))?, hd, q_dim);
             let inorm = get(&Gemma4TensorNames::input_norm(layer_idx))
                 .ok_or_else(|| format!("Missing input_norm for layer {}", layer_idx))?;
             let pnorm = get(&Gemma4TensorNames::post_attn_norm(layer_idx))
@@ -1522,20 +1531,21 @@ impl MappedGemma4Model {
             // FFN: MoE or dense?
             let ffn = if config.moe_layers.contains(&layer_idx) {
                 // MoE layer
-                let router = get(&Gemma4TensorNames::moe_router(layer_idx))
+                let router_raw = get(&Gemma4TensorNames::moe_router(layer_idx))
                     .ok_or_else(|| format!("Missing MoE router for layer {}", layer_idx))?;
+                let router = transpose(&router_raw, config.num_experts, hd);
 
                 let mut expert_gates = Vec::new();
                 let mut expert_ups = Vec::new();
                 let mut expert_downs = Vec::new();
 
                 for e in 0..config.num_experts {
-                    let g = get(&Gemma4TensorNames::expert_gate(layer_idx, e))
-                        .ok_or_else(|| format!("Missing expert {} gate for layer {}", e, layer_idx))?;
-                    let u = get(&Gemma4TensorNames::expert_up(layer_idx, e))
-                        .ok_or_else(|| format!("Missing expert {} up for layer {}", e, layer_idx))?;
-                    let d = get(&Gemma4TensorNames::expert_down(layer_idx, e))
-                        .ok_or_else(|| format!("Missing expert {} down for layer {}", e, layer_idx))?;
+                    let g = transpose(&get(&Gemma4TensorNames::expert_gate(layer_idx, e))
+                        .ok_or_else(|| format!("Missing expert {} gate for layer {}", e, layer_idx))?, idim, hd);
+                    let u = transpose(&get(&Gemma4TensorNames::expert_up(layer_idx, e))
+                        .ok_or_else(|| format!("Missing expert {} up for layer {}", e, layer_idx))?, idim, hd);
+                    let d = transpose(&get(&Gemma4TensorNames::expert_down(layer_idx, e))
+                        .ok_or_else(|| format!("Missing expert {} down for layer {}", e, layer_idx))?, hd, idim);
                     expert_gates.push(g);
                     expert_ups.push(u);
                     expert_downs.push(d);
@@ -1549,12 +1559,12 @@ impl MappedGemma4Model {
                 }
             } else {
                 // Dense FFN
-                let gate = get(&Gemma4TensorNames::gate_proj(layer_idx))
-                    .ok_or_else(|| format!("Missing gate_proj for layer {}", layer_idx))?;
-                let up = get(&Gemma4TensorNames::up_proj(layer_idx))
-                    .ok_or_else(|| format!("Missing up_proj for layer {}", layer_idx))?;
-                let down = get(&Gemma4TensorNames::down_proj(layer_idx))
-                    .ok_or_else(|| format!("Missing down_proj for layer {}", layer_idx))?;
+                let gate = transpose(&get(&Gemma4TensorNames::gate_proj(layer_idx))
+                    .ok_or_else(|| format!("Missing gate_proj for layer {}", layer_idx))?, idim, hd);
+                let up = transpose(&get(&Gemma4TensorNames::up_proj(layer_idx))
+                    .ok_or_else(|| format!("Missing up_proj for layer {}", layer_idx))?, idim, hd);
+                let down = transpose(&get(&Gemma4TensorNames::down_proj(layer_idx))
+                    .ok_or_else(|| format!("Missing down_proj for layer {}", layer_idx))?, hd, idim);
 
                 Gemma4FfnWeights::Dense {
                     gate_proj: gate,
@@ -1574,25 +1584,34 @@ impl MappedGemma4Model {
         config: Gemma4Config,
         get: F,
     ) -> Result<Self, String> {
+        let hd = config.hidden_dim;
+        let nh = config.num_heads;
+        let nkv = config.num_kv_heads;
+        let hdim = config.head_dim;
+        let q_dim = nh * hdim;
+        let kv_dim = nkv * hdim;
+        let idim = config.intermediate_dim;
+
         let embed_tokens = get(Gemma4MmTensorNames::embed_tokens())
             .ok_or_else(|| "Missing embed_tokens".to_string())?;
 
-        let lm_head = get(Gemma4MmTensorNames::lm_head())
+        let lm_head_raw = get(Gemma4MmTensorNames::lm_head())
             .unwrap_or_else(|| embed_tokens.clone());
+        let lm_head = transpose(&lm_head_raw, config.vocab_size, hd);
 
         let final_norm = get(Gemma4MmTensorNames::final_norm())
             .ok_or_else(|| "Missing final norm".to_string())?;
 
         let mut layers = Vec::new();
         for layer_idx in 0..config.num_layers {
-            let q = get(&Gemma4MmTensorNames::q_proj(layer_idx))
-                .ok_or_else(|| format!("Missing q_proj for layer {}", layer_idx))?;
-            let k = get(&Gemma4MmTensorNames::k_proj(layer_idx))
-                .ok_or_else(|| format!("Missing k_proj for layer {}", layer_idx))?;
-            let v = get(&Gemma4MmTensorNames::v_proj(layer_idx))
-                .ok_or_else(|| format!("Missing v_proj for layer {}", layer_idx))?;
-            let o = get(&Gemma4MmTensorNames::o_proj(layer_idx))
-                .ok_or_else(|| format!("Missing o_proj for layer {}", layer_idx))?;
+            let q = transpose(&get(&Gemma4MmTensorNames::q_proj(layer_idx))
+                .ok_or_else(|| format!("Missing q_proj for layer {}", layer_idx))?, q_dim, hd);
+            let k = transpose(&get(&Gemma4MmTensorNames::k_proj(layer_idx))
+                .ok_or_else(|| format!("Missing k_proj for layer {}", layer_idx))?, kv_dim, hd);
+            let v = transpose(&get(&Gemma4MmTensorNames::v_proj(layer_idx))
+                .ok_or_else(|| format!("Missing v_proj for layer {}", layer_idx))?, kv_dim, hd);
+            let o = transpose(&get(&Gemma4MmTensorNames::o_proj(layer_idx))
+                .ok_or_else(|| format!("Missing o_proj for layer {}", layer_idx))?, hd, q_dim);
             let inorm = get(&Gemma4MmTensorNames::input_norm(layer_idx))
                 .ok_or_else(|| format!("Missing input_norm for layer {}", layer_idx))?;
             let pnorm = get(&Gemma4MmTensorNames::post_attn_norm(layer_idx))
@@ -1604,13 +1623,12 @@ impl MappedGemma4Model {
                 post_attn_norm: pnorm,
             };
 
-            // All layers dense in 27B MM
-            let gate = get(&Gemma4MmTensorNames::gate_proj(layer_idx))
-                .ok_or_else(|| format!("Missing gate_proj for layer {}", layer_idx))?;
-            let up = get(&Gemma4MmTensorNames::up_proj(layer_idx))
-                .ok_or_else(|| format!("Missing up_proj for layer {}", layer_idx))?;
-            let down = get(&Gemma4MmTensorNames::down_proj(layer_idx))
-                .ok_or_else(|| format!("Missing down_proj for layer {}", layer_idx))?;
+            let gate = transpose(&get(&Gemma4MmTensorNames::gate_proj(layer_idx))
+                .ok_or_else(|| format!("Missing gate_proj for layer {}", layer_idx))?, idim, hd);
+            let up = transpose(&get(&Gemma4MmTensorNames::up_proj(layer_idx))
+                .ok_or_else(|| format!("Missing up_proj for layer {}", layer_idx))?, idim, hd);
+            let down = transpose(&get(&Gemma4MmTensorNames::down_proj(layer_idx))
+                .ok_or_else(|| format!("Missing down_proj for layer {}", layer_idx))?, hd, idim);
 
             let ffn = Gemma4FfnWeights::Dense {
                 gate_proj: gate,
@@ -1992,6 +2010,17 @@ impl Gemma4Teacher {
 
         layer_states
     }
+}
+
+/// Transpose a row-major matrix: [rows × cols] → [cols × rows].
+fn transpose(mat: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = mat[r * cols + c];
+        }
+    }
+    out
 }
 
 /// CPU matmul: C[m×n] = A[m×k] × B[k×n].
