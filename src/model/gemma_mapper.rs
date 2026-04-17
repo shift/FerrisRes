@@ -1667,7 +1667,7 @@ impl MappedGemma4Model {
         let q_dim = nh * hdim;
         let kv_dim = nkv * hdim;
         let idim = config.intermediate_dim;
-        let ple_dim = config.hidden_size_per_layer_input.unwrap_or(0);
+        let ple_dim = 0; // PLE disabled — requires model-level weights
 
         let embed_tokens = get(Gemma4MmTensorNames::embed_tokens())
             .ok_or_else(|| "Missing embed_tokens".to_string())?;
