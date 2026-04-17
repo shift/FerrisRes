@@ -6,8 +6,8 @@
 
 | Metric | Value |
 |---|---|
-| Source code | ~53,053 lines across 105 modules |
-| Test suites | 759 lib tests passing, 0 failures |
+| Source code | ~60,000 lines across 115 modules |
+| Test suites | 1189 lib tests passing, 0 failures |
 | Language | 100% Rust (safe + WGSL compute shaders) |
 | GPU backends | Vulkan, Metal, DX12, WebGPU via wgpu |
 | Tasks completed | **212 / 212 (all complete)** |
@@ -249,4 +249,39 @@
 | 15 | ✅ Done | Profile-driven dispatch: DispatchPlan per-op CPU/GPU, Intel iGPU detection, auto-tiling, --gpu flag removed |
 | 16 | ✅ Done | Real distillation verified: Gemma 4 27B on Intel HD 530, 27M tokens, checkpoint resilience |
 
-**All tasks complete — 951 tests passing, 0 failures.**
+**All tasks complete — 1189 tests passing, 0 failures.**
+
+## Cognitive Architecture
+
+FerrisRes includes a full cognitive architecture for self-improving AI inference:
+
+```
+Layer 0: CognitivePipeline wiring    ✅ PR #30
+Layer 1: Memory & Learning           ✅ PR #31
+Layer 2: Autonomy                    ✅ PR #32
+Layer 3: Self-Improvement            ✅ PR #33
+Layer 4: Emergence                   ⬜ Planned
+```
+
+### Cognitive Pipeline (Layer 0)
+The cognitive pipeline orchestrates all cognitive components:
+- **ConceptMap**: Persistent learned patterns with embedding-based retrieval
+- **LlmComputer (CALM VM)**: Deterministic computation via LookUp → Compute → BranchIf
+- **MirrorTest**: Recursive self-verification — model generates code, tests, and loss signals
+- **HullKVCache**: 2D convex hull attention with O(log n) lookups
+- **WasmSandbox**: Zero-trust tool execution with wasmi runtime
+
+### Memory & Learning (Layer 1)
+- **EpisodicMemory**: Event-based experience storage (not token-based). Stores (prompt, tool traces, outcome, quality, importance). Content-based retrieval via cosine similarity + recency bias. Compression merges similar episodes.
+- **DifferentiableLlmComputer**: Gumbel-Softmax op selection with Straight-Through Estimator. NTM-style DiffMemoryBank for gradient flow through memory. Temperature annealing.
+- **ToolTriggeredLora**: On-the-fly LoRA weight updates from the 'learn' tool. Elastic Weight Consolidation (Fisher diagonal) prevents catastrophic forgetting. Progressive adapter stacking.
+
+### Autonomy (Layer 2)
+- **ToolCreationPipeline**: Model generates tool specs via `[tool_create]` blocks. 6-stage validation (name, code size, structure, safety, syntax, semantics). Refinement loop with max 3 retries.
+- **PlanExecutor**: Multi-step `[plan]` with `$N` reference resolution. Condition evaluation, retry on failure, replanning from failed step.
+- **ToolUsageTracker**: Per-tool + per-context EMA quality tracking. Contextual bandit for best-tool recommendation. JSON persistence.
+
+### Self-Improvement (Layer 3)
+- **AbstractionEngine**: Scans concepts for clusters (cosine > 0.8), computes centroid meta-concepts, compresses N → 1. Hierarchical levels: Instance → Pattern → Principle → MetaPrinciple.
+- **IntrinsicMotivation**: Per-concept uncertainty tracking (entropy + quality + distance). Zone of Proximal Development goal selection. Learning progress tracking. Mastery detection.
+- **ProactiveController**: 4-level autonomy (Reactive → Suggestive → SemiAutonomous → FullyAutonomous). Initiative signals: concept degradation, tool obsolescence, knowledge gaps, memory pressure. Action logging with rollback.

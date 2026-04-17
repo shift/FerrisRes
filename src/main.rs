@@ -618,6 +618,9 @@ async fn cmd_infer(
                 path.set_file_name("tool_usage.json");
                 path
             }),
+            abstraction_enabled: true,
+            intrinsic_motivation_enabled: true,
+            proactive_controller_enabled: true,
         };
         info!(event = "cognitive_pipeline_enabled", "Cognitive pipeline enabled: concepts={}, llm_computer={}, mirror_test={}, tool_creation={}, plans={}, usage_tracking={}",
             cp_config.concepts_enabled, cp_config.llm_computer_enabled, cp_config.mirror_test_enabled,

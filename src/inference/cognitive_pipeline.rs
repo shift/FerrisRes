@@ -23,6 +23,9 @@ use crate::inference::episodic_memory::{EpisodicMemory, Episode, EpisodeOutcome,
 use crate::inference::tool_creation::ToolCreationPipeline;
 use crate::inference::plan_executor::PlanExecutor;
 use crate::inference::tool_usage_tracker::ToolUsageTracker;
+use crate::inference::abstraction_engine::AbstractionEngine;
+use crate::inference::intrinsic_motivation::IntrinsicMotivation;
+use crate::inference::proactive_controller::ProactiveController;
 use crate::inference::hull_kv_cache::HullKVCache;
 use crate::inference::llm_computer::{LlmComputer, LlmComputerConfig};
 use crate::inference::mirror_test::MirrorTestRunner;
@@ -88,6 +91,13 @@ pub struct CognitivePipelineConfig {
     pub tool_usage_tracking_enabled: bool,
     /// Path to persist tool usage data.
     pub tool_usage_path: Option<PathBuf>,
+
+    /// Enable abstraction engine.
+    pub abstraction_enabled: bool,
+    /// Enable intrinsic motivation.
+    pub intrinsic_motivation_enabled: bool,
+    /// Enable proactive controller.
+    pub proactive_controller_enabled: bool,
 }
 
 impl Default for CognitivePipelineConfig {
@@ -115,6 +125,9 @@ impl Default for CognitivePipelineConfig {
             plan_execution_enabled: false,
             tool_usage_tracking_enabled: false,
             tool_usage_path: None,
+            abstraction_enabled: false,
+            intrinsic_motivation_enabled: false,
+            proactive_controller_enabled: false,
         }
     }
 }
@@ -144,6 +157,12 @@ pub struct CognitivePipeline {
     plan_executor: Option<PlanExecutor>,
     /// Tool usage tracker — meta-learning via contextual bandits.
     tool_usage_tracker: Option<ToolUsageTracker>,
+    /// Abstraction engine — concept compression & generalization.
+    abstraction_engine: Option<AbstractionEngine>,
+    /// Intrinsic motivation — self-directed learning.
+    intrinsic_motivation: Option<IntrinsicMotivation>,
+    /// Proactive controller — bounded autonomous behavior.
+    proactive_controller: Option<ProactiveController>,
     /// Tool registry — augmented with cognitive tools.
     tool_registry: ToolRegistry,
 }
@@ -325,6 +344,27 @@ impl CognitivePipeline {
             None
         };
 
+        // Abstraction engine
+        let abstraction_engine = if config.abstraction_enabled {
+            Some(AbstractionEngine::default_engine())
+        } else {
+            None
+        };
+
+        // Intrinsic motivation
+        let intrinsic_motivation = if config.intrinsic_motivation_enabled {
+            Some(IntrinsicMotivation::default_motivation())
+        } else {
+            None
+        };
+
+        // Proactive controller
+        let proactive_controller = if config.proactive_controller_enabled {
+            Some(ProactiveController::default_controller())
+        } else {
+            None
+        };
+
         // Build augmented tool registry
         let mut tool_registry = ToolRegistry::new(ToolSearchConfig::default());
 
@@ -363,6 +403,9 @@ impl CognitivePipeline {
             tool_creation,
             plan_executor,
             tool_usage_tracker,
+            abstraction_engine,
+            intrinsic_motivation,
+            proactive_controller,
             tool_registry,
         }
     }
@@ -761,6 +804,36 @@ impl CognitivePipeline {
         self.tool_usage_tracker.as_mut()
     }
 
+    /// Access the abstraction engine.
+    pub fn abstraction_engine(&self) -> Option<&AbstractionEngine> {
+        self.abstraction_engine.as_ref()
+    }
+
+    /// Access the abstraction engine mutably.
+    pub fn abstraction_engine_mut(&mut self) -> Option<&mut AbstractionEngine> {
+        self.abstraction_engine.as_mut()
+    }
+
+    /// Access the intrinsic motivation.
+    pub fn intrinsic_motivation(&self) -> Option<&IntrinsicMotivation> {
+        self.intrinsic_motivation.as_ref()
+    }
+
+    /// Access the intrinsic motivation mutably.
+    pub fn intrinsic_motivation_mut(&mut self) -> Option<&mut IntrinsicMotivation> {
+        self.intrinsic_motivation.as_mut()
+    }
+
+    /// Access the proactive controller.
+    pub fn proactive_controller(&self) -> Option<&ProactiveController> {
+        self.proactive_controller.as_ref()
+    }
+
+    /// Access the proactive controller mutably.
+    pub fn proactive_controller_mut(&mut self) -> Option<&mut ProactiveController> {
+        self.proactive_controller.as_mut()
+    }
+
     /// Get the configuration.
     pub fn config(&self) -> &CognitivePipelineConfig {
         &self.config
@@ -1108,6 +1181,9 @@ mod tests {
             plan_execution_enabled: false,
             tool_usage_tracking_enabled: false,
             tool_usage_path: None,
+            abstraction_enabled: false,
+            intrinsic_motivation_enabled: false,
+            proactive_controller_enabled: false,
         };
 
         let pipeline = CognitivePipeline::new(config);
