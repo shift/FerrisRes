@@ -4654,9 +4654,13 @@ impl MappedGemma4Model {
             .ok_or_else(|| "Missing embedding weights".to_string())?;
 
         // LM head (may be tied to embedding)
-        let lm_head = get("lm_head.weight")
+        // GGUF stores weights as [out_features, in_features] row-major,
+        // same as safetensors. Must transpose to [in_features, out_features]
+        // for our matmul (C = A @ B where B is [k, n]).
+        let lm_head_raw = get("lm_head.weight")
             .or_else(|| get("output.weight"))
             .unwrap_or_else(|| embed_tokens.clone());
+        let lm_head = transpose(&lm_head_raw, config.vocab_size, hd);
 
         // Final norm
         let final_norm = get("model.norm.weight")
@@ -4700,6 +4704,14 @@ impl MappedGemma4Model {
                 .or_else(|| get(&format!("layers.{}.k_norm.weight", layer_idx)))
                 .unwrap_or_else(|| vec![1.0f32; layer_head_dim]);
 
+            // Transpose attention weights from [out, in] to [in, out]
+            // GGUF stores weights as [out_features, in_features] row-major,
+            // same as safetensors. Our matmul expects [in_features, out_features].
+            let q = transpose(&q, layer_q_dim, hd);
+            let k = transpose(&k, layer_kv_dim, hd);
+            let v = transpose(&v, layer_kv_dim, hd);
+            let o = transpose(&o, hd, layer_q_dim);
+
             let attn = Gemma4AttnWeights {
                 q_proj: q, k_proj: k, v_proj: v, o_proj: o,
                 input_norm: inorm,
@@ -4717,24 +4729,28 @@ impl MappedGemma4Model {
             let layer_inter_dim = gate_raw.as_ref().map(|g| g.len() / hd).unwrap_or(config.intermediate_dim);
 
             let ffn = if config.moe_layers.contains(&layer_idx) {
-                let router = get(&format!("model.layers.{}.block_sparse_moe.gate.weight", layer_idx))
+                let router_raw = get(&format!("model.layers.{}.block_sparse_moe.gate.weight", layer_idx))
                     .or_else(|| get(&format!("layers.{}.ff_gate.weight", layer_idx)))
                     .ok_or_else(|| format!("Missing MoE router for layer {}", layer_idx))?;
+                let router = transpose(&router_raw, config.num_experts, hd);
 
                 let mut expert_gates = Vec::new();
                 let mut expert_ups = Vec::new();
                 let mut expert_downs = Vec::new();
 
                 for e in 0..config.num_experts {
-                    let g = get(&format!("model.layers.{}.block_sparse_moe.experts.{}.w1.weight", layer_idx, e))
+                    let g_raw = get(&format!("model.layers.{}.block_sparse_moe.experts.{}.w1.weight", layer_idx, e))
                         .or_else(|| get(&format!("layers.{}.expert.{}.gate.weight", layer_idx, e)))
                         .ok_or_else(|| format!("Missing expert {} gate for layer {}", e, layer_idx))?;
-                    let u = get(&format!("model.layers.{}.block_sparse_moe.experts.{}.w3.weight", layer_idx, e))
+                    let u_raw = get(&format!("model.layers.{}.block_sparse_moe.experts.{}.w3.weight", layer_idx, e))
                         .or_else(|| get(&format!("layers.{}.expert.{}.up.weight", layer_idx, e)))
                         .ok_or_else(|| format!("Missing expert {} up for layer {}", e, layer_idx))?;
-                    let d = get(&format!("model.layers.{}.block_sparse_moe.experts.{}.w2.weight", layer_idx, e))
+                    let d_raw = get(&format!("model.layers.{}.block_sparse_moe.experts.{}.w2.weight", layer_idx, e))
                         .or_else(|| get(&format!("layers.{}.expert.{}.down.weight", layer_idx, e)))
                         .ok_or_else(|| format!("Missing expert {} down for layer {}", e, layer_idx))?;
+                    let g = transpose(&g_raw, layer_inter_dim, hd);
+                    let u = transpose(&u_raw, layer_inter_dim, hd);
+                    let d = transpose(&d_raw, hd, layer_inter_dim);
                     expert_gates.push(g);
                     expert_ups.push(u);
                     expert_downs.push(d);
@@ -4742,14 +4758,18 @@ impl MappedGemma4Model {
 
                 Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs }
             } else {
-                let gate = gate_raw
+                let gate_raw = gate_raw
                     .ok_or_else(|| format!("Missing gate_proj for layer {}", layer_idx))?;
-                let up = get(&format!("model.layers.{}.mlp.up_proj.weight", layer_idx))
+                let up_raw = get(&format!("model.layers.{}.mlp.up_proj.weight", layer_idx))
                     .or_else(|| get(&format!("layers.{}.ff_up.weight", layer_idx)))
                     .ok_or_else(|| format!("Missing up_proj for layer {}", layer_idx))?;
-                let down = get(&format!("model.layers.{}.mlp.down_proj.weight", layer_idx))
+                let down_raw = get(&format!("model.layers.{}.mlp.down_proj.weight", layer_idx))
                     .or_else(|| get(&format!("layers.{}.ff_down.weight", layer_idx)))
                     .ok_or_else(|| format!("Missing down_proj for layer {}", layer_idx))?;
+                // Transpose FFN weights from [out, in] to [in, out]
+                let gate = transpose(&gate_raw, layer_inter_dim, hd);
+                let up = transpose(&up_raw, layer_inter_dim, hd);
+                let down = transpose(&down_raw, hd, layer_inter_dim);
 
                 Gemma4FfnWeights::Dense { gate_proj: gate, up_proj: up, down_proj: down }
             };
