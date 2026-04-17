@@ -520,6 +520,10 @@ pub struct Gemma4Config {
     pub sliding_window: usize,
     /// Which layers use MoE (alternating pattern).
     pub moe_layers: Vec<usize>,
+    /// Per-layer embedding dimension (Gemma 4 PLE). 0 = disabled.
+    pub hidden_size_per_layer_input: Option<usize>,
+    /// Final logit softcapping value (Gemma 4). None = disabled.
+    pub final_logit_softcapping: Option<f32>,
 }
 
 impl Gemma4Config {
@@ -548,6 +552,10 @@ impl Gemma4Config {
             sliding_window: 512,
             // Gemma 4 E2B is all-dense (no MoE)
             moe_layers: vec![],
+            // Per-Layer Embeddings: 256 dims (from config.json)
+            hidden_size_per_layer_input: Some(256),
+            // Logit softcapping at 30.0
+            final_logit_softcapping: Some(30.0),
         }
     }
 
@@ -570,6 +578,8 @@ impl Gemma4Config {
             sliding_window: 512,
             // Block Summary injection at full_attention layers
             moe_layers: vec![5, 11, 17, 23, 29, 35, 41],
+        hidden_size_per_layer_input: None,
+        final_logit_softcapping: None,
         }
     }
 
@@ -590,6 +600,8 @@ impl Gemma4Config {
             max_position_embeddings: 131072,
             sliding_window: 1024,
             moe_layers: (1..48).step_by(2).collect(), // Placeholder
+        hidden_size_per_layer_input: None,
+        final_logit_softcapping: None,
         }
     }
 
@@ -610,6 +622,8 @@ impl Gemma4Config {
             max_position_embeddings: 262144,
             sliding_window: 1024,
             moe_layers: (1..60).step_by(2).collect(), // Placeholder
+        hidden_size_per_layer_input: None,
+        final_logit_softcapping: None,
         }
     }
 
@@ -639,6 +653,8 @@ impl Gemma4Config {
             sliding_window: 1024,
             // Block Summary injection at full_attention layers
             moe_layers: vec![5, 11, 17, 23, 29],
+        hidden_size_per_layer_input: None,
+        final_logit_softcapping: None,
         }
     }
 
@@ -661,6 +677,8 @@ impl Gemma4Config {
             sliding_window: 1024,
             // Block Summary injection at full_attention layers
             moe_layers: vec![5, 11, 17, 23, 29, 35, 41, 47, 53, 59],
+        hidden_size_per_layer_input: None,
+        final_logit_softcapping: None,
         }
     }
 
@@ -679,6 +697,8 @@ impl Gemma4Config {
             max_position_embeddings: 131072,
             sliding_window: 8192,
             moe_layers: vec![],
+        hidden_size_per_layer_input: None,
+        final_logit_softcapping: None,
         }
     }
 
@@ -697,6 +717,8 @@ impl Gemma4Config {
             max_position_embeddings: 131072,
             sliding_window: 8192,
             moe_layers: vec![],
+        hidden_size_per_layer_input: None,
+        final_logit_softcapping: None,
         }
     }
 
@@ -715,6 +737,8 @@ impl Gemma4Config {
             max_position_embeddings: 32768,
             sliding_window: 4096,
             moe_layers: vec![],
+        hidden_size_per_layer_input: None,
+        final_logit_softcapping: None,
         }
     }
 
@@ -733,6 +757,8 @@ impl Gemma4Config {
             max_position_embeddings: 32768,
             sliding_window: 4096,
             moe_layers: (0..32).step_by(2).collect(),
+        hidden_size_per_layer_input: None,
+        final_logit_softcapping: None,
         }
     }
 
@@ -751,6 +777,8 @@ impl Gemma4Config {
             max_position_embeddings: 131072,
             sliding_window: 4096,
             moe_layers: vec![],
+        hidden_size_per_layer_input: None,
+        final_logit_softcapping: None,
         }
     }
 
@@ -769,6 +797,8 @@ impl Gemma4Config {
             max_position_embeddings: 131072,
             sliding_window: 4096,
             moe_layers: vec![],
+        hidden_size_per_layer_input: None,
+        final_logit_softcapping: None,
         }
     }
 
@@ -1300,6 +1330,10 @@ pub struct Gemma4AttnWeights {
     pub o_proj: Vec<f32>,
     pub input_norm: Vec<f32>,
     pub post_attn_norm: Vec<f32>,
+    /// Per-head RMSNorm on Q (head_dim elements).
+    pub q_norm: Vec<f32>,
+    /// Per-head RMSNorm on K (head_dim elements).
+    pub k_norm: Vec<f32>,
 }
 
 /// Per-layer FFN weights (either dense or MoE).
@@ -1323,6 +1357,18 @@ pub enum Gemma4FfnWeights {
 pub struct Gemma4LayerWeights {
     pub attn: Gemma4AttnWeights,
     pub ffn: Gemma4FfnWeights,
+    /// Norm before FFN.
+    pub pre_ffn_norm: Vec<f32>,
+    /// Norm after FFN.
+    pub post_ffn_norm: Vec<f32>,
+    /// Per-layer scalar multiplier.
+    pub layer_scalar: f32,
+    /// Per-layer input gate weights [hidden_size × hidden_size_per_layer_input].
+    pub per_layer_input_gate: Option<Vec<f32>>,
+    /// Per-layer projection weights [hidden_size_per_layer_input × hidden_size].
+    pub per_layer_projection: Option<Vec<f32>>,
+    /// Per-layer projection norm (hidden_size elements).
+    pub post_per_layer_input_norm: Option<Vec<f32>>,
 }
 
 /// Full Gemma 4 model weights loaded and organized.
@@ -1412,13 +1458,23 @@ impl MappedGemma4Model {
                 o_proj: Vec::new(),
                 input_norm: inorm,
                 post_attn_norm: pnorm,
+                q_norm: vec![1.0f32; config.head_dim],
+                k_norm: vec![1.0f32; config.head_dim],
             };
             let ffn = Gemma4FfnWeights::Dense {
                 gate_proj: Vec::new(),
                 up_proj: Vec::new(),
                 down_proj: Vec::new(),
             };
-            layers.push(Gemma4LayerWeights { attn, ffn });
+            layers.push(Gemma4LayerWeights {
+                attn, ffn,
+                pre_ffn_norm: vec![1.0f32; config.hidden_dim],
+                post_ffn_norm: vec![1.0f32; config.hidden_dim],
+                layer_scalar: 1.0,
+                per_layer_input_gate: None,
+                per_layer_projection: None,
+                post_per_layer_input_norm: None,
+            });
         }
 
         Ok(Self { config, embed_tokens, layers, final_norm, lm_head })
@@ -1450,6 +1506,8 @@ impl MappedGemma4Model {
                 o_proj: Vec::new(),
                 input_norm: inorm,
                 post_attn_norm: pnorm,
+                q_norm: vec![1.0f32; config.head_dim],
+                k_norm: vec![1.0f32; config.head_dim],
             };
 
             let ffn = Gemma4FfnWeights::Dense {
@@ -1458,7 +1516,15 @@ impl MappedGemma4Model {
                 down_proj: Vec::new(),
             };
 
-            layers.push(Gemma4LayerWeights { attn, ffn });
+            layers.push(Gemma4LayerWeights {
+                attn, ffn,
+                pre_ffn_norm: vec![1.0f32; config.hidden_dim],
+                post_ffn_norm: vec![1.0f32; config.hidden_dim],
+                layer_scalar: 1.0,
+                per_layer_input_gate: None,
+                per_layer_projection: None,
+                post_per_layer_input_norm: None,
+            });
         }
 
         Ok(Self { config, embed_tokens, layers, final_norm, lm_head })
@@ -1526,6 +1592,8 @@ impl MappedGemma4Model {
                 q_proj: q, k_proj: k, v_proj: v, o_proj: o,
                 input_norm: inorm,
                 post_attn_norm: pnorm,
+                q_norm: vec![1.0f32; config.head_dim],
+                k_norm: vec![1.0f32; config.head_dim],
             };
 
             // FFN: MoE or dense?
@@ -1573,7 +1641,15 @@ impl MappedGemma4Model {
                 }
             };
 
-            layers.push(Gemma4LayerWeights { attn, ffn });
+            layers.push(Gemma4LayerWeights {
+                attn, ffn,
+                pre_ffn_norm: vec![1.0f32; config.hidden_dim],
+                post_ffn_norm: vec![1.0f32; config.hidden_dim],
+                layer_scalar: 1.0,
+                per_layer_input_gate: None,
+                per_layer_projection: None,
+                post_per_layer_input_norm: None,
+            });
         }
 
         Ok(Self { config, embed_tokens, layers, final_norm, lm_head })
@@ -1591,6 +1667,7 @@ impl MappedGemma4Model {
         let q_dim = nh * hdim;
         let kv_dim = nkv * hdim;
         let idim = config.intermediate_dim;
+        let ple_dim = config.hidden_size_per_layer_input.unwrap_or(0);
 
         let embed_tokens = get(Gemma4MmTensorNames::embed_tokens())
             .ok_or_else(|| "Missing embed_tokens".to_string())?;
@@ -1617,10 +1694,18 @@ impl MappedGemma4Model {
             let pnorm = get(&Gemma4MmTensorNames::post_attn_norm(layer_idx))
                 .ok_or_else(|| format!("Missing post_attn_norm for layer {}", layer_idx))?;
 
+            // Q/K per-head RMSNorm — Gemma 4 applies these after projection
+            let q_norm = get(&Gemma4MmTensorNames::q_norm(layer_idx))
+                .unwrap_or_else(|| vec![1.0f32; hdim]);
+            let k_norm = get(&Gemma4MmTensorNames::k_norm(layer_idx))
+                .unwrap_or_else(|| vec![1.0f32; hdim]);
+
             let attn = Gemma4AttnWeights {
                 q_proj: q, k_proj: k, v_proj: v, o_proj: o,
                 input_norm: inorm,
                 post_attn_norm: pnorm,
+                q_norm,
+                k_norm,
             };
 
             let gate = transpose(&get(&Gemma4MmTensorNames::gate_proj(layer_idx))
@@ -1636,7 +1721,41 @@ impl MappedGemma4Model {
                 down_proj: down,
             };
 
-            layers.push(Gemma4LayerWeights { attn, ffn });
+            // Pre/post FFN norms
+            let pre_ffn_norm = get(&Gemma4MmTensorNames::pre_ffn_norm(layer_idx))
+                .unwrap_or_else(|| vec![1.0f32; hd]);
+            let post_ffn_norm = get(&Gemma4MmTensorNames::post_ffn_norm(layer_idx))
+                .unwrap_or_else(|| vec![1.0f32; hd]);
+
+            // Per-layer scalar
+            let layer_scalar = get(&format!("model.language_model.layers.{}.layer_scalar.weight", layer_idx))
+                .and_then(|v| v.first().copied())
+                .unwrap_or(1.0f32);
+
+            // Per-layer embeddings (PLE)
+            let per_layer_input_gate = if ple_dim > 0 {
+                get(&format!("model.language_model.layers.{}.per_layer_input_gate.weight", layer_idx))
+                    .map(|w| transpose(&w, ple_dim, hd))
+            } else {
+                None
+            };
+            let per_layer_projection = if ple_dim > 0 {
+                get(&format!("model.language_model.layers.{}.per_layer_projection.weight", layer_idx))
+                    .map(|w| transpose(&w, hd, ple_dim))
+            } else {
+                None
+            };
+            let post_per_layer_input_norm = if ple_dim > 0 {
+                get(&format!("model.language_model.layers.{}.post_per_layer_input_norm.weight", layer_idx))
+            } else {
+                None
+            };
+
+            layers.push(Gemma4LayerWeights {
+                attn, ffn,
+                pre_ffn_norm, post_ffn_norm, layer_scalar,
+                per_layer_input_gate, per_layer_projection, post_per_layer_input_norm,
+            });
             tracing::info!(event = "loaded_layer", "Loaded layer {}/{}", layer_idx + 1, config.num_layers);
         }
 
@@ -1647,6 +1766,40 @@ impl MappedGemma4Model {
 // ---------------------------------------------------------------------------
 // RMS Norm (CPU)
 // ---------------------------------------------------------------------------
+
+/// GeLU activation (tanh approximation), as used by Gemma 4.
+/// gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+pub fn gelu_tanh(x: f32) -> f32 {
+    let c = (2.0 / std::f32::consts::PI).sqrt();
+    let inner = c * (x + 0.044715 * x * x * x);
+    0.5 * x * (1.0 + inner.tanh())
+}
+
+/// Per-head RMSNorm: apply RMSNorm independently to each attention head.
+/// Input shape: [seq × (num_heads × head_dim)]
+/// Weight shape: [head_dim] (shared across all heads and seq positions)
+pub fn per_head_rms_norm(input: &[f32], weight: &[f32], seq_len: usize, num_heads: usize, head_dim: usize) -> Vec<f32> {
+    let total_dim = num_heads * head_dim;
+    let mut output = vec![0.0f32; seq_len * total_dim];
+    for t in 0..seq_len {
+        for h in 0..num_heads {
+            let base = t * total_dim + h * head_dim;
+            // Compute RMS for this head
+            let mut sum_sq = 0.0f32;
+            for d in 0..head_dim {
+                let x = input[base + d];
+                sum_sq += x * x;
+            }
+            let inv_rms = 1.0 / (sum_sq / head_dim as f32 + 1e-6).sqrt();
+            // Apply norm * weight
+            for d in 0..head_dim {
+                let g = weight.get(d).copied().unwrap_or(1.0);
+                output[base + d] = input[base + d] * inv_rms * g;
+            }
+        }
+    }
+    output
+}
 
 /// RMSNorm: x * weight / sqrt(mean(x^2) + eps).
 pub fn rms_norm(input: &[f32], weight: &[f32], dim: usize, eps: f32) -> Vec<f32> {
@@ -1740,7 +1893,7 @@ impl Gemma4Teacher {
         let seq = token_ids.len();
         let vs = config.vocab_size;
 
-        // 1. Embedding lookup
+        // 1. Embedding lookup (Gemma scales by sqrt(hidden_dim))
         let mut hidden = vec![0.0f32; seq * hd];
         for (t, &tid) in token_ids.iter().enumerate() {
             let id = tid as usize;
@@ -1750,22 +1903,36 @@ impl Gemma4Teacher {
                 }
             }
         }
-        // Gemma scales embeddings by sqrt(hidden_dim)
         let scale = (hd as f32).sqrt();
         for h in hidden.iter_mut() { *h *= scale; }
 
-        // 2. Per-layer transformer
+        // 2. Per-layer transformer (Gemma 4 architecture)
+        //    residual = hidden
+        //    hidden = input_layernorm(hidden)
+        //    hidden = attention(hidden)  → Q/K norms applied inside
+        //    hidden = post_attention_layernorm(hidden)
+        //    hidden = residual + hidden
+        //    residual = hidden
+        //    hidden = pre_feedforward_layernorm(hidden)
+        //    hidden = ffn(hidden)        → GeLU activation, NOT SwiGLU
+        //    hidden = post_feedforward_layernorm(hidden)
+        //    hidden = residual + hidden
+        //    hidden = per_layer_input_gate + per_layer_projection (PLE)
+        //    hidden *= layer_scalar
         for (layer_idx, layer) in self.model.layers.iter().enumerate() {
             let residual = hidden.clone();
 
             // Input RMSNorm
             let normed = rms_norm(&hidden, &layer.attn.input_norm, hd, 1e-6);
 
-            // GQA Attention
+            // GQA Attention (with Q/K norms)
             let attn_out = self.attention_forward(
                 &normed, &layer.attn, nh, config.num_kv_heads, head_d, seq, hd,
                 config.sliding_window, layer_idx,
             );
+
+            // Post-attention RMSNorm (applied TO attn output, before residual)
+            let attn_out = rms_norm(&attn_out, &layer.attn.post_attn_norm, hd, 1e-6);
 
             // Residual connection
             for i in 0..hidden.len() {
@@ -1774,13 +1941,13 @@ impl Gemma4Teacher {
 
             let residual2 = hidden.clone();
 
-            // Post-attention RMSNorm
-            let normed2 = rms_norm(&hidden, &layer.attn.post_attn_norm, hd, 1e-6);
+            // Pre-FFN RMSNorm
+            let normed2 = rms_norm(&hidden, &layer.pre_ffn_norm, hd, 1e-6);
 
-            // FFN (dense or MoE)
+            // FFN: GeLU(gate(x)) * up(x), NOT SwiGLU
             let ffn_out = match &layer.ffn {
                 Gemma4FfnWeights::Dense { gate_proj, up_proj, down_proj } => {
-                    self.dense_ffn(&normed2, gate_proj, up_proj, down_proj, hd, config.intermediate_dim)
+                    self.dense_ffn_gelu(&normed2, gate_proj, up_proj, down_proj, hd, config.intermediate_dim)
                 }
                 Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs } => {
                     self.moe_ffn(&normed2, router, expert_gates, expert_ups, expert_downs,
@@ -1788,8 +1955,35 @@ impl Gemma4Teacher {
                 }
             };
 
+            // Post-FFN RMSNorm (applied TO ffn output, before residual)
+            let ffn_out = rms_norm(&ffn_out, &layer.post_ffn_norm, hd, 1e-6);
+
+            // Residual connection
             for i in 0..hidden.len() {
                 hidden[i] = residual2[i] + ffn_out[i];
+            }
+
+            // Per-Layer Embeddings (PLE) — learned input modulation
+            if let (Some(gate_w), Some(proj_w)) = (&layer.per_layer_input_gate, &layer.per_layer_projection) {
+                let ple_dim = gate_w.len() / hd;
+                let residual3 = hidden.clone();
+                // gate: sigmoid-like activation → element-wise multiply with per-layer embedding
+                let gated = matmul(&hidden, gate_w, seq, hd, ple_dim);
+                let gated: Vec<f32> = gated.iter().map(|&x| gelu_tanh(x)).collect();
+                let proj = matmul(&gated, proj_w, seq, ple_dim, hd);
+                let proj = match &layer.post_per_layer_input_norm {
+                    Some(norm) => rms_norm(&proj, norm, hd, 1e-6),
+                    None => proj,
+                };
+                for i in 0..hidden.len() {
+                    hidden[i] = residual3[i] + proj[i];
+                }
+            }
+
+            // Layer scalar
+            let ls = layer.layer_scalar;
+            if ls != 1.0 {
+                for h in hidden.iter_mut() { *h *= ls; }
             }
         }
 
@@ -1797,8 +1991,14 @@ impl Gemma4Teacher {
         hidden = rms_norm(&hidden, &self.model.final_norm, hd, 1e-6);
 
         // 4. LM head: [seq × hd] × [hd × vs] → [seq × vs]
-        // LM head: [seq × hd] × [hd × vs] → [seq × vs] (via fast GEMM)
-        let logits = matmul(&hidden, &self.model.lm_head, seq, hd, vs);
+        let mut logits = matmul(&hidden, &self.model.lm_head, seq, hd, vs);
+
+        // 5. Final logit softcapping: logits = tanh(logits / cap) * cap
+        if let Some(cap) = config.final_logit_softcapping {
+            for l in logits.iter_mut() {
+                *l = (*l / cap).tanh() * cap;
+            }
+        }
 
         logits
     }
@@ -1820,23 +2020,27 @@ impl Gemma4Teacher {
         let q_dim = num_heads * head_dim;     // Total Q dimension
 
         // Q projection: [seq × hd] × [hd × q_dim] → [seq × q_dim]
-        let q = matmul(input, &attn.q_proj, seq_len, hidden_dim, q_dim);
+        let mut q = matmul(input, &attn.q_proj, seq_len, hidden_dim, q_dim);
         // K projection: [seq × hd] × [hd × kv_dim] → [seq × kv_dim]
-        let k = matmul(input, &attn.k_proj, seq_len, hidden_dim, kv_dim);
+        let mut k = matmul(input, &attn.k_proj, seq_len, hidden_dim, kv_dim);
         // V projection: [seq × hd] × [hd × kv_dim] → [seq × kv_dim]
         let v = matmul(input, &attn.v_proj, seq_len, hidden_dim, kv_dim);
 
+        // Gemma 4: per-head RMSNorm on Q and K (AFTER projection, BEFORE RoPE)
+        // Q norm: reshape to [seq × num_heads × head_dim], norm per head
+        q = per_head_rms_norm(&q, &attn.q_norm, seq_len, num_heads, head_dim);
+        k = per_head_rms_norm(&k, &attn.k_norm, seq_len, num_kv_heads, head_dim);
+
         // Apply RoPE to Q and K
-        let mut q = q;
-        let mut k_mut = k;
         apply_rope(&mut q, seq_len, num_heads, head_dim, 0);
-        apply_rope_gqa(&mut k_mut, seq_len, num_kv_heads, head_dim, 0);
+        apply_rope_gqa(&mut k, seq_len, num_kv_heads, head_dim, 0);
 
         // Number of Q heads per KV head
         let heads_per_kv = num_heads / num_kv_heads;
 
         // Scaled dot-product attention with causal mask
-        let scale = 1.0 / (head_dim as f32).sqrt();
+        // Gemma 4 uses scaling=1.0 because Q norm normalizes to unit scale
+        let scale = 1.0f32;
         let mut attn_out = vec![0.0f32; seq_len * q_dim];
 
         for h in 0..num_heads {
@@ -1852,7 +2056,7 @@ impl Gemma4Teacher {
                     let mut dot = 0.0f32;
                     for d in 0..head_dim {
                         dot += q[t * q_dim + h * head_dim + d]
-                             * k_mut[s * kv_dim + kv_h * head_dim + d];
+                             * k[s * kv_dim + kv_h * head_dim + d];
                     }
                     scores[s] = dot * scale;
                     if scores[s] > max_score { max_score = scores[s]; }
@@ -1897,6 +2101,32 @@ impl Gemma4Teacher {
         // Gate + SiLU
         let gated = matmul(input, gate, seq, hidden_dim, intermediate_dim);
         let gated: Vec<f32> = gated.iter().map(|&x| x / (1.0 + (-x).exp())).collect();
+        // Up
+        let upped = matmul(input, up, seq, hidden_dim, intermediate_dim);
+        // Element-wise multiply
+        let mut combined = vec![0.0; seq * intermediate_dim];
+        for i in 0..combined.len() {
+            combined[i] = gated[i] * upped[i];
+        }
+        // Down
+        matmul(&combined, down, seq, intermediate_dim, hidden_dim)
+    }
+
+    /// GeLU-activated dense FFN: down(gelu(gate(x)) * up(x)).
+    /// Gemma 4 uses gelu_pytorch_tanh activation.
+    fn dense_ffn_gelu(
+        &self,
+        input: &[f32],
+        gate: &[f32],
+        up: &[f32],
+        down: &[f32],
+        hidden_dim: usize,
+        intermediate_dim: usize,
+    ) -> Vec<f32> {
+        let seq = input.len() / hidden_dim;
+        // Gate + GeLU (tanh approximation)
+        let gated = matmul(input, gate, seq, hidden_dim, intermediate_dim);
+        let gated: Vec<f32> = gated.iter().map(|&x| gelu_tanh(x)).collect();
         // Up
         let upped = matmul(input, up, seq, hidden_dim, intermediate_dim);
         // Element-wise multiply
@@ -2628,9 +2858,9 @@ impl Gemma4Student {
         let v = matmul(input, &attn.v_proj, seq_len, hidden_dim, kv_dim);
 
         let mut q = q;
-        let mut k_mut = k;
+        let mut k = k;
         apply_rope(&mut q, seq_len, num_heads, head_dim, 0);
-        apply_rope_gqa(&mut k_mut, seq_len, num_kv_heads, head_dim, 0);
+        apply_rope_gqa(&mut k, seq_len, num_kv_heads, head_dim, 0);
 
         let heads_per_kv = num_heads / num_kv_heads;
         let scale = 1.0 / (head_dim as f32).sqrt();
@@ -2645,7 +2875,7 @@ impl Gemma4Student {
                     let mut dot = 0.0f32;
                     for d in 0..head_dim {
                         dot += q[t * q_dim + h * head_dim + d]
-                             * k_mut[s * kv_dim + kv_h * head_dim + d];
+                             * k[s * kv_dim + kv_h * head_dim + d];
                     }
                     scores[s] = dot * scale;
                     if scores[s] > max_score { max_score = scores[s]; }
@@ -4170,6 +4400,8 @@ impl MappedGemma4Model {
                 q_proj: q, k_proj: k, v_proj: v, o_proj: o,
                 input_norm: inorm,
                 post_attn_norm: pnorm,
+                q_norm: vec![1.0f32; config.head_dim],
+                k_norm: vec![1.0f32; config.head_dim],
             };
 
             let ffn = if config.moe_layers.contains(&layer_idx) {
@@ -4211,7 +4443,15 @@ impl MappedGemma4Model {
                 Gemma4FfnWeights::Dense { gate_proj: gate, up_proj: up, down_proj: down }
             };
 
-            layers.push(Gemma4LayerWeights { attn, ffn });
+            layers.push(Gemma4LayerWeights {
+                attn, ffn,
+                pre_ffn_norm: vec![1.0f32; config.hidden_dim],
+                post_ffn_norm: vec![1.0f32; config.hidden_dim],
+                layer_scalar: 1.0,
+                per_layer_input_gate: None,
+                per_layer_projection: None,
+                post_per_layer_input_norm: None,
+            });
         }
 
         Ok(Self { config, embed_tokens, layers, final_norm, lm_head })
@@ -4745,6 +4985,8 @@ mod tests {
             o_proj: vec![0.1; 64],
             input_norm: vec![1.0; 8],
             post_attn_norm: vec![1.0; 8],
+            q_norm: vec![1.0; 8],
+            k_norm: vec![1.0; 8],
         };
         assert_eq!(aw.q_proj.len(), 64);
     }
@@ -4939,6 +5181,8 @@ mod tests {
             max_position_embeddings: 256,
             sliding_window: 32,
             moe_layers: vec![], // Dense only
+        hidden_size_per_layer_input: None,
+        final_logit_softcapping: None,
         }
     }
 
