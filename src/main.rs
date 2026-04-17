@@ -42,7 +42,23 @@ enum Commands {
         lora_rank: Option<usize>,
     },
 
+    /// Run inference on a prompt using a Block AttnRes model.
+    ///
+    /// Use --model-path to load a real model, or omit for a blank skeleton model.
     Infer {
+        /// Path to a distilled/GGUF model file to load. Omit to use a blank skeleton model.
+        #[arg(long)]
+        model_path: Option<String>,
+        /// Model config preset: e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b, llama3-8b, llama3-70b, mistral-7b, mixtral-8x7b, phi3-mini, qwen2-7b.
+        /// Required when using --model-path. Ignored for skeleton models.
+        #[arg(long, default_value = "e2b")]
+        config: String,
+        /// Model file format: safetensors or gguf. Only used with --model-path.
+        #[arg(long, default_value = "safetensors")]
+        model_format: String,
+        /// Path to tokenizer.json (HuggingFace format). Recommended when using --model-path.
+        #[arg(long)]
+        tokenizer: Option<String>,
         #[arg(long, default_value_t = 512)]
         hidden_dim: usize,
         #[arg(long, default_value_t = 8)]
@@ -147,6 +163,7 @@ enum Commands {
     },
 
     /// Evaluate teacher/student perplexity.
+    /// Evaluate teacher/student perplexity.
     Evaluate {
         /// Path to Gemma 4 safetensors file.
         #[arg(long)]
@@ -157,6 +174,40 @@ enum Commands {
         /// Text to evaluate on.
         #[arg(long)]
         text: String,
+    },
+
+    /// Start the OpenAI-compatible API server.
+    Serve {
+        /// Path to model file (safetensors or GGUF).
+        #[arg(long)]
+        model_path: Option<String>,
+        /// Model config preset: e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b, llama3-8b, llama3-70b, mistral-7b, mixtral-8x7b, phi3-mini, qwen2-7b.
+        #[arg(long, default_value = "e2b")]
+        config: String,
+        /// Model file format: safetensors or gguf.
+        #[arg(long, default_value = "safetensors")]
+        model_format: String,
+        /// Path to tokenizer.json (HuggingFace format).
+        #[arg(long)]
+        tokenizer: Option<String>,
+        /// Host to bind to.
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+        /// Port to listen on.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Model name for the API.
+        #[arg(long, default_value = "ferrisres")]
+        model_name: String,
+        /// Enable FerrisRes Armor (security filtering).
+        #[arg(long)]
+        armor: bool,
+        /// Enable cognitive pipeline.
+        #[arg(long)]
+        cognitive: bool,
+        /// Path to persist concept memory.
+        #[arg(long)]
+        concepts_path: Option<String>,
     },
 }
 
@@ -179,21 +230,11 @@ async fn main() -> anyhow::Result<()> {
             lora_rank,
         } => cmd_train(hidden_dim, num_blocks, block_size, epochs, batch_size, learning_rate, data, lora_rank).await,
         Commands::Infer {
-            hidden_dim,
-            num_blocks,
-            block_size,
-            prompt,
-            max_tokens,
-            temperature,
-            template,
-            yarn_scale,
-            image,
-            armor,
-            cognitive,
-            concepts_path,
-            persist_kv,
-            kv_path,
-        } => cmd_infer(hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale, image, armor, cognitive, concepts_path, persist_kv, kv_path).await,
+            model_path, config, model_format, tokenizer,
+            hidden_dim, num_blocks, block_size, prompt,
+            max_tokens, temperature, template, yarn_scale, image,
+            armor, cognitive, concepts_path, persist_kv, kv_path,
+        } => cmd_infer(model_path, config, model_format, tokenizer, hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale, image, armor, cognitive, concepts_path, persist_kv, kv_path).await,
         Commands::Benchmark {
             hidden_dim,
             num_blocks,
@@ -208,6 +249,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Evaluate {
             model_path, config, text,
         } => cmd_evaluate(model_path, config, text).await,
+        Commands::Serve {
+            model_path, config, model_format, tokenizer,
+            host, port, model_name, armor, cognitive, concepts_path,
+        } => cmd_serve(model_path, config, model_format, tokenizer, host, port, model_name, armor, cognitive, concepts_path).await,
     }
 }
 
@@ -440,6 +485,10 @@ async fn cmd_train(
 }
 
 async fn cmd_infer(
+    model_path: Option<String>,
+    config_name: String,
+    model_format: String,
+    tokenizer_path: Option<String>,
     hidden_dim: usize,
     num_blocks: usize,
     block_size: usize,
@@ -481,12 +530,6 @@ async fn cmd_infer(
     let compute = WgpuCompute::new().await?;
     let _capability = compute.detect_capability();
 
-    let config = BlockAttnResConfig::new(hidden_dim);
-    let config = BlockAttnResConfig {
-        num_blocks,
-        block_size,
-        ..config
-    };
 
     let device = Arc::new(compute.device().clone());
     let queue = Arc::new(compute.queue().clone());
@@ -509,11 +552,109 @@ async fn cmd_infer(
         prompt.clone()
     };
 
-    let tokenizer = SimpleTokenizer::new();
-    let model = BlockAttnResModel::new(Arc::clone(&device), Arc::clone(&queue), config.clone(), tokenizer.vocab_size())?;
+    // Select tokenizer based on whether we're loading a real model
+    let (tokens, vocab_size) = if let Some(ref path) = model_path {
+        // Loading a real model
+        info!(event = "loading_model", path = %path, format = %model_format, config = %config_name, "Loading model for inference");
 
-    let tokens = tokenizer.encode(&formatted_prompt);
-    info!(event = "encoded_tokens", "Encoded tokens ({}): {:?}", tokens.len(), tokens);
+        if let Some(ref tok_path) = tokenizer_path {
+            match ferrisres::model::tokenizer::HfTokenizer::from_tokenizer_json(std::path::Path::new(tok_path)) {
+                Ok(hf_tok) => {
+                    info!(event = "tokenizer_loaded", vocab_size = hf_tok.vocab_size(), "Loaded HfTokenizer");
+                    let tokens = hf_tok.encode(&formatted_prompt);
+                    (tokens, hf_tok.vocab_size())
+                }
+                Err(e) => {
+                    warn!(event = "tokenizer_load_error", "Failed to load tokenizer: {}. Falling back.", e);
+                    let tok = SimpleTokenizer::new();
+                    let tokens = tok.encode(&formatted_prompt);
+                    (tokens, tok.vocab_size())
+                }
+            }
+        } else {
+            info!(event = "using_simple_tokenizer", "No --tokenizer provided, using SimpleTokenizer");
+            let tok = SimpleTokenizer::new();
+            let tokens = tok.encode(&formatted_prompt);
+            (tokens, tok.vocab_size())
+        }
+    } else {
+        // Skeleton model
+        let tok = SimpleTokenizer::new();
+        let tokens = tok.encode(&formatted_prompt);
+        (tokens, tok.vocab_size())
+    };
+
+    let model_config = if model_path.is_some() {
+        // Derive BlockAttnResConfig from the model config preset
+        let gemma_config = resolve_model_config(&config_name)?;
+        gemma_config.to_block_attnres_config()
+    } else {
+        // Skeleton model from CLI args
+        let c = BlockAttnResConfig::new(hidden_dim);
+        BlockAttnResConfig { num_blocks, block_size, ..c }
+    };
+
+    // ========================================================================
+    // CPU inference path: load real model from GGUF/safetensors
+    // ========================================================================
+    if let Some(ref path) = model_path {
+        info!(event = "cpu_inference_path", "Loading model from {} for CPU inference", path);
+
+        let gemma_config = resolve_model_config(&config_name)?;
+        let model_path = std::path::Path::new(path);
+
+        let loaded_model = match model_format.as_str() {
+            "gguf" => {
+                info!(event = "loading_gguf", path = %model_path.display(), "Loading GGUF model");
+                gemma_mapper::load_gemma4_model_gguf(model_path, gemma_config)
+                    .map_err(|e| anyhow::anyhow!("GGUF load failed: {}", e))?
+            }
+            "safetensors" => {
+                info!(event = "loading_safetensors", path = %model_path.display(), "Loading safetensors model");
+                let mmaped = ferrisres::model::safetensors::MmapedSafetensors::open(model_path)
+                    .map_err(|e| anyhow::anyhow!("mmap failed: {:?}", e))?;
+                gemma_mapper::MappedGemma4Model::from_mmap(gemma_config, &mmaped)
+                    .map_err(|e| anyhow::anyhow!("safetensors load failed: {}", e))?
+            }
+            other => anyhow::bail!("Unknown model format: '{}'. Use 'gguf' or 'safetensors'.", other),
+        };
+
+        info!(event = "model_loaded", "Model loaded: {} layers, {} vocab", loaded_model.layers.len(), loaded_model.config.vocab_size);
+
+        // Wrap in teacher for forward() access
+        let teacher = Gemma4Teacher::new(loaded_model);
+
+        // Autoregressive generation on CPU
+        let gen_tokens = generate_cpu(&teacher, &tokens, max_tokens, temperature as f32, None);
+
+        // Decode generated tokens
+        let simple_tok = SimpleTokenizer::new();
+        let output_text = simple_tok.decode(&gen_tokens);
+
+        // Armor check
+        let display_output = if let Some(ref mut layer) = armor_layer {
+            match layer.sanitize_output(&output_text) {
+                ferrisres::SecurityVerdict::Redact(sanitized) => sanitized,
+                _ => output_text.clone(),
+            }
+        } else {
+            output_text.clone()
+        };
+
+        info!(event = "cpu_inference_complete", prompt_tokens = tokens.len(), generated_tokens = gen_tokens.len(), "CPU inference complete");
+        println!("{}", display_output);
+        return Ok(());
+    }
+
+    // ========================================================================
+    // GPU skeleton inference path (original)
+    // ========================================================================
+    let model = BlockAttnResModel::new(Arc::clone(&device), Arc::clone(&queue), model_config.clone(), vocab_size)?;
+
+    info!(event = "encoded_tokens", "Encoded tokens ({})", tokens.len());
+
+    // Keep a tokenizer for encode/decode operations later in the function
+    let simple_tokenizer = SimpleTokenizer::new();
 
     // Wire image preprocessing: upload patches to GPU and run Im2ColOp
     let mut image_patch_count: usize = 0;
@@ -566,14 +707,14 @@ async fn cmd_infer(
     let embedding = TokenEmbedding::new(
         Arc::clone(&device),
         Arc::clone(&queue),
-        config.hidden_dim,
-        tokenizer.vocab_size(),
+        model_config.hidden_dim,
+        vocab_size,
     )?;
     let lm_head = LMHead::new(
         Arc::clone(&device),
         Arc::clone(&queue),
-        config.hidden_dim,
-        tokenizer.vocab_size(),
+        model_config.hidden_dim,
+        vocab_size,
     )?;
     let generator = TokenGenerator::new(
         Arc::new(model),
@@ -627,6 +768,20 @@ async fn cmd_infer(
                 path.set_file_name("emergence.json");
                 path
             }),
+            // Phase 8: Integration
+            consolidation_enabled: true,
+            consolidation_interval_secs: 300,
+            uncertainty_feedback_enabled: true,
+            practice_enabled: true,
+            max_practice_queue_size: 5,
+            quality_propagation_enabled: true,
+            tool_exploration_enabled: true,
+            tool_exploration_epsilon: 0.1,
+            learn_tool_enabled: false, // Disabled by default for safety
+            learn_max_per_session: 5,
+            learn_max_per_hour: 20,
+            learn_cooldown_secs: 60,
+            learn_preflight_check: true,
         };
         info!(event = "cognitive_pipeline_enabled", "Cognitive pipeline enabled: concepts={}, llm_computer={}, mirror_test={}, tool_creation={}, plans={}, usage_tracking={}",
             cp_config.concepts_enabled, cp_config.llm_computer_enabled, cp_config.mirror_test_enabled,
@@ -650,13 +805,13 @@ async fn cmd_infer(
         // Use cognitive pipeline for full augmented generation
         let mut pipeline = pipeline_arc.lock().unwrap();
         let result = pipeline.process_generation(&formatted_prompt, |augmented_prompt| {
-            let aug_tokens = tokenizer.encode(augmented_prompt);
+            let aug_tokens = simple_tokenizer.encode(augmented_prompt);
             match generator.generate(&aug_tokens, &ferrisres::inference::generator::GenerateConfig {
                 temperature: temperature as f32,
                 max_tokens,
                 ..Default::default()
             }) {
-                Ok(tokens) => tokenizer.decode(&tokens),
+                Ok(tokens) => simple_tokenizer.decode(&tokens),
                 Err(_) => "[generation error]".to_string(),
             }
         });
@@ -666,7 +821,7 @@ async fn cmd_infer(
         result.output
     } else {
         let output_tokens = generator.generate(&tokens, &gen_config)?;
-        tokenizer.decode(&output_tokens)
+        simple_tokenizer.decode(&output_tokens)
     };
     
     // Sanitize output with Armor if enabled
@@ -813,6 +968,66 @@ async fn cmd_benchmark(
     info!(event = "benchmark_complete", "=== Benchmark Complete ===");
 
     Ok(())
+}
+
+/// Resolve a model config name to a Gemma4Config.
+fn resolve_model_config(config_name: &str) -> anyhow::Result<gemma_mapper::Gemma4Config> {
+    use ferrisres::model::gemma_mapper::Gemma4Config;
+    match config_name {
+        "e2b" => {
+            info!(event = "model_config_selected", config = "e2b", "Using Gemma 4 E2B config");
+            Ok(Gemma4Config::gemma4_e2b())
+        }
+        "e4b" => {
+            info!(event = "model_config_selected", config = "e4b", "Using Gemma 4 E4B config");
+            Ok(Gemma4Config::gemma4_e4b())
+        }
+        "12b" => {
+            info!(event = "model_config_selected", config = "12b", "Using Gemma 4 12B config");
+            Ok(Gemma4Config::gemma4_12b())
+        }
+        "27b" => {
+            info!(event = "model_config_selected", config = "27b", "Using Gemma 4 27B config");
+            Ok(Gemma4Config::gemma4_27b())
+        }
+        "27b-mm" => {
+            info!(event = "model_config_selected", config = "27b-mm", "Using Gemma 4 27B Multimodal config");
+            Ok(Gemma4Config::gemma4_27b_mm())
+        }
+        "26b-a4b" => {
+            info!(event = "model_config_selected", config = "26b-a4b", "Using Gemma 4 26B A4B config");
+            Ok(Gemma4Config::gemma4_26b_a4b())
+        }
+        "31b" => {
+            info!(event = "model_config_selected", config = "31b", "Using Gemma 4 31B config");
+            Ok(Gemma4Config::gemma4_31b())
+        }
+        "llama3-8b" => {
+            info!(event = "model_config_selected", config = "llama3-8b", "Using LLaMA 3.1 8B config");
+            Ok(Gemma4Config::llama3_8b())
+        }
+        "llama3-70b" => {
+            info!(event = "model_config_selected", config = "llama3-70b", "Using LLaMA 3.1 70B config");
+            Ok(Gemma4Config::llama3_70b())
+        }
+        "mistral-7b" => {
+            info!(event = "model_config_selected", config = "mistral-7b", "Using Mistral 7B config");
+            Ok(Gemma4Config::mistral_7b())
+        }
+        "mixtral-8x7b" => {
+            info!(event = "model_config_selected", config = "mixtral-8x7b", "Using Mixtral 8x7B config");
+            Ok(Gemma4Config::mixtral_8x7b())
+        }
+        "phi3-mini" => {
+            info!(event = "model_config_selected", config = "phi3-mini", "Using Phi-3 Mini config");
+            Ok(Gemma4Config::phi3_mini())
+        }
+        "qwen2-7b" => {
+            info!(event = "model_config_selected", config = "qwen2-7b", "Using Qwen 2.5 7B config");
+            Ok(Gemma4Config::qwen2_7b())
+        }
+        other => anyhow::bail!("Unknown model config: '{}'. Valid: e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b, 31b, llama3-8b, llama3-70b, mistral-7b, mixtral-8x7b, phi3-mini, qwen2-7b", other),
+    }
 }
 
 async fn cmd_distill(
@@ -1685,6 +1900,353 @@ async fn cmd_distill(
     info!(event = "distillation_complete", "Distillation complete!");
 
     Ok(())
+}
+
+/// Run the OpenAI-compatible API server.
+async fn cmd_serve(
+    model_path: Option<String>,
+    config_name: String,
+    model_format: String,
+    tokenizer_path: Option<String>,
+    host: String,
+    port: u16,
+    model_name: String,
+    armor: bool,
+    cognitive: bool,
+    concepts_path: Option<String>,
+) -> anyhow::Result<()> {
+    info!(event = "ferrisres_serve", "=== FerrisRes API Server ===");
+    info!(event = "server_config", host = %host, port = port, model = %model_name, "Starting server");
+
+    // Load real model if provided
+    let loaded_model = if let Some(ref path) = model_path {
+        let gemma_config = resolve_model_config(&config_name)?;
+        let model_path = std::path::Path::new(path);
+
+        let model = match model_format.as_str() {
+            "gguf" => {
+                info!(event = "loading_gguf", path = %model_path.display(), "Loading GGUF model");
+                gemma_mapper::load_gemma4_model_gguf(model_path, gemma_config)
+                    .map_err(|e| anyhow::anyhow!("GGUF load failed: {}", e))?
+            }
+            "safetensors" => {
+                info!(event = "loading_safetensors", path = %model_path.display(), "Loading safetensors model");
+                let mmaped = ferrisres::model::safetensors::MmapedSafetensors::open(model_path)
+                    .map_err(|e| anyhow::anyhow!("mmap failed: {:?}", e))?;
+                gemma_mapper::MappedGemma4Model::from_mmap(gemma_config, &mmaped)
+                    .map_err(|e| anyhow::anyhow!("safetensors load failed: {}", e))?
+            }
+            other => anyhow::bail!("Unknown model format: '{}'. Use 'gguf' or 'safetensors'.", other),
+        };
+        info!(event = "model_loaded", "Model loaded: {} layers", model.layers.len());
+        Some(Gemma4Teacher::new(model))
+    } else {
+        info!(event = "no_model", "No --model-path provided, server will return placeholder responses");
+        None
+    };
+
+    // Build tokenizer
+    let tokenizer: Arc<dyn Send + Sync + Fn(&str) -> Vec<u32>> = if let Some(ref tok_path) = tokenizer_path {
+        match ferrisres::model::tokenizer::HfTokenizer::from_tokenizer_json(std::path::Path::new(tok_path)) {
+            Ok(hf_tok) => {
+                info!(event = "tokenizer_loaded", "Loaded HfTokenizer from {}", tok_path);
+                Arc::new(move |text: &str| hf_tok.encode(text))
+            }
+            Err(e) => {
+                warn!(event = "tokenizer_fallback", "Failed to load tokenizer: {}, using SimpleTokenizer", e);
+                let tok = SimpleTokenizer::new();
+                Arc::new(move |text: &str| tok.encode(text))
+            }
+        }
+    } else {
+        let tok = SimpleTokenizer::new();
+        Arc::new(move |text: &str| tok.encode(text))
+    };
+
+    // Build cognitive pipeline if requested
+    let _cognitive_pipeline = if cognitive {
+        use ferrisres::inference::cognitive_pipeline::{CognitivePipeline, CognitivePipelineConfig};
+        let cp_config = CognitivePipelineConfig {
+            concepts_enabled: true,
+            concepts_path: concepts_path.clone().map(std::path::PathBuf::from),
+            concepts_embedding_dim: 64,
+            concepts_max: 10000,
+            mirror_test_enabled: true,
+            episodic_memory_enabled: true,
+            episodic_memory_path: concepts_path.as_ref().map(|p| {
+                let mut pb = std::path::PathBuf::from(p);
+                pb.set_extension("episodes.json");
+                pb
+            }),
+            intrinsic_motivation_enabled: true,
+            proactive_controller_enabled: true,
+            tool_usage_tracking_enabled: true,
+            ..Default::default()
+        };
+        info!(event = "cognitive_pipeline_enabled", "Cognitive pipeline enabled for server");
+        Some(CognitivePipeline::new(cp_config))
+    } else {
+        None
+    };
+
+    // Create the API handler
+    let handler = Box::new(FerrisResApiHandler {
+        model_name: model_name.clone(),
+        tokenizer,
+        loaded_model,
+        _armor: armor,
+    });
+
+    let server_config = ferrisres::server::ApiServerConfig {
+        host: host.clone(),
+        port,
+        model_name,
+    };
+
+    let server = ferrisres::server::ApiServer::new(server_config, handler);
+    info!(event = "server_starting", "FerrisRes API server starting on {}:{}", host, port);
+    println!("FerrisRes API server starting on {}:{}", host, port);
+    println!("Endpoints:");
+    println!("  GET  /health              - Health check");
+    println!("  GET  /v1/models            - List models");
+    println!("  POST /v1/chat/completions  - Chat completions");
+    println!("  POST /v1/completions       - Text completions");
+
+    server.serve()?;
+    Ok(())
+}
+
+/// API handler that wires the model to the server routes.
+struct FerrisResApiHandler {
+    model_name: String,
+    tokenizer: Arc<dyn Send + Sync + Fn(&str) -> Vec<u32>>,
+    loaded_model: Option<Gemma4Teacher>,
+    _armor: bool,
+}
+
+impl ferrisres::server::ApiHandler for FerrisResApiHandler {
+    fn chat_completion(&mut self, req: &ferrisres::server::ChatCompletionRequest) -> ferrisres::server::ChatCompletionResponse {
+        use ferrisres::server::*;
+
+        // Concatenate messages into a single prompt
+        let prompt: String = req.messages.iter()
+            .map(|m| format!("{}: {}", m.role, m.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let tokens = (self.tokenizer)(&prompt);
+
+        if let Some(ref model) = self.loaded_model {
+            // Real CPU inference
+            let gen_tokens = generate_cpu(model, &tokens, 256, 0.7, None);
+            let simple_tok = SimpleTokenizer::new();
+            let generated_text = simple_tok.decode(&gen_tokens);
+
+            ChatCompletionResponse {
+                id: format!("chatcmpl-{}", chrono_hash(&prompt)),
+                object: "chat.completion".into(),
+                created: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                model: self.model_name.clone(),
+                choices: vec![Choice {
+                    index: 0,
+                    message: ChatMessage::assistant(&generated_text),
+                    finish_reason: "stop".into(),
+                }],
+                usage: Usage {
+                    prompt_tokens: tokens.len(),
+                    completion_tokens: gen_tokens.len(),
+                    total_tokens: tokens.len() + gen_tokens.len(),
+                },
+            }
+        } else {
+            // Placeholder response
+            ChatCompletionResponse {
+                id: format!("chatcmpl-{}", chrono_hash(&prompt)),
+                object: "chat.completion".into(),
+                created: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                model: self.model_name.clone(),
+                choices: vec![Choice {
+                    index: 0,
+                    message: ChatMessage::assistant(
+                        &format!("[FerrisRes] No model loaded. Received {} tokens from {} message(s). Provide --model-path to enable generation.",
+                            tokens.len(), req.messages.len())
+                    ),
+                    finish_reason: "stop".into(),
+                }],
+                usage: Usage {
+                    prompt_tokens: tokens.len(),
+                    completion_tokens: 0,
+                    total_tokens: tokens.len(),
+                },
+            }
+        }
+    }
+
+    fn completion(&mut self, req: &ferrisres::server::CompletionRequest) -> ferrisres::server::ChatCompletionResponse {
+        use ferrisres::server::*;
+
+        let tokens = (self.tokenizer)(&req.prompt);
+
+        if let Some(ref model) = self.loaded_model {
+            // Real CPU inference
+            let gen_tokens = generate_cpu(model, &tokens, req.max_tokens, 0.7, None);
+            let simple_tok = SimpleTokenizer::new();
+            let generated_text = simple_tok.decode(&gen_tokens);
+
+            ChatCompletionResponse {
+                id: format!("cmpl-{}", chrono_hash(&req.prompt)),
+                object: "text_completion".into(),
+                created: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                model: self.model_name.clone(),
+                choices: vec![Choice {
+                    index: 0,
+                    message: ChatMessage::assistant(&generated_text),
+                    finish_reason: "stop".into(),
+                }],
+                usage: Usage {
+                    prompt_tokens: tokens.len(),
+                    completion_tokens: gen_tokens.len(),
+                    total_tokens: tokens.len() + gen_tokens.len(),
+                },
+            }
+        } else {
+            // Placeholder response
+            ChatCompletionResponse {
+                id: format!("cmpl-{}", chrono_hash(&req.prompt)),
+                object: "text_completion".into(),
+                created: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                model: self.model_name.clone(),
+                choices: vec![Choice {
+                    index: 0,
+                    message: ChatMessage::assistant(
+                        &format!("[FerrisRes] No model loaded. Received {} tokens. Provide --model-path to enable generation.", tokens.len())
+                    ),
+                    finish_reason: "stop".into(),
+                }],
+                usage: Usage {
+                    prompt_tokens: tokens.len(),
+                    completion_tokens: 0,
+                    total_tokens: tokens.len(),
+                },
+            }
+        }
+    }
+
+    fn list_models(&self) -> Vec<ferrisres::server::ModelInfo> {
+        vec![ferrisres::server::ModelInfo {
+            id: self.model_name.clone(),
+            object: "model".into(),
+            owned_by: "ferrisres".into(),
+        }]
+    }
+}
+
+/// Autoregressive generation on CPU using a loaded MappedGemma4Model.
+///
+/// Runs the model's `forward()` in a loop, sampling one token at a time.
+/// Returns the generated token IDs (excluding the prompt tokens).
+fn generate_cpu(
+    model: &Gemma4Teacher,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    temperature: f32,
+    eos_token_id: Option<u32>,
+) -> Vec<u32> {
+    let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
+    let prompt_len = prompt_tokens.len();
+    let vs = model.model().config.vocab_size;
+
+    for step in 0..max_new_tokens {
+        // Run full forward pass on all tokens so far
+        let logits = model.forward(&all_tokens);
+
+        // Take logits for the last token position
+        let last_offset = (all_tokens.len() - 1) * vs;
+        let last_logits = &logits[last_offset..last_offset + vs];
+
+        // Temperature scaling + sampling
+        let next_token = if temperature < 1e-6 {
+            // Greedy: argmax
+            last_logits.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0)
+        } else {
+            // Temperature-scaled sampling
+            let scaled: Vec<f32> = last_logits.iter()
+                .map(|&l| l / temperature)
+                .collect();
+            // Softmax
+            let max_val = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scaled.iter().map(|&s| (s - max_val).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
+
+            // Weighted random sample
+            let r: f32 = rand_in_range(0.0, 1.0);
+            let mut cumsum = 0.0f32;
+            let mut chosen = 0u32;
+            for (i, &p) in probs.iter().enumerate() {
+                cumsum += p;
+                if cumsum >= r {
+                    chosen = i as u32;
+                    break;
+                }
+            }
+            chosen
+        };
+
+        // Check EOS
+        if let Some(eos) = eos_token_id {
+            if next_token == eos {
+                info!(event = "cpu_gen_eos", step = step, "Hit EOS token");
+                break;
+            }
+        }
+
+        all_tokens.push(next_token);
+
+        if step % 10 == 0 {
+            info!(event = "cpu_gen_progress", step = step, tokens = all_tokens.len(), "Generating...");
+        }
+    }
+
+    info!(event = "cpu_gen_done", prompt_len = prompt_len, generated = all_tokens.len() - prompt_len, "Generation complete");
+    all_tokens[prompt_len..].to_vec()
+}
+
+/// Simple random float in [lo, hi).
+fn rand_in_range(lo: f32, hi: f32) -> f32 {
+    use std::time::SystemTime;
+    let ns = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let state = ns.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let x = ((state >> 33) as u32) as f32 / u32::MAX as f32;
+    lo + x * (hi - lo)
+}
+
+/// Simple hash for generating unique IDs.
+fn chrono_hash(s: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
 }
 
 async fn cmd_evaluate(
