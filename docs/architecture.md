@@ -70,6 +70,65 @@ FerrisRes implements a closed-loop self-correction system:
 4. **Test failures → loss signal → backprop** at the weight level
 5. **Concept Memory** persists learned patterns across sessions
 
+## Cognitive Architecture
+
+FerrisRes includes a 5-layer cognitive architecture for self-improving AI:
+
+```
+Layer 0: Pipeline Wiring    — orchestrates all cognitive components
+Layer 1: Memory & Learning  — episodic memory, differentiable execution, LoRA weight updates
+Layer 2: Autonomy            — tool creation, multi-step planning, usage tracking
+Layer 3: Self-Improvement    — abstraction, intrinsic motivation, proactive behavior
+Layer 4: Emergence           — quantitative emergence measurement (6 categories)
+```
+
+### Layer 0: Cognitive Pipeline
+The `CognitivePipeline` orchestrates all cognitive components through a unified
+`process_generation()` entry point:
+- **ConceptMap**: embedding-based learned pattern retrieval with quality scoring
+- **LlmComputer**: CALM virtual machine (LookUp → Compute → BranchIf)
+- **MirrorTest**: recursive self-verification — generate code → test → loss
+- **HullKVCache**: 2D convex hull attention with O(log n) lookups
+- **WasmSandbox**: zero-trust tool execution with wasmi runtime
+
+### Layer 1: Memory & Learning
+- **EpisodicMemory**: Stores *experiences* (prompt, tool traces, outcome, importance),
+  not raw tokens. Content-based retrieval via cosine similarity + recency bias.
+  Importance = surprise × uncertainty × outcome_magnitude. Compression merges
+  similar episodes (cosine > 0.85) into generalizations.
+- **DifferentiableLlmComputer**: Makes CALM VM differentiable via Gumbel-Softmax
+  op selection with Straight-Through Estimator (STE). NTM-style DiffMemoryBank
+  for gradient flow through memory. Temperature annealing (τ: 1.0 → 0.1).
+- **ToolTriggeredLora**: On-the-fly LoRA weight updates from the `learn` tool.
+  Elastic Weight Consolidation (Fisher diagonal) prevents catastrophic forgetting.
+  Progressive adapter stacking — new adapter per learning event.
+
+### Layer 2: Autonomy
+- **ToolCreationPipeline**: Model generates tool specs via `[tool_create]` blocks.
+  6-stage validation (name, code size, structure, safety, syntax, semantics).
+  Bans unsafe code (filesystem, network, process spawning). Refinement loop.
+- **PlanExecutor**: Multi-step `[plan]` execution with `$N` reference resolution.
+  Condition evaluation (`$1.success`), retry on failure, replanning.
+- **ToolUsageTracker**: Per-tool + per-context EMA quality tracking.
+  Contextual bandit for best-tool recommendation. JSON persistence.
+
+### Layer 3: Self-Improvement
+- **AbstractionEngine**: Scans concepts for similarity clusters (cosine > 0.8),
+  computes centroid meta-concepts. Hierarchical levels:
+  Instance → Pattern → Principle → MetaPrinciple.
+- **IntrinsicMotivation**: Per-concept uncertainty (entropy + quality + distance).
+  Zone of Proximal Development goal selection. Mastery detection.
+- **ProactiveController**: 4 autonomy levels (Reactive → Suggestive →
+  SemiAutonomous → FullyAutonomous). 6 initiative signals. Action logging + rollback.
+
+### Layer 4: Emergence Measurement
+- **EmergenceBenchmark**: 6 measurement categories:
+  - Skill Acquisition (improvement rate), Self-Correction (error recurrence),
+    Self-Extension (tools × reuse × depth), Cognitive Scaffolding (concepts vs diversity),
+    Planning (success rate), Abstraction (compression ratio).
+  - Compares baseline (no pipeline) vs augmented (with pipeline).
+  - Trend analysis and composite emergence index (0.0–1.0).
+
 ## Key Design Decisions
 
 | Decision | Rationale |

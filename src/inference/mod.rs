@@ -33,7 +33,16 @@ pub mod scientific;
 pub mod tactile;
 pub mod ee;
 pub mod science2;
+pub mod episodic_memory;
+pub mod diff_llm_computer;
 pub mod cognitive_pipeline;
+pub mod tool_creation;
+pub mod plan_executor;
+pub mod tool_usage_tracker;
+pub mod abstraction_engine;
+pub mod intrinsic_motivation;
+pub mod proactive_controller;
+pub mod emergence_benchmark;
 
 pub use kv_cache::{LayerKVCache, ModelKVCache};
 pub use two_phase::{TwoPhaseConfig, TwoPhaseInference, KVCache, Sampler, GenerationState};
@@ -50,4 +59,6 @@ pub use sampling::{sample_argmax, sample_temperature, sample_top_k, sample_top_p
 pub use token_merging::{ToMeMerger, ToMeConfig, TokenSizes, cosine_sim};
 pub use matryoshka::ElasticRagStore;
 pub use paca::{PacaEngine, PacaConfig, ClusterMethod, ClusterAssignment};
+pub use episodic_memory::{EpisodicMemory, EpisodicMemoryConfig, Episode, EpisodeOutcome, ToolTrace, RetrievedEpisode, EpisodicMemoryStats};
+pub use diff_llm_computer::{DiffLlmComputer, DiffLlmComputerConfig, OpLogits, DiffMemoryBank, DiffProgramResult, DiffStepResult};
 pub use cognitive_pipeline::{CognitivePipeline, CognitivePipelineConfig, CognitiveGenerationResult, ToolExecutionResult, CalmResult};

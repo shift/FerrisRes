@@ -1,6 +1,6 @@
 # FerrisRes API Reference
 
-> **Version 0.2.0** — API is unstable and may change before 1.0.0.
+> **Version 0.2.2** — API is unstable and may change before 1.0.0.
 
 ## Module Stability Tiers
 
@@ -8,7 +8,7 @@
 |---|---|---|
 | **Stable** | `inference::sampling`, `inference::prompt_templates`, `model::config` | No breaking changes |
 | **Beta** | `inference::generator`, `inference::rag`, `model::block_attn_res`, `model::safetensors` | Minor breaking changes possible |
-| **Unstable** | `compute::*`, `device::*`, `model::gpu_forward`, `training::*` | May change any time |
+| **Unstable** | `compute::*`, `device::*`, `model::gpu_forward`, `training::*`, `inference::cognitive_pipeline`, `inference::episodic_memory`, `inference::diff_llm_computer`, `inference::tool_creation`, `inference::plan_executor`, `inference::tool_usage_tracker`, `inference::abstraction_engine`, `inference::intrinsic_motivation`, `inference::proactive_controller`, `inference::emergence_benchmark` | May change any time |
 
 ## Core Types
 
@@ -127,6 +127,11 @@ Distill options:
 
 Serve options:
   --port <PORT>          Server port (default: 8080)
+
+Cognitive options (with --cognitive):
+  --concepts-path <PATH>  Path to concept store
+  --persist-kv             Persist KV cache
+  --kv-path <PATH>        Path for KV cache
 ```
 
 ## Error Handling
@@ -141,4 +146,73 @@ pub enum FerrisResError {
     Model(String),       // Model loading/forward error
     Tokenizer(String),   // Tokenization error
 }
+```
+
+## Cognitive Architecture API
+
+> **Tier: Unstable** — all cognitive modules may change before 1.0.
+
+### Cognitive Pipeline
+
+```rust
+use ferrisres::inference::cognitive_pipeline::{CognitivePipeline, CognitivePipelineConfig};
+
+let config = CognitivePipelineConfig {
+    concepts_enabled: true,
+    concepts_path: Some("concepts.json".into()),
+    episodic_memory_enabled: true,
+    tool_creation_enabled: true,
+    emergence_benchmark_enabled: true,
+    ..Default::default()
+};
+let mut pipeline = CognitivePipeline::new(config);
+
+// Process a generation with full cognitive augmentation
+let result = pipeline.process_generation("prompt", |prompt| {
+    // Your generation function
+    "output".to_string()
+});
+```
+
+### Episodic Memory
+
+```rust
+use ferrisres::inference::episodic_memory::{EpisodicMemory, Episode, EpisodeOutcome};
+
+let mut memory = EpisodicMemory::default();
+memory.store(Episode { /* ... */ });
+let relevant = memory.retrieve(&embedding, 5);
+let failures = memory.retrieve_failures(&embedding, 3);
+```
+
+### Tool Creation
+
+```rust
+use ferrisres::inference::tool_creation::ToolCreationPipeline;
+
+let mut pipeline = ToolCreationPipeline::default_pipeline();
+let attempt = pipeline.create_tool(spec);
+```
+
+### Plan Execution
+
+```rust
+use ferrisres::inference::plan_executor::{PlanExecutor, ToolPlan, PlanStep};
+
+let mut executor = PlanExecutor::default_executor();
+let plan = ToolPlan::parse_from_output(model_output).unwrap();
+let result = executor.execute_plan(plan, |tool, args| {
+    ("result".into(), true, Some(0.95))
+});
+```
+
+### Emergence Measurement
+
+```rust
+use ferrisres::inference::emergence_benchmark::EmergenceBenchmark;
+
+let mut bench = EmergenceBenchmark::default_benchmark();
+bench.measure_from_snapshot(0.3, &snapshot);
+let report = bench.report();
+println!("Emergence index: {:.2}", report.emergence_index);
 ```

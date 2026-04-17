@@ -19,6 +19,14 @@
 use std::path::PathBuf;
 
 use crate::inference::concept_memory::{ConceptMap, ConceptContent, ConceptSource};
+use crate::inference::episodic_memory::{EpisodicMemory, Episode, EpisodeOutcome, ToolTrace};
+use crate::inference::tool_creation::ToolCreationPipeline;
+use crate::inference::plan_executor::PlanExecutor;
+use crate::inference::tool_usage_tracker::ToolUsageTracker;
+use crate::inference::abstraction_engine::AbstractionEngine;
+use crate::inference::intrinsic_motivation::IntrinsicMotivation;
+use crate::inference::proactive_controller::ProactiveController;
+use crate::inference::emergence_benchmark::EmergenceBenchmark;
 use crate::inference::hull_kv_cache::HullKVCache;
 use crate::inference::llm_computer::{LlmComputer, LlmComputerConfig};
 use crate::inference::mirror_test::MirrorTestRunner;
@@ -68,6 +76,33 @@ pub struct CognitivePipelineConfig {
 
     /// Enable self-correction loop (retry on low quality).
     pub self_correction_enabled: bool,
+
+    /// Enable episodic memory (event-based experience storage).
+    pub episodic_memory_enabled: bool,
+    /// Path to persist episodic memory.
+    pub episodic_memory_path: Option<PathBuf>,
+    /// Episodic memory configuration.
+    pub episodic_config: Option<crate::inference::episodic_memory::EpisodicMemoryConfig>,
+
+    /// Enable tool creation pipeline.
+    pub tool_creation_enabled: bool,
+    /// Enable plan executor.
+    pub plan_execution_enabled: bool,
+    /// Enable tool usage tracking.
+    pub tool_usage_tracking_enabled: bool,
+    /// Path to persist tool usage data.
+    pub tool_usage_path: Option<PathBuf>,
+
+    /// Enable abstraction engine.
+    pub abstraction_enabled: bool,
+    /// Enable intrinsic motivation.
+    pub intrinsic_motivation_enabled: bool,
+    /// Enable proactive controller.
+    pub proactive_controller_enabled: bool,
+    /// Enable emergence benchmark.
+    pub emergence_benchmark_enabled: bool,
+    /// Path to persist emergence benchmark data.
+    pub emergence_benchmark_path: Option<PathBuf>,
 }
 
 impl Default for CognitivePipelineConfig {
@@ -88,6 +123,18 @@ impl Default for CognitivePipelineConfig {
             mirror_max_retries: 2,
             wasm_sandbox_enabled: false,
             self_correction_enabled: false,
+            episodic_memory_enabled: false,
+            episodic_memory_path: None,
+            episodic_config: None,
+            tool_creation_enabled: false,
+            plan_execution_enabled: false,
+            tool_usage_tracking_enabled: false,
+            tool_usage_path: None,
+            abstraction_enabled: false,
+            intrinsic_motivation_enabled: false,
+            proactive_controller_enabled: false,
+            emergence_benchmark_enabled: false,
+            emergence_benchmark_path: None,
         }
     }
 }
@@ -109,6 +156,22 @@ pub struct CognitivePipeline {
     mirror_runner: Option<MirrorTestRunner>,
     /// WASM runtime — sandboxed tool execution.
     wasm_runtime: Option<WasmRuntime>,
+    /// Episodic memory — event-based experience storage.
+    episodic_memory: Option<EpisodicMemory>,
+    /// Tool creation pipeline — model generates its own tools.
+    tool_creation: Option<ToolCreationPipeline>,
+    /// Plan executor — multi-step tool chaining.
+    plan_executor: Option<PlanExecutor>,
+    /// Tool usage tracker — meta-learning via contextual bandits.
+    tool_usage_tracker: Option<ToolUsageTracker>,
+    /// Abstraction engine — concept compression & generalization.
+    abstraction_engine: Option<AbstractionEngine>,
+    /// Intrinsic motivation — self-directed learning.
+    intrinsic_motivation: Option<IntrinsicMotivation>,
+    /// Proactive controller — bounded autonomous behavior.
+    proactive_controller: Option<ProactiveController>,
+    /// Emergence benchmark — quantitative emergence measurement.
+    emergence_benchmark: Option<EmergenceBenchmark>,
     /// Tool registry — augmented with cognitive tools.
     tool_registry: ToolRegistry,
 }
@@ -132,6 +195,18 @@ pub struct CognitiveGenerationResult {
     pub retries: usize,
     /// Whether KV cache was persisted.
     pub kv_persisted: bool,
+    /// Number of episodes stored.
+    pub episodes_stored: usize,
+    /// Number of relevant episodes retrieved before generation.
+    pub episodes_retrieved: usize,
+    /// Whether a tool was created.
+    pub tool_created: bool,
+    /// Name of created tool (if any).
+    pub created_tool_name: Option<String>,
+    /// Whether a plan was executed.
+    pub plan_executed: bool,
+    /// Number of plan steps executed.
+    pub plan_steps: usize,
 }
 
 impl CognitivePipeline {
@@ -215,6 +290,114 @@ impl CognitivePipeline {
             None
         };
 
+        // Create episodic memory
+        let episodic_memory = if config.episodic_memory_enabled {
+            let epi_config = config.episodic_config.clone().unwrap_or_default();
+            if let Some(ref path) = config.episodic_memory_path {
+                if path.exists() {
+                    match EpisodicMemory::load(path) {
+                        Ok(m) => {
+                            tracing::info!(event = "episodic_loaded", "Loaded {} episodes from {}", m.len(), path.display());
+                            Some(m)
+                        }
+                        Err(e) => {
+                            tracing::warn!(event = "episodic_load_error", "Failed to load episodes: {}, starting fresh", e);
+                            Some(EpisodicMemory::new(epi_config))
+                        }
+                    }
+                } else {
+                    Some(EpisodicMemory::new(epi_config))
+                }
+            } else {
+                Some(EpisodicMemory::new(epi_config))
+            }
+        } else {
+            None
+        };
+
+        // Tool creation pipeline
+        let tool_creation = if config.tool_creation_enabled {
+            Some(ToolCreationPipeline::default_pipeline())
+        } else {
+            None
+        };
+
+        // Plan executor
+        let plan_executor = if config.plan_execution_enabled {
+            Some(PlanExecutor::default_executor())
+        } else {
+            None
+        };
+
+        // Tool usage tracker
+        let tool_usage_tracker = if config.tool_usage_tracking_enabled {
+            if let Some(ref path) = config.tool_usage_path {
+                if path.exists() {
+                    match ToolUsageTracker::load(path) {
+                        Ok(t) => {
+                            tracing::info!(event = "usage_tracker_loaded", "Loaded usage tracker with {} events", t.total_events());
+                            Some(t)
+                        }
+                        Err(e) => {
+                            tracing::warn!(event = "usage_tracker_load_error", "Failed to load usage tracker: {}", e);
+                            Some(ToolUsageTracker::default_tracker())
+                        }
+                    }
+                } else {
+                    Some(ToolUsageTracker::default_tracker())
+                }
+            } else {
+                Some(ToolUsageTracker::default_tracker())
+            }
+        } else {
+            None
+        };
+
+        // Abstraction engine
+        let abstraction_engine = if config.abstraction_enabled {
+            Some(AbstractionEngine::default_engine())
+        } else {
+            None
+        };
+
+        // Intrinsic motivation
+        let intrinsic_motivation = if config.intrinsic_motivation_enabled {
+            Some(IntrinsicMotivation::default_motivation())
+        } else {
+            None
+        };
+
+        // Proactive controller
+        let proactive_controller = if config.proactive_controller_enabled {
+            Some(ProactiveController::default_controller())
+        } else {
+            None
+        };
+
+        // Emergence benchmark
+        let emergence_benchmark = if config.emergence_benchmark_enabled {
+            if let Some(ref path) = config.emergence_benchmark_path {
+                if path.exists() {
+                    match EmergenceBenchmark::load(path) {
+                        Ok(b) => {
+                            tracing::info!(event = "emergence_loaded", "Loaded emergence benchmark with {} measurements", b.total_measurements());
+                            Some(b)
+                        }
+                        Err(e) => {
+                            tracing::warn!(event = "emergence_load_error", "Failed to load benchmark: {}", e);
+                            Some(EmergenceBenchmark::default_benchmark())
+                        }
+                    }
+                } else {
+                    Some(EmergenceBenchmark::default_benchmark())
+                }
+            } else {
+                Some(EmergenceBenchmark::default_benchmark())
+            }
+        } else {
+            None
+        };
+
         // Build augmented tool registry
         let mut tool_registry = ToolRegistry::new(ToolSearchConfig::default());
 
@@ -249,6 +432,14 @@ impl CognitivePipeline {
             llm_computer,
             mirror_runner,
             wasm_runtime,
+            episodic_memory,
+            tool_creation,
+            plan_executor,
+            tool_usage_tracker,
+            abstraction_engine,
+            intrinsic_motivation,
+            proactive_controller,
+            emergence_benchmark,
             tool_registry,
         }
     }
@@ -553,6 +744,30 @@ impl CognitivePipeline {
             tracing::info!(event = "hull_kv_saved", "Saved Hull-KV ({} points) to {}", kv.len(), path.display());
         }
 
+        if let (Some(ref mem), Some(ref path)) = (&self.episodic_memory, &self.config.episodic_memory_path) {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            mem.save(path)?;
+            tracing::info!(event = "episodes_saved", "Saved {} episodes to {}", mem.len(), path.display());
+        }
+
+        if let (Some(ref tracker), Some(ref path)) = (&self.tool_usage_tracker, &self.config.tool_usage_path) {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            tracker.save(path)?;
+            tracing::info!(event = "usage_tracker_saved", "Saved usage tracker ({} events) to {}", tracker.total_events(), path.display());
+        }
+
+        if let (Some(ref benchmark), Some(ref path)) = (&self.emergence_benchmark, &self.config.emergence_benchmark_path) {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            benchmark.save(path)?;
+            tracing::info!(event = "emergence_saved", "Saved emergence benchmark ({} measurements) to {}", benchmark.total_measurements(), path.display());
+        }
+
         Ok(())
     }
 
@@ -591,6 +806,86 @@ impl CognitivePipeline {
         self.hull_kv.as_mut()
     }
 
+    /// Access the episodic memory.
+    pub fn episodic_memory(&self) -> Option<&EpisodicMemory> {
+        self.episodic_memory.as_ref()
+    }
+
+    /// Access the episodic memory mutably.
+    pub fn episodic_memory_mut(&mut self) -> Option<&mut EpisodicMemory> {
+        self.episodic_memory.as_mut()
+    }
+
+    /// Access the tool creation pipeline.
+    pub fn tool_creation(&self) -> Option<&ToolCreationPipeline> {
+        self.tool_creation.as_ref()
+    }
+
+    /// Access the tool creation pipeline mutably.
+    pub fn tool_creation_mut(&mut self) -> Option<&mut ToolCreationPipeline> {
+        self.tool_creation.as_mut()
+    }
+
+    /// Access the plan executor.
+    pub fn plan_executor(&self) -> Option<&PlanExecutor> {
+        self.plan_executor.as_ref()
+    }
+
+    /// Access the plan executor mutably.
+    pub fn plan_executor_mut(&mut self) -> Option<&mut PlanExecutor> {
+        self.plan_executor.as_mut()
+    }
+
+    /// Access the tool usage tracker.
+    pub fn tool_usage_tracker(&self) -> Option<&ToolUsageTracker> {
+        self.tool_usage_tracker.as_ref()
+    }
+
+    /// Access the tool usage tracker mutably.
+    pub fn tool_usage_tracker_mut(&mut self) -> Option<&mut ToolUsageTracker> {
+        self.tool_usage_tracker.as_mut()
+    }
+
+    /// Access the abstraction engine.
+    pub fn abstraction_engine(&self) -> Option<&AbstractionEngine> {
+        self.abstraction_engine.as_ref()
+    }
+
+    /// Access the abstraction engine mutably.
+    pub fn abstraction_engine_mut(&mut self) -> Option<&mut AbstractionEngine> {
+        self.abstraction_engine.as_mut()
+    }
+
+    /// Access the intrinsic motivation.
+    pub fn intrinsic_motivation(&self) -> Option<&IntrinsicMotivation> {
+        self.intrinsic_motivation.as_ref()
+    }
+
+    /// Access the intrinsic motivation mutably.
+    pub fn intrinsic_motivation_mut(&mut self) -> Option<&mut IntrinsicMotivation> {
+        self.intrinsic_motivation.as_mut()
+    }
+
+    /// Access the proactive controller.
+    pub fn proactive_controller(&self) -> Option<&ProactiveController> {
+        self.proactive_controller.as_ref()
+    }
+
+    /// Access the proactive controller mutably.
+    pub fn proactive_controller_mut(&mut self) -> Option<&mut ProactiveController> {
+        self.proactive_controller.as_mut()
+    }
+
+    /// Access the emergence benchmark.
+    pub fn emergence_benchmark(&self) -> Option<&EmergenceBenchmark> {
+        self.emergence_benchmark.as_ref()
+    }
+
+    /// Access the emergence benchmark mutably.
+    pub fn emergence_benchmark_mut(&mut self) -> Option<&mut EmergenceBenchmark> {
+        self.emergence_benchmark.as_mut()
+    }
+
     /// Get the configuration.
     pub fn config(&self) -> &CognitivePipelineConfig {
         &self.config
@@ -616,8 +911,41 @@ impl CognitivePipeline {
         // Step 1: Augment with concepts
         let (augmented_prompt, concepts_retrieved) = self.augment_with_concepts(prompt);
 
+        // Step 1b: Retrieve relevant episodes
+        let mut episodes_retrieved = 0;
+        let mut episode_context = String::new();
+        if let Some(ref mem) = self.episodic_memory {
+            let embedding = prompt_to_embedding(prompt, self.config.concepts_embedding_dim);
+            let episodes = mem.retrieve(&embedding, 3);
+            episodes_retrieved = episodes.len();
+            if !episodes.is_empty() {
+                episode_context.push_str("\n[Relevant past experiences]\n");
+                for re in &episodes {
+                    let outcome_str = match re.episode.outcome {
+                        EpisodeOutcome::Success => "✓",
+                        EpisodeOutcome::PartialSuccess => "~",
+                        EpisodeOutcome::Failure => "✗",
+                    };
+                    episode_context.push_str(&format!(
+                        "- {} [{}] quality={:.2}: {}\n",
+                        outcome_str,
+                        re.episode.prompt.chars().take(80).collect::<String>(),
+                        re.episode.quality_score,
+                        re.episode.output.chars().take(100).collect::<String>(),
+                    ));
+                }
+                episode_context.push_str("[/Relevant past experiences]\n");
+            }
+        }
+
+        let full_prompt = if episode_context.is_empty() {
+            augmented_prompt
+        } else {
+            format!("{}{}", episode_context, augmented_prompt)
+        };
+
         // Step 2: Generate
-        let output = generate_fn(&augmented_prompt);
+        let output = generate_fn(&full_prompt);
 
         // Step 3: Check for tool calls
         let mut tool_called = false;
@@ -625,6 +953,7 @@ impl CognitivePipeline {
         let mut final_output = output.clone();
         let mut mirror_quality = None;
         let mut retries = 0;
+        let mut tool_traces: Vec<ToolTrace> = Vec::new();
 
         if let Some(start) = output.find("[tool_call]") {
             let content_start = start + "[tool_call]".len();
@@ -646,12 +975,26 @@ impl CognitivePipeline {
             // Execute tool
             let result = self.execute_tool(&name, &args);
 
+            tool_traces.push(ToolTrace {
+                tool_name: name.clone(),
+                args: args.clone(),
+                output: result.output.clone(),
+                success: result.success,
+                step: 0,
+            });
+
             // Step 4: Self-evaluate with retry
             if self.config.self_correction_enabled && result.mirror_quality.unwrap_or(1.0) < self.config.mirror_quality_threshold {
-                for _ in 0..self.config.mirror_max_retries {
+                for retry_idx in 0..self.config.mirror_max_retries {
                     retries += 1;
-                    // Re-execute (in practice, the model would generate different params)
                     let retry_result = self.execute_tool(&name, &args);
+                    tool_traces.push(ToolTrace {
+                        tool_name: name.clone(),
+                        args: args.clone(),
+                        output: retry_result.output.clone(),
+                        success: retry_result.success,
+                        step: retry_idx + 1,
+                    });
                     if retry_result.mirror_quality.unwrap_or(1.0) >= self.config.mirror_quality_threshold {
                         final_output = format!("{}\n\nTool result: {}", output, retry_result.output);
                         mirror_quality = retry_result.mirror_quality;
@@ -662,6 +1005,43 @@ impl CognitivePipeline {
                 final_output = format!("{}\n\nTool result: {}", output, result.output);
                 mirror_quality = result.mirror_quality;
             }
+        }
+
+        // Step 4b: Handle tool creation requests
+        let mut tool_created_result: Option<(String, f32)> = None;
+        if let Some(ref mut creation) = self.tool_creation {
+            if let Some(attempt) = creation.process_creation(&output) {
+                if attempt.success {
+                    let tool_name_created = attempt.spec.name.clone();
+                    let quality = attempt.quality;
+                    if let Some(ref spec) = creation.get_created_tool(&tool_name_created) {
+                        let tool = crate::inference::tool_search::Tool::new(
+                            &spec.name, &spec.description,
+                        )
+                            .with_category(&spec.category);
+                        self.tool_registry.register(tool);
+                        tracing::info!(
+                            event = "auto_created_tool",
+                            name = %tool_name_created,
+                            "Automatically registered created tool"
+                        );
+                    }
+                    tool_created_result = Some((tool_name_created, quality));
+                }
+            }
+        }
+        if let Some((ref name, quality)) = tool_created_result {
+            final_output = format!(
+                "{}\n\n[Created tool: {} (quality: {:.2})]",
+                final_output, name, quality
+            );
+        }
+
+        // Step 4c: Record tool usage
+        if let (Some(ref mut tracker), Some(ref tname)) = (&mut self.tool_usage_tracker, &tool_name) {
+            let embedding = prompt_to_embedding(prompt, self.config.concepts_embedding_dim);
+            let quality = mirror_quality.unwrap_or(0.5);
+            tracker.record(tname, &embedding, quality);
         }
 
         // Step 5: Store learning if quality is sufficient
@@ -686,7 +1066,52 @@ impl CognitivePipeline {
             }
         }
 
-        // Step 6: Persist
+        // Step 6: Store episode
+        let mut episodes_stored = 0;
+        if let Some(ref mut mem) = self.episodic_memory {
+            let embedding = prompt_to_embedding(prompt, self.config.concepts_embedding_dim);
+            let quality = mirror_quality.unwrap_or(0.5);
+            let outcome = if quality >= 0.7 {
+                EpisodeOutcome::Success
+            } else if quality >= 0.4 {
+                EpisodeOutcome::PartialSuccess
+            } else {
+                EpisodeOutcome::Failure
+            };
+
+            let mut episode = Episode {
+                id: 0, // Auto-assigned by store
+                context_embedding: embedding,
+                prompt: prompt.to_string(),
+                tools_used: tool_traces,
+                plan_description: None,
+                output: final_output.chars().take(500).collect(),
+                outcome,
+                quality_score: quality,
+                logit_entropy: 0.0, // Would be filled by actual model
+                confidence: quality,
+                importance: 0.0, // Auto-computed by store
+                timestamp: 0, // Auto-assigned by store
+                tags: vec!["auto".into()],
+                compressed_from: vec![],
+                consolidated: false,
+            };
+            episode.compute_importance();
+
+            if mem.store(episode).is_some() {
+                episodes_stored = 1;
+            }
+
+            // Auto-compress if near capacity
+            if mem.should_compress() {
+                let compressed = mem.compress();
+                if compressed > 0 {
+                    tracing::info!(event = "episodes_auto_compressed", count = compressed, "Auto-compressed episodes");
+                }
+            }
+        }
+
+        // Step 7: Persist
         let kv_persisted = self.hull_kv.is_some() && self.config.kv_persist_path.is_some();
         if let Err(e) = self.persist() {
             tracing::warn!(event = "pipeline_persist_error", "Failed to persist cognitive state: {}", e);
@@ -701,6 +1126,12 @@ impl CognitivePipeline {
             mirror_quality,
             retries,
             kv_persisted,
+            episodes_stored,
+            episodes_retrieved,
+            tool_created: tool_created_result.is_some(),
+            created_tool_name: tool_created_result.map(|(n, _)| n),
+            plan_executed: false,
+            plan_steps: 0,
         }
     }
 }
@@ -795,6 +1226,18 @@ mod tests {
             mirror_max_retries: 1,
             wasm_sandbox_enabled: false,
             self_correction_enabled: false,
+            episodic_memory_enabled: false,
+            episodic_memory_path: None,
+            episodic_config: None,
+            tool_creation_enabled: false,
+            plan_execution_enabled: false,
+            tool_usage_tracking_enabled: false,
+            tool_usage_path: None,
+            abstraction_enabled: false,
+            intrinsic_motivation_enabled: false,
+            proactive_controller_enabled: false,
+            emergence_benchmark_enabled: false,
+            emergence_benchmark_path: None,
         };
 
         let pipeline = CognitivePipeline::new(config);
@@ -970,5 +1413,87 @@ mod tests {
         // Different input → different embedding
         let diff: f32 = e1.iter().zip(e3.iter()).map(|(a, b)| (a - b).powi(2)).sum();
         assert!(diff > 0.0, "Different prompts should produce different embeddings");
+    }
+
+    #[test]
+    fn test_episodic_memory_integration() {
+        let dir = std::env::temp_dir().join("ferrisres_epi_pipeline_test");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let config = CognitivePipelineConfig {
+            concepts_enabled: false,
+            episodic_memory_enabled: true,
+            episodic_memory_path: Some(dir.join("episodes.json")),
+            episodic_config: Some(crate::inference::episodic_memory::EpisodicMemoryConfig {
+                embedding_dim: 32,
+                importance_threshold: 0.0, // Accept all episodes for testing
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut pipeline = CognitivePipeline::new(config);
+
+        // First generation — stores episode
+        let result = pipeline.process_generation("test query", |_prompt| {
+            "test output".to_string()
+        });
+        assert_eq!(result.output, "test output");
+        assert_eq!(result.episodes_stored, 1, "Should store 1 episode");
+        assert_eq!(result.episodes_retrieved, 0, "First generation has no past episodes");
+
+        // Second generation — should retrieve the episode
+        let result2 = pipeline.process_generation("test query", |_prompt| {
+            "test output 2".to_string()
+        });
+        assert_eq!(result2.episodes_retrieved, 1, "Should retrieve past episode");
+
+        // Verify persistence
+        pipeline.persist().unwrap();
+        assert!(dir.join("episodes.json").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tool_creation_in_pipeline() {
+        let config = CognitivePipelineConfig {
+            tool_creation_enabled: true,
+            ..Default::default()
+        };
+
+        let mut pipeline = CognitivePipeline::new(config);
+
+        // Model output contains a tool creation block
+        let output = pipeline.process_generation("create a tool", |_prompt| {
+            "[tool_create]\nname: helper\ndescription: A helper\n---\nfn helper() { 42 }\n[/tool_create]".to_string()
+        });
+
+        assert!(output.tool_created);
+        assert_eq!(output.created_tool_name.as_deref(), Some("helper"));
+        assert!(pipeline.tool_registry().get("helper").is_some());
+    }
+
+    #[test]
+    fn test_tool_usage_tracking() {
+        let config = CognitivePipelineConfig {
+            llm_computer_enabled: true,
+            llm_computer_max_program: 64,
+            llm_computer_max_steps: 128,
+            tool_usage_tracking_enabled: true,
+            ..Default::default()
+        };
+
+        let mut pipeline = CognitivePipeline::new(config);
+
+        // Execute a tool call
+        let _ = pipeline.process_generation("compute", |_prompt| {
+            "[tool_call]calm_execute(add 3 5)[/tool_call]".to_string()
+        });
+
+        // Check usage was tracked
+        let tracker = pipeline.tool_usage_tracker().unwrap();
+        assert!(tracker.get_tool_stats("calm_execute").is_some());
+        assert_eq!(tracker.total_events(), 1);
     }
 }

@@ -589,7 +589,7 @@ async fn cmd_infer(
         use ferrisres::inference::cognitive_pipeline::{CognitivePipeline, CognitivePipelineConfig};
         let cp_config = CognitivePipelineConfig {
             concepts_enabled: true,
-            concepts_path: concepts_path.map(|p| p.into()),
+            concepts_path: concepts_path.clone().map(|p| p.into()),
             concepts_embedding_dim: 64,
             concepts_max: 10000,
             kv_persist_enabled: persist_kv,
@@ -603,9 +603,34 @@ async fn cmd_infer(
             mirror_max_retries: 2,
             wasm_sandbox_enabled: false,
             self_correction_enabled: true,
+            episodic_memory_enabled: true,
+            episodic_memory_path: concepts_path.as_ref().map(|p| {
+                let mut path: std::path::PathBuf = p.clone().into();
+                path.set_file_name("episodes.json");
+                path
+            }),
+            episodic_config: None,
+            tool_creation_enabled: true,
+            plan_execution_enabled: true,
+            tool_usage_tracking_enabled: true,
+            tool_usage_path: concepts_path.as_ref().map(|p| {
+                let mut path: std::path::PathBuf = p.clone().into();
+                path.set_file_name("tool_usage.json");
+                path
+            }),
+            abstraction_enabled: true,
+            intrinsic_motivation_enabled: true,
+            proactive_controller_enabled: true,
+            emergence_benchmark_enabled: true,
+            emergence_benchmark_path: concepts_path.as_ref().map(|p| {
+                let mut path: std::path::PathBuf = p.clone().into();
+                path.set_file_name("emergence.json");
+                path
+            }),
         };
-        info!(event = "cognitive_pipeline_enabled", "Cognitive pipeline enabled: concepts={}, llm_computer={}, mirror_test={}",
-            cp_config.concepts_enabled, cp_config.llm_computer_enabled, cp_config.mirror_test_enabled);
+        info!(event = "cognitive_pipeline_enabled", "Cognitive pipeline enabled: concepts={}, llm_computer={}, mirror_test={}, tool_creation={}, plans={}, usage_tracking={}",
+            cp_config.concepts_enabled, cp_config.llm_computer_enabled, cp_config.mirror_test_enabled,
+            cp_config.tool_creation_enabled, cp_config.plan_execution_enabled, cp_config.tool_usage_tracking_enabled);
         Some(std::sync::Arc::new(std::sync::Mutex::new(CognitivePipeline::new(cp_config))))
     } else {
         None

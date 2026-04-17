@@ -2,7 +2,7 @@
 
 FerrisRes is a Rust-native AI inference and training engine built around **Block AttnRes** — a novel linear-time transformer architecture that replaces the quadratic attention bottleneck of standard transformers. It runs on any GPU or iGPU via [wgpu](https://github.com/gfx-rs/wgpu) (Vulkan, Metal, DX12, WebGPU), adapts automatically to the hardware it finds, and is written entirely in safe Rust with no Python dependency.
 
-> ⚠️ **v0.2.1 — near-production grade, not yet 1.0.** FerrisRes has 951 passing tests, a full self-improvement loop, a verified Gemma 4 distillation pipeline (tested on real 27B model with Intel HD 530 iGPU), five output modalities (vision, speech, tactile, robotics, scientific), a 4-layer security proxy (FerrisRes Armor), and profile-driven GPU dispatch that automatically adapts from Intel iGPUs to H100s. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0. Suitable for research, high-performance prototyping, and early-adopter production workloads.
+> ⚠️ **v0.2.2 — near-production grade, not yet 1.0.** FerrisRes has 1216 passing tests, a full cognitive architecture with 5 layers (pipeline wiring, memory & learning, autonomy, self-improvement, emergence measurement), a verified Gemma 4 distillation pipeline (tested on real 27B model with Intel HD 530 iGPU), five output modalities (vision, speech, tactile, robotics, scientific), a 4-layer security proxy (FerrisRes Armor), and profile-driven GPU dispatch that automatically adapts from Intel iGPUs to H100s. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0. Suitable for research, high-performance prototyping, and early-adopter production workloads.
 
 ---
 
@@ -66,6 +66,21 @@ The `TokenGenerator` orchestrates both phases and exposes `generate_stream` for 
 - **Mirror Test** — recursive self-verification: code → test → execute → loss
 - **Concept Memory** — persistent learned patterns with embedding-based retrieval
 - **PagedAttention** — vLLM-style block management, copy-on-write, prefix sharing
+
+### Cognitive Architecture
+
+FerrisRes includes a full cognitive architecture for self-improving AI:
+
+- **EpisodicMemory** — event-based experience storage with importance filtering, content-based retrieval, and compression
+- **DifferentiableLlmComputer** — Gumbel-Softmax + STE for differentiable CALM VM execution
+- **ToolTriggeredLora** — on-the-fly LoRA weight updates with Elastic Weight Consolidation
+- **ToolCreationPipeline** — model generates its own tools via `[tool_create]` blocks
+- **PlanExecutor** — multi-step tool chaining with `$N` reference resolution and replanning
+- **ToolUsageTracker** — contextual bandit meta-learning for tool selection
+- **AbstractionEngine** — concept compression via cluster detection and generalization
+- **IntrinsicMotivation** — self-directed learning with Zone of Proximal Development goal selection
+- **ProactiveController** — bounded autonomous behavior with 4-level autonomy
+- **EmergenceBenchmark** — quantitative emergence measurement across 6 categories (skill acquisition, self-correction, self-extension, scaffolding, planning, abstraction)
 
 ### Multimodal
 
@@ -427,7 +442,7 @@ FerrisRes requires a working Vulkan driver. On Linux the recommended path is thr
 ```bash
 nix develop          # enters the dev shell with Rust + Vulkan layers
 cargo build
-cargo test            # 951 tests
+cargo test            # 1216 tests
 cargo bench
 ```
 
@@ -477,6 +492,16 @@ src/
 │   ├── mirror_test.rs     # Recursive self-verification
 │   ├── block_draft.rs     # Speculative Block Decoding
 │   ├── concept_memory.rs  # Persistent concept memory + Hull-KV bridge
+│   ├── cognitive_pipeline.rs # Orchestrates all cognitive components
+│   ├── episodic_memory.rs # Event-based experience storage
+│   ├── diff_llm_computer.rs # Differentiable LLM-Computer
+│   ├── tool_creation.rs    # Model generates its own tools
+│   ├── plan_executor.rs    # Multi-step tool chaining
+│   ├── tool_usage_tracker.rs # Meta-learning tool usage
+│   ├── abstraction_engine.rs # Concept compression & generalization
+│   ├── intrinsic_motivation.rs # Self-directed learning
+│   ├── proactive_controller.rs # Bounded autonomous behavior
+│   ├── emergence_benchmark.rs  # Quantitative emergence measurement
 │   ├── pdf_ingestion.rs   # Raw PDF text extraction
 │   ├── acp.rs             # Agent Capability Protocol router
 │   ├── tts_stream.rs      # Streaming TTS with overlap-add reconstruction
@@ -518,7 +543,8 @@ src/
     ├── lora.rs           # LoRA adapter
     ├── gradient_accum.rs # Tile-based gradient accumulation
     ├── partial_backprop  # Layer freeze, selective backward
-    └── cpu_offload.rs / async_offload.rs
+    ├── cpu_offload.rs / async_offload.rs
+    └── tool_triggered_lora.rs # On-the-fly LoRA with EWC protection
 ```
 
 ---
@@ -541,8 +567,9 @@ src/
 | 14 | ✅ Done | FerrisRes Armor: L0 regex+bloom, L1 neural scanner, L2 RepE probe, L3 sanitizer, GPU-accelerated distillation |
 | 15 | ✅ Done | Profile-driven dispatch: `DispatchPlan` per-op CPU/GPU, Intel iGPU detection, auto-tiling, `--gpu` flag removed |
 | 16 | ✅ Done | Real distillation verified: Gemma 4 27B on Intel HD 530, 27M tokens, checkpoint resilience |
+| 17 | ✅ Done | Cognitive architecture: Layer 0-4 (pipeline wiring, memory & learning, autonomy, self-improvement, emergence measurement) |
 
-**All tasks complete — 951 tests passing.**
+**All tasks complete — 1216 tests passing.**
 
 See [ROADMAP.md](ROADMAP.md) for full technical details.
 
