@@ -2193,6 +2193,17 @@ fn generate_cpu(
         let last_offset = (all_tokens.len() - 1) * vs;
         let last_logits = &logits[last_offset..last_offset + vs];
 
+        // Diagnostic: dump top-5 logits on first step
+        if step == 0 {
+            let mut indexed: Vec<(usize, f32)> = last_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            info!(event = "logits_diagnostic", "Top-5 logits:");
+            for (rank, (id, val)) in indexed.iter().take(5).enumerate() {
+                info!(event = "logit", rank = rank, token_id = id, value = val);
+            }
+            info!(event = "logits_range", min = indexed.last().unwrap().1, max = indexed[0].1, "Logit range");
+        }
+
         // Temperature scaling + sampling
         let next_token = if temperature < 1e-6 {
             // Greedy: argmax
