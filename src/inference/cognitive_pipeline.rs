@@ -19,6 +19,7 @@
 use std::path::PathBuf;
 
 use crate::inference::concept_memory::{ConceptMap, ConceptContent, ConceptSource};
+use crate::inference::episodic_memory::{EpisodicMemory, Episode, EpisodeOutcome, ToolTrace};
 use crate::inference::hull_kv_cache::HullKVCache;
 use crate::inference::llm_computer::{LlmComputer, LlmComputerConfig};
 use crate::inference::mirror_test::MirrorTestRunner;
@@ -68,6 +69,13 @@ pub struct CognitivePipelineConfig {
 
     /// Enable self-correction loop (retry on low quality).
     pub self_correction_enabled: bool,
+
+    /// Enable episodic memory (event-based experience storage).
+    pub episodic_memory_enabled: bool,
+    /// Path to persist episodic memory.
+    pub episodic_memory_path: Option<PathBuf>,
+    /// Episodic memory configuration.
+    pub episodic_config: Option<crate::inference::episodic_memory::EpisodicMemoryConfig>,
 }
 
 impl Default for CognitivePipelineConfig {
@@ -88,6 +96,9 @@ impl Default for CognitivePipelineConfig {
             mirror_max_retries: 2,
             wasm_sandbox_enabled: false,
             self_correction_enabled: false,
+            episodic_memory_enabled: false,
+            episodic_memory_path: None,
+            episodic_config: None,
         }
     }
 }
@@ -109,6 +120,8 @@ pub struct CognitivePipeline {
     mirror_runner: Option<MirrorTestRunner>,
     /// WASM runtime — sandboxed tool execution.
     wasm_runtime: Option<WasmRuntime>,
+    /// Episodic memory — event-based experience storage.
+    episodic_memory: Option<EpisodicMemory>,
     /// Tool registry — augmented with cognitive tools.
     tool_registry: ToolRegistry,
 }
@@ -132,6 +145,10 @@ pub struct CognitiveGenerationResult {
     pub retries: usize,
     /// Whether KV cache was persisted.
     pub kv_persisted: bool,
+    /// Number of episodes stored.
+    pub episodes_stored: usize,
+    /// Number of relevant episodes retrieved before generation.
+    pub episodes_retrieved: usize,
 }
 
 impl CognitivePipeline {
@@ -215,6 +232,31 @@ impl CognitivePipeline {
             None
         };
 
+        // Create episodic memory
+        let episodic_memory = if config.episodic_memory_enabled {
+            let epi_config = config.episodic_config.clone().unwrap_or_default();
+            if let Some(ref path) = config.episodic_memory_path {
+                if path.exists() {
+                    match EpisodicMemory::load(path) {
+                        Ok(m) => {
+                            tracing::info!(event = "episodic_loaded", "Loaded {} episodes from {}", m.len(), path.display());
+                            Some(m)
+                        }
+                        Err(e) => {
+                            tracing::warn!(event = "episodic_load_error", "Failed to load episodes: {}, starting fresh", e);
+                            Some(EpisodicMemory::new(epi_config))
+                        }
+                    }
+                } else {
+                    Some(EpisodicMemory::new(epi_config))
+                }
+            } else {
+                Some(EpisodicMemory::new(epi_config))
+            }
+        } else {
+            None
+        };
+
         // Build augmented tool registry
         let mut tool_registry = ToolRegistry::new(ToolSearchConfig::default());
 
@@ -249,6 +291,7 @@ impl CognitivePipeline {
             llm_computer,
             mirror_runner,
             wasm_runtime,
+            episodic_memory,
             tool_registry,
         }
     }
@@ -553,6 +596,14 @@ impl CognitivePipeline {
             tracing::info!(event = "hull_kv_saved", "Saved Hull-KV ({} points) to {}", kv.len(), path.display());
         }
 
+        if let (Some(ref mem), Some(ref path)) = (&self.episodic_memory, &self.config.episodic_memory_path) {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            mem.save(path)?;
+            tracing::info!(event = "episodes_saved", "Saved {} episodes to {}", mem.len(), path.display());
+        }
+
         Ok(())
     }
 
@@ -591,6 +642,16 @@ impl CognitivePipeline {
         self.hull_kv.as_mut()
     }
 
+    /// Access the episodic memory.
+    pub fn episodic_memory(&self) -> Option<&EpisodicMemory> {
+        self.episodic_memory.as_ref()
+    }
+
+    /// Access the episodic memory mutably.
+    pub fn episodic_memory_mut(&mut self) -> Option<&mut EpisodicMemory> {
+        self.episodic_memory.as_mut()
+    }
+
     /// Get the configuration.
     pub fn config(&self) -> &CognitivePipelineConfig {
         &self.config
@@ -616,8 +677,41 @@ impl CognitivePipeline {
         // Step 1: Augment with concepts
         let (augmented_prompt, concepts_retrieved) = self.augment_with_concepts(prompt);
 
+        // Step 1b: Retrieve relevant episodes
+        let mut episodes_retrieved = 0;
+        let mut episode_context = String::new();
+        if let Some(ref mem) = self.episodic_memory {
+            let embedding = prompt_to_embedding(prompt, self.config.concepts_embedding_dim);
+            let episodes = mem.retrieve(&embedding, 3);
+            episodes_retrieved = episodes.len();
+            if !episodes.is_empty() {
+                episode_context.push_str("\n[Relevant past experiences]\n");
+                for re in &episodes {
+                    let outcome_str = match re.episode.outcome {
+                        EpisodeOutcome::Success => "✓",
+                        EpisodeOutcome::PartialSuccess => "~",
+                        EpisodeOutcome::Failure => "✗",
+                    };
+                    episode_context.push_str(&format!(
+                        "- {} [{}] quality={:.2}: {}\n",
+                        outcome_str,
+                        re.episode.prompt.chars().take(80).collect::<String>(),
+                        re.episode.quality_score,
+                        re.episode.output.chars().take(100).collect::<String>(),
+                    ));
+                }
+                episode_context.push_str("[/Relevant past experiences]\n");
+            }
+        }
+
+        let full_prompt = if episode_context.is_empty() {
+            augmented_prompt
+        } else {
+            format!("{}{}", episode_context, augmented_prompt)
+        };
+
         // Step 2: Generate
-        let output = generate_fn(&augmented_prompt);
+        let output = generate_fn(&full_prompt);
 
         // Step 3: Check for tool calls
         let mut tool_called = false;
@@ -625,6 +719,7 @@ impl CognitivePipeline {
         let mut final_output = output.clone();
         let mut mirror_quality = None;
         let mut retries = 0;
+        let mut tool_traces: Vec<ToolTrace> = Vec::new();
 
         if let Some(start) = output.find("[tool_call]") {
             let content_start = start + "[tool_call]".len();
@@ -646,12 +741,26 @@ impl CognitivePipeline {
             // Execute tool
             let result = self.execute_tool(&name, &args);
 
+            tool_traces.push(ToolTrace {
+                tool_name: name.clone(),
+                args: args.clone(),
+                output: result.output.clone(),
+                success: result.success,
+                step: 0,
+            });
+
             // Step 4: Self-evaluate with retry
             if self.config.self_correction_enabled && result.mirror_quality.unwrap_or(1.0) < self.config.mirror_quality_threshold {
-                for _ in 0..self.config.mirror_max_retries {
+                for retry_idx in 0..self.config.mirror_max_retries {
                     retries += 1;
-                    // Re-execute (in practice, the model would generate different params)
                     let retry_result = self.execute_tool(&name, &args);
+                    tool_traces.push(ToolTrace {
+                        tool_name: name.clone(),
+                        args: args.clone(),
+                        output: retry_result.output.clone(),
+                        success: retry_result.success,
+                        step: retry_idx + 1,
+                    });
                     if retry_result.mirror_quality.unwrap_or(1.0) >= self.config.mirror_quality_threshold {
                         final_output = format!("{}\n\nTool result: {}", output, retry_result.output);
                         mirror_quality = retry_result.mirror_quality;
@@ -686,7 +795,52 @@ impl CognitivePipeline {
             }
         }
 
-        // Step 6: Persist
+        // Step 6: Store episode
+        let mut episodes_stored = 0;
+        if let Some(ref mut mem) = self.episodic_memory {
+            let embedding = prompt_to_embedding(prompt, self.config.concepts_embedding_dim);
+            let quality = mirror_quality.unwrap_or(0.5);
+            let outcome = if quality >= 0.7 {
+                EpisodeOutcome::Success
+            } else if quality >= 0.4 {
+                EpisodeOutcome::PartialSuccess
+            } else {
+                EpisodeOutcome::Failure
+            };
+
+            let mut episode = Episode {
+                id: 0, // Auto-assigned by store
+                context_embedding: embedding,
+                prompt: prompt.to_string(),
+                tools_used: tool_traces,
+                plan_description: None,
+                output: final_output.chars().take(500).collect(),
+                outcome,
+                quality_score: quality,
+                logit_entropy: 0.0, // Would be filled by actual model
+                confidence: quality,
+                importance: 0.0, // Auto-computed by store
+                timestamp: 0, // Auto-assigned by store
+                tags: vec!["auto".into()],
+                compressed_from: vec![],
+                consolidated: false,
+            };
+            episode.compute_importance();
+
+            if mem.store(episode).is_some() {
+                episodes_stored = 1;
+            }
+
+            // Auto-compress if near capacity
+            if mem.should_compress() {
+                let compressed = mem.compress();
+                if compressed > 0 {
+                    tracing::info!(event = "episodes_auto_compressed", count = compressed, "Auto-compressed episodes");
+                }
+            }
+        }
+
+        // Step 7: Persist
         let kv_persisted = self.hull_kv.is_some() && self.config.kv_persist_path.is_some();
         if let Err(e) = self.persist() {
             tracing::warn!(event = "pipeline_persist_error", "Failed to persist cognitive state: {}", e);
@@ -701,6 +855,8 @@ impl CognitivePipeline {
             mirror_quality,
             retries,
             kv_persisted,
+            episodes_stored,
+            episodes_retrieved,
         }
     }
 }
@@ -795,6 +951,9 @@ mod tests {
             mirror_max_retries: 1,
             wasm_sandbox_enabled: false,
             self_correction_enabled: false,
+            episodic_memory_enabled: false,
+            episodic_memory_path: None,
+            episodic_config: None,
         };
 
         let pipeline = CognitivePipeline::new(config);
@@ -970,5 +1129,45 @@ mod tests {
         // Different input → different embedding
         let diff: f32 = e1.iter().zip(e3.iter()).map(|(a, b)| (a - b).powi(2)).sum();
         assert!(diff > 0.0, "Different prompts should produce different embeddings");
+    }
+
+    #[test]
+    fn test_episodic_memory_integration() {
+        let dir = std::env::temp_dir().join("ferrisres_epi_pipeline_test");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let config = CognitivePipelineConfig {
+            concepts_enabled: false,
+            episodic_memory_enabled: true,
+            episodic_memory_path: Some(dir.join("episodes.json")),
+            episodic_config: Some(crate::inference::episodic_memory::EpisodicMemoryConfig {
+                embedding_dim: 32,
+                importance_threshold: 0.0, // Accept all episodes for testing
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut pipeline = CognitivePipeline::new(config);
+
+        // First generation — stores episode
+        let result = pipeline.process_generation("test query", |_prompt| {
+            "test output".to_string()
+        });
+        assert_eq!(result.output, "test output");
+        assert_eq!(result.episodes_stored, 1, "Should store 1 episode");
+        assert_eq!(result.episodes_retrieved, 0, "First generation has no past episodes");
+
+        // Second generation — should retrieve the episode
+        let result2 = pipeline.process_generation("test query", |_prompt| {
+            "test output 2".to_string()
+        });
+        assert_eq!(result2.episodes_retrieved, 1, "Should retrieve past episode");
+
+        // Verify persistence
+        pipeline.persist().unwrap();
+        assert!(dir.join("episodes.json").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

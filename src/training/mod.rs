@@ -6,8 +6,10 @@ pub mod lora;
 pub mod gradient_accum;
 pub mod partial_backprop;
 pub mod qlora;
+pub mod tool_triggered_lora;
 
 pub use optimizer::{SgdOptimizer, AdamOptimizer, CrossEntropyLoss};
+pub use tool_triggered_lora::{ToolTriggeredLora, ToolTriggeredLoraConfig, StackedAdapter, FisherDiagonal, LearningEvent, ToolTriggeredLoraStats};
 pub use checkpointing::CheckpointStore;
 pub use cpu_offload::CpuGradientBuffer;
 pub use async_offload::AsyncGradientOffload;
