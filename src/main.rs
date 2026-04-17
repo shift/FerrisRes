@@ -527,81 +527,49 @@ async fn cmd_infer(
         }
     }
 
-    let compute = WgpuCompute::new().await?;
-    let _capability = compute.detect_capability();
-
-
-    let device = Arc::new(compute.device().clone());
-    let queue = Arc::new(compute.queue().clone());
-
-    // Apply chat template if specified
-    let formatted_prompt = if let Some(ref template_name) = template {
-        match ferrisres::TemplateFormat::from_name(template_name) {
-            Some(fmt) => {
-                let registry = ferrisres::PromptTemplateRegistry::new(fmt);
-                let result = registry.apply_single(&prompt);
-                info!(event = "applied_template_chars_chars", "Applied {} template: {} chars → {} chars", template_name, prompt.len(), result.len());
-                result
-            }
-            None => {
-                info!(event = "unknown_template_using_raw_prompt", "Unknown template '{}', using raw prompt", template_name);
-                prompt.clone()
-            }
-        }
-    } else {
-        prompt.clone()
-    };
-
-    // Select tokenizer based on whether we're loading a real model
-    let (tokens, vocab_size) = if let Some(ref path) = model_path {
-        // Loading a real model
-        info!(event = "loading_model", path = %path, format = %model_format, config = %config_name, "Loading model for inference");
-
-        if let Some(ref tok_path) = tokenizer_path {
-            match ferrisres::model::tokenizer::HfTokenizer::from_tokenizer_json(std::path::Path::new(tok_path)) {
-                Ok(hf_tok) => {
-                    info!(event = "tokenizer_loaded", vocab_size = hf_tok.vocab_size(), "Loaded HfTokenizer");
-                    let tokens = hf_tok.encode(&formatted_prompt);
-                    (tokens, hf_tok.vocab_size())
-                }
-                Err(e) => {
-                    warn!(event = "tokenizer_load_error", "Failed to load tokenizer: {}. Falling back.", e);
-                    let tok = SimpleTokenizer::new();
-                    let tokens = tok.encode(&formatted_prompt);
-                    (tokens, tok.vocab_size())
-                }
-            }
-        } else {
-            info!(event = "using_simple_tokenizer", "No --tokenizer provided, using SimpleTokenizer");
-            let tok = SimpleTokenizer::new();
-            let tokens = tok.encode(&formatted_prompt);
-            (tokens, tok.vocab_size())
-        }
-    } else {
-        // Skeleton model
-        let tok = SimpleTokenizer::new();
-        let tokens = tok.encode(&formatted_prompt);
-        (tokens, tok.vocab_size())
-    };
-
-    let model_config = if model_path.is_some() {
-        // Derive BlockAttnResConfig from the model config preset
-        let gemma_config = resolve_model_config(&config_name)?;
-        gemma_config.to_block_attnres_config()
-    } else {
-        // Skeleton model from CLI args
-        let c = BlockAttnResConfig::new(hidden_dim);
-        BlockAttnResConfig { num_blocks, block_size, ..c }
-    };
-
     // ========================================================================
     // CPU inference path: load real model from GGUF/safetensors
+    // Skip GPU init entirely when using --model-path for CPU inference.
     // ========================================================================
     if let Some(ref path) = model_path {
         info!(event = "cpu_inference_path", "Loading model from {} for CPU inference", path);
 
         let gemma_config = resolve_model_config(&config_name)?;
         let model_path = std::path::Path::new(path);
+
+        // Tokenize
+        let formatted_prompt = if let Some(ref template_name) = template {
+            match ferrisres::TemplateFormat::from_name(template_name) {
+                Some(fmt) => {
+                    let registry = ferrisres::PromptTemplateRegistry::new(fmt);
+                    let result = registry.apply_single(&prompt);
+                    info!(event = "applied_template", "Applied {} template: {} chars → {} chars", template_name, prompt.len(), result.len());
+                    result
+                }
+                None => {
+                    info!(event = "unknown_template", "Unknown template '{}', using raw prompt", template_name);
+                    prompt.clone()
+                }
+            }
+        } else {
+            prompt.clone()
+        };
+
+        let tokens = if let Some(ref tok_path) = tokenizer_path {
+            match ferrisres::model::tokenizer::HfTokenizer::from_tokenizer_json(std::path::Path::new(tok_path)) {
+                Ok(hf_tok) => {
+                    info!(event = "tokenizer_loaded", vocab_size = hf_tok.vocab_size(), "Loaded HfTokenizer");
+                    hf_tok.encode(&formatted_prompt)
+                }
+                Err(e) => {
+                    warn!(event = "tokenizer_fallback", "Failed to load tokenizer: {}", e);
+                    SimpleTokenizer::new().encode(&formatted_prompt)
+                }
+            }
+        } else {
+            info!(event = "using_simple_tokenizer", "No --tokenizer provided, using SimpleTokenizer");
+            SimpleTokenizer::new().encode(&formatted_prompt)
+        };
 
         let loaded_model = match model_format.as_str() {
             "gguf" => {
@@ -648,6 +616,41 @@ async fn cmd_infer(
 
     // ========================================================================
     // GPU skeleton inference path (original)
+    // Only reached when --model-path is NOT provided.
+    // ========================================================================
+
+    let compute = WgpuCompute::new().await?;
+    let _capability = compute.detect_capability();
+
+    let device = Arc::new(compute.device().clone());
+    let queue = Arc::new(compute.queue().clone());
+
+    // Apply chat template if specified
+    let formatted_prompt = if let Some(ref template_name) = template {
+        match ferrisres::TemplateFormat::from_name(template_name) {
+            Some(fmt) => {
+                let registry = ferrisres::PromptTemplateRegistry::new(fmt);
+                let result = registry.apply_single(&prompt);
+                info!(event = "applied_template", "Applied {} template", template_name);
+                result
+            }
+            None => {
+                info!(event = "unknown_template", "Unknown template '{}', using raw prompt", template_name);
+                prompt.clone()
+            }
+        }
+    } else {
+        prompt.clone()
+    };
+
+    let tok = SimpleTokenizer::new();
+    let tokens = tok.encode(&formatted_prompt);
+    let vocab_size = tok.vocab_size();
+
+    let model_config = {
+        let c = BlockAttnResConfig::new(hidden_dim);
+        BlockAttnResConfig { num_blocks, block_size, ..c }
+    };
     // ========================================================================
     let model = BlockAttnResModel::new(Arc::clone(&device), Arc::clone(&queue), model_config.clone(), vocab_size)?;
 

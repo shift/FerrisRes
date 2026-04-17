@@ -935,7 +935,7 @@ impl GgufFile {
 
     /// Map GGUF tensor names to standard FerrisRes names.
     pub fn standard_name_map(&self) -> HashMap<String, String> {
-        let arch = self.architecture();
+        let _arch = self.architecture();
         let mut map = HashMap::new();
 
         let n_layers = self.infer_num_layers();
@@ -955,15 +955,14 @@ impl GgufFile {
             map.insert(format!("{}attn_output.weight", prefix), format!("layers.{}.out_proj.weight", i));
             map.insert(format!("{}ffn_norm.weight", prefix), format!("layers.{}.ff_norm.weight", i));
 
-            // FFN: varies by architecture
-            if arch == "llama" || arch == "mistral" {
-                map.insert(format!("{}ffn_gate.weight", prefix), format!("layers.{}.ff_gate.weight", i));
-                map.insert(format!("{}ffn_up.weight", prefix), format!("layers.{}.ff_up.weight", i));
-                map.insert(format!("{}ffn_down.weight", prefix), format!("layers.{}.ff_down.weight", i));
-            } else {
-                map.insert(format!("{}ffn_up.weight", prefix), format!("layers.{}.ff_up.weight", i));
-                map.insert(format!("{}ffn_down.weight", prefix), format!("layers.{}.ff_down.weight", i));
-            }
+            // FFN: gate is used by most modern architectures (GeGLU, SwiGLU)
+            map.insert(format!("{}ffn_gate.weight", prefix), format!("layers.{}.ff_gate.weight", i));
+            map.insert(format!("{}ffn_up.weight", prefix), format!("layers.{}.ff_up.weight", i));
+            map.insert(format!("{}ffn_down.weight", prefix), format!("layers.{}.ff_down.weight", i));
+
+            // Gemma 4 extras
+            map.insert(format!("{}post_attention_norm.weight", prefix), format!("layers.{}.post_attn_norm.weight", i));
+            map.insert(format!("{}post_ffw_norm.weight", prefix), format!("layers.{}.post_ff_norm.weight", i));
         }
 
         map

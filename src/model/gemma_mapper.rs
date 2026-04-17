@@ -1338,15 +1338,25 @@ pub struct MappedGemma4Model {
 impl MappedGemma4Model {
     /// Load from a mmap'd safetensors file. Only one tensor is in RAM at a time,
     /// making this suitable for large models that don't fit in memory.
+    /// Auto-detects naming convention: checks for `model.language_model.embed_tokens.weight`
+    /// (multimodal/Gemma 4 IT) vs `model.embed_tokens.weight` (standard HuggingFace).
     pub fn from_mmap(
         config: Gemma4Config,
         mmaped: &crate::model::safetensors::MmapedSafetensors,
     ) -> Result<Self, String> {
-        let get = |name: &str| -> Option<Vec<f32>> {
-            mmaped.get_tensor_f32(name).ok()
-        };
-
-        Self::build_from_getter(config, get)
+        // Probe for multimodal naming convention
+        let is_mm = mmaped.get_tensor_f32(Gemma4MmTensorNames::embed_tokens()).is_ok();
+        if is_mm {
+            let get = |name: &str| -> Option<Vec<f32>> {
+                mmaped.get_tensor_f32(name).ok()
+            };
+            Self::build_from_getter_mm(config, get)
+        } else {
+            let get = |name: &str| -> Option<Vec<f32>> {
+                mmaped.get_tensor_f32(name).ok()
+            };
+            Self::build_from_getter(config, get)
+        }
     }
 
     /// Load from a mmap'd safetensors file using multimodal naming convention
