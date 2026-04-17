@@ -2296,8 +2296,10 @@ impl Gemma4Teacher {
                 for h in hidden.iter_mut() { *h *= ls; }
             }
 
-            // Diagnostic: hidden state stats after each layer (first token only, first 5 values)
+            // Diagnostic: hidden state stats after each layer
+            // Show first token AND last token to detect if generation is changing
             if layer_idx <= 1 || layer_idx == config.num_layers - 1 {
+                // First token stats
                 let norm: f32 = hidden.iter().take(hd).map(|x| x * x).sum::<f32>().sqrt();
                 let first5: Vec<f32> = hidden.iter().take(5).copied().collect();
                 tracing::info!(
@@ -2306,8 +2308,22 @@ impl Gemma4Teacher {
                     ls = ls,
                     l2_norm = norm,
                     first5 = ?first5,
-                    "Hidden state after layer"
+                    "Hidden state after layer (token 0)"
                 );
+                // Last token stats
+                if seq > 1 {
+                    let last_off = (seq - 1) * hd;
+                    let last_norm: f32 = hidden[last_off..last_off+hd].iter().map(|x| x * x).sum::<f32>().sqrt();
+                    let last5: Vec<f32> = hidden[last_off..last_off+5].to_vec();
+                    tracing::info!(
+                        event = "hidden_stats_last",
+                        layer = layer_idx,
+                        pos = seq - 1,
+                        l2_norm = last_norm,
+                        first5 = ?last5,
+                        "Hidden state after layer (last token)"
+                    );
+                }
             }
         }
 
