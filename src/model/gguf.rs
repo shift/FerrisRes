@@ -972,12 +972,19 @@ impl GgufFile {
             map.insert(format!("{}attn_k_norm.weight", prefix), format!("layers.{}.k_norm.weight", i));
 
             // Gemma 4 PLE (Per-Layer Embeddings)
+            // Actual GGUF names from unsloth conversion: inp_gate, proj, post_norm
+            map.insert(format!("{}inp_gate.weight", prefix), format!("model.layers.{}.per_layer_input_gate.weight", i));
+            map.insert(format!("{}proj.weight", prefix), format!("model.layers.{}.per_layer_projection.weight", i));
+            map.insert(format!("{}post_norm.weight", prefix), format!("model.layers.{}.post_per_layer_input_norm.weight", i));
+            // Also map the HuggingFace-style names in case other converters use them
             map.insert(format!("{}per_layer_input_gate.weight", prefix), format!("model.layers.{}.per_layer_input_gate.weight", i));
             map.insert(format!("{}per_layer_projection.weight", prefix), format!("model.layers.{}.per_layer_projection.weight", i));
             map.insert(format!("{}post_per_layer_input_norm.weight", prefix), format!("model.layers.{}.post_per_layer_input_norm.weight", i));
+            // Layer scalar / output scale
+            map.insert(format!("{}layer_output_scale.weight", prefix), format!("model.layers.{}.layer_scalar", i));
         }
 
-        // PLE embedding table
+        // PLE embedding table (not present in GGUF — would need token_embd_per_layer.weight)
         map.insert("token_embd_per_layer.weight".into(), "model.language_model.embed_tokens_per_layer.weight".into());
 
         map

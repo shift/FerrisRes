@@ -4742,6 +4742,7 @@ impl MappedGemma4Model {
                 .or_else(|| get(&format!("layers.{}.attn_norm.weight", layer_idx)))
                 .ok_or_else(|| format!("Missing input_norm for layer {}", layer_idx))?;
             let pnorm = get(&format!("model.layers.{}.post_attention_layernorm.weight", layer_idx))
+                .or_else(|| get(&format!("layers.{}.post_attn_norm.weight", layer_idx)))
                 .or_else(|| get(&format!("layers.{}.ff_norm.weight", layer_idx)))
                 .ok_or_else(|| format!("Missing post_attn_norm for layer {}", layer_idx))?;
 
