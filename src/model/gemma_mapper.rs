@@ -1906,6 +1906,11 @@ impl Gemma4Teacher {
         let scale = (hd as f32).sqrt();
         for h in hidden.iter_mut() { *h *= scale; }
 
+        // Diagnostic: embedding output
+        let emb_norm: f32 = hidden.iter().take(hd).map(|x| x * x).sum::<f32>().sqrt();
+        let emb_first5: Vec<f32> = hidden.iter().take(5).copied().collect();
+        tracing::info!(event = "embed_diag", l2 = emb_norm, first5 = ?emb_first5, "After embedding + scaling");
+
         // 2. Per-layer transformer (Gemma 4 architecture)
         //    residual = hidden
         //    hidden = input_layernorm(hidden)
@@ -1984,6 +1989,20 @@ impl Gemma4Teacher {
             let ls = layer.layer_scalar;
             if ls != 1.0 {
                 for h in hidden.iter_mut() { *h *= ls; }
+            }
+
+            // Diagnostic: hidden state stats after each layer (first token only, first 5 values)
+            if layer_idx <= 1 || layer_idx == config.num_layers - 1 {
+                let norm: f32 = hidden.iter().take(hd).map(|x| x * x).sum::<f32>().sqrt();
+                let first5: Vec<f32> = hidden.iter().take(5).copied().collect();
+                tracing::info!(
+                    event = "hidden_stats",
+                    layer = layer_idx,
+                    ls = ls,
+                    l2_norm = norm,
+                    first5 = ?first5,
+                    "Hidden state after layer"
+                );
             }
         }
 
