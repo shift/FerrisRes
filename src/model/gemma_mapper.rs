@@ -2438,6 +2438,13 @@ impl Gemma4Teacher {
         }
 
         // 3. Final RMSNorm
+        // Diagnostic: check final_norm weights
+        {
+            let fn5: Vec<f32> = self.model.final_norm.iter().take(5).copied().collect();
+            let fn_max: f32 = self.model.final_norm.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let fn_min: f32 = self.model.final_norm.iter().cloned().fold(f32::INFINITY, f32::min);
+            tracing::info!(event = "final_norm_weights", first5 = ?fn5, min = fn_min, max = fn_max, "Final norm weights");
+        }
         hidden = rms_norm(&hidden, &self.model.final_norm, hd, 1e-6);
 
         // Diagnostic: hidden state at last position before logits
