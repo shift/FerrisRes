@@ -457,7 +457,14 @@ impl HfTokenizer {
                 tracing::warn!(event = "tokenizer_encode_error", "Encoding failed: {}, falling back to empty", e);
                 self.inner.encode("", false).unwrap()
             });
-        encoding.get_ids().to_vec()
+        let mut ids = encoding.get_ids().to_vec();
+        // Add BOS if the tokenizer doesn't add it automatically
+        if let Some(bos) = self.bos_id {
+            if ids.first().copied() != Some(bos) {
+                ids.insert(0, bos);
+            }
+        }
+        ids
     }
 
     /// Encode text → token IDs without BOS/EOS wrapping (passthrough to crate).
