@@ -2347,7 +2347,7 @@ impl Gemma4Teacher {
             //   per_layer_projection = model_proj(hidden) * scale → reshape → norm
             //   per_layer_input = (per_layer_projection + token_embedding) * 1/sqrt(2)
             //   In each layer:
-            //     gate = sigmoid(hidden @ gate_w)           // hidden→ple_dim
+            //     gate = gelu(hidden @ gate_w)           // hidden→ple_dim
             //     gated = gate * per_layer_input             // element-wise in ple_dim
             //     out = gated @ proj_w                      // ple_dim→hidden
             //     out = post_norm(out)
@@ -2387,15 +2387,16 @@ impl Gemma4Teacher {
                         // per_layer_input_scale = 1/sqrt(2) only needed when combining both components
                         // With just context projection, ple_input is already correct
 
-                        // 2. Gate: hidden → ple_dim with sigmoid
+                        // 2. Gate: hidden → ple_dim with GELU (gelu_pytorch_tanh)
+                        //    HuggingFace uses act_fn = gelu_pytorch_tanh, NOT sigmoid
                         //    gate_w is [hd, ple_dim], so matmul(hidden, gate) = [seq, ple_dim]
                         let gate_out = matmul(&hidden, gate_w, seq, hd, ple_dim);
-                        let gate_sig: Vec<f32> = gate_out.iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect();
+                        let gate_gelu: Vec<f32> = gate_out.iter().map(|&x| gelu_tanh(x)).collect();
 
                         // 3. Gated input: gate * per_layer_input (element-wise in ple_dim)
                         let mut gated_input = vec![0.0f32; seq * ple_dim];
                         for i in 0..seq * ple_dim {
-                            gated_input[i] = gate_sig[i] * ple_input[i];
+                            gated_input[i] = gate_gelu[i] * ple_input[i];
                         }
 
                         // 4. Project back: [seq, ple_dim] → [seq, hd]
