@@ -1981,18 +1981,19 @@ impl MappedGemma4Model {
                 .unwrap_or(1.0f32);
 
             // Per-layer embeddings (PLE)
-            // Gate: raw [ple_dim, hd] — already in correct layout [k, n] for matmul(ple, gate)
-            // Do NOT transpose.
+            // Gate: raw [ple_dim, hd] → transpose to [hd, ple_dim] for matmul(hidden, gate)
+            // HuggingFace: nn.Linear(hidden_size=hd, ple_dim) stores weight as [ple_dim, hd]
             let per_layer_input_gate = if ple_dim > 0 {
                 get(&format!("model.language_model.layers.{}.per_layer_input_gate.weight", layer_idx))
                     .map(|w| {
                         tracing::info!(event = "ple_gate_shape", layer = layer_idx, raw_len = w.len(), ple_dim, hd, "PLE gate weight");
-                        w // already [ple_dim, hd]
+                        transpose(&w, ple_dim, hd) // [ple_dim, hd] → [hd, ple_dim]
                     })
             } else {
                 None
             };
-            // Projection: raw [hd, ple_dim] → transpose to [ple_dim, hd] for matmul(ple, proj)
+            // Projection: raw [hd, ple_dim] → transpose to [ple_dim, hd] for matmul(gated, proj)
+            // HuggingFace: nn.Linear(ple_dim, hidden_size=hd) stores weight as [hd, ple_dim]
             let per_layer_projection = if ple_dim > 0 {
                 get(&format!("model.language_model.layers.{}.per_layer_projection.weight", layer_idx))
                     .map(|w| {
@@ -2059,6 +2060,27 @@ pub fn per_head_rms_norm(input: &[f32], weight: &[f32], seq_len: usize, num_head
             for d in 0..head_dim {
                 let g = weight.get(d).copied().unwrap_or(1.0);
                 output[base + d] = input[base + d] * inv_rms * g;
+            }
+        }
+    }
+    output
+}
+
+/// Per-head RMSNorm without learned scale (for V normalization in Gemma 4).
+/// Just normalizes: x / sqrt(mean(x^2) + eps)
+pub fn per_head_rms_norm_no_scale(input: &[f32], seq_len: usize, num_heads: usize, head_dim: usize) -> Vec<f32> {
+    let total_dim = num_heads * head_dim;
+    let mut output = vec![0.0f32; seq_len * total_dim];
+    for t in 0..seq_len {
+        for h in 0..num_heads {
+            let base = t * total_dim + h * head_dim;
+            let mut sum_sq = 0.0f32;
+            for d in 0..head_dim {
+                sum_sq += input[base + d] * input[base + d];
+            }
+            let inv_rms = 1.0 / (sum_sq / head_dim as f32 + 1e-6).sqrt();
+            for d in 0..head_dim {
+                output[base + d] = input[base + d] * inv_rms;
             }
         }
     }
@@ -2258,9 +2280,15 @@ impl Gemma4Teacher {
             }
 
             // Per-Layer Embeddings (PLE) — Gemma 4 critical architecture component.
-            // Architecture: project hidden state to per-layer PLE space via model-level
-            // projection, then gate and project back per-layer.
-            // Flow: hidden[seq,hd] → model_proj[hd, 35*256] → slice → norm → gate*proj → add
+            // HuggingFace implementation:
+            //   per_layer_projection = model_proj(hidden) * scale → reshape → norm
+            //   per_layer_input = (per_layer_projection + token_embedding) * 1/sqrt(2)
+            //   In each layer:
+            //     gate = sigmoid(hidden @ gate_w)           // hidden→ple_dim
+            //     gated = gate * per_layer_input             // element-wise in ple_dim
+            //     out = gated @ proj_w                      // ple_dim→hidden
+            //     out = post_norm(out)
+            //     hidden += out
             if let (Some(ref model_proj), Some(ref proj_norm)) =
                 (&self.model.ple_model_projection, &self.model.ple_projection_norm)
             {
@@ -2272,9 +2300,13 @@ impl Gemma4Teacher {
                         let ple_total = ple_dim * config.num_layers;
                         let layer_offset = layer_idx * ple_dim;
 
-                        // Project hidden state to PLE space: [seq, hd] @ [hd, ple_total]
-                        // model_proj is already transposed to [hd, ple_total]
+                        // 1. Context projection: hidden[seq, hd] → [seq, ple_total] → slice → norm
+                        //    model_proj is [hd, ple_total], scale by 1/sqrt(hd)
+                        let model_proj_scale = (hd as f32).sqrt().recip();
                         let ple_all = matmul(&hidden, model_proj, seq, hd, ple_total);
+
+                        // Apply model projection scale
+                        let ple_all_scaled: Vec<f32> = ple_all.iter().map(|&x| x * model_proj_scale).collect();
 
                         // Extract this layer's PLE slice: [seq, ple_dim]
                         let mut ple_slice = vec![0.0f32; seq * ple_dim];
@@ -2282,30 +2314,33 @@ impl Gemma4Teacher {
                             let src = t * ple_total + layer_offset;
                             let dst = t * ple_dim;
                             for d in 0..ple_dim {
-                                ple_slice[dst + d] = ple_all[src + d];
+                                ple_slice[dst + d] = ple_all_scaled[src + d];
                             }
                         }
 
-                        // Normalize the PLE slice with model-level norm
-                        let ple_normed = rms_norm(&ple_slice, proj_norm, ple_dim, 1e-6);
+                        // Normalize with model-level norm
+                        let ple_input = rms_norm(&ple_slice, proj_norm, ple_dim, 1e-6);
+                        // No token_embedding available (safetensors lacks embed_tokens_per_layer)
+                        // per_layer_input_scale = 1/sqrt(2) only needed when combining both components
+                        // With just context projection, ple_input is already correct
 
-                        // Gate: PLE slice → hidden dim (with sigmoid)
-                        // gate_w is [ple_dim, hd], so matmul(ple, gate) = [seq, hd]
-                        let gate_out = matmul(&ple_normed, gate_w, seq, ple_dim, hd);
+                        // 2. Gate: hidden → ple_dim with sigmoid
+                        //    gate_w is [hd, ple_dim], so matmul(hidden, gate) = [seq, ple_dim]
+                        let gate_out = matmul(&hidden, gate_w, seq, hd, ple_dim);
                         let gate_sig: Vec<f32> = gate_out.iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect();
 
-                        // Projection: PLE slice → hidden dim
-                        // proj_w is [ple_dim, hd], so matmul(ple, proj) = [seq, hd]
-                        let proj_out = matmul(&ple_normed, proj_w, seq, ple_dim, hd);
-
-                        // Gated projection + post norm
-                        let mut ple_hidden = vec![0.0f32; seq * hd];
-                        for i in 0..seq * hd {
-                            ple_hidden[i] = gate_sig[i] * proj_out[i];
+                        // 3. Gated input: gate * per_layer_input (element-wise in ple_dim)
+                        let mut gated_input = vec![0.0f32; seq * ple_dim];
+                        for i in 0..seq * ple_dim {
+                            gated_input[i] = gate_sig[i] * ple_input[i];
                         }
-                        let ple_final = rms_norm(&ple_hidden, post_norm, hd, 1e-6);
 
-                        // Add to residual
+                        // 4. Project back: [seq, ple_dim] → [seq, hd]
+                        //    proj_w is [ple_dim, hd], so matmul(gated, proj) = [seq, hd]
+                        let proj_out = matmul(&gated_input, proj_w, seq, ple_dim, hd);
+
+                        // 5. Post norm and add residual
+                        let ple_final = rms_norm(&proj_out, post_norm, hd, 1e-6);
                         for i in 0..hidden.len() {
                             hidden[i] += ple_final[i];
                         }
@@ -2386,11 +2421,14 @@ impl Gemma4Teacher {
         // K projection: [seq × hd] × [hd × kv_dim] → [seq × kv_dim]
         let mut k = matmul(input, &attn.k_proj, seq_len, hidden_dim, kv_dim);
         // V projection: [seq × hd] × [hd × kv_dim] → [seq × kv_dim]
-        let v = matmul(input, &attn.v_proj, seq_len, hidden_dim, kv_dim);
+        let v_raw = matmul(input, &attn.v_proj, seq_len, hidden_dim, kv_dim);
 
         // Gemma 4: per-head RMSNorm on Q and K (AFTER projection, BEFORE RoPE)
         q = per_head_rms_norm(&q, &attn.q_norm, seq_len, num_heads, head_dim);
         k = per_head_rms_norm(&k, &attn.k_norm, seq_len, num_kv_heads, head_dim);
+
+        // Gemma 4: per-head RMSNorm on V (no learned scale, just normalization)
+        let v = per_head_rms_norm_no_scale(&v_raw, seq_len, num_kv_heads, head_dim);
 
         // Apply RoPE to Q and K — per-layer theta and partial_rotary_factor
         // For full_attention layers: partial_rotary_factor < 1 means only first
@@ -2407,9 +2445,10 @@ impl Gemma4Teacher {
         let heads_per_kv = num_heads / num_kv_heads;
 
         // Scaled dot-product attention with causal mask
-        // Gemma 4: Q/K are per-head RMSNorm'd (unit scale), so dot product ≈ head_dim.
-        // query_pre_attn_scalar = head_dim → scale = 1/head_dim to keep logits in reasonable range.
-        let scale = 1.0f32 / (head_dim as f32);
+        // Gemma 4: attention scaling = 1.0 (per-head RMSNorm on Q/K normalizes to unit scale)
+        // The config's query_pre_attn_scalar=head_dim is pre-normalization scaling;
+        // after RMSNorm the dot products are O(1) not O(head_dim).
+        let scale = 1.0f32;
         let mut attn_out = vec![0.0f32; seq_len * q_dim];
 
         for h in 0..num_heads {
@@ -4896,7 +4935,7 @@ impl MappedGemma4Model {
                 get(&format!("model.layers.{}.per_layer_input_gate.weight", layer_idx))
                     .map(|w| {
                         tracing::info!(event = "ple_gate_shape", layer = layer_idx, raw_len = w.len(), ple_dim, hd);
-                        w // already [ple_dim, hd]
+                        transpose(&w, ple_dim, hd) // [ple_dim, hd] → [hd, ple_dim]
                     })
             } else { None };
             let per_layer_projection = if ple_dim > 0 {
