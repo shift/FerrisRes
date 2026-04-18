@@ -587,9 +587,9 @@ impl HfTokenizer {
             }
         }
 
-        if let Some(eos) = self.eos_id {
-            result.push(eos);
-        }
+        // Note: Do NOT append EOS during encoding. EOS terminates generation output,
+        // not input prompts. Models like Gemma 4 treat EOS in the input as a signal that
+        // the sequence is complete, which corrupts generation.
 
         result
     }
@@ -661,9 +661,7 @@ impl HfTokenizer {
             let tok = format!("<0x{:02X}>", b);
             result.push(*self.vocab.get(&tok).unwrap_or(&self.unk_id));
         }
-        if let Some(eos) = self.eos_id {
-            result.push(eos);
-        }
+        // No EOS for input encoding
         result
     }
 
@@ -772,12 +770,11 @@ mod hf_tokenizer_tests {
         assert_eq!(tok.eos_id(), Some(2));
 
         let ids = tok.encode("hi");
-        // Should be [BOS, <0x68>, <0x69>, EOS]
-        assert_eq!(ids.len(), 4);
+        // Should be [BOS, <0x68>, <0x69>] (no EOS for input encoding)
+        assert_eq!(ids.len(), 3);
         assert_eq!(ids[0], 1); // BOS
-        assert_eq!(ids[ids.len() - 1], 2); // EOS
 
-        let decoded = tok.decode(&ids[1..ids.len()-1]);
+        let decoded = tok.decode(&ids[1..]);
         assert_eq!(decoded, "hi");
     }
 
