@@ -618,6 +618,9 @@ async fn cmd_infer(
         // Wrap in teacher for forward() access
         let teacher = Gemma4Teacher::new(loaded_model);
 
+        // Diagnostic: show prompt token IDs
+        info!(event = "prompt_tokens", ids = ?tokens, "Prompt token IDs (first 20)");
+
         // Autoregressive generation on CPU
         let gen_tokens = generate_cpu(&teacher, &tokens, max_tokens, temperature as f32, None);
 
