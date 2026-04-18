@@ -442,12 +442,29 @@ impl HfTokenizer {
         }
 
         // Parse merges (priority = position in list)
+        // Handle both formats:
+        //   String format: "a b"
+        //   Array format: ["a", "b"]
         let mut merge_ranks = HashMap::new();
         for (i, merge) in merges_json.as_array().unwrap_or(&vec![]).iter().enumerate() {
-            let merge_str = merge.as_str().unwrap_or("");
-            let parts: Vec<&str> = merge_str.splitn(2, ' ').collect();
-            if parts.len() == 2 {
-                merge_ranks.insert((parts[0].to_string(), parts[1].to_string()), i);
+            let parts: Option<(String, String)> = if let Some(s) = merge.as_str() {
+                // String format: "token_a token_b"
+                let split: Vec<&str> = s.splitn(2, ' ').collect();
+                if split.len() == 2 {
+                    Some((split[0].to_string(), split[1].to_string()))
+                } else { None }
+            } else if let Some(arr) = merge.as_array() {
+                // Array format: ["token_a", "token_b"]
+                if arr.len() == 2 {
+                    let a = arr[0].as_str().unwrap_or("");
+                    let b = arr[1].as_str().unwrap_or("");
+                    if !a.is_empty() && !b.is_empty() {
+                        Some((a.to_string(), b.to_string()))
+                    } else { None }
+                } else { None }
+            } else { None };
+            if let Some((a, b)) = parts {
+                merge_ranks.insert((a, b), i);
             }
         }
 
