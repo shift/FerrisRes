@@ -2388,8 +2388,30 @@ impl Gemma4Teacher {
         // 3. Final RMSNorm
         hidden = rms_norm(&hidden, &self.model.final_norm, hd, 1e-6);
 
+        // Diagnostic: hidden state at last position before logits
+        if seq > 0 {
+            let last_off = (seq - 1) * hd;
+            let last_norm: f32 = hidden[last_off..last_off+hd].iter().map(|x| x * x).sum::<f32>().sqrt();
+            let last5: Vec<f32> = hidden[last_off..last_off+5].to_vec();
+            tracing::info!(event = "final_hidden", l2 = last_norm, first5 = ?last5, "Final hidden state (last pos)");
+        }
+
         // 4. LM head: [seq × hd] × [hd × vs] → [seq × vs]
         let mut logits = matmul(&hidden, &self.model.lm_head, seq, hd, vs);
+
+        // Diagnostic: logit stats at last position
+        if seq > 0 {
+            let last_logits = &logits[(seq-1)*vs..seq*vs];
+            let max_l = last_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let min_l = last_logits.iter().cloned().fold(f32::INFINITY, f32::min);
+            let mean_l: f32 = last_logits.iter().sum::<f32>() / vs as f32;
+            let top5: Vec<(usize, f32)> = {
+                let mut indexed: Vec<(usize, f32)> = last_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                indexed[..5.min(indexed.len())].to_vec()
+            };
+            tracing::info!(event = "logits_raw", min = min_l, max = max_l, mean = mean_l, top5 = ?top5, "Raw logits (last pos, pre-softcap)");
+        }
 
         // 5. Final logit softcapping: logits = tanh(logits / cap) * cap
         if let Some(cap) = config.final_logit_softcapping {
