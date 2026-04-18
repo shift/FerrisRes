@@ -2122,18 +2122,29 @@ pub fn rms_norm(input: &[f32], weight: &[f32], dim: usize, eps: f32) -> Vec<f32>
 }
 
 /// Rotary position embedding (RoPE) for attention.
-/// Rotary position embedding (RoPE) for attention.
+///
+/// Gemma 4 uses two RoPE types:
+/// - `default` (sliding_attention): standard RoPE with freq = 1/theta^(2d/dim)
+/// - `proportional` (full_attention): freq = 1/theta^(2d/head_dim) where only
+///   the first `partial_rotary_factor * head_dim` dimensions get rotation.
+///
+/// The key difference is the exponent denominator:
+/// - default: uses `rotary_dims` (= head_dim for full rotation)
+/// - proportional: always uses `head_dim`, not `rotary_dims`
+///
 /// `partial_rotary_factor` controls what fraction of dimensions get RoPE.
 /// For standard RoPE: partial_rotary_factor=1.0 (all dims).
 /// For Gemma 4 full attention: partial_rotary_factor=0.25 (first 25% of dims).
 pub fn apply_rope(x: &mut [f32], seq_len: usize, num_heads: usize, head_dim: usize, offset: usize, theta: f64, partial_rotary_factor: f32) {
-    let rotary_dims = ((head_dim as f32 * partial_rotary_factor) as usize).next_power_of_two();
+    let rotary_dims = (head_dim as f32 * partial_rotary_factor) as usize;
     let half = rotary_dims / 2;
     for t in 0..seq_len {
         let pos = (t + offset) as f64;
         for h in 0..num_heads {
             for d in 0..half {
-                let freq = 1.0 / theta.powf(d as f64 / half as f64);
+                // Proportional RoPE: exponent uses head_dim as denominator
+                // freq = 1/theta^(2d/head_dim), matching HuggingFace's proportional RoPE
+                let freq = 1.0 / theta.powf((2 * d) as f64 / head_dim as f64);
                 let angle = pos * freq;
                 let cos_a = angle.cos() as f32;
                 let sin_a = angle.sin() as f32;
@@ -2151,14 +2162,14 @@ pub fn apply_rope(x: &mut [f32], seq_len: usize, num_heads: usize, head_dim: usi
 
 /// RoPE for GQA KV heads (fewer heads than Q).
 pub fn apply_rope_gqa(x: &mut [f32], seq_len: usize, num_kv_heads: usize, head_dim: usize, offset: usize, theta: f64, partial_rotary_factor: f32) {
-    let rotary_dims = ((head_dim as f32 * partial_rotary_factor) as usize).next_power_of_two();
+    let rotary_dims = (head_dim as f32 * partial_rotary_factor) as usize;
     let half = rotary_dims / 2;
     let kv_dim = num_kv_heads * head_dim;
     for t in 0..seq_len {
         let pos = (t + offset) as f64;
         for h in 0..num_kv_heads {
             for d in 0..half {
-                let freq = 1.0 / theta.powf(d as f64 / half as f64);
+                let freq = 1.0 / theta.powf((2 * d) as f64 / head_dim as f64);
                 let angle = pos * freq;
                 let cos_a = angle.cos() as f32;
                 let sin_a = angle.sin() as f32;
