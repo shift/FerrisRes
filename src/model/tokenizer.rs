@@ -538,7 +538,7 @@ impl HfTokenizer {
             return self.encode_byte_fallback(text);
         }
 
-        // Pre-tokenize: split on whitespace and punctuation boundaries
+        // Pre-tokenize: split on whitespace boundaries
         let words = self.pre_tokenize(text);
         let mut result = Vec::new();
 
@@ -547,17 +547,43 @@ impl HfTokenizer {
         }
 
         for word in &words {
-            // Start with byte-level representation
-            let mut tokens: Vec<String> = word.bytes()
-                .map(|b| self.byte_to_token(b))
-                .collect();
+            // Start with character-level tokens (not byte-level hex)
+            // This matches SentencePiece-style BPE where merges operate on
+            // actual characters like ['▁', 'W', 'h', 'a', 't'] → '▁What'
+            let mut tokens: Vec<String> = word.chars().map(|c| c.to_string()).collect();
+
+            // Map any characters not in vocab to byte-fallback tokens
+            for tok in tokens.iter_mut() {
+                if !self.vocab.contains_key(tok.as_str()) {
+                    // Try byte-fallback
+                    let bytes = tok.as_bytes();
+                    if bytes.len() == 1 {
+                        let hex = format!("<0x{:02X}>", bytes[0]);
+                        if self.vocab.contains_key(&hex) {
+                            *tok = hex;
+                        }
+                    }
+                    // Multi-byte chars that aren't in vocab → decompose to bytes
+                    // (handled below after initial tokenization)
+                }
+            }
 
             // Iteratively apply BPE merges
             tokens = self.apply_bpe(&tokens);
 
             // Map to IDs
             for token in &tokens {
-                result.push(*self.vocab.get(token).unwrap_or(&self.unk_id));
+                if let Some(&id) = self.vocab.get(token.as_str()) {
+                    result.push(id);
+                } else {
+                    // Final fallback: try byte-level for remaining unknown tokens
+                    for b in token.as_bytes() {
+                        let hex = format!("<0x{:02X}>", b);
+                        if let Some(&id) = self.vocab.get(&hex) {
+                            result.push(id);
+                        }
+                    }
+                }
             }
         }
 
