@@ -30,6 +30,7 @@ memmap2 = "0.9"
 ureq = { version = "2", features = ["json"] }
 matrixmultiply = "0.3"
 regex = "1"
+tokenizers = "0.21"
 
 [dev-dependencies]
 assert_matches = "1"
