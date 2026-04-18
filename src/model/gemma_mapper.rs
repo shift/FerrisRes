@@ -537,6 +537,9 @@ pub struct Gemma4Config {
     pub rope_theta_full: f64,
     /// Partial rotary factor for full attention layers (0.25 = only 25% of dims get RoPE).
     pub partial_rotary_factor_full: f32,
+    /// Number of layers (from the end) that share KV states from earlier layers.
+    /// Gemma 4 E2B: 20 (layers 15-34 share KV from layers 13/14).
+    pub num_kv_shared_layers: usize,
 }
 
 impl Gemma4Config {
@@ -624,6 +627,9 @@ impl Gemma4Config {
             rope_theta_sliding,
             rope_theta_full,
             partial_rotary_factor_full,
+            num_kv_shared_layers: tc.get("num_kv_shared_layers")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize,
         })
     }
 
@@ -683,6 +689,7 @@ impl Gemma4Config {
             rope_theta_sliding: 10000.0,
             rope_theta_full: 1000000.0,
             partial_rotary_factor_full: 0.25,
+            num_kv_shared_layers: 0,
         }
     }
 
@@ -712,6 +719,7 @@ impl Gemma4Config {
             rope_theta_sliding: 10000.0,
             rope_theta_full: 1000000.0,
             partial_rotary_factor_full: 0.25,
+            num_kv_shared_layers: 0,
         }
     }
 
@@ -739,6 +747,7 @@ impl Gemma4Config {
             rope_theta_sliding: 10000.0,
             rope_theta_full: 1000000.0,
             partial_rotary_factor_full: 0.25,
+            num_kv_shared_layers: 0,
         }
     }
 
@@ -766,6 +775,7 @@ impl Gemma4Config {
             rope_theta_sliding: 10000.0,
             rope_theta_full: 1000000.0,
             partial_rotary_factor_full: 0.25,
+            num_kv_shared_layers: 0,
         }
     }
 
@@ -802,6 +812,7 @@ impl Gemma4Config {
             rope_theta_sliding: 10000.0,
             rope_theta_full: 1000000.0,
             partial_rotary_factor_full: 0.25,
+            num_kv_shared_layers: 0,
         }
     }
 
@@ -831,6 +842,7 @@ impl Gemma4Config {
             rope_theta_sliding: 10000.0,
             rope_theta_full: 1000000.0,
             partial_rotary_factor_full: 0.25,
+            num_kv_shared_layers: 0,
         }
     }
 
@@ -856,6 +868,7 @@ impl Gemma4Config {
             rope_theta_sliding: 10000.0,
             rope_theta_full: 1000000.0,
             partial_rotary_factor_full: 0.25,
+            num_kv_shared_layers: 0,
         }
     }
 
@@ -881,6 +894,7 @@ impl Gemma4Config {
             rope_theta_sliding: 10000.0,
             rope_theta_full: 1000000.0,
             partial_rotary_factor_full: 0.25,
+            num_kv_shared_layers: 0,
         }
     }
 
@@ -906,6 +920,7 @@ impl Gemma4Config {
             rope_theta_sliding: 10000.0,
             rope_theta_full: 1000000.0,
             partial_rotary_factor_full: 0.25,
+            num_kv_shared_layers: 0,
         }
     }
 
@@ -931,6 +946,7 @@ impl Gemma4Config {
             rope_theta_sliding: 10000.0,
             rope_theta_full: 1000000.0,
             partial_rotary_factor_full: 0.25,
+            num_kv_shared_layers: 0,
         }
     }
 
@@ -956,6 +972,7 @@ impl Gemma4Config {
             rope_theta_sliding: 10000.0,
             rope_theta_full: 1000000.0,
             partial_rotary_factor_full: 0.25,
+            num_kv_shared_layers: 0,
         }
     }
 
@@ -981,6 +998,7 @@ impl Gemma4Config {
             rope_theta_sliding: 10000.0,
             rope_theta_full: 1000000.0,
             partial_rotary_factor_full: 0.25,
+            num_kv_shared_layers: 0,
         }
     }
 
@@ -2202,6 +2220,11 @@ impl Gemma4Teacher {
         let emb_first5: Vec<f32> = hidden.iter().take(5).copied().collect();
         tracing::info!(event = "embed_diag", l2 = emb_norm, first5 = ?emb_first5, "After embedding + scaling");
 
+        // KV sharing: Gemma 4 layers 15-34 share K/V states from layers 13/14.
+        // We store computed K/V so shared layers can reuse them.
+        let first_shared_layer = config.num_layers.saturating_sub(config.num_kv_shared_layers);
+        let mut shared_kv_states: std::collections::HashMap<usize, (Vec<f32>, Vec<f32>)> = std::collections::HashMap::new();
+
         // 2. Per-layer transformer (Gemma 4 architecture)
         //    residual = hidden
         //    hidden = input_layernorm(hidden)
@@ -2227,12 +2250,41 @@ impl Gemma4Teacher {
             // Input RMSNorm
             let normed = rms_norm(&hidden, &layer.attn.input_norm, hd, 1e-6);
 
-            // GQA Attention (with Q/K norms) — uses per-layer head_dim
-            let attn_out = self.attention_forward(
-                &normed, &layer.attn, nh, config.num_kv_heads, layer_head_dim,
-                layer_q_dim, layer_kv_dim, seq, hd,
-                layer.rope_theta, layer.partial_rotary_factor,
-            );
+            // GQA Attention — with KV sharing for shared layers
+            let attn_out = if layer_idx >= first_shared_layer && first_shared_layer > 0 {
+                // Shared KV layer — look up which layer to share from
+                let kv_source = Self::kv_shared_source_layer(
+                    layer_idx, first_shared_layer, &config.layer_types,
+                );
+                if let Some((shared_k, shared_v)) = shared_kv_states.get(&kv_source) {
+                    self.attention_forward_with_shared_kv(
+                        &normed, &layer.attn, nh, config.num_kv_heads, layer_head_dim,
+                        layer_q_dim, seq, hd,
+                        layer.rope_theta, layer.partial_rotary_factor,
+                        shared_k, shared_v,
+                    )
+                } else {
+                    // Fallback: compute own K/V (shouldn't happen if source layer < first_shared)
+                    tracing::warn!(event = "kv_share_fallback", layer = layer_idx, source = kv_source, "No shared KV found, computing own");
+                    self.attention_forward(
+                        &normed, &layer.attn, nh, config.num_kv_heads, layer_head_dim,
+                        layer_q_dim, layer_kv_dim, seq, hd,
+                        layer.rope_theta, layer.partial_rotary_factor,
+                    )
+                }
+            } else {
+                // Normal layer — compute own K/V and store for potential sharing
+                let (attn_output, kv_k, kv_v) = self.attention_forward_collect_kv(
+                    &normed, &layer.attn, nh, config.num_kv_heads, layer_head_dim,
+                    layer_q_dim, layer_kv_dim, seq, hd,
+                    layer.rope_theta, layer.partial_rotary_factor,
+                );
+                // Store K/V for shared layers to reference
+                if first_shared_layer > 0 {
+                    shared_kv_states.insert(layer_idx, (kv_k, kv_v));
+                }
+                attn_output
+            };
 
             // Post-attention RMSNorm (applied TO attn output, before residual)
             let attn_out_raw_l2 = if layer_idx == 0 {
@@ -2421,6 +2473,140 @@ impl Gemma4Teacher {
         }
 
         logits
+    }
+
+    /// Compute which layer a shared layer gets its KV from.
+    /// Mirrors HuggingFace: kv_shared_layer_index = last non-shared layer of same type.
+    fn kv_shared_source_layer(layer_idx: usize, first_shared: usize, layer_types: &[String]) -> usize {
+        let my_type = layer_types.get(layer_idx).map(|s| s.as_str()).unwrap_or("sliding_attention");
+        let prev_layers = &layer_types[..first_shared];
+        // Find last layer of same type before sharing starts
+        prev_layers.iter().enumerate().rev()
+            .find(|(_, lt)| lt.as_str() == my_type)
+            .map(|(i, _)| i)
+            .unwrap_or(first_shared.saturating_sub(1))
+    }
+
+    /// Attention forward that also returns K/V states for sharing.
+    /// Returns (output, k, v).
+    fn attention_forward_collect_kv(
+        &self,
+        input: &[f32],
+        attn: &Gemma4AttnWeights,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        seq_len: usize,
+        hidden_dim: usize,
+        rope_theta: f64,
+        partial_rotary_factor: f32,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let mut q = matmul(input, &attn.q_proj, seq_len, hidden_dim, q_dim);
+        let mut k = matmul(input, &attn.k_proj, seq_len, hidden_dim, kv_dim);
+        let v_raw = matmul(input, &attn.v_proj, seq_len, hidden_dim, kv_dim);
+
+        q = per_head_rms_norm(&q, &attn.q_norm, seq_len, num_heads, head_dim);
+        k = per_head_rms_norm(&k, &attn.k_norm, seq_len, num_kv_heads, head_dim);
+        let v = per_head_rms_norm_no_scale(&v_raw, seq_len, num_kv_heads, head_dim);
+
+        apply_rope(&mut q, seq_len, num_heads, head_dim, 0, rope_theta, partial_rotary_factor);
+        apply_rope_gqa(&mut k, seq_len, num_kv_heads, head_dim, 0, rope_theta, partial_rotary_factor);
+
+        let heads_per_kv = num_heads / num_kv_heads;
+        let scale = 1.0f32;
+        let mut attn_out = vec![0.0f32; seq_len * q_dim];
+
+        for h in 0..num_heads {
+            let kv_h = h / heads_per_kv;
+            for t in 0..seq_len {
+                let mut max_score = f32::NEG_INFINITY;
+                let mut scores = vec![0.0f32; seq_len];
+                for s in 0..=t {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[t * q_dim + h * head_dim + d]
+                             * k[s * kv_dim + kv_h * head_dim + d];
+                    }
+                    scores[s] = dot * scale;
+                    if scores[s] > max_score { max_score = scores[s]; }
+                }
+                let mut sum_exp = 0.0f32;
+                for s in 0..=t {
+                    scores[s] = (scores[s] - max_score).exp();
+                    sum_exp += scores[s];
+                }
+                for s in 0..=t { scores[s] /= sum_exp; }
+                for d in 0..head_dim {
+                    let mut sum = 0.0f32;
+                    for s in 0..=t {
+                        sum += scores[s] * v[s * kv_dim + kv_h * head_dim + d];
+                    }
+                    attn_out[t * q_dim + h * head_dim + d] = sum;
+                }
+            }
+        }
+
+        (matmul(&attn_out, &attn.o_proj, seq_len, q_dim, hidden_dim), k, v)
+    }
+
+    /// Attention forward with shared K/V states (for KV-shared layers).
+    fn attention_forward_with_shared_kv(
+        &self,
+        input: &[f32],
+        attn: &Gemma4AttnWeights,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        q_dim: usize,
+        seq_len: usize,
+        hidden_dim: usize,
+        rope_theta: f64,
+        partial_rotary_factor: f32,
+        shared_k: &[f32],
+        shared_v: &[f32],
+    ) -> Vec<f32> {
+        let mut q = matmul(input, &attn.q_proj, seq_len, hidden_dim, q_dim);
+        q = per_head_rms_norm(&q, &attn.q_norm, seq_len, num_heads, head_dim);
+        apply_rope(&mut q, seq_len, num_heads, head_dim, 0, rope_theta, partial_rotary_factor);
+
+        let kv_dim = num_kv_heads * head_dim;
+        let heads_per_kv = num_heads / num_kv_heads;
+        let scale = 1.0f32;
+        let mut attn_out = vec![0.0f32; seq_len * q_dim];
+
+        for h in 0..num_heads {
+            let kv_h = h / heads_per_kv;
+            for t in 0..seq_len {
+                let mut max_score = f32::NEG_INFINITY;
+                let mut scores = vec![0.0f32; seq_len];
+                for s in 0..=t {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[t * q_dim + h * head_dim + d]
+                             * shared_k[s * kv_dim + kv_h * head_dim + d];
+                    }
+                    scores[s] = dot * scale;
+                    if scores[s] > max_score { max_score = scores[s]; }
+                }
+                let mut sum_exp = 0.0f32;
+                for s in 0..=t {
+                    scores[s] = (scores[s] - max_score).exp();
+                    sum_exp += scores[s];
+                }
+                for s in 0..=t { scores[s] /= sum_exp; }
+                for d in 0..head_dim {
+                    let mut sum = 0.0f32;
+                    for s in 0..=t {
+                        sum += scores[s] * shared_v[s * kv_dim + kv_h * head_dim + d];
+                    }
+                    attn_out[t * q_dim + h * head_dim + d] = sum;
+                }
+            }
+        }
+
+        matmul(&attn_out, &attn.o_proj, seq_len, q_dim, hidden_dim)
     }
 
     /// GQA attention forward.
@@ -5724,6 +5910,7 @@ mod tests {
             rope_theta_sliding: 10000.0,
             rope_theta_full: 1000000.0,
             partial_rotary_factor_full: 0.25,
+            num_kv_shared_layers: 0,
         }
     }
 
