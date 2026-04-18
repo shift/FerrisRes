@@ -1896,6 +1896,7 @@ impl MappedGemma4Model {
 
         // Load per-layer token embeddings for PLE if present
         // PLE model-level weights (projects hidden state to per-layer PLE space)
+        tracing::info!(event = "ple_lookup", "Looking for PLE model projection");
         let ple_model_projection = get("model.language_model.per_layer_model_projection.weight")
             .map(|w| {
                 let ple_total = config.num_layers * config.hidden_size_per_layer_input.unwrap_or(256);
