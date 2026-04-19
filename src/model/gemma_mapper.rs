@@ -2231,6 +2231,13 @@ impl Gemma4Teacher {
         let emb_first5: Vec<f32> = hidden.iter().take(5).copied().collect();
         tracing::info!(event = "embed_diag", l2 = emb_norm, first5 = ?emb_first5, "After embedding + scaling");
 
+        // Debug: dump first 10 values at key points for layer 0 to compare with Python reference
+        // Python ref: after_embed=[-1.636183, -1.530931, 0.187778, ...]
+        if false {
+            let first10: Vec<String> = hidden.iter().take(10).map(|v| format!("{:.6}", v)).collect();
+            tracing::info!(event = "debug_compare", step = "after_embed", vals = ?first10);
+        }
+
         // KV sharing: Gemma 4 layers 15-34 share K/V states from layers 13/14.
         // We store computed K/V so shared layers can reuse them.
         let first_shared_layer = config.num_layers.saturating_sub(config.num_kv_shared_layers);
@@ -2255,6 +2262,12 @@ impl Gemma4Teacher {
             let layer_q_dim = layer.attn.q_dim;
             let layer_kv_dim = layer.attn.kv_dim;
             let layer_inter_dim = layer.intermediate_dim;
+
+            // Diagnostic: detailed layer 0 trace for comparison with Python reference
+            if layer_idx == 0 {
+                let first10: Vec<String> = hidden.iter().take(10).map(|v| format!("{:.6}", v)).collect();
+                tracing::info!(event = "debug_compare", step = "before_layer", vals = ?first10);
+            }
 
             let residual = hidden.clone();
 
@@ -2335,7 +2348,15 @@ impl Gemma4Teacher {
             };
 
             // Post-FFN RMSNorm (applied TO ffn output, before residual)
+            if layer_idx == 0 {
+                let first10: Vec<String> = ffn_out.iter().take(10).map(|v| format!("{:.6}", v)).collect();
+                tracing::info!(event = "debug_compare", step = "ffn_out_before_norm", vals = ?first10);
+            }
             let ffn_out = rms_norm(&ffn_out, &layer.post_ffn_norm, hd, 1e-6);
+            if layer_idx == 0 {
+                let first10: Vec<String> = ffn_out.iter().take(10).map(|v| format!("{:.6}", v)).collect();
+                tracing::info!(event = "debug_compare", step = "ffn_out_after_norm", vals = ?first10);
+            }
 
             // Residual connection
             for i in 0..hidden.len() {
@@ -2414,8 +2435,16 @@ impl Gemma4Teacher {
 
             // Layer scalar
             let ls = layer.layer_scalar;
+            if layer_idx == 0 {
+                let first10: Vec<String> = hidden.iter().take(10).map(|v| format!("{:.6}", v)).collect();
+                tracing::info!(event = "debug_compare", step = "before_layer_scalar", ls = ls, vals = ?first10);
+            }
             if ls != 1.0 {
                 for h in hidden.iter_mut() { *h *= ls; }
+            }
+            if layer_idx == 0 {
+                let first10: Vec<String> = hidden.iter().take(10).map(|v| format!("{:.6}", v)).collect();
+                tracing::info!(event = "debug_compare", step = "after_layer_scalar", vals = ?first10);
             }
 
             // Diagnostic: hidden state stats after each layer
