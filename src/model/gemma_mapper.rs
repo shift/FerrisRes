@@ -2209,6 +2209,12 @@ pub fn apply_rope_gqa(x: &mut [f32], seq_len: usize, num_kv_heads: usize, head_d
 
 /// Gemma 4 teacher model for distillation.
 /// Full CPU forward pass producing logits.
+/// Result of Gemma 4 forward pass. Contains logits always, and optionally per-layer hidden states.
+struct Gemma4ForwardResult {
+    logits: Vec<f32>,
+    layer_states: Vec<Vec<f32>>,
+}
+
 pub struct Gemma4Teacher {
     pub model: MappedGemma4Model,
 }
@@ -2225,11 +2231,24 @@ impl Gemma4Teacher {
 
     /// Forward pass: token IDs → logits.
     pub fn forward(&self, token_ids: &[u32]) -> Vec<f32> {
+        self.forward_impl(token_ids, false).logits
+    }
+
+    /// Forward pass: token IDs → per-layer hidden states.
+    /// Returns Vec where [0] = post-embedding, [1] = post-layer0, ..., [N] = post-layer(N-1).
+    pub fn forward_with_hidden_states(&self, token_ids: &[u32]) -> Vec<Vec<f32>> {
+        self.forward_impl(token_ids, true).layer_states
+    }
+
+    /// Unified forward implementation shared by forward() and forward_with_hidden_states().
+    /// Single source of truth for the entire Gemma 4 transformer.
+    fn forward_impl(&self, token_ids: &[u32], collect_states: bool) -> Gemma4ForwardResult {
         let config = &self.model.config;
         let hd = config.hidden_dim;
         let nh = config.num_heads;
         let seq = token_ids.len();
         let vs = config.vocab_size;
+        let mut layer_states: Vec<Vec<f32>> = if collect_states { Vec::new() } else { Vec::new() };
 
         // 1. Embedding lookup (Gemma scales by sqrt(hidden_dim))
         let mut hidden = vec![0.0f32; seq * hd];
@@ -2243,6 +2262,9 @@ impl Gemma4Teacher {
         }
         let scale = (hd as f32).sqrt();
         for h in hidden.iter_mut() { *h *= scale; }
+
+        // Collect post-embedding state
+        if collect_states { layer_states.push(hidden.clone()); }
 
         // Diagnostic: embedding output
         let emb_norm: f32 = hidden.iter().take(hd).map(|x| x * x).sum::<f32>().sqrt();
@@ -2489,19 +2511,12 @@ impl Gemma4Teacher {
 
             // Layer scalar
             let ls = layer.layer_scalar;
-            if layer_idx == 0 {
-                let first10: Vec<String> = hidden.iter().take(10).map(|v| format!("{:.6}", v)).collect();
-                let l2 = hidden.iter().take(hd).map(|x| x*x).sum::<f32>().sqrt();
-                tracing::info!(event = "debug_compare", step = "before_layer_scalar", layer = layer_idx, ls = ls, l2 = l2, vals = ?first10);
-            }
             if ls != 1.0 {
                 for h in hidden.iter_mut() { *h *= ls; }
             }
-            if layer_idx == 0 {
-                let first10: Vec<String> = hidden.iter().take(10).map(|v| format!("{:.6}", v)).collect();
-                let l2 = hidden.iter().take(hd).map(|x| x*x).sum::<f32>().sqrt();
-                tracing::info!(event = "debug_compare", step = "after_layer_scalar", layer = layer_idx, l2 = l2, vals = ?first10);
-            }
+
+            // Collect post-layer state
+            if collect_states { layer_states.push(hidden.clone()); }
 
             // Diagnostic: hidden state stats after each layer
             // Show first token AND last token to detect if generation is changing
@@ -2596,7 +2611,10 @@ impl Gemma4Teacher {
             tracing::info!(event = "logits_after_softcap", entropy = entropy, max = max_l, top5 = ?top5, "After softcapping");
         }
 
-        logits
+        let logits = logits;
+
+        // Return both logits and collected states
+        Gemma4ForwardResult { logits, layer_states }
     }
 
     /// Compute which layer a shared layer gets its KV from.
@@ -2935,53 +2953,6 @@ impl Gemma4Teacher {
         }
 
         output
-    }
-
-    /// Forward pass that returns per-layer hidden states.
-    /// Used for computing layer-wise cosine similarity between teacher and student.
-    pub fn forward_with_hidden_states(&self, token_ids: &[u32]) -> Vec<Vec<f32>> {
-        let config = &self.model.config;
-        let hd = config.hidden_dim;
-        let nh = config.num_heads;
-        let seq = token_ids.len();
-        let mut layer_states = Vec::new();
-
-        // Embedding
-        let mut hidden = vec![0.0f32; seq * hd];
-        for (t, &tid) in token_ids.iter().enumerate() {
-            let id = tid as usize;
-            if id * hd + hd <= self.model.embed_tokens.len() {
-                for d in 0..hd { hidden[t * hd + d] = self.model.embed_tokens[id * hd + d]; }
-            }
-        }
-        let scale = (hd as f32).sqrt();
-        for h in hidden.iter_mut() { *h *= scale; }
-        layer_states.push(hidden.clone()); // Embedding state
-
-        for (_layer_idx, layer) in self.model.layers.iter().enumerate() {
-            let residual = hidden.clone();
-            let normed = rms_norm(&hidden, &layer.attn.input_norm, hd, 1e-6);
-            let attn_out = self.attention_forward(
-                &normed, &layer.attn, nh, config.num_kv_heads, layer.attn.head_dim,
-                layer.attn.q_dim, layer.attn.kv_dim, seq, hd,
-                layer.rope_theta, layer.partial_rotary_factor,
-            );
-            for i in 0..hidden.len() { hidden[i] = residual[i] + attn_out[i]; }
-            let residual2 = hidden.clone();
-            let normed2 = rms_norm(&hidden, &layer.attn.post_attn_norm, hd, 1e-6);
-            let ffn_out = match &layer.ffn {
-                Gemma4FfnWeights::Dense { gate_proj, up_proj, down_proj } => {
-                    self.dense_ffn(&normed2, gate_proj, up_proj, down_proj, hd, config.intermediate_dim)
-                }
-                Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs } => {
-                    self.moe_ffn(&normed2, router, expert_gates, expert_ups, expert_downs, hd, config.intermediate_dim, config.num_experts, config.top_k)
-                }
-            };
-            for i in 0..hidden.len() { hidden[i] = residual2[i] + ffn_out[i]; }
-            layer_states.push(hidden.clone()); // Post-layer state
-        }
-
-        layer_states
     }
 }
 
