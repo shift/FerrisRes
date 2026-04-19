@@ -1,6 +1,7 @@
 use crate::model::cpu_linear::{CpuLinear, CpuRmsNorm};
 use crate::model::cpu_moe::CpuMoELayer;
 use crate::model::gemma_mapper::{matmul, rms_norm, apply_rope, apply_rope_gqa, gelu_tanh};
+use crate::model::gemma_mapper::{MappedGemma4Model, Gemma4FfnWeights};
 
 /// CPU-only BlockAttnResLayer with full Gemma 4 architectural support.
 ///
@@ -599,5 +600,131 @@ impl CpuBlockAttnResModel {
             .find(|(_, l)| (l.rope_theta - my_rope).abs() < 1.0)
             .map(|(i, _)| i)
             .unwrap_or(first_shared.saturating_sub(1))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Weight Mapping: MappedGemma4Model → CpuBlockAttnResModel
+// ---------------------------------------------------------------------------
+
+/// Convert a loaded Gemma 4 model into a CpuBlockAttnResModel for distillation.
+/// This preserves ALL weights — the student starts from the teacher's knowledge.
+/// The conversion maps Gemma 4 architecture to BlockAttnRes with per-layer config.
+pub fn gemma4_to_block_attnres(teacher: &MappedGemma4Model) -> CpuBlockAttnResModel {
+    let config = &teacher.config;
+    let hd = config.hidden_dim;
+    let nh = config.num_heads;
+    let nkv = config.num_kv_heads;
+    let vs = config.vocab_size;
+    let first_shared_layer = config.num_layers.saturating_sub(config.num_kv_shared_layers);
+
+    let mut layers = Vec::with_capacity(config.num_layers);
+
+    for (layer_idx, layer_weights) in teacher.layers.iter().enumerate() {
+        let layer_head_dim = layer_weights.attn.head_dim;
+        let layer_q_dim = layer_weights.attn.q_dim;
+        let layer_kv_dim = layer_weights.attn.kv_dim;
+        let layer_inter_dim = layer_weights.intermediate_dim;
+        let is_kv_shared = layer_idx >= first_shared_layer && first_shared_layer > 0;
+
+        // Determine FFN type
+        let (ffn_gate, ffn_up, ffn_down, moe, use_gelu) = match &layer_weights.ffn {
+            Gemma4FfnWeights::Dense { gate_proj, up_proj, down_proj } => {
+                // Gate is stored transposed in gemma_mapper: [hd, inter_dim]
+                // CpuLinear expects [in_features, out_features] for matmul(input, weight)
+                // Gemma4AttnWeights stores: q_proj is [hd, q_dim] (transposed for matmul)
+                // Same convention for gate_proj
+                (
+                    Some(CpuLinear::from_weight(gate_proj.clone(), hd, layer_inter_dim)),
+                    Some(CpuLinear::from_weight(up_proj.clone(), hd, layer_inter_dim)),
+                    Some(CpuLinear::from_weight(down_proj.clone(), layer_inter_dim, hd)),
+                    None,
+                    true, // Gemma 4 dense FFN uses GeLU
+                )
+            }
+            Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs } => {
+                let mut moe_layer = CpuMoELayer::new(hd, layer_inter_dim, config.num_experts, config.top_k);
+                moe_layer.gate_weights = router.clone();
+                moe_layer.expert_gate = expert_gates.clone();
+                moe_layer.expert_up = expert_ups.clone();
+                moe_layer.expert_down = expert_downs.clone();
+                moe_layer.use_gelu = true; // Gemma 4
+                (
+                    None, None, None,
+                    Some(moe_layer),
+                    true,
+                )
+            }
+        };
+
+        let mut cpu_layer = CpuBlockAttnResLayer::new(hd, nh, nkv, layer_head_dim, layer_inter_dim);
+        cpu_layer.layer_number = layer_idx;
+
+        // Attention weights — stored in gemma_mapper as transposed for matmul(input, weight)
+        // q_proj: [hd, q_dim], k_proj: [hd, kv_dim], v_proj: [hd, kv_dim], o_proj: [q_dim, hd]
+        cpu_layer.q_proj = CpuLinear::from_weight(layer_weights.attn.q_proj.clone(), hd, layer_q_dim);
+        cpu_layer.k_proj = CpuLinear::from_weight(layer_weights.attn.k_proj.clone(), hd, layer_kv_dim);
+        cpu_layer.v_proj = CpuLinear::from_weight(layer_weights.attn.v_proj.clone(), hd, layer_kv_dim);
+        cpu_layer.out_proj = CpuLinear::from_weight(layer_weights.attn.o_proj.clone(), layer_q_dim, hd);
+
+        // Norms
+        cpu_layer.attn_norm = CpuRmsNorm::from_weight(layer_weights.attn.input_norm.clone(), 1e-6);
+        cpu_layer.q_norm = CpuRmsNorm::from_weight(layer_weights.attn.q_norm.clone(), 1e-6);
+        cpu_layer.k_norm = CpuRmsNorm::from_weight(layer_weights.attn.k_norm.clone(), 1e-6);
+        cpu_layer.v_norm = CpuRmsNorm::new(layer_head_dim, 1e-6); // V has no learned weights in Gemma 4
+        cpu_layer.post_attn_norm = CpuRmsNorm::from_weight(layer_weights.attn.post_attn_norm.clone(), 1e-6);
+        cpu_layer.pre_ffn_norm = CpuRmsNorm::from_weight(layer_weights.pre_ffn_norm.clone(), 1e-6);
+        cpu_layer.post_ffn_norm = CpuRmsNorm::from_weight(layer_weights.post_ffn_norm.clone(), 1e-6);
+
+        // FFN
+        cpu_layer.ffn_gate = ffn_gate;
+        cpu_layer.ffn_up = ffn_up;
+        cpu_layer.ffn_down = ffn_down;
+        cpu_layer.moe = moe;
+        cpu_layer.use_gelu = use_gelu;
+
+        // Layer scalar
+        cpu_layer.layer_scalar = layer_weights.layer_scalar;
+
+        // PLE per-layer weights
+        if let Some(ref gate_w) = layer_weights.per_layer_input_gate {
+            cpu_layer.ple_input_gate = Some(CpuLinear::from_weight(gate_w.clone(), hd, config.hidden_size_per_layer_input.unwrap_or(0)));
+        }
+        if let Some(ref proj_w) = layer_weights.per_layer_projection {
+            cpu_layer.ple_projection = Some(CpuLinear::from_weight(proj_w.clone(), config.hidden_size_per_layer_input.unwrap_or(0), hd));
+        }
+        if let Some(ref norm_w) = layer_weights.post_per_layer_input_norm {
+            cpu_layer.ple_post_norm = Some(CpuRmsNorm::from_weight(norm_w.clone(), 1e-6));
+        }
+
+        // RoPE parameters
+        cpu_layer.rope_theta = layer_weights.rope_theta;
+        cpu_layer.partial_rotary_factor = layer_weights.partial_rotary_factor;
+
+        // KV sharing
+        cpu_layer.kv_shared = is_kv_shared;
+
+        layers.push(cpu_layer);
+    }
+
+    // LM head: stored as [hd, vs] in gemma_mapper (transposed for matmul)
+    let lm_head = teacher.lm_head.clone();
+
+    CpuBlockAttnResModel {
+        layers,
+        embed_tokens: teacher.embed_tokens.clone(),
+        lm_head,
+        final_norm: teacher.final_norm.clone(),
+        hidden_dim: hd,
+        vocab_size: vs,
+        num_layers: config.num_layers,
+        final_logit_softcapping: config.final_logit_softcapping,
+
+        // PLE model-level weights
+        ple_model_projection: teacher.ple_model_projection.clone(),
+        ple_projection_norm: teacher.ple_projection_norm.clone(),
+        embed_tokens_per_layer: teacher.embed_tokens_per_layer.clone(),
+        hidden_size_per_layer_input: config.hidden_size_per_layer_input.unwrap_or(0),
+        num_kv_shared_layers: config.num_kv_shared_layers,
     }
 }
