@@ -1596,6 +1596,9 @@ pub struct MappedGemma4Model {
     pub ple_model_projection: Option<Vec<f32>>,
     /// PLE model-level norm: [ple_dim] weights for normalizing the PLE projection output.
     pub ple_projection_norm: Option<Vec<f32>>,
+    /// PLE per-layer token embeddings: [vocab_size × (num_layers × ple_dim)].
+    /// Token-level per-layer embeddings added to context projection in PLE.
+    pub embed_tokens_per_layer: Option<Vec<f32>>,
 }
 
 impl MappedGemma4Model {
@@ -1700,7 +1703,7 @@ impl MappedGemma4Model {
             });
         }
 
-        Ok(Self { config, embed_tokens, layers, final_norm, lm_head, ple_model_projection: None, ple_projection_norm: None })
+        Ok(Self { config, embed_tokens, layers, final_norm, lm_head, ple_model_projection: None, ple_projection_norm: None, embed_tokens_per_layer: None })
     }
 
     fn build_skeleton_mm<
@@ -1756,7 +1759,7 @@ impl MappedGemma4Model {
             });
         }
 
-        Ok(Self { config, embed_tokens, layers, final_norm, lm_head, ple_model_projection: None, ple_projection_norm: None })
+        Ok(Self { config, embed_tokens, layers, final_norm, lm_head, ple_model_projection: None, ple_projection_norm: None, embed_tokens_per_layer: None })
     }
 
     /// Load from a safetensors LoadedWeights object.
@@ -1887,7 +1890,7 @@ impl MappedGemma4Model {
             });
         }
 
-        Ok(Self { config, embed_tokens, layers, final_norm, lm_head, ple_model_projection: None, ple_projection_norm: None })
+        Ok(Self { config, embed_tokens, layers, final_norm, lm_head, ple_model_projection: None, ple_projection_norm: None, embed_tokens_per_layer: None })
     }
 
     /// Build model using multimodal naming convention (model.language_model.layers.N.*).
@@ -1922,6 +1925,21 @@ impl MappedGemma4Model {
                 transpose(&w, ple_total, hd)
             });
         let ple_projection_norm = get("model.language_model.per_layer_projection_norm.weight");
+
+        // Load per-layer token embeddings for PLE: [vocab_size × (num_layers × ple_dim)]
+        // This is the token-level component that gets ADDED to the context projection.
+        let embed_tokens_per_layer = get("model.language_model.embed_tokens_per_layer.weight")
+            .map(|w| {
+                let ple_dim = config.hidden_size_per_layer_input.unwrap_or(256);
+                let ple_total = config.num_layers * ple_dim;
+                tracing::info!(event = "ple_tokens_loaded", raw_len = w.len(), expected = config.vocab_size * ple_total, "Loaded embed_tokens_per_layer");
+                // Store as-is: [vocab_size × ple_total], rows are token embeddings
+                w
+            });
+        if embed_tokens_per_layer.is_some() {
+            tracing::info!(event = "ple_tokens_loaded", "Loaded per-layer token embeddings for PLE");
+        }
+
         if ple_model_projection.is_some() {
             tracing::info!(event = "ple_loaded", "Loaded PLE model projection + norm");
         }
@@ -2042,7 +2060,7 @@ impl MappedGemma4Model {
             );
         }
 
-        Ok(Self { config, embed_tokens, layers, final_norm, lm_head, ple_model_projection, ple_projection_norm })
+        Ok(Self { config, embed_tokens, layers, final_norm, lm_head, ple_model_projection, ple_projection_norm, embed_tokens_per_layer })
     }
 }
 
@@ -2376,7 +2394,7 @@ impl Gemma4Teacher {
             //     out = gated @ proj_w                      // ple_dim→hidden
             //     out = post_norm(out)
             //     hidden += out
-            let ple_disabled = true; // Debug: DISABLED for comparison with Python reference
+            let ple_disabled = false; // PLE enabled
             if !ple_disabled && self.model.ple_model_projection.is_some() && self.model.ple_projection_norm.is_some()
             {
                 let model_proj = self.model.ple_model_projection.as_ref().unwrap();
@@ -2390,7 +2408,7 @@ impl Gemma4Teacher {
 
                         // 1. Context projection: hidden[seq, hd] → [seq, ple_total] → slice → norm
                         //    model_proj is [hd, ple_total], scale by 1/sqrt(hd)
-                        let model_proj_scale = (hd as f32).sqrt().recip();
+                        let model_proj_scale = (hd as f32).sqrt(); // HuggingFace: scale UP by sqrt(hidden_dim)
                         let ple_all = matmul(&hidden, model_proj, seq, hd, ple_total);
 
                         // Apply model projection scale
@@ -2407,10 +2425,24 @@ impl Gemma4Teacher {
                         }
 
                         // Normalize with model-level norm
-                        let ple_input = rms_norm(&ple_slice, proj_norm, ple_dim, 1e-6);
-                        // No token_embedding available (safetensors lacks embed_tokens_per_layer)
-                        // per_layer_input_scale = 1/sqrt(2) only needed when combining both components
-                        // With just context projection, ple_input is already correct
+                        // Add per-layer token embeddings if available
+                        let ple_input = if let Some(ref token_embs) = self.model.embed_tokens_per_layer {
+                            // token_embs is [vocab_size × ple_total]
+                            // For each token, look up its embedding slice for this layer
+                            let mut ple_with_tokens = ple_slice.clone();
+                            for t in 0..seq {
+                                let tok_id = token_ids[t] as usize;
+                                let tok_emb_start = tok_id * ple_total + layer_offset;
+                                let dst = t * ple_dim;
+                                for d in 0..ple_dim {
+                                    ple_with_tokens[dst + d] += token_embs[tok_emb_start + d];
+                                }
+                            }
+                            rms_norm(&ple_with_tokens, proj_norm, ple_dim, 1e-6)
+                        } else {
+                            // No token embeddings — just context projection (degraded)
+                            rms_norm(&ple_slice, proj_norm, ple_dim, 1e-6)
+                        };
 
                         // 2. Gate: hidden → ple_dim with GELU (gelu_pytorch_tanh)
                         //    HuggingFace uses act_fn = gelu_pytorch_tanh, NOT sigmoid
@@ -5080,6 +5112,9 @@ impl MappedGemma4Model {
             });
         let ple_projection_norm = get("model.language_model.per_layer_projection_norm.weight")
             .or_else(|| get("model.per_layer_projection_norm.weight"));
+        // Per-layer token embeddings for PLE
+        let embed_tokens_per_layer = get("model.language_model.embed_tokens_per_layer.weight")
+            .or_else(|| get("model.embed_tokens_per_layer.weight"));
         if ple_model_projection.is_some() {
             tracing::info!(event = "ple_loaded", "Loaded PLE model projection + norm");
         }
@@ -5247,7 +5282,7 @@ impl MappedGemma4Model {
             );
         }
 
-        Ok(Self { config, embed_tokens, layers, final_norm, lm_head, ple_model_projection, ple_projection_norm })
+        Ok(Self { config, embed_tokens, layers, final_norm, lm_head, ple_model_projection, ple_projection_norm, embed_tokens_per_layer })
     }
 }
 // ---------------------------------------------------------------------------
