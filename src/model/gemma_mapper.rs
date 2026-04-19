@@ -2282,7 +2282,7 @@ impl Gemma4Teacher {
             let layer_inter_dim = layer.intermediate_dim;
 
             // Diagnostic: detailed layer trace for comparison with Python reference
-            if layer_idx <= 3 || layer_idx == 4 {
+            if layer_idx == 0 {
                 let first10: Vec<String> = hidden.iter().take(10).map(|v| format!("{:.6}", v)).collect();
                 let l2 = hidden.iter().take(hd).map(|x| x*x).sum::<f32>().sqrt();
                 tracing::info!(event = "debug_compare", step = "before_layer", layer = layer_idx, l2 = l2, vals = ?first10);
@@ -2345,7 +2345,7 @@ impl Gemma4Teacher {
                 hidden[i] = residual[i] + attn_out[i];
             }
 
-            if layer_idx <= 3 {
+            if layer_idx == 0 {
                 let n: f32 = hidden.iter().take(hd).map(|x| x * x).sum::<f32>().sqrt();
                 tracing::info!(event = "substep", step = "after_attn_residual", layer = layer_idx, l2 = n);
             }
@@ -2367,13 +2367,13 @@ impl Gemma4Teacher {
             };
 
             // Post-FFN RMSNorm (applied TO ffn output, before residual)
-            if layer_idx <= 3 {
+            if layer_idx == 0 {
                 let first10: Vec<String> = ffn_out.iter().take(10).map(|v| format!("{:.6}", v)).collect();
                 let l2 = ffn_out.iter().take(hd).map(|x| x*x).sum::<f32>().sqrt();
                 tracing::info!(event = "debug_compare", step = "ffn_out_before_norm", layer = layer_idx, l2 = l2, vals = ?first10);
             }
             let ffn_out = rms_norm(&ffn_out, &layer.post_ffn_norm, hd, 1e-6);
-            if layer_idx <= 3 {
+            if layer_idx == 0 {
                 let first10: Vec<String> = ffn_out.iter().take(10).map(|v| format!("{:.6}", v)).collect();
                 let l2 = ffn_out.iter().take(hd).map(|x| x*x).sum::<f32>().sqrt();
                 tracing::info!(event = "debug_compare", step = "ffn_out_after_norm", layer = layer_idx, l2 = l2, vals = ?first10);
@@ -2471,7 +2471,7 @@ impl Gemma4Teacher {
 
             // Layer scalar
             let ls = layer.layer_scalar;
-            if layer_idx <= 3 {
+            if layer_idx == 0 {
                 let first10: Vec<String> = hidden.iter().take(10).map(|v| format!("{:.6}", v)).collect();
                 let l2 = hidden.iter().take(hd).map(|x| x*x).sum::<f32>().sqrt();
                 tracing::info!(event = "debug_compare", step = "before_layer_scalar", layer = layer_idx, ls = ls, l2 = l2, vals = ?first10);
@@ -2479,7 +2479,7 @@ impl Gemma4Teacher {
             if ls != 1.0 {
                 for h in hidden.iter_mut() { *h *= ls; }
             }
-            if layer_idx <= 3 {
+            if layer_idx == 0 {
                 let first10: Vec<String> = hidden.iter().take(10).map(|v| format!("{:.6}", v)).collect();
                 let l2 = hidden.iter().take(hd).map(|x| x*x).sum::<f32>().sqrt();
                 tracing::info!(event = "debug_compare", step = "after_layer_scalar", layer = layer_idx, l2 = l2, vals = ?first10);
