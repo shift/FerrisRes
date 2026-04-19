@@ -181,7 +181,7 @@ for layer_idx in range(num_layers):
     # Layer scalar
     hidden = hidden * ls_val
 
-    if layer_idx <= 1 or layer_idx == 4 or layer_idx == 34:
+    if layer_idx <= 3 or layer_idx == 4 or layer_idx == 34:
         l2 = np.linalg.norm(hidden)
         print(f"Layer {layer_idx}: l2={l2:.4f} ls={ls_val:.6f} first5={hidden[0,:5].tolist()}")
 
