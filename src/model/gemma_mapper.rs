@@ -2376,7 +2376,7 @@ impl Gemma4Teacher {
             //     out = gated @ proj_w                      // ple_dim→hidden
             //     out = post_norm(out)
             //     hidden += out
-            let ple_disabled = false; // Debug: set to true to disable PLE
+            let ple_disabled = true; // Debug: DISABLED for comparison with Python reference
             if !ple_disabled && self.model.ple_model_projection.is_some() && self.model.ple_projection_norm.is_some()
             {
                 let model_proj = self.model.ple_model_projection.as_ref().unwrap();
