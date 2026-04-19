@@ -6,8 +6,8 @@ use ferrisres::{WgpuCompute, DeviceProfile, BlockAttnResConfig, BlockAttnResMode
 use ferrisres::compute::{GpuBuffer, MatMulOp, RmsNormOp, SoftmaxOp, ElementWiseOp};
 use ferrisres::training::AdamOptimizer;
 use ferrisres::model::gemma_mapper::{
-    self, Gemma4Config, Gemma4Teacher, Gemma4Student, DistillationConfig,
-    BlockSummaryLayer, load_gemma4_model_mmap,
+    self, Gemma4Config, Gemma4Teacher,
+    load_gemma4_model_mmap,
     DistillationCheckpoint, load_gemma4_model_gguf,
 };
 use ferrisres::model::tokenizer::HfTokenizer;
@@ -1396,28 +1396,16 @@ async fn cmd_distill(
     };
     let model2 = load_model_full(path)
         .map_err(|e| anyhow::anyhow!("Failed to reload model for student: {}", e))?;
-    info!(event = "student_model_loaded", "Student model loaded");
+    info!(event = "student_model_loaded", "Student model loaded for weight mapping");
 
-    let injection_points = config.block_summary_injection_points();
-    let block_summaries: Vec<BlockSummaryLayer> = injection_points.iter()
-        .map(|_| BlockSummaryLayer::new_identity(config.hidden_dim, config.sliding_window))
-        .collect();
-    info!(event = "student_ready", block_summary_layers = block_summaries.len(), "student model created");
-
-    let distill_config = DistillationConfig {
-        learning_rate: learning_rate as f32,
-        temperature: temperature as f32,
-        num_steps: steps,
-        max_seq_len: seq_len,
-        ..DistillationConfig::default()
-    };
-
-    let mut student = Gemma4Student::new(model2, block_summaries, distill_config.clone());
+    // Convert teacher weights to CpuBlockAttnResModel (proper FerrisRes architecture)
+    // This replaces the broken Gemma4Student with the correct BlockAttnRes student.
+    let student = ferrisres::model::cpu_block_attn_res::gemma4_to_block_attnres(&model2);
+    info!(event = "student_ready", layers = student.layers.len(), "student CpuBlockAttnResModel created from teacher weights");
 
     // Cache transposed lm_head for backward pass (d_logits → d_hidden)
-    // Transposed once instead of every step: 400M ops saved per step
     let lm_head_t: Vec<f32> = {
-        let lm_head = &student.model.lm_head;
+        let lm_head = &student.lm_head;
         let hd = config.hidden_dim;
         let vs = config.vocab_size;
         let mut t = vec![0.0f32; vs * hd];
@@ -1429,11 +1417,8 @@ async fn cmd_distill(
         t
     };
 
-    // Initialize optimizers (fresh or from checkpoint)
+    // Training state
     let mut global_step: usize = 0;
-    let mut optimizers: Vec<gemma_mapper::BlockSummaryAdam> = student.block_summaries.iter()
-        .map(|bs| gemma_mapper::BlockSummaryAdam::new(bs, distill_config.learning_rate))
-        .collect();
     let mut best_loss = f32::INFINITY;
 
     // Resume from checkpoint if specified
@@ -1441,18 +1426,8 @@ async fn cmd_distill(
         match DistillationCheckpoint::load(std::path::Path::new(ckpt_path)) {
             Ok(ckpt) => {
                 global_step = ckpt.global_step;
-                info!(event = "resuming_from_checkpoint", step = global_step, layers = ckpt.layer_checkpoints.len(), "resuming from checkpoint");
-                if ckpt.layer_checkpoints.len() == student.block_summaries.len() {
-                    optimizers = ckpt.apply(&mut student);
-                    info!(event = "checkpoint_restored", layers = student.block_summaries.len(), "restored block summary layers and optimizer state");
-                } else {
-                    tracing::warn!(
-                        event = "checkpoint_layer_mismatch",
-                        checkpoint_layers = ckpt.layer_checkpoints.len(),
-                        expected_layers = student.block_summaries.len(),
-                        "Checkpoint has wrong number of layers — starting fresh"
-                    );
-                }
+                info!(event = "resuming_from_checkpoint", step = global_step, "resuming from checkpoint");
+                // Note: BlockSummary checkpoint restore removed — student is now CpuBlockAttnResModel
             }
             Err(e) => {
                 tracing::warn!(event = "checkpoint_load_failed", error = %e, "Failed to load checkpoint — starting fresh: {}", e);
@@ -1571,25 +1546,13 @@ async fn cmd_distill(
 
         let teacher_logits = &teacher_logits_chunks[chunk_idx];
 
-        // Student forward (using cached frozen hidden states)
-        let frozen_states = &frozen_states_per_chunk[chunk_idx];
-        let student_logits = if let Some(ref gpu) = gpu_accel {
-            match dispatch.attn_qkv_dispatch {
-                ferrisres::device::OpTarget::Gpu | ferrisres::device::OpTarget::GpuTiled => {
-                    student.forward_from_frozen_gpu(frozen_states, gpu)
-                }
-                ferrisres::device::OpTarget::Cpu => {
-                    student.forward_from_frozen(frozen_states)
-                }
-            }
-        } else {
-            student.forward_from_frozen(frozen_states)
-        };
+        // Student forward using CpuBlockAttnResModel
+        let student_logits = student.forward(batch_tokens);
 
         // KL divergence loss
         let loss = gemma_mapper::kl_divergence_loss(
             teacher_logits, &student_logits,
-            distill_config.temperature, vs, actual_seq,
+            temperature as f32, vs, actual_seq,
         );
 
         // Update EMA
@@ -1601,7 +1564,7 @@ async fn cmd_distill(
         // d_kl/d_s_logit = (softmax(s/T) - softmax(t/T)) / T
         // Use log-softmax to avoid exp overflow on large logits
         let mut d_logits = vec![0.0f32; actual_seq * vs];
-        let inv_temp = 1.0 / distill_config.temperature;
+        let inv_temp = 1.0 / (temperature as f32);
         for t in 0..actual_seq {
             let offset = t * vs;
             // Find max for numerical stability
@@ -1631,76 +1594,18 @@ async fn cmd_distill(
             }
         }
 
-        // Project d_logits [seq × vocab] back through LM head to get d_hidden [seq × hd]
-        // d_hidden = d_logits × lm_head^T  (lm_head is [hd × vs], transposed to [vs × hd])
-        // Use pre-cached transposed lm_head (computed once at setup)
-        let d_hidden: Vec<f32> = {
+        // TODO: LoRA backprop through student (d3777391)
+        // For now, student is frozen (initialized from teacher weights) and we only measure KL loss.
+        // The d_hidden is computed for future use when LoRA training is wired in.
+        let _d_hidden: Vec<f32> = {
             gpu_matmul(&d_logits, &lm_head_t, actual_seq, vs, config.hidden_dim, &dispatch)
         };
+        let grad_norm = 0.0f32; // No gradients yet
 
-        // Backprop through Block Summary layers using cached frozen hidden states
-        let frozen_states = &frozen_states_per_chunk[chunk_idx];
-        let all_grads: Vec<(usize, gemma_mapper::BlockSummaryGradients)> = student.block_summaries.iter().enumerate()
-            .filter(|(_, bs)| bs.trainable)
-            .filter(|(si, _)| *si < optimizers.len())
-            .map(|(si, bs)| {
-                // Get the frozen hidden state at this injection point
-                // frozen_states[layer_idx + 1] = state after layer layer_idx
-                let layer_idx = injection_points.get(si).copied().unwrap_or(0);
-                let block_tokens = if layer_idx + 1 < frozen_states.len() {
-                    frozen_states[layer_idx + 1].as_slice()
-                } else {
-                    // Fallback: use embedding (should not happen)
-                    &student.model.embed_tokens[..seq_len * config.hidden_dim]
-                };
-                let grads = gemma_mapper::backprop_block_summary(bs, block_tokens, &d_hidden);
-                (si, grads)
-            })
-            .collect();
+        // Old BlockSummary backprop removed — student is now CpuBlockAttnResModel
+        let _frozen_states = &frozen_states_per_chunk[chunk_idx];
 
-        // Track gradient norm across all block summary layers
-        let grad_norm: f32 = all_grads.iter()
-            .map(|(_, g)| g.d_bridge_weight * g.d_bridge_weight)
-            .sum::<f32>()
-            .sqrt();
-
-        // Gradient clipping: prevent explosions (max norm = 1.0)
-        let max_grad_norm = 1.0f32;
-        let clipped_grads: Vec<(usize, gemma_mapper::BlockSummaryGradients)> = if grad_norm > max_grad_norm && grad_norm.is_finite() {
-            let scale = max_grad_norm / grad_norm;
-            all_grads.into_iter().map(|(si, mut g)| {
-                g.d_bridge_weight *= scale;
-                for v in &mut g.d_summary_queries { *v *= scale; }
-                for v in &mut g.d_out_proj { *v *= scale; }
-                for v in &mut g.d_query_proj { *v *= scale; }
-                (si, g)
-            }).collect()
-        } else if !grad_norm.is_finite() {
-            // Skip NaN/inf gradients entirely
-            vec![]
-        } else {
-            all_grads
-        };
-
-        for (si, grads) in clipped_grads {
-            optimizers[si].step(&mut student.block_summaries[si], &grads);
-        }
-
-        // Collect per-layer bridge weights
-        let bridge_weights: Vec<f32> = student.block_summaries.iter()
-            .map(|bs| bs.bridge_weight)
-            .collect();
-        let bridge_w = bridge_weights.first().copied().unwrap_or(0.0);
-        let bridge_mean = if bridge_weights.is_empty() { 0.0 }
-            else { bridge_weights.iter().sum::<f32>() / bridge_weights.len() as f32 };
-        let bridge_min = bridge_weights.iter().cloned().fold(f32::INFINITY, f32::min);
-        let bridge_max = bridge_weights.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-
-        let lr = if global_step < distill_config.warmup_steps {
-            distill_config.learning_rate * (global_step + 1) as f32 / distill_config.warmup_steps.max(1) as f32
-        } else {
-            distill_config.learning_rate
-        };
+        let lr = learning_rate as f32;
 
         let step_ms = step_start.elapsed().as_millis();
         let tps = actual_seq as f32 / step_start.elapsed().as_secs_f32();
@@ -1714,7 +1619,7 @@ async fn cmd_distill(
         results.push(gemma_mapper::DistillationStepResult {
             step: global_step,
             kl_loss: loss,
-            bridge_weight: bridge_w,
+            bridge_weight: 0.0,
             learning_rate: lr,
             layer_cosine_sim: vec![],
         });
@@ -1729,9 +1634,6 @@ async fn cmd_distill(
                 loss_ema = format_args!("{:.6}", loss_ema),
                 best_loss = format_args!("{:.6}", best_loss),
                 grad_norm = format_args!("{:.3e}", grad_norm),
-                bridge_mean = format_args!("{:.4}", bridge_mean),
-                bridge_min = format_args!("{:.4}", bridge_min),
-                bridge_max = format_args!("{:.4}", bridge_max),
                 lr = format_args!("{:.2e}", lr),
                 step_ms = step_ms,
                 tok_per_s = format_args!("{:.2}", tps),
@@ -1742,11 +1644,8 @@ async fn cmd_distill(
 
         // Mid-training checkpoint
         if checkpoint_every > 0 && (global_step + 1) % checkpoint_every == 0 {
-            let ckpt = DistillationCheckpoint::from_student(&student, &optimizers, global_step + 1);
-            let ckpt_path = format!("{}.checkpoint.bin", output_path);
-            ckpt.save(std::path::Path::new(&ckpt_path))
-                .map_err(|e| anyhow::anyhow!("Failed to save checkpoint: {}", e))?;
-            info!(event = "checkpoint_saved", step = global_step + 1, path = %ckpt_path, "mid-training checkpoint saved");
+            // Checkpoints temporarily disabled — student is now CpuBlockAttnResModel
+            // TODO: implement CpuBlockAttnResModel checkpoint (d3777391)
         }
 
         prev_loss = loss;
@@ -1786,44 +1685,23 @@ async fn cmd_distill(
     }
     if let Some(last) = results.last() {
         info!(event = "final_kl_loss", "Final KL loss:   {:.6}", last.kl_loss);
-        info!(event = "final_bridge_weight", "Final bridge_weight: {:.6}", last.bridge_weight);
     }
 
     // Log loss curve
     for result in &results {
         if result.step % log_every == 0 {
-            info!(event = "distill_step_summary", step = result.step, loss = result.kl_loss, bridge_w = result.bridge_weight, lr = result.learning_rate, "distillation step summary");
+            info!(event = "distill_step_summary", step = result.step, loss = result.kl_loss, lr = result.learning_rate, "distillation step summary");
         }
     }
 
-    // Save distilled model (block summary params)
-    for (i, bs) in student.block_summaries.iter().enumerate() {
-        let params = bs.export_trainable();
-        let save_path = format!("{}.block_summary_{}.bin", output_path, i);
-        let bytes: Vec<u8> = params.iter().flat_map(|f| f.to_le_bytes()).collect();
-        std::fs::write(&save_path, &bytes)?;
-        info!(event = "saved_block_summary_params", "Saved Block Summary {} → {} ({} params)", i, save_path, params.len());
-    }
-
-    // Save full checkpoint (for resume) with optimizer state
-    let ckpt_path = format!("{}.checkpoint.bin", output_path);
-    let final_step = results.last().map(|r| r.step).unwrap_or(0) + 1;
-    let final_ckpt = DistillationCheckpoint::from_student(&student, &optimizers, final_step);
-    final_ckpt.save(std::path::Path::new(&ckpt_path))
-        .map_err(|e| anyhow::anyhow!("Failed to save checkpoint: {}", e))?;
-    info!(event = "checkpoint_saved", step = final_step, path = %ckpt_path, "final checkpoint saved");
+    // TODO: Save CpuBlockAttnResModel as distilled checkpoint (d3777391)
+    info!(event = "distillation_model_save", "Student model save not yet implemented — needs LoRA adapter serialization");
 
     // Save loss curve as CSV
     let csv_path = format!("{}.loss_curve.csv", output_path);
-    let mut csv = String::from("step,kl_loss,bridge_weight,learning_rate,cosine_sim_avg\n");
+    let mut csv = String::from("step,kl_loss,learning_rate\n");
     for r in &results {
-        let avg_cos = if r.layer_cosine_sim.is_empty() {
-            String::from("n/a")
-        } else {
-            let avg = r.layer_cosine_sim.iter().sum::<f32>() / r.layer_cosine_sim.len() as f32;
-            format!("{:.6}", avg)
-        };
-        csv.push_str(&format!("{},{},{},{},{}\n", r.step, r.kl_loss, r.bridge_weight, r.learning_rate, avg_cos));
+        csv.push_str(&format!("{},{},{}\n", r.step, r.kl_loss, r.learning_rate));
     }
     std::fs::write(&csv_path, &csv)?;
     info!(event = "loss_curve_saved", "Loss curve saved → {}", csv_path);
