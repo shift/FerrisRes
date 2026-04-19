@@ -2373,11 +2373,12 @@ impl Gemma4Teacher {
             //     out = gated @ proj_w                      // ple_dim→hidden
             //     out = post_norm(out)
             //     hidden += out
-            if let (Some(ref model_proj), Some(ref proj_norm)) =
-                (&self.model.ple_model_projection, &self.model.ple_projection_norm)
+            let ple_disabled = true; // Debug: set to true to disable PLE
+            if !ple_disabled && self.model.ple_model_projection.is_some() && self.model.ple_projection_norm.is_some()
             {
-                if let (Some(ref gate_w), Some(ref proj_w), Some(ref post_norm)) =
-                    (&layer.per_layer_input_gate, &layer.per_layer_projection, &layer.post_per_layer_input_norm)
+                let model_proj = self.model.ple_model_projection.as_ref().unwrap();
+                let proj_norm = self.model.ple_projection_norm.as_ref().unwrap();
+                if layer.per_layer_input_gate.is_some() && layer.per_layer_projection.is_some() && layer.post_per_layer_input_norm.is_some()
                 {
                     let ple_dim = config.hidden_size_per_layer_input.unwrap_or(0);
                     if ple_dim > 0 {
@@ -2411,7 +2412,7 @@ impl Gemma4Teacher {
                         // 2. Gate: hidden → ple_dim with GELU (gelu_pytorch_tanh)
                         //    HuggingFace uses act_fn = gelu_pytorch_tanh, NOT sigmoid
                         //    gate_w is [hd, ple_dim], so matmul(hidden, gate) = [seq, ple_dim]
-                        let gate_out = matmul(&hidden, gate_w, seq, hd, ple_dim);
+                        let gate_out = matmul(&hidden, layer.per_layer_input_gate.as_ref().unwrap(), seq, hd, ple_dim);
                         let gate_gelu: Vec<f32> = gate_out.iter().map(|&x| gelu_tanh(x)).collect();
 
                         // 3. Gated input: gate * per_layer_input (element-wise in ple_dim)
@@ -2422,10 +2423,10 @@ impl Gemma4Teacher {
 
                         // 4. Project back: [seq, ple_dim] → [seq, hd]
                         //    proj_w is [ple_dim, hd], so matmul(gated, proj) = [seq, hd]
-                        let proj_out = matmul(&gated_input, proj_w, seq, ple_dim, hd);
+                        let proj_out = matmul(&gated_input, layer.per_layer_projection.as_ref().unwrap(), seq, ple_dim, hd);
 
                         // 5. Post norm and add residual
-                        let ple_final = rms_norm(&proj_out, post_norm, hd, 1e-6);
+                        let ple_final = rms_norm(&proj_out, layer.post_per_layer_input_norm.as_ref().unwrap(), hd, 1e-6);
                         for i in 0..hidden.len() {
                             hidden[i] += ple_final[i];
                         }
