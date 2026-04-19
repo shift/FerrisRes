@@ -1550,10 +1550,37 @@ async fn cmd_distill(
         let student_logits = student.forward(batch_tokens);
 
         // KL divergence loss
-        let loss = gemma_mapper::kl_divergence_loss(
+        let kl_loss = gemma_mapper::kl_divergence_loss(
             teacher_logits, &student_logits,
             temperature as f32, vs, actual_seq,
         );
+
+        // Hidden state matching loss: MSE between teacher and student per-layer states
+        let teacher_states = &frozen_states_per_chunk[chunk_idx];
+        let student_states = student.forward_with_hidden_states(batch_tokens);
+        let hidden_mse_loss = if teacher_states.len() == student_states.len() && !teacher_states.is_empty() {
+            let _hd = config.hidden_dim;
+            let mut total_mse = 0.0f32;
+            let mut num_layers_compared = 0usize;
+            // Compare at every 5th layer to save compute
+            for layer_idx in (0..teacher_states.len()).step_by(5) {
+                let t_state = &teacher_states[layer_idx];
+                let s_state = &student_states[layer_idx];
+                if t_state.len() == s_state.len() {
+                    let mse: f32 = t_state.iter().zip(s_state.iter())
+                        .map(|(t, s)| (t - s) * (t - s))
+                        .sum::<f32>() / t_state.len() as f32;
+                    total_mse += mse;
+                    num_layers_compared += 1;
+                }
+            }
+            if num_layers_compared > 0 { total_mse / num_layers_compared as f32 } else { 0.0 }
+        } else {
+            0.0
+        };
+
+        // Combined loss: KL + 0.5 * hidden_MSE
+        let loss = kl_loss + 0.5 * hidden_mse_loss;
 
         // Update EMA
         loss_ema = if loss_ema.is_nan() { loss }
@@ -1618,8 +1645,8 @@ async fn cmd_distill(
 
         results.push(gemma_mapper::DistillationStepResult {
             step: global_step,
-            kl_loss: loss,
-            bridge_weight: 0.0,
+            kl_loss: kl_loss,
+            bridge_weight: hidden_mse_loss,
             learning_rate: lr,
             layer_cosine_sim: vec![],
         });
