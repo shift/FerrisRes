@@ -17,6 +17,12 @@ for tid in prompt_tokens:
     token_str = id_to_token.get(tid, f"<UNKNOWN:{tid}>")
     print(f"  {tid}: '{token_str}'")
 
+bos_top_tokens = [9622, 50921, 231990, 2795, 27978]
+print("\n=== BOS single token top predictions (no PLE) ===")
+for tid in bos_top_tokens:
+    token_str = id_to_token.get(tid, f"<UNKNOWN:{tid}>")
+    print(f"  {tid}: '{token_str}'")
+
 # Top tokens from the Rust output
 top_tokens = [207641, 99747, 241550, 208634, 220628]
 
