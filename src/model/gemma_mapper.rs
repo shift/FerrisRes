@@ -2261,6 +2261,73 @@ impl Gemma4Teacher {
         let first_shared_layer = config.num_layers.saturating_sub(config.num_kv_shared_layers);
         let mut shared_kv_states: std::collections::HashMap<usize, (Vec<f32>, Vec<f32>)> = std::collections::HashMap::new();
 
+        // Pre-compute PLE (Per-Layer Embedding) inputs using the INITIAL hidden state.
+        // This matches llama.cpp's project_per_layer_inputs() which runs ONCE before the layer loop.
+        // Flow: proj = hidden @ model_proj * (1/sqrt(hd)) → norm → + token_embs * sqrt(ple_dim) → * (1/sqrt(2))
+        let ple_dim = config.hidden_size_per_layer_input.unwrap_or(0);
+        let ple_precomputed: Option<Vec<f32>> = if ple_dim > 0
+            && self.model.ple_model_projection.is_some()
+            && self.model.ple_projection_norm.is_some()
+        {
+            let model_proj = self.model.ple_model_projection.as_ref().unwrap();
+            let proj_norm = self.model.ple_projection_norm.as_ref().unwrap();
+            let ple_total = ple_dim * config.num_layers;
+
+            // 1. Context projection: hidden[seq, hd] @ model_proj[hd, ple_total] → [seq, ple_total]
+            //    Scale by 1/sqrt(hd) — NOT sqrt(hd)!
+            let model_proj_scale = (hd as f32).sqrt().recip(); // 1/sqrt(hd)
+            let ple_all = matmul(&hidden, model_proj, seq, hd, ple_total);
+
+            // Apply scale and reshape to [seq, n_layer, ple_dim]
+            let mut ple_projected = vec![0.0f32; seq * config.num_layers * ple_dim];
+            for t in 0..seq {
+                for l in 0..config.num_layers {
+                    for d in 0..ple_dim {
+                        let src = t * ple_total + l * ple_dim + d;
+                        let dst = t * config.num_layers * ple_dim + l * ple_dim + d;
+                        ple_projected[dst] = ple_all[src] * model_proj_scale;
+                    }
+                }
+            }
+
+            // 2. Per-layer RMS norm on the context projection
+            //    Norm is applied per-layer slice [ple_dim]
+            let mut ple_normed = vec![0.0f32; ple_projected.len()];
+            for t in 0..seq {
+                for l in 0..config.num_layers {
+                    let base = t * config.num_layers * ple_dim + l * ple_dim;
+                    let slice = &ple_projected[base..base+ple_dim];
+                    let normed = rms_norm(slice, proj_norm, ple_dim, 1e-6);
+                    ple_normed[base..base+ple_dim].copy_from_slice(&normed);
+                }
+            }
+
+            // 3. Add per-layer token embeddings (scaled by sqrt(ple_dim))
+            let tok_scale = (ple_dim as f32).sqrt();
+            if let Some(ref token_embs) = self.model.embed_tokens_per_layer {
+                for t in 0..seq {
+                    let tok_id = token_ids[t] as usize;
+                    for l in 0..config.num_layers {
+                        let dst = t * config.num_layers * ple_dim + l * ple_dim;
+                        let src = tok_id * ple_total + l * ple_dim;
+                        for d in 0..ple_dim {
+                            ple_normed[dst + d] += token_embs[src + d] * tok_scale;
+                        }
+                    }
+                }
+            }
+
+            // 4. Apply 1/sqrt(2) scale
+            let combined_scale = (2.0f32).sqrt().recip();
+            for v in ple_normed.iter_mut() {
+                *v *= combined_scale;
+            }
+
+            Some(ple_normed) // shape: [seq, n_layer, ple_dim]
+        } else {
+            None
+        };
+
         // 2. Per-layer transformer (Gemma 4 architecture)
         //    residual = hidden
         //    hidden = input_layernorm(hidden)
@@ -2384,87 +2451,38 @@ impl Gemma4Teacher {
                 hidden[i] = residual2[i] + ffn_out[i];
             }
 
-            // Per-Layer Embeddings (PLE) — Gemma 4 critical architecture component.
-            // HuggingFace implementation:
-            //   per_layer_projection = model_proj(hidden) * scale → reshape → norm
-            //   per_layer_input = (per_layer_projection + token_embedding) * 1/sqrt(2)
-            //   In each layer:
-            //     gate = gelu(hidden @ gate_w)           // hidden→ple_dim
-            //     gated = gate * per_layer_input             // element-wise in ple_dim
-            //     out = gated @ proj_w                      // ple_dim→hidden
-            //     out = post_norm(out)
-            //     hidden += out
-            let ple_disabled = false; // PLE enabled
-            if !ple_disabled && self.model.ple_model_projection.is_some() && self.model.ple_projection_norm.is_some()
-            {
-                let model_proj = self.model.ple_model_projection.as_ref().unwrap();
-                let proj_norm = self.model.ple_projection_norm.as_ref().unwrap();
+            // Per-Layer Embeddings (PLE) — uses PRE-COMPUTED inputs from initial hidden state.
+            // Inside the loop, we only do: gate = gelu(hidden @ gate_w), then gate * ple_input @ proj_w
+            if let Some(ref ple_pre) = ple_precomputed {
                 if layer.per_layer_input_gate.is_some() && layer.per_layer_projection.is_some() && layer.post_per_layer_input_norm.is_some()
                 {
-                    let ple_dim = config.hidden_size_per_layer_input.unwrap_or(0);
-                    if ple_dim > 0 {
-                        let ple_total = ple_dim * config.num_layers;
-                        let layer_offset = layer_idx * ple_dim;
-
-                        // 1. Context projection: hidden[seq, hd] → [seq, ple_total] → slice → norm
-                        //    model_proj is [hd, ple_total], scale by 1/sqrt(hd)
-                        let model_proj_scale = (hd as f32).sqrt(); // HuggingFace: scale UP by sqrt(hidden_dim)
-                        let ple_all = matmul(&hidden, model_proj, seq, hd, ple_total);
-
-                        // Apply model projection scale
-                        let ple_all_scaled: Vec<f32> = ple_all.iter().map(|&x| x * model_proj_scale).collect();
-
-                        // Extract this layer's PLE slice: [seq, ple_dim]
-                        let mut ple_slice = vec![0.0f32; seq * ple_dim];
-                        for t in 0..seq {
-                            let src = t * ple_total + layer_offset;
-                            let dst = t * ple_dim;
-                            for d in 0..ple_dim {
-                                ple_slice[dst + d] = ple_all_scaled[src + d];
-                            }
+                    // Extract this layer's PLE slice: [seq, ple_dim]
+                    let mut ple_input = vec![0.0f32; seq * ple_dim];
+                    for t in 0..seq {
+                        let src = t * config.num_layers * ple_dim + layer_idx * ple_dim;
+                        let dst = t * ple_dim;
+                        for d in 0..ple_dim {
+                            ple_input[dst + d] = ple_pre[src + d];
                         }
+                    }
 
-                        // Normalize with model-level norm
-                        // Add per-layer token embeddings if available
-                        let ple_input = if let Some(ref token_embs) = self.model.embed_tokens_per_layer {
-                            // token_embs is [vocab_size × ple_total]
-                            // For each token, look up its embedding slice for this layer
-                            let mut ple_with_tokens = ple_slice.clone();
-                            for t in 0..seq {
-                                let tok_id = token_ids[t] as usize;
-                                let tok_emb_start = tok_id * ple_total + layer_offset;
-                                let dst = t * ple_dim;
-                                for d in 0..ple_dim {
-                                    ple_with_tokens[dst + d] += token_embs[tok_emb_start + d];
-                                }
-                            }
-                            rms_norm(&ple_with_tokens, proj_norm, ple_dim, 1e-6)
-                        } else {
-                            // No token embeddings — just context projection (degraded)
-                            rms_norm(&ple_slice, proj_norm, ple_dim, 1e-6)
-                        };
+                    // Gate: hidden → ple_dim with GELU
+                    let gate_out = matmul(&hidden, layer.per_layer_input_gate.as_ref().unwrap(), seq, hd, ple_dim);
+                    let gate_gelu: Vec<f32> = gate_out.iter().map(|&x| gelu_tanh(x)).collect();
 
-                        // 2. Gate: hidden → ple_dim with GELU (gelu_pytorch_tanh)
-                        //    HuggingFace uses act_fn = gelu_pytorch_tanh, NOT sigmoid
-                        //    gate_w is [hd, ple_dim], so matmul(hidden, gate) = [seq, ple_dim]
-                        let gate_out = matmul(&hidden, layer.per_layer_input_gate.as_ref().unwrap(), seq, hd, ple_dim);
-                        let gate_gelu: Vec<f32> = gate_out.iter().map(|&x| gelu_tanh(x)).collect();
+                    // Gated input: gate * ple_input (element-wise in ple_dim)
+                    let mut gated_input = vec![0.0f32; seq * ple_dim];
+                    for i in 0..seq * ple_dim {
+                        gated_input[i] = gate_gelu[i] * ple_input[i];
+                    }
 
-                        // 3. Gated input: gate * per_layer_input (element-wise in ple_dim)
-                        let mut gated_input = vec![0.0f32; seq * ple_dim];
-                        for i in 0..seq * ple_dim {
-                            gated_input[i] = gate_gelu[i] * ple_input[i];
-                        }
+                    // Project back: [seq, ple_dim] → [seq, hd]
+                    let proj_out = matmul(&gated_input, layer.per_layer_projection.as_ref().unwrap(), seq, ple_dim, hd);
 
-                        // 4. Project back: [seq, ple_dim] → [seq, hd]
-                        //    proj_w is [ple_dim, hd], so matmul(gated, proj) = [seq, hd]
-                        let proj_out = matmul(&gated_input, layer.per_layer_projection.as_ref().unwrap(), seq, ple_dim, hd);
-
-                        // 5. Post norm and add residual
-                        let ple_final = rms_norm(&proj_out, layer.post_per_layer_input_norm.as_ref().unwrap(), hd, 1e-6);
-                        for i in 0..hidden.len() {
-                            hidden[i] += ple_final[i];
-                        }
+                    // Post norm and add residual
+                    let ple_final = rms_norm(&proj_out, layer.post_per_layer_input_norm.as_ref().unwrap(), hd, 1e-6);
+                    for i in 0..hidden.len() {
+                        hidden[i] += ple_final[i];
                     }
                 }
             }
