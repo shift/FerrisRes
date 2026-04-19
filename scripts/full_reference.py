@@ -56,13 +56,14 @@ ple_model_proj = get_tensor("model.language_model.per_layer_model_projection.wei
 ple_proj_norm = get_tensor("model.language_model.per_layer_projection_norm.weight")  # [256]
 embed_per_layer = get_tensor("model.language_model.embed_tokens_per_layer.weight")  # [262144, 8960]
 ple_total = num_layers * ple_dim  # 8960
-ple_scale = np.sqrt(hd)  # sqrt(1536)
+ple_inputs_precomputed = None  # Will be set on layer 0
 
 # Load final norm + lm_head
 final_norm = get_tensor("model.language_model.norm.weight")  # [1536]
 lm_head = embed  # tied weights [262144, 1536]
 
 token_id = 2  # BOS
+initial_hidden = hidden.copy()  # Save for PLE pre-computation
 
 for layer_idx in range(num_layers):
     is_full = layer_types[layer_idx] == "full_attention"
@@ -149,19 +150,29 @@ for layer_idx in range(num_layers):
     hidden = residual2 + ffn_out
 
     # === PLE ===
-    layer_offset = layer_idx * ple_dim
+    # IMPORTANT: PLE uses pre-computed inputs from the INITIAL hidden state.
+    # project_per_layer_inputs runs ONCE before the loop in llama.cpp.
+    if layer_idx == 0:
+        ple_proj_all = (initial_hidden @ ple_model_proj.T) * (1.0 / np.sqrt(hd))
+        ple_proj_all = ple_proj_all.reshape(1, num_layers, ple_dim)
+        
+        # Per-layer RMS norm on context projection
+        ple_normed = np.zeros_like(ple_proj_all)
+        for l in range(num_layers):
+            sl = ple_proj_all[0, l, :]
+            ms = np.mean(sl ** 2) + 1e-6
+            ple_normed[0, l, :] = sl / np.sqrt(ms) * ple_proj_norm
+        
+        # Add token embeddings scaled by sqrt(ple_dim)
+        tok_emb_all = embed_per_layer[token_id].reshape(num_layers, ple_dim) * np.sqrt(ple_dim)
+        ple_normed[0, :, :] += tok_emb_all
+        
+        # Scale by 1/sqrt(2)
+        ple_normed *= 1.0 / np.sqrt(2.0)
+        
+        ple_inputs_precomputed = ple_normed[0]  # [num_layers, ple_dim]
     
-    # Context projection: hidden @ ple_model_proj.T * sqrt(hd)
-    ple_proj = (hidden @ ple_model_proj.T) * ple_scale  # [1, ple_total]
-    
-    # Token embedding for BOS (token 2)
-    tok_emb = embed_per_layer[token_id, layer_offset:layer_offset+ple_dim]  # [ple_dim]
-    
-    # Combine
-    ple_combined = ple_proj[0, layer_offset:layer_offset+ple_dim] + tok_emb  # [ple_dim]
-    
-    # Normalize
-    ple_input = rms_norm(ple_combined.reshape(1, ple_dim), ple_proj_norm).reshape(ple_dim)
+    ple_input = ple_inputs_precomputed[layer_idx]  # [ple_dim]
     
     # Gate: hidden @ gate_w → gelu
     ple_gate_w = get_tensor(f"{prefix}.per_layer_input_gate.weight")  # [ple_dim, hd]
