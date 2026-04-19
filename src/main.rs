@@ -1242,6 +1242,7 @@ async fn cmd_distill(
     // Pre-compute teacher logits for each chunk, then drop teacher to free ~10GB
     info!(event = "teacher_precompute_start", "pre-computing teacher logits");
     let mut teacher_logits_chunks: Vec<Vec<f32>> = Vec::new();
+    let mut frozen_states_per_chunk: Vec<Vec<Vec<f32>>> = Vec::new();
     let num_chunks = (token_ids.len() + seq_len - 1) / seq_len;
 
     if gpu_accel.is_some() && dispatch.attn_qkv_dispatch != ferrisres::device::OpTarget::Cpu {
@@ -1357,6 +1358,10 @@ async fn cmd_distill(
             let logits = teacher.forward(&chunk);
             teacher_logits_chunks.push(logits);
 
+            // Compute frozen hidden states from teacher (same forward pass, states collected)
+            let frozen = teacher.forward_with_hidden_states(&chunk);
+            frozen_states_per_chunk.push(frozen);
+
             let elapsed = teacher_start.elapsed().as_secs_f32();
             let per_chunk = elapsed / (chunk_idx + 1) as f32;
             let remaining = per_chunk * (total_chunks - chunk_idx - 1) as f32;
@@ -1459,18 +1464,19 @@ async fn cmd_distill(
     info!(event = "distill_start", total_steps = steps, start_step = global_step, seq_len = seq_len, lr = learning_rate, temp = temperature, "starting distillation");
     info!("");
 
-    // Precompute frozen base model hidden states for each chunk.
     // Since base weights don't change during training, we only need to run
     // the full model forward ONCE per chunk. During training, we only recompute
     // from injection points where block summary layers modify the state.
     // This saves ~80% of per-step compute (skip layers before first injection).
     let vs = config.vocab_size;
     let injection_points = config.block_summary_injection_points();
-    let first_injection = injection_points.first().copied().unwrap_or(0);
-    let mut frozen_states_per_chunk: Vec<Vec<Vec<f32>>> = Vec::new();
+    let _first_injection = injection_points.first().copied().unwrap_or(0);
+
+    // Frozen states are now computed alongside teacher logits in the teacher loop above.
+    // This section just reports stats.
 
     // GPU-aware matmul helper: consults DispatchPlan, does tiled GPU when needed
-    // For GpuTiled: chunks the B matrix into column tiles that fit in max_buffer
+    // Used for student-side operations (backprop through LM head).
     let gpu_matmul = |a: &[f32], b: &[f32], m: usize, k: usize, n: usize, dispatch: &ferrisres::device::DispatchPlan| -> Vec<f32> {
         match dispatch.should_gpu_matmul(m as u64, k as u64, n as u64) {
             ferrisres::device::OpTarget::Cpu => gemma_mapper::matmul(a, b, m, k, n),
@@ -1537,117 +1543,12 @@ async fn cmd_distill(
         }
     };
 
-    // GPU-aware SwiGLU FFN
-    let swiglu_ffn_gpu = |input: &[f32], gate: &[f32], up: &[f32], down: &[f32], hd: usize, id: usize| -> Vec<f32> {
-        let seq = input.len() / hd;
-        let gated = gpu_matmul(input, gate, seq, hd, id, &dispatch);
-        let gated: Vec<f32> = gated.iter().map(|&x| x / (1.0 + (-x).exp())).collect();
-        let upped = gpu_matmul(input, up, seq, hd, id, &dispatch);
-        let mut combined = vec![0.0f32; seq * id];
-        for i in 0..combined.len() { combined[i] = gated[i] * upped[i]; }
-        gpu_matmul(&combined, down, seq, id, hd, &dispatch)
-    };
-
-    info!(event = "precompute_frozen_states", chunks = teacher_logits_chunks.len(), first_injection = first_injection, dispatch = ?dispatch.attn_qkv_dispatch, "precomputing frozen base model hidden states");
-    let frozen_start = std::time::Instant::now();
-    for (chunk_idx, _chunk_tokens) in teacher_logits_chunks.iter().enumerate() {
-        // We need the token IDs for this chunk
-        let start_tok = (chunk_idx * seq_len) % token_ids.len();
-        let end_tok = (start_tok + seq_len).min(token_ids.len());
-        let tok_ids: Vec<u32> = token_ids[start_tok..end_tok].to_vec();
-        if tok_ids.len() < seq_len { break; }
-
-        // Run the frozen base model to get all per-layer hidden states
-        // We create a temporary teacher-like model for this
-        let frozen_states = {
-            let config_ref = &student.model.config;
-            let hd = config_ref.hidden_dim;
-            let seq = tok_ids.len();
-            let mut states = Vec::new();
-
-            // Embedding
-            let mut hidden = vec![0.0f32; seq * hd];
-            for (t, &tid) in tok_ids.iter().enumerate() {
-                let id = tid as usize;
-                if id * hd + hd <= student.model.embed_tokens.len() {
-                    for d in 0..hd { hidden[t * hd + d] = student.model.embed_tokens[id * hd + d]; }
-                }
-            }
-            let scale = (hd as f32).sqrt();
-            for h in hidden.iter_mut() { *h *= scale; }
-            states.push(hidden.clone());
-
-            for layer in &student.model.layers {
-                let residual = hidden.clone();
-                let normed = gemma_mapper::rms_norm(&hidden, &layer.attn.input_norm, hd, 1e-6);
-                let q_dim = config_ref.num_heads * config_ref.head_dim;
-                let kv_dim = config_ref.num_kv_heads * config_ref.head_dim;
-                let q = gpu_matmul(&normed, &layer.attn.q_proj, seq, hd, q_dim, &dispatch);
-                let k = gpu_matmul(&normed, &layer.attn.k_proj, seq, hd, kv_dim, &dispatch);
-                let v = gpu_matmul(&normed, &layer.attn.v_proj, seq, hd, kv_dim, &dispatch);
-                let mut q = q; let mut k = k;
-                gemma_mapper::apply_rope(&mut q, seq, config_ref.num_heads, config_ref.head_dim, 0, 10000.0, 1.0);
-                gemma_mapper::apply_rope_gqa(&mut k, seq, config_ref.num_kv_heads, config_ref.head_dim, 0, 10000.0, 1.0);
-                let heads_per_kv = config_ref.num_heads / config_ref.num_kv_heads;
-                let attn_scale = 1.0 / (config_ref.head_dim as f32).sqrt();
-                let mut attn_out = vec![0.0f32; seq * q_dim];
-                for h_idx in 0..config_ref.num_heads {
-                    let kv_h = h_idx / heads_per_kv;
-                    for t in 0..seq {
-                        let mut max_s = f32::NEG_INFINITY;
-                        let mut scores = vec![0.0f32; seq];
-                        for s in 0..seq {
-                            if s > t { scores[s] = f32::NEG_INFINITY; continue; }
-                            let mut dot = 0.0;
-                            for d in 0..config_ref.head_dim {
-                                dot += q[t * q_dim + h_idx * config_ref.head_dim + d]
-                                     * k[s * kv_dim + kv_h * config_ref.head_dim + d];
-                            }
-                            scores[s] = dot * attn_scale;
-                            if scores[s] > max_s { max_s = scores[s]; }
-                        }
-                        let mut sum_e = 0.0;
-                        for s in &mut scores { *s = (*s - max_s).exp(); sum_e += *s; }
-                        for s in &mut scores { *s /= sum_e; }
-                        for d in 0..config_ref.head_dim {
-                            let mut val = 0.0;
-                            for s in 0..seq { val += scores[s] * v[s * kv_dim + kv_h * config_ref.head_dim + d]; }
-                            attn_out[t * q_dim + h_idx * config_ref.head_dim + d] = val;
-                        }
-                    }
-                }
-                let attn_proj = gpu_matmul(&attn_out, &layer.attn.o_proj, seq, q_dim, hd, &dispatch);
-                for i in 0..hidden.len() { hidden[i] = residual[i] + attn_proj[i]; }
-                let residual2 = hidden.clone();
-                let normed2 = gemma_mapper::rms_norm(&hidden, &layer.attn.post_attn_norm, hd, 1e-6);
-                let ffn_out = match &layer.ffn {
-                    gemma_mapper::Gemma4FfnWeights::Dense { gate_proj, up_proj, down_proj } => {
-                        swiglu_ffn_gpu(&normed2, gate_proj, up_proj, down_proj, hd, config_ref.intermediate_dim)
-                    }
-                    gemma_mapper::Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs } => {
-                        let mut moe = gemma_mapper::CpuMoELayer::new(hd, config_ref.intermediate_dim, config_ref.num_experts, config_ref.top_k);
-                        moe.gate_weights = router.clone();
-                        moe.expert_gate = expert_gates.clone();
-                        moe.expert_up = expert_ups.clone();
-                        moe.expert_down = expert_downs.clone();
-                        moe.forward(&normed2, seq)
-                    }
-                };
-                for i in 0..hidden.len() { hidden[i] = residual2[i] + ffn_out[i]; }
-                states.push(hidden.clone());
-            }
-            states
-        };
-        frozen_states_per_chunk.push(frozen_states);
-        let elapsed = frozen_start.elapsed().as_secs_f32();
-        let per_chunk = elapsed / (chunk_idx + 1) as f32;
-        let remaining = per_chunk * (teacher_logits_chunks.len() - chunk_idx - 1) as f32;
-        info!(event = "frozen_state_chunk", chunk = chunk_idx + 1, total = teacher_logits_chunks.len(), elapsed_s = elapsed as u32, eta_s = remaining as u32, "frozen base hidden states precomputed");
-    }
+    // Frozen states were computed alongside teacher logits above.
+    // Report stats.
     let total_states_mb = frozen_states_per_chunk.iter()
         .map(|c| c.iter().map(|s| s.len() * 4).sum::<usize>())
         .sum::<usize>() as f64 / (1024.0 * 1024.0);
-    info!(event = "frozen_states_ready", chunks = frozen_states_per_chunk.len(), size_mb = total_states_mb as u32, "frozen states precomputed");
+    info!(event = "frozen_states_ready", chunks = frozen_states_per_chunk.len(), size_mb = total_states_mb as u32, "frozen states precomputed (alongside teacher logits)");
 
     // Run distillation using pre-computed teacher logits
     let mut results: Vec<gemma_mapper::DistillationStepResult> = Vec::new();
