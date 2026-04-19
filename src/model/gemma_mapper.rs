@@ -2264,9 +2264,9 @@ impl Gemma4Teacher {
             let layer_inter_dim = layer.intermediate_dim;
 
             // Diagnostic: detailed layer 0 trace for comparison with Python reference
-            if layer_idx == 0 {
+            if layer_idx == 0 || layer_idx == 4 {
                 let first10: Vec<String> = hidden.iter().take(10).map(|v| format!("{:.6}", v)).collect();
-                tracing::info!(event = "debug_compare", step = "before_layer", vals = ?first10);
+                tracing::info!(event = "debug_compare", step = "before_layer", layer = layer_idx, vals = ?first10);
             }
 
             let residual = hidden.clone();
@@ -2373,7 +2373,7 @@ impl Gemma4Teacher {
             //     out = gated @ proj_w                      // ple_dim→hidden
             //     out = post_norm(out)
             //     hidden += out
-            let ple_disabled = true; // Debug: set to true to disable PLE
+            let ple_disabled = false; // Debug: set to true to disable PLE
             if !ple_disabled && self.model.ple_model_projection.is_some() && self.model.ple_projection_norm.is_some()
             {
                 let model_proj = self.model.ple_model_projection.as_ref().unwrap();
@@ -2519,6 +2519,26 @@ impl Gemma4Teacher {
             for l in logits.iter_mut() {
                 *l = (*l / cap).tanh() * cap;
             }
+        }
+
+        // Diagnostic: entropy after softcapping
+        if seq > 0 {
+            let last_logits = &logits[(seq-1)*vs..seq*vs];
+            let max_l = last_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum_exp = 0.0f32;
+            for l in last_logits { sum_exp += (l - max_l).exp(); }
+            let log_sum_exp = sum_exp.ln() + max_l;
+            let mut entropy = 0.0f32;
+            for l in last_logits {
+                let p = (l - log_sum_exp).exp();
+                if p > 0.0 { entropy -= p * p.ln(); }
+            }
+            let top5: Vec<(usize, f32)> = {
+                let mut indexed: Vec<(usize, f32)> = last_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                indexed[..5.min(indexed.len())].to_vec()
+            };
+            tracing::info!(event = "logits_after_softcap", entropy = entropy, max = max_l, top5 = ?top5, "After softcapping");
         }
 
         logits
