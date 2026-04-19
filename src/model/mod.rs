@@ -1,6 +1,7 @@
 pub mod config;
 pub mod linear;
 pub mod cpu_linear;
+pub mod cpu_moe;
 pub mod moe_linear;
 pub mod block_attn_res;
 pub mod model;
