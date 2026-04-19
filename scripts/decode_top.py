@@ -11,6 +11,12 @@ vocab = model.get("vocab", {})
 # Reverse: id -> token
 id_to_token = {v: k for k, v in vocab.items()}
 
+prompt_tokens = [2, 3689, 563, 236743, 236778, 236862, 236778, 236881]
+print("\n=== Prompt tokens ===")
+for tid in prompt_tokens:
+    token_str = id_to_token.get(tid, f"<UNKNOWN:{tid}>")
+    print(f"  {tid}: '{token_str}'")
+
 # Top tokens from the Rust output
 top_tokens = [207641, 99747, 241550, 208634, 220628]
 
