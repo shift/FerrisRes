@@ -2,7 +2,7 @@
 import json, sys
 
 # Load tokenizer
-with open("/home/shift/c/ferrisres/tokenizer.json", "r") as f:
+with open("/home/shift/code/ferrisres/tokenizer.json", "r") as f:
     tok_data = json.load(f)
 
 model = tok_data.get("model", {})
