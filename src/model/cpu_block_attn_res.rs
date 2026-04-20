@@ -330,7 +330,7 @@ impl CpuBlockAttnResLayer {
 
     /// CPU causal self-attention with GQA.
     /// scale = 1.0 (after per-head RMSNorm, no 1/sqrt(d) needed).
-    fn cpu_attention(
+    pub fn cpu_attention(
         &self,
         q: &[f32],
         k: &[f32],
@@ -381,7 +381,7 @@ impl CpuBlockAttnResLayer {
     }
 
     /// CPU dense FFN with configurable activation (feature 10).
-    fn cpu_ffn(&self, input: &[f32], seq: usize) -> Vec<f32> {
+    pub fn cpu_ffn(&self, input: &[f32], seq: usize) -> Vec<f32> {
         let hd = self.hidden_dim;
         let id = self.intermediate_dim;
 
@@ -644,7 +644,7 @@ impl CpuBlockAttnResModel {
     }
 
     /// Pre-compute PLE inputs from initial hidden state (matches llama.cpp).
-    fn precompute_ple(
+    pub fn precompute_ple(
         &self,
         hidden: &[f32],
         token_ids: &[u32],
@@ -715,7 +715,7 @@ impl CpuBlockAttnResModel {
     }
 
     /// Find KV sharing source: last non-shared layer of same type.
-    fn kv_shared_source_layer(
+    pub fn kv_shared_source_layer(
         layer_idx: usize,
         first_shared: usize,
         layers: &[CpuBlockAttnResLayer],
@@ -741,7 +741,7 @@ impl CpuBlockAttnResModel {
     /// values = normed block representations (same as keys)
     ///
     /// Returns: attention output [hidden_dim] to add as residual.
-    fn inter_block_attention(
+    pub fn inter_block_attention(
         &self,
         hidden: &[f32],      // [seq, hidden_dim] current token states
         block_reps: &[Vec<f32>], // block representations so far (each [hidden_dim])
@@ -828,7 +828,7 @@ impl CpuBlockAttnResModel {
     }
 
     /// Check if a layer is a block boundary (last layer of its block).
-    fn is_block_boundary(&self, layer_idx: usize) -> bool {
+    pub fn is_block_boundary(&self, layer_idx: usize) -> bool {
         self.block_config.boundary_layers.contains(&layer_idx)
     }
 

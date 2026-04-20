@@ -50,7 +50,10 @@ pub mod subgoal_generator;
 pub mod plan_cache;
 pub mod tool_bootstrapper;
 pub mod domain_detector;
+pub mod cpu_generator;
 pub mod self_modification_guard;
+
+pub use cpu_generator::{CpuTokenGenerator, CpuGenerateConfig, CpuLayerKVCache, CpuModelKVCache};
 
 pub use kv_cache::{LayerKVCache, ModelKVCache};
 pub use two_phase::{TwoPhaseConfig, TwoPhaseInference, KVCache, Sampler, GenerationState};
