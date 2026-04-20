@@ -10,9 +10,9 @@
 | Test suites | 1448 lib tests passing, 0 failures |
 | Language | 100% Rust (safe + WGSL compute shaders) |
 | GPU backends | Vulkan, Metal, DX12, WebGPU via wgpu |
-| Tasks completed | **442 / 493** |
+| Tasks completed | **444 / 493** |
 | Tasks in progress | **0** |
-| Tasks planned | **43** |
+| Tasks planned | **41** |
 | License | AGPL-3.0-or-later |
 
 ---
@@ -268,7 +268,7 @@
 | 26 | 📝 Planned | Elastic Inference (E2B/E4B switching) |
 | 27 | 📝 Planned | GPU BlockAttnResLayer (Gemma 4 features + backward kernels) |
 
-**442 tasks done, 0 in progress, 43 planned — 1448 tests passing.**
+**444 tasks done, 0 in progress, 41 planned — 1456 tests passing.**
 
 ## Cognitive Architecture
 
