@@ -7,12 +7,12 @@
 | Metric | Value |
 |---|---|
 | Source code | ~94,000 lines across 158 modules |
-| Test suites | 1469 lib tests passing, 0 failures |
+| Test suites | 1470 lib tests passing, 0 failures |
 | Language | 100% Rust (safe + WGSL compute shaders) |
 | GPU backends | Vulkan, Metal, DX12, WebGPU via wgpu |
-| Tasks completed | **447 / 493** |
+| Tasks completed | **449 / 493** |
 | Tasks in progress | **0** |
-| Tasks planned | **38** |
+| Tasks planned | **36** |
 | License | AGPL-3.0-or-later |
 
 ---
@@ -25,122 +25,122 @@
 │     train --lora-rank / infer --template --image --yarn     │
 ├─────────────────────────────────────────────────────────────┤
 │                     Inference Layer                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ TokenGenerator│ │ UnifiedToken │  │ Prompt           │  │
-│  │ (BlockAttnRes)│ │ Generator    │  │ Templates        │  │
-│  │              │ │ (AnyModel:   │  │ (ChatML/Llama2   │  │
-│  │              │ │  Standard or │  │  /Mistral/Alpaca  │  │
-│  │              │ │  BlockAttnRes)│ │  /Raw)           │  │
-│  └──────┬───────┘  └──────────────┘  └──────────────────┘  │
-│  ┌──────┴───────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ Logit        │  │ Sampling     │  │ KV Cache         │  │
-│  │ Processors   │  │ (argmax/temp │  │ (Per-layer GPU   │  │
-│  │ (repetition→ │  │  /top-k/top-p│  │  + TurboQuant    │  │
-│  │  freq/pres→  │  │              │  │  2-bit compress  │  │
-│  │  temp→topk→  │  │              │  │  + PagedAttention│  │
-│  │  topp→sample)│  │              │  │  + compaction)   │  │
-│  └──────────────┘  └──────────────┘  └──────────────────┘  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ RAG Pipeline │  │ Tool Search  │  │ DECS             │  │
-│  │ (dense/sparse│  │ Registry     │  │ (reasoning token │  │
-│  │  hybrid +    │  │ (keyword/    │  │  optimizer,      │  │
-│  │  Matryoshka  │  │  embedding/  │  │  plateau detect) │  │
-│  │  elastic)    │  │  hybrid)     │  │                  │  │
-│  └──────────────┘  └──────────────┘  └──────────────────┘  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ ToMeMerger   │  │ HullKVCache  │  │ LLM-Computer     │  │
-│  │ (bipartite   │  │ (2D convex   │  │ (CALM VM: LookUp │  │
-│  │  soft match, │  │  hull attn,  │  │  → Compute →     │  │
-│  │  token merge)│  │  O(log n))   │  │  BranchIf)       │  │
-│  └──────────────┘  └──────────────┘  └──────────────────┘  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ Speculative  │  │ PagedAttention│  │ Cross-Modal      │  │
-│  │ Decoding     │  │ (vLLM-style  │  │ Attention        │  │
-│  │ (n-gram draft│  │  block pool, │  │ (text/vision/    │  │
-│  │  + verify)   │  │  COW, prefix │  │  audio fusion)   │  │
-│  │              │  │  sharing)    │  │                  │  │
-│  └──────────────┘  └──────────────┘  └──────────────────┘  │
-│  ┌──────────────┐  ┌──────────────┐                         │
-│  │ Video Token  │  │ Streaming    │                         │
-│  │ Compression  │  │ I/O Pipelines│                         │
-│  │ (temporal    │  │ (image/audio │                         │
-│  │  redundancy, │  │  /video:     │                         │
-│  │  motion comp,│  │  progressive │                         │
-│  │  4-8× reduce)│  │  decode)     │                         │
-│  └──────────────┘  └──────────────┘                         │
+│  ┌───────────────┐  ┌───────────────┐  ┌──────────────────┐ │
+│  │ TokenGenerator│  │ UnifiedToken  │  │ Prompt           │ │
+│  │ (BlockAttnRes)│  │ Generator     │  │ Templates        │ │
+│  │               │  │ (AnyModel:    │  │ (ChatML/Llama2   │ │
+│  │               │  │  Standard or  │  │  /Mistral/Alpaca │ │
+│  │               │  │  BlockAttnRes)│  │  /Raw)           │ │
+│  └──────┬────────┘  └───────────────┘  └──────────────────┘ │
+│  ┌──────┴────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │ Logit         │  │ Sampling     │  │ KV Cache         │  │
+│  │ Processors    │  │ (argmax/temp │  │ (Per-layer GPU   │  │
+│  │ (repetition→  │  │  /top-k/top-p│  │  + TurboQuant    │  │
+│  │  freq/pres→   │  │              │  │  2-bit compress  │  │
+│  │  temp→topk→   │  │              │  │  + PagedAttention│  │
+│  │  topp→sample) │  │              │  │  + compaction)   │  │
+│  └───────────────┘  └──────────────┘  └──────────────────┘  │
+│  ┌───────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │ RAG Pipeline  │  │ Tool Search  │  │ DECS             │  │
+│  │ (dense/sparse │  │ Registry     │  │ (reasoning token │  │
+│  │  hybrid +     │  │ (keyword/    │  │  optimizer,      │  │
+│  │  Matryoshka   │  │  embedding/  │  │  plateau detect) │  │
+│  │  elastic)     │  │  hybrid)     │  │                  │  │
+│  └───────────────┘  └──────────────┘  └──────────────────┘  │
+│  ┌───────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │ ToMeMerger    │  │ HullKVCache  │  │ LLM-Computer     │  │
+│  │ (bipartite    │  │ (2D convex   │  │ (CALM VM: LookUp │  │
+│  │  soft match,  │  │  hull attn,  │  │  → Compute →     │  │
+│  │  token merge) │  │  O(log n))   │  │  BranchIf)       │  │
+│  └───────────────┘  └──────────────┘  └──────────────────┘  │
+│  ┌───────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │ Speculative   │  │PagedAttention│  │ Cross-Modal      │  │
+│  │ Decoding      │  │ (vLLM-style  │  │ Attention        │  │
+│  │ (n-gram draft │  │  block pool, │  │ (text/vision/    │  │
+│  │  + verify)    │  │  COW, prefix │  │  audio fusion)   │  │
+│  │               │  │  sharing)    │  │                  │  │
+│  └───────────────┘  └──────────────┘  └──────────────────┘  │
+│  ┌───────────────┐  ┌──────────────┐                        │
+│  │ Video Token   │  │ Streaming    │                        │
+│  │ Compression   │  │ I/O Pipelines│                        │
+│  │ (temporal     │  │ (image/audio │                        │
+│  │  redundancy,  │  │  /video:     │                        │
+│  │  motion comp, │  │  progressive │                        │
+│  │  4-8× reduce) │  │  decode)     │                        │
+│  └───────────────┘  └──────────────┘                        │
 ├─────────────────────────────────────────────────────────────┤
 │                      Model Layer                            │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ BlockAttnRes │  │ Standard     │  │ Architecture     │  │
-│  │ Model/Layer  │  │ Transformer  │  │ Dispatcher       │  │
-│  │ O(n) + back  │  │ O(n²) compat │  │ (auto-detect:   │  │
-│  │              │  │ mode         │  │  safetensors/GGUF│  │
-│  └──────────────┘  └──────────────┘  │  → AnyModel)     │  │
-│  ┌──────────────┐  ┌──────────────┐  └──────────────────┘  │
-│  │ Safetensors  │  │ GGUF Loader  │  ┌──────────────────┐  │
-│  │ (F32/F16/    │  │ (v2/v3, Q8_0 │  │ Audio Encoder    │  │
-│  │  BF16, shard)│  │  Q4_0/Q4_K/  │  │ (EnCodec-style,  │  │
-│  │              │  │  Q5_K/Q6_K)  │  │  RVQ codebooks)  │  │
-│  └──────────────┘  └──────────────┘  └──────────────────┘  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ BPE Tokenizer│  │ BLT Tokenizer│  │ QA-Token         │  │
-│  │ + Domain     │  │ (byte-level, │  │ (quality-aware)  │  │
-│  │ Vocabulary   │  │  entropy     │  │                  │  │
-│  │              │  │  patching)   │  │                  │  │
-│  └──────────────┘  └──────────────┘  └──────────────────┘  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ VisionEncoder│  │ VQ-VAE       │  │ ModelShard       │  │
-│  │ (Implicit    │  │ Codebook     │  │ (F32/F16/I8/I4)  │  │
-│  │  GEMM + ToMe)│  │ (EMA, multi- │  │                  │  │
-│  │              │  │  codebook)   │  │                  │  │
-│  └──────────────┘  └──────────────┘  └──────────────────┘  │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │ BlockAttnRes │  │ Standard     │  │ Architecture     │   │
+│  │ Model/Layer  │  │ Transformer  │  │ Dispatcher       │   │
+│  │ O(n) + back  │  │ O(n²) compat │  │ (auto-detect:    │   │
+│  │              │  │ mode         │  │  safetensors/GGUF│   │
+│  └──────────────┘  └──────────────┘  │  → AnyModel)     │   │
+│  ┌──────────────┐  ┌──────────────┐  └──────────────────┘   │
+│  │ Safetensors  │  │ GGUF Loader  │  ┌──────────────────┐   │
+│  │ (F32/F16/    │  │ (v2/v3, Q8_0 │  │ Audio Encoder    │   │
+│  │  BF16, shard)│  │  Q4_0/Q4_K/  │  │ (EnCodec-style,  │   │
+│  │              │  │  Q5_K/Q6_K)  │  │  RVQ codebooks)  │   │
+│  └──────────────┘  └──────────────┘  └──────────────────┘   │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │ BPE Tokenizer│  │ BLT Tokenizer│  │ QA-Token         │   │
+│  │ + Domain     │  │ (byte-level, │  │ (quality-aware)  │   │
+│  │ Vocabulary   │  │  entropy     │  │                  │   │
+│  │              │  │  patching)   │  │                  │   │
+│  └──────────────┘  └──────────────┘  └──────────────────┘   │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │ VisionEncoder│  │ VQ-VAE       │  │ ModelShard       │   │
+│  │ (Implicit    │  │ Codebook     │  │ (F32/F16/I8/I4)  │   │
+│  │  GEMM + ToMe)│  │ (EMA, multi- │  │                  │   │
+│  │              │  │  codebook)   │  │                  │   │
+│  └──────────────┘  └──────────────┘  └──────────────────┘   │
 ├─────────────────────────────────────────────────────────────┤
-│                    Training Layer                            │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ LoRA         │  │ Gradient     │  │ Autodiff         │  │
-│  │ (merge/      │  │ Checkpointing│  │ (ComputationGraph│  │
-│  │  unmerge,    │  │ (closure-    │  │  + backward)     │  │
-│  │  hot-swap)   │  │  based       │  │                  │  │
-│  │              │  │  recompute)  │  │                  │  │
-│  └──────────────┘  └──────────────┘  └──────────────────┘  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ Adam/SGD     │  │ Tile-Based   │  │ Partial          │  │
-│  │ Optimizers   │  │ Gradient     │  │ Backpropagation  │  │
-│  │              │  │ Accumulation │  │ (layer freeze,   │  │
-│  │              │  │              │  │  selective bwd)  │  │
-│  └──────────────┘  └──────────────┘  └──────────────────┘  │
+│                    Training Layer                           │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │ LoRA         │  │ Gradient     │  │ Autodiff         │   │
+│  │ (merge/      │  │ Checkpointing│  │ (ComputationGraph│   │
+│  │  unmerge,    │  │ (closure-    │  │  + backward)     │   │
+│  │  hot-swap)   │  │  based       │  │                  │   │
+│  │              │  │  recompute)  │  │                  │   │
+│  └──────────────┘  └──────────────┘  └──────────────────┘   │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │ Adam/SGD     │  │ Tile-Based   │  │ Partial          │   │
+│  │ Optimizers   │  │ Gradient     │  │ Backpropagation  │   │
+│  │              │  │ Accumulation │  │ (layer freeze,   │   │
+│  │              │  │              │  │  selective bwd)  │   │
+│  └──────────────┘  └──────────────┘  └──────────────────┘   │
 ├─────────────────────────────────────────────────────────────┤
-│                    Compute Layer                             │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ wgpu Runtime │  │ TurboQuant   │  │ Flash Attention  │  │
-│  │ (Vulkan/     │  │ (Outlier     │  │ (FlashDecode +   │  │
-│  │  Metal/DX12/ │  │  Channel     │  │  PrefillAttn)    │  │
-│  │  WebGPU)     │  │  Split,      │  │                  │  │
-│  │              │  │  2.5-bit)    │  │                  │  │
-│  └──────────────┘  └──────────────┘  └──────────────────┘  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ Tensor       │  │ Pipeline     │  │ 3D Factored      │  │
-│  │ Parallelism  │  │ Parallelism  │  │ Convolution      │  │
-│  │ (weight      │  │ (GPipe/1F1B  │  │ (temporal +      │  │
-│  │  sharding)   │  │  schedules)  │  │  spatial)        │  │
-│  └──────────────┘  └──────────────┘  └──────────────────┘  │
+│                    Compute Layer                            │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │ wgpu Runtime │  │ TurboQuant   │  │ Flash Attention  │   │
+│  │ (Vulkan/     │  │ (Outlier     │  │ (FlashDecode +   │   │
+│  │  Metal/DX12/ │  │  Channel     │  │  PrefillAttn)    │   │
+│  │  WebGPU)     │  │  Split,      │  │                  │   │
+│  │              │  │  2.5-bit)    │  │                  │   │
+│  └──────────────┘  └──────────────┘  └──────────────────┘   │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │ Tensor       │  │ Pipeline     │  │ 3D Factored      │   │
+│  │ Parallelism  │  │ Parallelism  │  │ Convolution      │   │
+│  │ (weight      │  │ (GPipe/1F1B  │  │ (temporal +      │   │
+│  │  sharding)   │  │  schedules)  │  │  spatial)        │   │
+│  └──────────────┘  └──────────────┘  └──────────────────┘   │
 ├─────────────────────────────────────────────────────────────┤
-│                     Device Layer                             │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ DeviceProfile│  │ Capability   │  │ Hardware Tuning  │  │
-│  │ (GPU vendor  │  │ Detection    │  │ (workgroup size, │  │
-│  │  + memory)   │  │              │  │  coalescing,     │  │
-│  │              │  │              │  │  compute params) │  │
-│  └──────────────┘  └──────────────┘  └──────────────────┘  │
+│                     Device Layer                            │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │ DeviceProfile│  │ Capability   │  │ Hardware Tuning  │   │
+│  │ (GPU vendor  │  │ Detection    │  │ (workgroup size, │   │
+│  │  + memory)   │  │              │  │  coalescing,     │   │
+│  │              │  │              │  │  compute params) │   │
+│  └──────────────┘  └──────────────┘  └──────────────────┘   │
 ├─────────────────────────────────────────────────────────────┤
-│                 Distributed / Hardware Layer                  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ Cloud GPU    │  │ ANE / NPU    │  │ RDMA / DirectGPU │  │
-│  │ Orchestrator │  │ Op Placement │  │ (NVLink/RoCE/    │  │
-│  │ (workers,    │  │ (auto route  │  │  InfiniBand/TCP) │  │
-│  │  fault tol,  │  │  ops to GPU  │  │                  │  │
-│  │  cost sched) │  │  or ANE)     │  │                  │  │
-│  └──────────────┘  └──────────────┘  └──────────────────┘  │
+│                 Distributed / Hardware Layer                │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │ Cloud GPU    │  │ ANE / NPU    │  │ RDMA / DirectGPU │   │
+│  │ Orchestrator │  │ Op Placement │  │ (NVLink/RoCE/    │   │
+│  │ (workers,    │  │ (auto route  │  │  InfiniBand/TCP) │   │
+│  │  fault tol,  │  │  ops to GPU  │  │                  │   │
+│  │  cost sched) │  │  or ANE)     │  │                  │   │
+│  └──────────────┘  └──────────────┘  └──────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -268,7 +268,7 @@
 | 26 | 📝 Planned | Elastic Inference (E2B/E4B switching) |
 | 27 | 📝 Planned | GPU BlockAttnResLayer (Gemma 4 features + backward kernels) |
 
-**447 tasks done, 0 in progress, 38 planned — 1469 tests passing.**
+**449 tasks done, 0 in progress, 36 planned — 1470 tests passing.**
 
 ## Cognitive Architecture
 
