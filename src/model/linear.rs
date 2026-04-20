@@ -122,6 +122,14 @@ impl Linear {
         &self.weight
     }
 
+    /// Upload weights from a CPU slice to the GPU buffer.
+    pub fn set_weight(&self, queue: &Queue, data: &[f32]) {
+        let expected = self.out_features * self.in_features;
+        assert_eq!(data.len(), expected, "set_weight: expected {} floats, got {}", expected, data.len());
+        let bytes = bytemuck::cast_slice(data);
+        queue.write_buffer(self.weight.buffer(), 0, bytes);
+    }
+
     pub fn bias(&self) -> Option<&GpuBuffer> {
         self.bias.as_ref()
     }

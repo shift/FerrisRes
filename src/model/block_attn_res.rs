@@ -127,19 +127,51 @@ pub struct BlockAttnResLayer {
     layer_number: usize,
     hidden_dim: usize,
     num_heads: usize,
+    num_kv_heads: usize,
     head_dim: usize,
     intermediate_dim: usize,
 
+    // Attention
     attn_norm: RmsNormOp,
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
     out_proj: Linear,
+    /// Per-head Q RMSNorm (Gemma 4 feature 3)
+    q_norm: RmsNormOp,
+    /// Per-head K RMSNorm (Gemma 4 feature 3)
+    k_norm: RmsNormOp,
+    /// Per-head V RMSNorm (Gemma 4 feature 4)
+    v_norm: RmsNormOp,
+    /// Post-attention RMSNorm (Gemma 4 feature 1)
+    post_attn_norm: RmsNormOp,
 
+    // FFN
     ff_norm: RmsNormOp,
     ff_up: Option<Linear>,
+    ff_gate: Option<Linear>,
     ff_down: Option<Linear>,
     moe_linear: Option<RefCell<MoELinear>>,
+    /// Post-FFN RMSNorm (Gemma 4 feature 2)
+    post_ffn_norm: RmsNormOp,
+
+    // Layer scalar (Gemma 4 feature 5)
+    layer_scalar: f32,
+
+    // PLE (Gemma 4 feature 6)
+    ple_input_gate: Option<Linear>,
+    ple_projection: Option<Linear>,
+    ple_post_norm: Option<RmsNormOp>,
+
+    // RoPE parameters (Gemma 4 feature 8)
+    rope_theta: f64,
+    partial_rotary_factor: f32,
+
+    // Activation (Gemma 4 feature 10)
+    use_gelu: bool,
+
+    // KV sharing (Gemma 4 feature 7)
+    kv_shared: bool,
 
     #[allow(dead_code)]
     pseudo_query: GpuBuffer,
@@ -168,89 +200,101 @@ impl BlockAttnResLayer {
         config: &BlockAttnResConfig,
         layer_number: usize,
     ) -> Result<Self> {
-        tracing::info!(
-            "Creating BlockAttnResLayer {}: hidden_dim={} intermediate_dim={} num_heads={}",
-            layer_number, config.hidden_dim, config.intermediate_dim, config.attention_heads
-        );
+        Self::new_with_params(
+            device, queue, config, layer_number,
+            1,      // num_kv_heads
+            config.hidden_dim / config.attention_heads, // head_dim
+            config.intermediate_dim,
+            10000.0, // rope_theta
+            1.0,     // partial_rotary_factor
+            false,   // use_gelu
+            false,   // kv_shared
+        )
+    }
 
+    /// Create a layer with per-layer Gemma 4 parameters.
+    pub fn new_with_params(
+        device: Arc<Device>,
+        queue: Arc<Queue>,
+        config: &BlockAttnResConfig,
+        layer_number: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        intermediate_dim: usize,
+        rope_theta: f64,
+        partial_rotary_factor: f32,
+        use_gelu: bool,
+        kv_shared: bool,
+    ) -> Result<Self> {
         let num_heads = config.attention_heads;
-        let head_dim = config.hidden_dim / num_heads;
-        assert_eq!(
-            config.hidden_dim % num_heads,
-            0,
-            "hidden_dim must be divisible by num_heads"
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        tracing::info!(
+            "Creating BlockAttnResLayer {}: hidden={} q_dim={} kv_dim={} intermediate={} heads={} kv_heads={} head_dim={} theta={} rotary={} gelu={} kv_shared={}",
+            layer_number, config.hidden_dim, q_dim, kv_dim, intermediate_dim,
+            num_heads, num_kv_heads, head_dim, rope_theta, partial_rotary_factor, use_gelu, kv_shared
         );
 
         let attn_norm = RmsNormOp::new(&device)?;
         let ff_norm = RmsNormOp::new(&device)?;
         let attn_res_norm = RmsNormOp::new(&device)?;
 
+        // Per-head Q/K/V norms (Gemma 4 features 3-4)
+        let q_norm = RmsNormOp::new(&device)?;
+        let k_norm = RmsNormOp::new(&device)?;
+        let v_norm = RmsNormOp::new(&device)?;
+
+        // Post-attention and post-FFN norms (Gemma 4 features 1-2)
+        let post_attn_norm = RmsNormOp::new(&device)?;
+        let post_ffn_norm = RmsNormOp::new(&device)?;
+
         let q_proj = Linear::new(
-            Arc::clone(&device),
-            Arc::clone(&queue),
-            config.hidden_dim,
-            config.hidden_dim,
-            false,
+            Arc::clone(&device), Arc::clone(&queue),
+            config.hidden_dim, q_dim, false,
         )?;
         let k_proj = Linear::new(
-            Arc::clone(&device),
-            Arc::clone(&queue),
-            config.hidden_dim,
-            config.hidden_dim,
-            false,
+            Arc::clone(&device), Arc::clone(&queue),
+            config.hidden_dim, kv_dim, false,
         )?;
         let v_proj = Linear::new(
-            Arc::clone(&device),
-            Arc::clone(&queue),
-            config.hidden_dim,
-            config.hidden_dim,
-            false,
+            Arc::clone(&device), Arc::clone(&queue),
+            config.hidden_dim, kv_dim, false,
         )?;
         let out_proj = Linear::new(
-            Arc::clone(&device),
-            Arc::clone(&queue),
-            config.hidden_dim,
-            config.hidden_dim,
-            false,
+            Arc::clone(&device), Arc::clone(&queue),
+            q_dim, config.hidden_dim, false,
         )?;
 
-        let (ff_up, ff_down, moe_linear) = if config.use_moe {
+        let (ff_up, ff_gate, ff_down, moe_linear) = if config.use_moe {
             let moe = MoELinear::new(
-                &device,
-                &queue,
-                config.hidden_dim,
-                config.intermediate_dim,
-                config.num_experts,
-                config.top_k,
+                &device, &queue,
+                config.hidden_dim, intermediate_dim,
+                config.num_experts, config.top_k,
             )?;
-            (None, None, Some(RefCell::new(moe)))
+            (None, None, None, Some(RefCell::new(moe)))
         } else {
+            let gate = Linear::new(
+                Arc::clone(&device), Arc::clone(&queue),
+                config.hidden_dim, intermediate_dim, false,
+            )?;
             let up = Linear::new(
-                Arc::clone(&device),
-                Arc::clone(&queue),
-                config.hidden_dim,
-                config.intermediate_dim,
-                false,
+                Arc::clone(&device), Arc::clone(&queue),
+                config.hidden_dim, intermediate_dim, false,
             )?;
             let down = Linear::new(
-                Arc::clone(&device),
-                Arc::clone(&queue),
-                config.intermediate_dim,
-                config.hidden_dim,
-                false,
+                Arc::clone(&device), Arc::clone(&queue),
+                intermediate_dim, config.hidden_dim, false,
             )?;
-            (Some(up), Some(down), None)
+            (Some(up), Some(gate), Some(down), None)
         };
 
         let pseudo_query_bytes = config.hidden_dim * std::mem::size_of::<f32>();
         let pseudo_query = GpuBuffer::zeros(&device, &queue, pseudo_query_bytes, Some("Pseudo Query"))?;
 
         let attn_res_proj = Linear::new(
-            Arc::clone(&device),
-            Arc::clone(&queue),
-            config.hidden_dim,
-            2 * config.hidden_dim,
-            false,
+            Arc::clone(&device), Arc::clone(&queue),
+            config.hidden_dim, 2 * config.hidden_dim, false,
         )?;
 
         let elementwise = ElementWiseOp::new(&device, &queue);
@@ -261,29 +305,50 @@ impl BlockAttnResLayer {
         let causal_mask = CausalMaskOp::new(&device)?;
         let flash_decode = FlashDecodeOp::new(&device, &queue)?;
         let prefill_attn = PrefillAttnOp::new(&device)?;
-        
-        let hidden_dim = config.hidden_dim;
 
         tracing::info!(
-            "BlockAttnResLayer {} created: heads={} head_dim={}",
-            layer_number, num_heads, head_dim
+            "BlockAttnResLayer {} created: heads={} kv_heads={} head_dim={}",
+            layer_number, num_heads, num_kv_heads, head_dim
         );
 
         Ok(Self {
             layer_number,
-            hidden_dim,
+            hidden_dim: config.hidden_dim,
             num_heads,
+            num_kv_heads,
             head_dim,
-            intermediate_dim: config.intermediate_dim,
+            intermediate_dim,
+
+            // Attention
             attn_norm,
-            q_proj,
-            k_proj,
-            v_proj,
-            out_proj,
+            q_proj, k_proj, v_proj, out_proj,
+            q_norm, k_norm, v_norm,
+            post_attn_norm,
+
+            // FFN
             ff_norm,
-            ff_up,
-            ff_down,
+            ff_up, ff_gate, ff_down,
             moe_linear,
+            post_ffn_norm,
+
+            // Layer scalar
+            layer_scalar: 1.0,
+
+            // PLE — none by default, set via setter
+            ple_input_gate: None,
+            ple_projection: None,
+            ple_post_norm: None,
+
+            // RoPE
+            rope_theta,
+            partial_rotary_factor,
+
+            // Activation
+            use_gelu,
+
+            // KV sharing
+            kv_shared,
+
             pseudo_query,
             attn_res_proj,
             attn_res_norm,
@@ -298,6 +363,77 @@ impl BlockAttnResLayer {
             device,
             queue,
         })
+    }
+
+    // --- Setters for per-layer weights (for Gemma 4 weight loading) ---
+
+    /// Set the layer scalar (feature 5).
+    pub fn set_layer_scalar(&mut self, scalar: f32) {
+        self.layer_scalar = scalar;
+    }
+
+    /// Set PLE weights (feature 6).
+    pub fn set_ple(
+        &mut self,
+        gate: Linear,
+        projection: Linear,
+        post_norm: RmsNormOp,
+    ) {
+        self.ple_input_gate = Some(gate);
+        self.ple_projection = Some(projection);
+        self.ple_post_norm = Some(post_norm);
+    }
+
+    /// Get per-layer RoPE parameters.
+    pub fn rope_params(&self) -> (f64, f32) {
+        (self.rope_theta, self.partial_rotary_factor)
+    }
+
+    /// Whether this layer uses shared KV.
+    pub fn is_kv_shared(&self) -> bool {
+        self.kv_shared
+    }
+
+    // --- Weight accessors for upload (used by upload.rs) ---
+
+    pub fn q_proj_accessor(&self) -> &Linear {
+        &self.q_proj
+    }
+
+    pub fn k_proj_accessor(&self) -> &Linear {
+        &self.k_proj
+    }
+
+    pub fn v_proj_accessor(&self) -> &Linear {
+        &self.v_proj
+    }
+
+    pub fn out_proj_accessor(&self) -> &Linear {
+        &self.out_proj
+    }
+
+    pub fn ffn_gate_accessor(&self) -> Option<&Linear> {
+        self.ff_gate.as_ref()
+    }
+
+    pub fn ffn_up_accessor(&self) -> Option<&Linear> {
+        self.ff_up.as_ref()
+    }
+
+    pub fn ffn_down_accessor(&self) -> Option<&Linear> {
+        self.ff_down.as_ref()
+    }
+
+    pub fn moe_accessor(&self) -> Option<&RefCell<crate::model::moe_linear::MoELinear>> {
+        self.moe_linear.as_ref()
+    }
+
+    pub fn ple_input_gate_accessor(&self) -> Option<&Linear> {
+        self.ple_input_gate.as_ref()
+    }
+
+    pub fn ple_projection_accessor(&self) -> Option<&Linear> {
+        self.ple_projection.as_ref()
     }
 
     pub fn forward_intra_block(
@@ -315,21 +451,9 @@ impl BlockAttnResLayer {
             self.layer_number, batch_size, self.num_heads
         );
 
-        // When PerBlock checkpointing is enabled, save the hidden_states input
-        // at the start of this block so the backward pass can recompute
-        // intermediate activations from this saved state instead of keeping
-        // them all live in VRAM.
-        //
-        // The backward pass is implemented in BlockAttnResModel::backward(),
-        // which calls CheckpointStore::recompute_block() for each layer in
-        // reverse order to regenerate intermediate activations.
         if checkpoint_granularity == CheckpointGranularity::PerBlock {
             if let Some(store) = checkpoint_store {
                 store.save(encoder, self.layer_number, "hidden_states_input", hidden_states)?;
-                tracing::debug!(
-                    "CheckpointStore: saved PerBlock checkpoint for layer={}",
-                    self.layer_number
-                );
             }
         }
 
@@ -339,46 +463,64 @@ impl BlockAttnResLayer {
 
         // --- Self-Attention ---
 
-        // 1. Pre-norm
+        // 1. Pre-attention RMSNorm
         let normed = GpuBuffer::new(
             &self.device,
-            batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
+            numel as usize * std::mem::size_of::<f32>(),
             Some("intra_normed"),
         )?;
         self.attn_norm.dispatch(
-            &self.device,
-            &self.queue,
-            encoder,
-            hidden_states,
-            &normed,
-            batch_size,
-            hidden_dim,
+            &self.device, &self.queue, encoder,
+            hidden_states, &normed, batch_size, hidden_dim,
         )?;
 
-        // 2-4. Q, K, V projections
+        // 2. Q, K, V projections (with per-layer dims)
+        let q_dim = self.num_heads * self.head_dim;
+        let kv_dim = self.num_kv_heads * self.head_dim;
+
         let q_buf = GpuBuffer::new(
             &self.device,
-            batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
+            batch_size as usize * q_dim * std::mem::size_of::<f32>(),
             Some("intra_q"),
         )?;
         let k_buf = GpuBuffer::new(
             &self.device,
-            batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
+            batch_size as usize * kv_dim * std::mem::size_of::<f32>(),
             Some("intra_k"),
         )?;
         let v_buf = GpuBuffer::new(
             &self.device,
-            batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
+            batch_size as usize * kv_dim * std::mem::size_of::<f32>(),
             Some("intra_v"),
         )?;
         self.q_proj.forward(encoder, &normed, &q_buf, batch_size)?;
         self.k_proj.forward(encoder, &normed, &k_buf, batch_size)?;
         self.v_proj.forward(encoder, &normed, &v_buf, batch_size)?;
 
-        // 5-6. Scaled dot-product attention (seq_len=1)
-        // Per-head dot product: scores[b, h] = dot(Q_h, K_h) / sqrt(head_dim)
-        // View Q,K as [batch*num_heads, head_dim], compute per-row dot product via matmul
+        // 3. Per-head Q/K/V RMSNorm (Gemma 4 features 3-4)
+        let q_normed = GpuBuffer::new(
+            &self.device, q_buf.size() as usize, Some("intra_q_normed"),
+        )?;
+        let k_normed = GpuBuffer::new(
+            &self.device, k_buf.size() as usize, Some("intra_k_normed"),
+        )?;
+        let v_normed = GpuBuffer::new(
+            &self.device, v_buf.size() as usize, Some("intra_v_normed"),
+        )?;
+        self.q_norm.dispatch(
+            &self.device, &self.queue, encoder,
+            &q_buf, &q_normed, batch_size, q_dim as u32,
+        )?;
+        self.k_norm.dispatch(
+            &self.device, &self.queue, encoder,
+            &k_buf, &k_normed, batch_size, kv_dim as u32,
+        )?;
+        self.v_norm.dispatch(
+            &self.device, &self.queue, encoder,
+            &v_buf, &v_normed, batch_size, kv_dim as u32,
+        )?;
 
+        // 4. Scaled dot-product attention (seq_len=1 intra-block)
         let head_dim = self.head_dim as u32;
         let num_heads = self.num_heads as u32;
 
@@ -387,113 +529,130 @@ impl BlockAttnResLayer {
             batch_size as usize * self.num_heads * std::mem::size_of::<f32>(),
             Some("intra_attn_scores"),
         )?;
-
         self.matmul.dispatch(
-            encoder,
-            &q_buf,
-            &k_buf,
-            &scores,
-            batch_size * num_heads,
-            head_dim,
-            1u32,
+            encoder, &q_normed, &k_normed, &scores,
+            batch_size * num_heads, head_dim, 1u32,
         )?;
 
         let scale_factor = 1.0f32 / (self.head_dim as f32).sqrt();
-        self.elementwise.dispatch_scale(
-            encoder,
-            &scores,
-            &scores,
-            scale_factor,
-            batch_size * num_heads,
-        )?;
+        self.elementwise.dispatch_scale(encoder, &scores, &scores, scale_factor, batch_size * num_heads)?;
 
         let attn_weights = GpuBuffer::new(
             &self.device,
             batch_size as usize * self.num_heads * std::mem::size_of::<f32>(),
             Some("intra_attn_weights"),
         )?;
-        self.softmax.dispatch(
-            encoder,
-            &scores,
-            &attn_weights,
-            batch_size,
-            num_heads,
-        )?;
+        self.softmax.dispatch(encoder, &scores, &attn_weights, batch_size, num_heads)?;
 
-        // Weighted V: attn_out[b, h*d+j] = attn_weights[b, h] * V[b, h*d+j]
         let attn_out = GpuBuffer::new(
             &self.device,
-            batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
+            batch_size as usize * q_dim * std::mem::size_of::<f32>(),
             Some("intra_attn_out"),
         )?;
-
         self.dispatch_head_weight_mul(
-            encoder,
-            &attn_weights,
-            &v_buf,
-            &attn_out,
-            batch_size,
-            num_heads,
-            head_dim,
+            encoder, &attn_weights, &v_normed, &attn_out,
+            batch_size, num_heads, head_dim,
         )?;
 
-        // 8. Output projection
+        // 5. Output projection
         let proj_out = GpuBuffer::new(
             &self.device,
-            batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
+            numel as usize * std::mem::size_of::<f32>(),
             Some("intra_proj_out"),
         )?;
         self.out_proj.forward(encoder, &attn_out, &proj_out, batch_size)?;
 
-        // 9. Residual connection
-        self.elementwise.dispatch_add(encoder, hidden_states, &proj_out, output, numel)?;
+        // 6. Post-attention RMSNorm + layer scalar + residual (features 1, 5)
+        let post_attn = GpuBuffer::new(
+            &self.device, proj_out.size() as usize, Some("intra_post_attn"),
+        )?;
+        self.post_attn_norm.dispatch(
+            &self.device, &self.queue, encoder,
+            &proj_out, &post_attn, batch_size, hidden_dim,
+        )?;
+        if (self.layer_scalar - 1.0).abs() > 1e-8 {
+            self.elementwise.dispatch_scale(encoder, &post_attn, &post_attn, self.layer_scalar, numel)?;
+        }
+        self.elementwise.dispatch_add(encoder, hidden_states, &post_attn, output, numel)?;
 
         // --- Feed-Forward Network ---
 
-        // 10. Pre-norm
+        // 7. Pre-FFN RMSNorm
         let ff_normed = GpuBuffer::new(
             &self.device,
-            batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
+            numel as usize * std::mem::size_of::<f32>(),
             Some("intra_ff_normed"),
         )?;
         self.ff_norm.dispatch(
-            &self.device,
-            &self.queue,
-            encoder,
-            output,
-            &ff_normed,
-            batch_size,
-            hidden_dim,
+            &self.device, &self.queue, encoder,
+            output, &ff_normed, batch_size, hidden_dim,
         )?;
 
-        // 11. FFN up projection + ReLU / MoE
+        // 8. FFN with gated activation (feature 10: GELU vs ReLU)
         if let Some(ref moe) = self.moe_linear {
             let mut moe_ref = moe.borrow_mut();
             let ff_out = moe_ref.forward(encoder, &ff_normed, batch_size as usize)?;
-            self.elementwise.dispatch_add(encoder, output, ff_out, output, numel)?;
+
+            let post_ffn = GpuBuffer::new(
+                &self.device, ff_out.size() as usize, Some("intra_post_ffn_moe"),
+            )?;
+            self.post_ffn_norm.dispatch(
+                &self.device, &self.queue, encoder,
+                ff_out, &post_ffn, batch_size, hidden_dim,
+            )?;
+            if (self.layer_scalar - 1.0).abs() > 1e-8 {
+                self.elementwise.dispatch_scale(encoder, &post_ffn, &post_ffn, self.layer_scalar, numel)?;
+            }
+            self.elementwise.dispatch_add(encoder, output, &post_ffn, output, numel)?;
         } else {
-            let ff_hidden = GpuBuffer::new(
+            let ff_gate_buf = GpuBuffer::new(
                 &self.device,
                 batch_size as usize * self.intermediate_dim * std::mem::size_of::<f32>(),
-                Some("intra_ff_hidden"),
+                Some("intra_ff_gate"),
             )?;
-            self.ff_up.as_ref().unwrap().forward(encoder, &ff_normed, &ff_hidden, batch_size)?;
+            let ff_up_buf = GpuBuffer::new(
+                &self.device,
+                batch_size as usize * self.intermediate_dim * std::mem::size_of::<f32>(),
+                Some("intra_ff_up"),
+            )?;
 
-            self.elementwise.dispatch_relu(
-                encoder,
-                &ff_hidden,
-                &ff_hidden,
-                batch_size * intermediate_dim,
+            self.ff_gate.as_ref().unwrap().forward(encoder, &ff_normed, &ff_gate_buf, batch_size)?;
+            self.ff_up.as_ref().unwrap().forward(encoder, &ff_normed, &ff_up_buf, batch_size)?;
+
+            // Activation: act(up)
+            if self.use_gelu {
+                self.elementwise.dispatch_gelu(
+                    encoder, &ff_up_buf, &ff_up_buf, batch_size * intermediate_dim,
+                )?;
+            } else {
+                self.elementwise.dispatch_relu(
+                    encoder, &ff_up_buf, &ff_up_buf, batch_size * intermediate_dim,
+                )?;
+            }
+            // Gated: gate * act(up)
+            self.elementwise.dispatch_mul(
+                encoder, &ff_gate_buf, &ff_up_buf, &ff_up_buf, batch_size * intermediate_dim,
             )?;
 
             let ff_out = GpuBuffer::new(
                 &self.device,
-                batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
+                numel as usize * std::mem::size_of::<f32>(),
                 Some("intra_ff_out"),
             )?;
-            self.ff_down.as_ref().unwrap().forward(encoder, &ff_hidden, &ff_out, batch_size)?;
+            self.ff_down.as_ref().unwrap().forward(encoder, &ff_up_buf, &ff_out, batch_size)?;
 
-            self.elementwise.dispatch_add(encoder, output, &ff_out, output, numel)?;
+            // Post-FFN RMSNorm + layer scalar + residual (features 2, 5)
+            let post_ffn = GpuBuffer::new(
+                &self.device, ff_out.size() as usize, Some("intra_post_ffn"),
+            )?;
+            self.post_ffn_norm.dispatch(
+                &self.device, &self.queue, encoder,
+                &ff_out, &post_ffn, batch_size, hidden_dim,
+            )?;
+            if (self.layer_scalar - 1.0).abs() > 1e-8 {
+                self.elementwise.dispatch_scale(encoder, &post_ffn, &post_ffn, self.layer_scalar, numel)?;
+            }
+            self.elementwise.dispatch_add(encoder, output, &post_ffn, output, numel)?;
         }
 
         self.elementwise.dispatch_add(encoder, partial_sum, output, partial_sum, numel)?;
@@ -630,6 +789,13 @@ impl BlockAttnResLayer {
     ///
     /// Callers should prefer this over `forward_decode_token_with_pos` for
     /// single-token decode steps.
+    /// Optimized decode: project K directly into KV cache, apply RoPE in-place.
+    ///
+    /// Full Gemma 4 decode path with all features:
+    /// - Per-head Q/K/V RMSNorm
+    /// - Post-attention RMSNorm + layer scalar
+    /// - Gated FFN (gate * act(up)) with GELU
+    /// - Post-FFN RMSNorm + layer scalar
     pub fn forward_decode_token_direct(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -639,9 +805,12 @@ impl BlockAttnResLayer {
     ) -> Result<GpuBuffer> {
         let hidden_dim = self.hidden_dim;
         let num_heads = self.num_heads as u32;
+        let num_kv_heads = self.num_kv_heads as u32;
         let head_dim = self.head_dim as u32;
         let intermediate_dim = self.intermediate_dim as u32;
         let f32_size = std::mem::size_of::<f32>();
+        let q_dim = self.num_heads * self.head_dim;
+        let kv_dim = self.num_kv_heads * self.head_dim;
 
         // RMSNorm on input
         let normed = GpuBuffer::new(
@@ -650,126 +819,156 @@ impl BlockAttnResLayer {
             Some("decode_direct_normed"),
         )?;
         self.attn_norm.dispatch(
-            &self.device,
-            &self.queue,
-            encoder,
-            hidden_states,
-            &normed,
-            1u32,
-            hidden_dim as u32,
+            &self.device, &self.queue, encoder,
+            hidden_states, &normed, 1u32, hidden_dim as u32,
         )?;
 
-        // Q projection → temp buffer (Q is consumed by flash_decode, not cached)
-        let q_buf = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_q"))?;
+        // Q projection → temp buffer
+        let q_buf = GpuBuffer::new(&self.device, q_dim * f32_size, Some("decode_direct_q"))?;
         self.q_proj.forward(encoder, &normed, &q_buf, 1u32)?;
 
-        // Compute the cache slot offset
-        let pos = effective_pos.unwrap_or_else(|| kv_cache.current_len());
-        let per_pos_bytes = num_heads as u64 * head_dim as u64 * f32_size as u64;
-        let slot_offset = kv_cache.current_len() as u64 * per_pos_bytes;
-        let row_bytes = hidden_dim as u64 * f32_size as u64;
-
-        // K projection → directly into KV cache slot
-        self.k_proj.forward_into_offset(
-            encoder,
-            &normed,
-            kv_cache.key_buffer().buffer(),
-            slot_offset,
-            row_bytes,
-            1u32,
+        // Per-head Q RMSNorm
+        let q_normed = GpuBuffer::new(&self.device, q_dim * f32_size, Some("decode_direct_q_normed"))?;
+        self.q_norm.dispatch(
+            &self.device, &self.queue, encoder,
+            &q_buf, &q_normed, 1u32, q_dim as u32,
         )?;
 
-        // RoPE in-place on the cache slot we just wrote
+        // K projection → temp buffer → K RMSNorm → cache slot
+        let k_buf = GpuBuffer::new(&self.device, kv_dim * f32_size, Some("decode_direct_k"))?;
+        self.k_proj.forward(encoder, &normed, &k_buf, 1u32)?;
+
+        // Per-head K RMSNorm
+        let k_normed = GpuBuffer::new(&self.device, kv_dim * f32_size, Some("decode_direct_k_normed"))?;
+        self.k_norm.dispatch(
+            &self.device, &self.queue, encoder,
+            &k_buf, &k_normed, 1u32, kv_dim as u32,
+        )?;
+
+        // Copy K into cache slot then apply RoPE in-place
+        let pos = effective_pos.unwrap_or_else(|| kv_cache.current_len());
+        let per_pos_bytes = num_kv_heads as u64 * head_dim as u64 * f32_size as u64;
+        let slot_offset = kv_cache.current_len() as u64 * per_pos_bytes;
+        let kv_row_bytes = kv_dim as u64 * f32_size as u64;
+
+        encoder.copy_buffer_to_buffer(
+            k_normed.buffer(), 0,
+            kv_cache.key_buffer().buffer(), slot_offset,
+            kv_row_bytes,
+        );
+
+        // RoPE in-place on the cache slot (after K norm)
         self.rope.dispatch_inplace_at_offset(
             encoder,
             kv_cache.key_buffer().buffer(),
             slot_offset,
-            row_bytes,
+            kv_row_bytes,
             1u32,
-            num_heads,
+            num_kv_heads,
             head_dim,
             pos,
         )?;
 
-        // V projection → temp buffer (V is appended to cache via update)
-        let v_buf = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_v"))?;
+        // V projection → temp → V norm → cache
+        let v_buf = GpuBuffer::new(&self.device, kv_dim * f32_size, Some("decode_direct_v"))?;
         self.v_proj.forward(encoder, &normed, &v_buf, 1u32)?;
 
-        // RoPE on Q (Q needs RoPE but goes to flash_decode, not cache)
-        let rope_q = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_rope_q"))?;
-        self.rope.dispatch_with_offset(encoder, &q_buf, &rope_q, 1u32, num_heads, head_dim, pos)?;
+        let v_normed = GpuBuffer::new(&self.device, kv_dim * f32_size, Some("decode_direct_v_normed"))?;
+        self.v_norm.dispatch(
+            &self.device, &self.queue, encoder,
+            &v_buf, &v_normed, 1u32, kv_dim as u32,
+        )?;
+
+        // RoPE on Q (needs its own buffer)
+        let rope_q = GpuBuffer::new(&self.device, q_dim * f32_size, Some("decode_direct_rope_q"))?;
+        self.rope.dispatch_with_offset(
+            encoder, &q_normed, &rope_q, 1u32, num_heads, head_dim, pos,
+        )?;
 
         // V: copy into cache (no RoPE needed for V)
-        // K is already in-place via direct projection, so we only copy V
-        // and manually bump the counter.
         let v_slot_offset = kv_cache.current_len() as u64 * per_pos_bytes;
-        let v_copy_size = (v_buf.size() as u64).min(per_pos_bytes);
         encoder.copy_buffer_to_buffer(
-            v_buf.buffer(),
-            0,
+            v_normed.buffer(), 0,
             kv_cache.value_buffer().buffer(),
             v_slot_offset,
-            v_copy_size,
+            (v_normed.size() as u64).min(per_pos_bytes),
         );
         kv_cache.increment_len();
         let new_len = kv_cache.current_len();
 
         // Flash decode attention
-        let attn_out = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_attn_out"))?;
+        let attn_out = GpuBuffer::new(&self.device, q_dim * f32_size, Some("decode_direct_attn_out"))?;
         self.flash_decode.dispatch(
-            encoder,
-            &rope_q,
-            kv_cache.key_buffer(),
-            kv_cache.value_buffer(),
-            &attn_out,
-            new_len,
-            num_heads,
-            head_dim,
+            encoder, &rope_q,
+            kv_cache.key_buffer(), kv_cache.value_buffer(),
+            &attn_out, new_len, num_heads, head_dim,
         )?;
 
-        // Output projection + residual + FFN (same as regular decode)
+        // Output projection
         let proj_out = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_proj"))?;
         self.out_proj.forward(encoder, &attn_out, &proj_out, 1u32)?;
 
+        // Post-attention RMSNorm + layer scalar + residual
+        let post_attn = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_post_attn"))?;
+        self.post_attn_norm.dispatch(
+            &self.device, &self.queue, encoder,
+            &proj_out, &post_attn, 1u32, hidden_dim as u32,
+        )?;
+        if (self.layer_scalar - 1.0).abs() > 1e-8 {
+            self.elementwise.dispatch_scale(encoder, &post_attn, &post_attn, self.layer_scalar, hidden_dim as u32)?;
+        }
         let residual1 = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_res1"))?;
-        self.elementwise.dispatch_add(encoder, hidden_states, &proj_out, &residual1, hidden_dim as u32)?;
+        self.elementwise.dispatch_add(encoder, hidden_states, &post_attn, &residual1, hidden_dim as u32)?;
+
+        // Pre-FFN RMSNorm
+        let ff_normed = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_ff_norm"))?;
+        self.ff_norm.dispatch(
+            &self.device, &self.queue, encoder,
+            &residual1, &ff_normed, 1u32, hidden_dim as u32,
+        )?;
 
         let output = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_output"))?;
 
-        let ff_normed = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_ff_norm"))?;
-        self.ff_norm.dispatch(
-            &self.device,
-            &self.queue,
-            encoder,
-            &residual1,
-            &ff_normed,
-            1u32,
-            hidden_dim as u32,
-        )?;
-
+        // FFN: MoE or gated dense
         if let Some(ref moe) = self.moe_linear {
             let mut moe_ref = moe.borrow_mut();
             let ff_out = moe_ref.forward(encoder, &ff_normed, 1)?;
-            self.elementwise.dispatch_add(encoder, &residual1, ff_out, &output, hidden_dim as u32)?;
-        } else {
-            let ff_hidden = GpuBuffer::new(
-                &self.device,
-                self.intermediate_dim * f32_size,
-                Some("decode_direct_ff_hidden"),
-            )?;
-            self.ff_up.as_ref().unwrap().forward(encoder, &ff_normed, &ff_hidden, 1u32)?;
 
-            let ff_relu = GpuBuffer::new(
-                &self.device,
-                self.intermediate_dim * f32_size,
-                Some("decode_direct_ff_relu"),
+            let post_ffn = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_post_ffn"))?;
+            self.post_ffn_norm.dispatch(
+                &self.device, &self.queue, encoder,
+                ff_out, &post_ffn, 1u32, hidden_dim as u32,
             )?;
-            self.elementwise.dispatch_relu(encoder, &ff_hidden, &ff_relu, intermediate_dim)?;
+            if (self.layer_scalar - 1.0).abs() > 1e-8 {
+                self.elementwise.dispatch_scale(encoder, &post_ffn, &post_ffn, self.layer_scalar, hidden_dim as u32)?;
+            }
+            self.elementwise.dispatch_add(encoder, &residual1, &post_ffn, &output, hidden_dim as u32)?;
+        } else {
+            let ff_gate = GpuBuffer::new(&self.device, self.intermediate_dim * f32_size, Some("decode_direct_ff_gate"))?;
+            let ff_up = GpuBuffer::new(&self.device, self.intermediate_dim * f32_size, Some("decode_direct_ff_up"))?;
+
+            self.ff_gate.as_ref().unwrap().forward(encoder, &ff_normed, &ff_gate, 1u32)?;
+            self.ff_up.as_ref().unwrap().forward(encoder, &ff_normed, &ff_up, 1u32)?;
+
+            if self.use_gelu {
+                self.elementwise.dispatch_gelu(encoder, &ff_up, &ff_up, intermediate_dim)?;
+            } else {
+                self.elementwise.dispatch_relu(encoder, &ff_up, &ff_up, intermediate_dim)?;
+            }
+            self.elementwise.dispatch_mul(encoder, &ff_gate, &ff_up, &ff_up, intermediate_dim)?;
 
             let ff_out = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_ff_out"))?;
-            self.ff_down.as_ref().unwrap().forward(encoder, &ff_relu, &ff_out, 1u32)?;
+            self.ff_down.as_ref().unwrap().forward(encoder, &ff_up, &ff_out, 1u32)?;
 
-            self.elementwise.dispatch_add(encoder, &residual1, &ff_out, &output, hidden_dim as u32)?;
+            let post_ffn = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_post_ffn"))?;
+            self.post_ffn_norm.dispatch(
+                &self.device, &self.queue, encoder,
+                &ff_out, &post_ffn, 1u32, hidden_dim as u32,
+            )?;
+            if (self.layer_scalar - 1.0).abs() > 1e-8 {
+                self.elementwise.dispatch_scale(encoder, &post_ffn, &post_ffn, self.layer_scalar, hidden_dim as u32)?;
+            }
+            self.elementwise.dispatch_add(encoder, &residual1, &post_ffn, &output, hidden_dim as u32)?;
         }
 
         Ok(output)
@@ -784,106 +983,178 @@ impl BlockAttnResLayer {
     ) -> Result<GpuBuffer> {
         let hidden_dim = self.hidden_dim;
         let num_heads = self.num_heads as u32;
+        let num_kv_heads = self.num_kv_heads as u32;
         let head_dim = self.head_dim as u32;
         let intermediate_dim = self.intermediate_dim as u32;
         let f32_size = std::mem::size_of::<f32>();
         let numel = seq_len * hidden_dim as u32;
+        let q_dim = self.num_heads * self.head_dim;
+        let kv_dim = self.num_kv_heads * self.head_dim;
 
+        // Pre-attention RMSNorm
         let normed = GpuBuffer::new(
             &self.device,
             seq_len as usize * hidden_dim * f32_size,
             Some("prefill_normed"),
         )?;
         self.attn_norm.dispatch(
-            &self.device,
-            &self.queue,
-            encoder,
-            hidden_states,
-            &normed,
-            seq_len,
-            hidden_dim as u32,
+            &self.device, &self.queue, encoder,
+            hidden_states, &normed, seq_len, hidden_dim as u32,
         )?;
 
-        let q_buf = GpuBuffer::new(&self.device, seq_len as usize * hidden_dim * f32_size, Some("prefill_q"))?;
-        let k_buf = GpuBuffer::new(&self.device, seq_len as usize * hidden_dim * f32_size, Some("prefill_k"))?;
-        let v_buf = GpuBuffer::new(&self.device, seq_len as usize * hidden_dim * f32_size, Some("prefill_v"))?;
+        // Q, K, V projections
+        let q_buf = GpuBuffer::new(
+            &self.device, seq_len as usize * q_dim * f32_size, Some("prefill_q"),
+        )?;
+        let k_buf = GpuBuffer::new(
+            &self.device, seq_len as usize * kv_dim * f32_size, Some("prefill_k"),
+        )?;
+        let v_buf = GpuBuffer::new(
+            &self.device, seq_len as usize * kv_dim * f32_size, Some("prefill_v"),
+        )?;
         self.q_proj.forward(encoder, &normed, &q_buf, seq_len)?;
         self.k_proj.forward(encoder, &normed, &k_buf, seq_len)?;
         self.v_proj.forward(encoder, &normed, &v_buf, seq_len)?;
 
+        // Per-head Q/K/V RMSNorm
+        let q_normed = GpuBuffer::new(
+            &self.device, q_buf.size() as usize, Some("prefill_q_normed"),
+        )?;
+        let k_normed = GpuBuffer::new(
+            &self.device, k_buf.size() as usize, Some("prefill_k_normed"),
+        )?;
+        let v_normed = GpuBuffer::new(
+            &self.device, v_buf.size() as usize, Some("prefill_v_normed"),
+        )?;
+        self.q_norm.dispatch(
+            &self.device, &self.queue, encoder,
+            &q_buf, &q_normed, seq_len, q_dim as u32,
+        )?;
+        self.k_norm.dispatch(
+            &self.device, &self.queue, encoder,
+            &k_buf, &k_normed, seq_len, kv_dim as u32,
+        )?;
+        self.v_norm.dispatch(
+            &self.device, &self.queue, encoder,
+            &v_buf, &v_normed, seq_len, kv_dim as u32,
+        )?;
+
+        // RoPE
         let pos = kv_cache.current_len();
+        let rope_q = GpuBuffer::new(
+            &self.device, q_normed.size() as usize, Some("prefill_rope_q"),
+        )?;
+        let rope_k = GpuBuffer::new(
+            &self.device, k_normed.size() as usize, Some("prefill_rope_k"),
+        )?;
+        self.rope.dispatch_with_offset(
+            encoder, &q_normed, &rope_q, seq_len, num_heads, head_dim, pos,
+        )?;
+        self.rope.dispatch_with_offset(
+            encoder, &k_normed, &rope_k, seq_len, num_kv_heads, head_dim, pos,
+        )?;
 
-        let rope_q = GpuBuffer::new(&self.device, seq_len as usize * hidden_dim * f32_size, Some("prefill_rope_q"))?;
-        let rope_k = GpuBuffer::new(&self.device, seq_len as usize * hidden_dim * f32_size, Some("prefill_rope_k"))?;
-        self.rope.dispatch_with_offset(encoder, &q_buf, &rope_q, seq_len, num_heads, head_dim, pos)?;
-        self.rope.dispatch_with_offset(encoder, &k_buf, &rope_k, seq_len, num_heads, head_dim, pos)?;
+        // KV cache update
+        let _new_len = kv_cache.update_batch(encoder, &rope_k, &v_normed, seq_len)?;
 
-        let _new_len = kv_cache.update_batch(encoder, &rope_k, &v_buf, seq_len)?;
-
+        // Prefill attention (causal)
         let attn_out = GpuBuffer::new(
-            &self.device,
-            seq_len as usize * hidden_dim * f32_size,
-            Some("prefill_attn_out"),
+            &self.device, seq_len as usize * q_dim * f32_size, Some("prefill_attn_out"),
         )?;
-        // rope_q and rope_k are both [seq_len, num_heads, head_dim].
-        // v_buf is [seq_len, num_heads, head_dim].
-        // PrefillAttnOp correctly handles this layout: each thread owns
-        // one (query_pos, head) pair, indexes k/v as
-        //   s * num_heads * head_dim + h * head_dim + d
-        // and applies causal masking + online softmax internally.
         self.prefill_attn.dispatch(
-            encoder,
-            &rope_q,
-            &rope_k,
-            &v_buf,
-            &attn_out,
-            seq_len,
-            num_heads,
-            head_dim,
+            encoder, &rope_q, &rope_k, &v_normed, &attn_out,
+            seq_len, num_heads, head_dim,
         )?;
 
-        let proj_out = GpuBuffer::new(&self.device, seq_len as usize * hidden_dim * f32_size, Some("prefill_proj_out"))?;
+        // Output projection
+        let proj_out = GpuBuffer::new(
+            &self.device, seq_len as usize * hidden_dim * f32_size, Some("prefill_proj_out"),
+        )?;
         self.out_proj.forward(encoder, &attn_out, &proj_out, seq_len)?;
 
-        let residual1 = GpuBuffer::new(&self.device, seq_len as usize * hidden_dim * f32_size, Some("prefill_residual1"))?;
-        self.elementwise.dispatch_add(encoder, hidden_states, &proj_out, &residual1, numel)?;
+        // Post-attention RMSNorm + layer scalar + residual
+        let post_attn = GpuBuffer::new(
+            &self.device, proj_out.size() as usize, Some("prefill_post_attn"),
+        )?;
+        self.post_attn_norm.dispatch(
+            &self.device, &self.queue, encoder,
+            &proj_out, &post_attn, seq_len, hidden_dim as u32,
+        )?;
+        if (self.layer_scalar - 1.0).abs() > 1e-8 {
+            self.elementwise.dispatch_scale(encoder, &post_attn, &post_attn, self.layer_scalar, numel)?;
+        }
+        let residual1 = GpuBuffer::new(
+            &self.device, seq_len as usize * hidden_dim * f32_size, Some("prefill_residual1"),
+        )?;
+        self.elementwise.dispatch_add(encoder, hidden_states, &post_attn, &residual1, numel)?;
 
-        let ff_normed = GpuBuffer::new(&self.device, seq_len as usize * hidden_dim * f32_size, Some("prefill_ff_normed"))?;
+        // Pre-FFN RMSNorm
+        let ff_normed = GpuBuffer::new(
+            &self.device, seq_len as usize * hidden_dim * f32_size, Some("prefill_ff_normed"),
+        )?;
         self.ff_norm.dispatch(
-            &self.device,
-            &self.queue,
-            encoder,
-            &residual1,
-            &ff_normed,
-            seq_len,
-            hidden_dim as u32,
+            &self.device, &self.queue, encoder,
+            &residual1, &ff_normed, seq_len, hidden_dim as u32,
         )?;
 
-        let output = GpuBuffer::new(&self.device, seq_len as usize * hidden_dim * f32_size, Some("prefill_output"))?;
+        let output = GpuBuffer::new(
+            &self.device, seq_len as usize * hidden_dim * f32_size, Some("prefill_output"),
+        )?;
 
+        // FFN
         if let Some(ref moe) = self.moe_linear {
             let mut moe_ref = moe.borrow_mut();
             let ff_out = moe_ref.forward(encoder, &ff_normed, seq_len as usize)?;
-            self.elementwise.dispatch_add(encoder, &residual1, ff_out, &output, numel)?;
+
+            let post_ffn = GpuBuffer::new(
+                &self.device, ff_out.size() as usize, Some("prefill_post_ffn_moe"),
+            )?;
+            self.post_ffn_norm.dispatch(
+                &self.device, &self.queue, encoder,
+                ff_out, &post_ffn, seq_len, hidden_dim as u32,
+            )?;
+            if (self.layer_scalar - 1.0).abs() > 1e-8 {
+                self.elementwise.dispatch_scale(encoder, &post_ffn, &post_ffn, self.layer_scalar, numel)?;
+            }
+            self.elementwise.dispatch_add(encoder, &residual1, &post_ffn, &output, numel)?;
         } else {
-            let ff_hidden = GpuBuffer::new(
+            let ff_gate = GpuBuffer::new(
                 &self.device,
                 seq_len as usize * self.intermediate_dim * f32_size,
-                Some("prefill_ff_hidden"),
+                Some("prefill_ff_gate"),
             )?;
-            self.ff_up.as_ref().unwrap().forward(encoder, &ff_normed, &ff_hidden, seq_len)?;
-
-            let ff_relu = GpuBuffer::new(
+            let ff_up = GpuBuffer::new(
                 &self.device,
                 seq_len as usize * self.intermediate_dim * f32_size,
-                Some("prefill_ff_relu"),
+                Some("prefill_ff_up"),
             )?;
-            self.elementwise.dispatch_relu(encoder, &ff_hidden, &ff_relu, seq_len * intermediate_dim)?;
 
-            let ff_out = GpuBuffer::new(&self.device, seq_len as usize * hidden_dim * f32_size, Some("prefill_ff_out"))?;
-            self.ff_down.as_ref().unwrap().forward(encoder, &ff_relu, &ff_out, seq_len)?;
+            self.ff_gate.as_ref().unwrap().forward(encoder, &ff_normed, &ff_gate, seq_len)?;
+            self.ff_up.as_ref().unwrap().forward(encoder, &ff_normed, &ff_up, seq_len)?;
 
-            self.elementwise.dispatch_add(encoder, &residual1, &ff_out, &output, numel)?;
+            if self.use_gelu {
+                self.elementwise.dispatch_gelu(encoder, &ff_up, &ff_up, seq_len * intermediate_dim)?;
+            } else {
+                self.elementwise.dispatch_relu(encoder, &ff_up, &ff_up, seq_len * intermediate_dim)?;
+            }
+            self.elementwise.dispatch_mul(encoder, &ff_gate, &ff_up, &ff_up, seq_len * intermediate_dim)?;
+
+            let ff_out = GpuBuffer::new(
+                &self.device, seq_len as usize * hidden_dim * f32_size, Some("prefill_ff_out"),
+            )?;
+            self.ff_down.as_ref().unwrap().forward(encoder, &ff_up, &ff_out, seq_len)?;
+
+            let post_ffn = GpuBuffer::new(
+                &self.device, ff_out.size() as usize, Some("prefill_post_ffn"),
+            )?;
+            self.post_ffn_norm.dispatch(
+                &self.device, &self.queue, encoder,
+                &ff_out, &post_ffn, seq_len, hidden_dim as u32,
+            )?;
+            if (self.layer_scalar - 1.0).abs() > 1e-8 {
+                self.elementwise.dispatch_scale(encoder, &post_ffn, &post_ffn, self.layer_scalar, numel)?;
+            }
+            self.elementwise.dispatch_add(encoder, &residual1, &post_ffn, &output, numel)?;
         }
 
         Ok(output)

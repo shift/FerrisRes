@@ -30,7 +30,7 @@ chmod 755 "${OUTPUT_DIR}/${PKG_NAME}/usr/bin/ferrisres"
 
 # NVIDIA Vulkan ICD — makes GPU visible on Colab/AWS/GCP cloud instances
 # where driver libs exist but ICD JSON is missing
-cp "${SCRIPT_DIR}/../nvidia_icd.x86_64.json" \
+cp "${SCRIPT_DIR}/nvidia_icd.x86_64.json" \
    "${OUTPUT_DIR}/${PKG_NAME}/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json"
 chmod 644 "${OUTPUT_DIR}/${PKG_NAME}/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json"
 

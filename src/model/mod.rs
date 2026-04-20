@@ -29,6 +29,12 @@ pub mod gpu_forward;
 pub mod generation_head;
 pub mod checkpoint;
 pub mod ternary;
+pub mod ternary_linear;
+pub mod ternary_moe;
+pub mod sparse_ternary;
+pub mod quantized_model;
+pub mod expert_loader;
+pub mod upload;
 
 pub use config::BlockAttnResConfig;
 pub use linear::Linear;

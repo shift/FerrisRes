@@ -13,6 +13,13 @@ pub mod prefill_attn;
 pub mod turboquant_kernels;
 pub mod fft;
 pub mod conv3d;
+pub mod immediates;
+pub mod ternary_matmul;
+pub mod sparse_ternary;
+pub mod optimizer_scale;
+pub mod paged_attention;
+pub mod hull_kv;
+pub mod coop_matmul;
 
 pub mod gpu_transformer;
 
