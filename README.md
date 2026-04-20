@@ -26,11 +26,11 @@ FerrisRes is a **Multimodal City of Experts** — many input encoders, many outp
 │           Video ──→  Stream ──→ Cross-modal ──→     │
 │                                                     │
 │  Experts: [E0][E1]..[EN]  MoE router selects top-2  │
-│           1.58-bit ternary │ NF4 encoders/LM head    │
-│           BF16 router/norms │ 3-bit KV cache         │
+│           1.58-bit ternary │ NF4 encoders/LM head   │
+│           BF16 router/norms │ 3-bit KV cache        │
 │                                                     │
-│  Outputs: VisionHead SpeechHead VideoHead TTS        │
-│           ActionHead MeshHead TactileHead GCode      │
+│  Outputs: VisionHead SpeechHead VideoHead TTS       │
+│           ActionHead MeshHead TactileHead GCode     │
 │                                                     │
 │  Elastic: RPi (top-1, SCALE) ←→ GPU (top-2, AdaMeM) │
 └─────────────────────────────────────────────────────┘
