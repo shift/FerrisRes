@@ -433,6 +433,16 @@ impl LoraManager {
     pub fn adapters_mut(&mut self) -> impl Iterator<Item = &mut LoraLayer> {
         self.adapters.iter_mut().map(|(_, _, l)| l)
     }
+
+    /// Iterate over adapters with layer_idx and module_name.
+    pub fn adapters_iter(&self) -> impl Iterator<Item = (usize, &str, &LoraLayer)> {
+        self.adapters.iter().map(|(idx, name, layer)| (*idx, name.as_str(), layer))
+    }
+
+    /// Iterate mutably over adapters with layer_idx and module_name.
+    pub fn adapters_iter_mut(&mut self) -> impl Iterator<Item = (usize, &str, &mut LoraLayer)> {
+        self.adapters.iter_mut().map(|(idx, name, layer)| (*idx, name.as_str(), layer))
+    }
 }
 
 #[cfg(test)]

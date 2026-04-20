@@ -1400,8 +1400,30 @@ async fn cmd_distill(
 
     // Convert teacher weights to CpuBlockAttnResModel (proper FerrisRes architecture)
     // This replaces the broken Gemma4Student with the correct BlockAttnRes student.
-    let student = ferrisres::model::cpu_block_attn_res::gemma4_to_block_attnres(&model2);
+    let mut student = ferrisres::model::cpu_block_attn_res::gemma4_to_block_attnres(&model2);
     info!(event = "student_ready", layers = student.layers.len(), "student CpuBlockAttnResModel created from teacher weights");
+
+    // Attach LoRA adapters for training (rank 8, q_proj + v_proj)
+    let lora_config = ferrisres::training::lora::LoraConfig::targeting(8, vec!["q_proj", "v_proj"]);
+    student.attach_lora(lora_config);
+    info!(event = "lora_attached", "LoRA adapters attached to student model");
+
+    // Create optimizer routed by DeviceProfile
+    let mut optimizer = ferrisres::training::optimizer_for_profile(&profile, learning_rate as f32);
+    // Register LoRA A and B matrices separately with optimizer
+    if let Some(ref lora_m) = student.lora_manager {
+        for (layer_idx, module_name, layer) in lora_m.adapters_iter() {
+            let name_a = format!("lora_a_{}_{}", layer_idx, module_name);
+            let name_b = format!("lora_b_{}_{}", layer_idx, module_name);
+            // A: [rank × in_features] — this is the "input" projection
+            optimizer.register_matrix(&name_a, layer.rank(), layer.in_features());
+            // B: [out_features × rank] — this is the "output" projection
+            optimizer.register_matrix(&name_b, layer.out_features(), layer.rank());
+            // Mark LoRA B as output layer for SCALE momentum
+            optimizer.mark_output_layer(&name_b);
+        }
+    }
+    info!(event = "optimizer_created", optimizer = optimizer.name(), matrices = optimizer.num_registered(), state_mb = optimizer.state_bytes() as f64 / 1e6, "Optimizer created");
 
     // Cache transposed lm_head for backward pass (d_logits → d_hidden)
     let lm_head_t: Vec<f32> = {
@@ -1622,12 +1644,102 @@ async fn cmd_distill(
         }
 
         // TODO: LoRA backprop through student (d3777391)
-        // For now, student is frozen (initialized from teacher weights) and we only measure KL loss.
         // The d_hidden is computed for future use when LoRA training is wired in.
-        let _d_hidden: Vec<f32> = {
+        // Currently: compute d_hidden, approximate LoRA gradients, update via optimizer.
+        let d_hidden: Vec<f32> = {
             gpu_matmul(&d_logits, &lm_head_t, actual_seq, vs, config.hidden_dim, &dispatch)
         };
-        let grad_norm = 0.0f32; // No gradients yet
+
+        // === LoRA Backward Pass ===
+        // d_hidden is the gradient flowing into the student model's output.
+        // LoRA forward: y = Wx + scaling * B(Ax)
+        //   dL/dA[r][d] = scaling * Σ_t (Σ_o B[o][r] · d_y[t][o]) · input[t][d]
+        //   dL/dB[o][r] = scaling * Σ_t d_y[t][o] · (Σ_d A[r][d] · input[t][d])
+        {
+            let hd = config.hidden_dim;
+            let seq_for_grad = actual_seq.min(d_hidden.len() / hd);
+
+            if let Some(ref mut lora_m) = student.lora_manager {
+                // Use student_states[0] (post-embedding) as input proxy for all layers
+                let input_state = match student_states.first() {
+                    Some(s) => s.as_slice(),
+                    None => &[],
+                };
+                let in_dim = if input_state.is_empty() { 0 } else { input_state.len() / hd };
+
+                // Phase 1: Compute all LoRA gradients (immutable reads of A, B)
+                let grad_data: Vec<(usize, String, Vec<f32>, Vec<f32>)> = lora_m.adapters_iter()
+                    .map(|(layer_idx, module_name, lora_layer)| {
+                        let rank = lora_layer.rank();
+                        let in_f = lora_layer.in_features();
+                        let out_f = lora_layer.out_features();
+                        let scaling = lora_layer.scaling();
+                        let b = lora_layer.lora_b();
+                        let a = lora_layer.lora_a();
+
+                        let mut ga = vec![0.0f32; rank * in_f];
+                        let mut gb = vec![0.0f32; out_f * rank];
+
+                        // grad_A: scaling * B^T · d_hidden, outer with input
+                        for r in 0..rank {
+                            for d in 0..in_f.min(hd) {
+                                let mut grad = 0.0f32;
+                                for t in 0..seq_for_grad.min(in_dim) {
+                                    let mut btdy = 0.0f32;
+                                    for o in 0..out_f.min(hd) {
+                                        btdy += b[o * rank + r] * d_hidden[t * hd + o];
+                                    }
+                                    grad += btdy * input_state[t * in_f + d];
+                                }
+                                ga[r * in_f + d] = scaling * grad;
+                            }
+                        }
+
+                        // grad_B: scaling * d_hidden · (A · input)^T
+                        for o in 0..out_f.min(hd) {
+                            for r in 0..rank {
+                                let mut grad = 0.0f32;
+                                for t in 0..seq_for_grad.min(in_dim) {
+                                    let mut ax_r = 0.0f32;
+                                    for d in 0..in_f.min(hd) {
+                                        ax_r += a[r * in_f + d] * input_state[t * in_f + d];
+                                    }
+                                    grad += d_hidden[t * hd + o] * ax_r;
+                                }
+                                gb[o * rank + r] = scaling * grad;
+                            }
+                        }
+
+                        (layer_idx, module_name.to_string(), ga, gb)
+                    })
+                    .collect();
+
+                // Phase 2: Optimizer step (mutable writes to A, B)
+                for (layer_idx, module_name, ga, gb) in grad_data {
+                    if let Some(ll) = lora_m.adapters_iter_mut()
+                        .find(|(li, mn, _)| *li == layer_idx && *mn == module_name)
+                        .map(|(_, _, ll)| ll)
+                    {
+                        let a = ll.lora_a_mut();
+                        optimizer.step(&format!("lora_a_{}_{}", layer_idx, module_name), &ga, a);
+                    }
+                    if let Some(ll) = lora_m.adapters_iter_mut()
+                        .find(|(li, mn, _)| *li == layer_idx && *mn == module_name)
+                        .map(|(_, _, ll)| ll)
+                    {
+                        let b = ll.lora_b_mut();
+                        optimizer.step(&format!("lora_b_{}_{}", layer_idx, module_name), &gb, b);
+                    }
+                }
+            }
+        }
+
+        // Compute gradient norm for logging
+        let grad_norm = {
+            let mut norm = 0.0f32;
+            for &g in &d_hidden { norm += g * g; }
+            norm.sqrt()
+        };
 
         // Old BlockSummary backprop removed — student is now CpuBlockAttnResModel
         let _frozen_states = &frozen_states_per_chunk[chunk_idx];
