@@ -2,7 +2,7 @@
 
 FerrisRes is a Rust-native AI inference and training engine built around **Block AttnRes** — a novel linear-time transformer architecture that replaces the quadratic attention bottleneck of standard transformers. It runs on any GPU or iGPU via [wgpu](https://github.com/gfx-rs/wgpu) (Vulkan, Metal, DX12, WebGPU), adapts automatically to the hardware it finds, and is written entirely in safe Rust with no Python dependency.
 
-> ⚠️ **v0.2.3 — near-production grade, not yet 1.0.** FerrisRes has 1370 passing tests (~92K lines across 155 modules), a Block-MoE-Res architecture with inter-block attention and ternary quantization, a full cognitive architecture with 5 layers, a verified Gemma 4 distillation pipeline, five output modalities, a 4-layer security proxy (FerrisRes Armor), and profile-driven GPU dispatch that adapts from Intel iGPUs to H100s. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0.
+> ⚠️ **v0.2.3 — near-production grade, not yet 1.0.** FerrisRes has 1434 passing tests (~94K lines across 158 modules), a Block-MoE-Res architecture with inter-block attention, 1.58-bit ternary quantization, 2:4 sparse ternary, TurboQuant 3-bit KV cache, expert mmap loading, and recurrent block summaries for unlimited context length. a full cognitive architecture with 5 layers, a verified Gemma 4 distillation pipeline, five output modalities, a 4-layer security proxy (FerrisRes Armor), and profile-driven GPU dispatch that adapts from Intel iGPUs to H100s. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0.
 
 ---
 
@@ -495,7 +495,7 @@ FerrisRes requires a working Vulkan driver. On Linux the recommended path is thr
 ```bash
 nix develop          # enters the dev shell with Rust + Vulkan layers
 cargo build
-cargo test            # 1370 tests
+cargo test            # 1434 tests
 cargo bench
 ```
 
@@ -632,8 +632,8 @@ src/
 | 17 | ✅ Done | Cognitive architecture: Layer 0-4 (pipeline wiring, memory & learning, autonomy, self-improvement, emergence measurement) |
 | 18 | ✅ Done | Phase 8 integration: consolidation engine, quality propagation, uncertainty feedback, tool exploration, safe learn tool, GGUF CPU inference, API server |
 | 19 | 🚧 In Progress | Block-MoE-Res: ternary quantization, SCALE/AdaMeM optimizers, inter-block attention, MoE conversion, distillation pipeline, checkpoint serialization |
-| 20 | 📝 Planned | 1.58-bit inference stack: ternary matmul, 2:4 sparse ternary, TernaryMoELayer, TernaryLinear, STE training integration, GPU kernels |
-| 21 | 📝 Planned | Edge I/O: expert mmap loading, 3-bit TurboQuant KV cache, block summary recurrent KV, post-training pruning pipeline |
+| 20 | ✅ Done | 1.58-bit inference stack: ternary matmul (6 variants), TernaryLinear, TernaryMoELayer, STE integration, TernaryBlockAttnResModel |
+| 21 | ✅ Done | Edge I/O: 2:4 sparse ternary, expert mmap loader (.stm format), 3-bit TurboQuant KV, recurrent block summary KV, pruning pipeline |
 | 22 | 📝 Planned | Expert I/O Pipeline: PreScope predictive prefetch, BuddyMoE fallback |
 | 23 | 📝 Planned | CPU/GPU Backend Abstraction: YaRN WGSL shaders, GPU capabilities, cooperative matrix MatMul, subgroup FlashDecode, WGSL backward passes |
 | 24 | 📝 Planned | Inference pipeline: wire CpuBlockAttnResModel into KV cache, prefill, decode |
@@ -641,7 +641,7 @@ src/
 | 26 | 📝 Planned | Elastic Inference: dynamic E2B/E4B path switching per DeviceProfile |
 | 27 | 📝 Planned | GPU BlockAttnResLayer: all 10 Gemma 4 features on GPU, LoRA backward, matmul/RoPE/softmax/RMSNorm backward kernels |
 
-**1370 tests passing. 425 tasks done, 2 in progress, 58 planned.**
+**1434 tests passing. 437 tasks done, 2 in progress, 47 planned.**
 
 See [ROADMAP.md](ROADMAP.md) for full technical details.
 

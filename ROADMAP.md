@@ -6,13 +6,13 @@
 
 | Metric | Value |
 |---|---|
-| Source code | ~92,000 lines across 155 modules |
-| Test suites | 1370 lib tests passing, 0 failures |
+| Source code | ~94,000 lines across 158 modules |
+| Test suites | 1434 lib tests passing, 0 failures |
 | Language | 100% Rust (safe + WGSL compute shaders) |
 | GPU backends | Vulkan, Metal, DX12, WebGPU via wgpu |
-| Tasks completed | **425 / 490** |
+| Tasks completed | **437 / 493** |
 | Tasks in progress | **2** |
-| Tasks planned | **58** |
+| Tasks planned | **47** |
 | License | AGPL-3.0-or-later |
 
 ---
@@ -259,8 +259,8 @@
 | 17 | ✅ Done | Cognitive architecture: Layer 0-4 (pipeline wiring, memory & learning, autonomy, self-improvement, emergence measurement) |
 | 18 | ✅ Done | Phase 8 integration: consolidation engine, quality propagation, uncertainty feedback, tool exploration, safe learn tool, GGUF CPU inference, API server |
 | 19 | 🚧 In Progress | Block-MoE-Res architecture: ternary quantization, SCALE/AdaMeM optimizers, inter-block attention, MoE conversion, distillation, checkpoint serialization |
-| 20 | 📝 Planned | 1.58-bit inference stack |
-| 21 | 📝 Planned | Edge I/O and KV compression |
+| 20 | ✅ Done | 1.58-bit inference stack: ternary matmul (6 variants), TernaryLinear, TernaryMoELayer, STE, TernaryBlockAttnResModel |
+| 21 | ✅ Done | Edge I/O: 2:4 sparse ternary, expert mmap (.stm), 3-bit TurboQuant KV, recurrent block summary KV, pruning pipeline |
 | 22 | 📝 Planned | Expert I/O Pipeline (PreScope + BuddyMoE) |
 | 23 | 📝 Planned | CPU/GPU Backend Abstraction (YaRN, capabilities, WGSL) |
 | 24 | 📝 Planned | Inference pipeline wiring |
@@ -268,7 +268,7 @@
 | 26 | 📝 Planned | Elastic Inference (E2B/E4B switching) |
 | 27 | 📝 Planned | GPU BlockAttnResLayer (Gemma 4 features + backward kernels) |
 
-**425 tasks done, 2 in progress, 58 planned — 1370 tests passing.**
+**437 tasks done, 2 in progress, 47 planned — 1434 tests passing.**
 
 ## Cognitive Architecture
 
