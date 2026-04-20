@@ -7,12 +7,12 @@
 | Metric | Value |
 |---|---|
 | Source code | ~94,000 lines across 158 modules |
-| Test suites | 1524 lib tests passing, 0 failures |
+| Test suites | 1569 lib tests passing, 0 failures |
 | Language | 100% Rust (safe + WGSL compute shaders) |
 | GPU backends | Vulkan, Metal, DX12, WebGPU via wgpu |
-| Tasks completed | **471 / 493** |
+| Tasks completed | **482 / 493** |
 | Tasks in progress | **0** |
-| Tasks planned | **14** |
+| Tasks planned | **3** |
 | License | AGPL-3.0-or-later |
 
 ---
@@ -268,7 +268,7 @@
 | 26 | 📝 Planned | Elastic Inference (E2B/E4B switching) |
 | 27 | 📝 Planned | GPU BlockAttnResLayer (Gemma 4 features + backward kernels) |
 
-**471 tasks done, 0 in progress, 14 planned — 1524 tests passing.**
+**482 tasks done, 0 in progress, 3 planned — 1569 tests passing.**
 
 ## Cognitive Architecture
 
