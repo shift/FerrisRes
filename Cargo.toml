@@ -69,3 +69,8 @@ harness = false
 name = "turboquant_benchmarks"
 harness = false
 path = "benches/turboquant_benchmarks.rs"
+
+[[bench]]
+name = "sparse_ternary_bench"
+harness = false
+path = "benches/sparse_ternary_bench.rs"
