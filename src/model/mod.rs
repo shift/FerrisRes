@@ -32,6 +32,7 @@ pub mod ternary;
 pub mod ternary_linear;
 pub mod ternary_moe;
 pub mod sparse_ternary;
+pub mod quantized_model;
 
 pub use config::BlockAttnResConfig;
 pub use linear::Linear;
