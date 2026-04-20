@@ -74,3 +74,4 @@ pub use episodic_memory::{EpisodicMemory, EpisodicMemoryConfig, Episode, Episode
 pub use diff_llm_computer::{DiffLlmComputer, DiffLlmComputerConfig, OpLogits, DiffMemoryBank, DiffProgramResult, DiffStepResult};
 pub use cognitive_pipeline::{CognitivePipeline, CognitivePipelineConfig, CognitiveGenerationResult, ToolExecutionResult, CalmResult};
 pub mod prescope;
+pub mod buddy_moe;
