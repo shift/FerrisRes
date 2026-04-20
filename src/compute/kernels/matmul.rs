@@ -222,9 +222,148 @@ fn matmul_double_buf(
 }
 "#;
 
+/// MatMul with transposed B: C = A × B^T where A is [M, K] and B is [K, N] (stored row-major).
+/// Used for backward pass: dL/dA = dC × B^T where dC=[M,N], B=[K,N] → result [M,K]
+const MATMUL_TRANSPOSE_B_WGSL: &str = r#"
+struct Params {
+    M: u32,
+    K: u32,
+    N: u32,
+}
+
+@group(0) @binding(0) var<storage, read> a: array<f32>;  // [M, K]
+@group(0) @binding(1) var<storage, read> b: array<f32>;  // [K, N] — will be read transposed
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;  // [M, K]
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(16, 16)
+fn matmul_tb(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = gid.x;
+    let col = gid.y;
+    let local_row = lid.x;
+    let local_col = lid.y;
+    let tile_size = 16u;
+
+    var acc: f32 = 0.0;
+    // We tile over the N dimension (the shared dimension for A×B^T)
+    let num_tiles = (params.N + tile_size - 1u) / tile_size;
+
+    for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {
+        let a_col = t * tile_size + local_col;  // index into N for A... wait.
+        // A is [M, K], we want C[m,k] = Σ_n A[m,n] * B[k,n]
+        // Actually, we need to rethink: dL/dA[m,k] = Σ_n dC[m,n] * B[k,n]
+        // So A = dC [M,N], B = weights [K,N], result C = dL/dA [M,K]
+        // The shared dimension is N.
+        // A_tile loads A[m, t*tile: t*tile+tile] = dC[m, n_segment]
+        // B_tile loads B[k, t*tile: t*tile+tile] = weights[k, n_segment]
+
+        // Tile A: reads from a[row * N + (t*tile + local_col)]  — A is [M, N]
+        let a_col_idx = t * tile_size + local_col;
+        let a_valid = row < params.M && a_col_idx < params.N;
+
+        // Tile B: reads from b[col * N + (t*tile + local_row)]  — B is [K, N], row=col, col=t_segment
+        let b_col_idx = t * tile_size + local_row;
+        let b_valid = col < params.K && b_col_idx < params.N;
+
+        // Note: A is [M,N] so tile_a should be loaded with A's row stride = N
+        if (a_valid) {
+            tile_a[local_row * tile_size + local_col] = a[row * params.N + a_col_idx];
+        } else {
+            tile_a[local_row * tile_size + local_col] = 0.0;
+        }
+
+        // B is [K,N] — we read B[col, b_col_idx] = B[col*N + b_col_idx]
+        if (b_valid) {
+            tile_b[local_row * tile_size + local_col] = b[col * params.N + b_col_idx];
+        } else {
+            tile_b[local_row * tile_size + local_col] = 0.0;
+        }
+
+        workgroupBarrier();
+
+        for (var i: u32 = 0u; i < tile_size; i = i + 1u) {
+            acc = acc + tile_a[local_row * tile_size + i] * tile_b[local_col * tile_size + i];
+        }
+
+        workgroupBarrier();
+    }
+
+    if (row < params.M && col < params.K) {
+        c[row * params.K + col] = acc;
+    }
+}
+"#;
+
+/// MatMul with transposed A: C = A^T × B where A is [M, K] and B is [M, N] (both row-major).
+/// Used for backward pass: dL/dB = A^T × dC where A=[M,K], dC=[M,N] → result [K,N]
+const MATMUL_TRANSPOSE_A_WGSL: &str = r#"
+struct Params {
+    M: u32,
+    K: u32,
+    N: u32,
+}
+
+@group(0) @binding(0) var<storage, read> a: array<f32>;  // [M, K] — will be read transposed
+@group(0) @binding(1) var<storage, read> b: array<f32>;  // [M, N]
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;  // [K, N]
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(16, 16)
+fn matmul_ta(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = gid.x;  // output row = K dim
+    let col = gid.y;  // output col = N dim
+    let local_row = lid.x;
+    let local_col = lid.y;
+    let tile_size = 16u;
+
+    var acc: f32 = 0.0;
+    // C[k,n] = Σ_m A[m,k] * B[m,n] = Σ_m A^T[k,m] * B[m,n]
+    // Shared dimension is M
+    let num_tiles = (params.M + tile_size - 1u) / tile_size;
+
+    for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {
+        // A_tile: A[m_segment, k] = A[(t*tile+local_col)*K + row]  — transposed read
+        let a_row_idx = t * tile_size + local_col;
+        let a_valid = row < params.K && a_row_idx < params.M;
+
+        // B_tile: B[m_segment, n] = B[(t*tile+local_row)*N + col]
+        let b_row_idx = t * tile_size + local_row;
+        let b_valid = b_row_idx < params.M && col < params.N;
+
+        if (a_valid) {
+            tile_a[local_row * tile_size + local_col] = a[a_row_idx * params.K + row];
+        } else {
+            tile_a[local_row * tile_size + local_col] = 0.0;
+        }
+
+        if (b_valid) {
+            tile_b[local_row * tile_size + local_col] = b[b_row_idx * params.N + col];
+        } else {
+            tile_b[local_row * tile_size + local_col] = 0.0;
+        }
+
+        workgroupBarrier();
+
+        for (var i: u32 = 0u; i < tile_size; i = i + 1u) {
+            acc = acc + tile_a[local_row * tile_size + i] * tile_b[i * tile_size + local_col];
+        }
+
+        workgroupBarrier();
+    }
+
+    if (row < params.K && col < params.N) {
+        c[row * params.N + col] = acc;
+    }
+}
+"#;
+
 pub struct MatMulOp {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    /// Pipeline for dL/dA = dC × B^T (transpose-B matmul)
+    backward_b_pipeline: wgpu::ComputePipeline,
+    /// Pipeline for dL/dB = A^T × dC (transpose-A matmul)
+    backward_a_pipeline: wgpu::ComputePipeline,
     device: Arc<Device>,
     queue: Arc<Queue>,
 }
@@ -300,9 +439,39 @@ impl MatMulOp {
         });
 
         tracing::debug!(event = "matmulop_pipeline_created_successfully", "MatMulOp pipeline created successfully");
+
+        // === Backward pipelines ===
+        let tb_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("MatMul TransposeB Shader"),
+            source: wgpu::ShaderSource::Wgsl(MATMUL_TRANSPOSE_B_WGSL.into()),
+        });
+        let backward_b_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("MatMul TransposeB Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &tb_shader,
+            entry_point: Some("matmul_tb"),
+            cache: None,
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+
+        let ta_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("MatMul TransposeA Shader"),
+            source: wgpu::ShaderSource::Wgsl(MATMUL_TRANSPOSE_A_WGSL.into()),
+        });
+        let backward_a_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("MatMul TransposeA Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &ta_shader,
+            entry_point: Some("matmul_ta"),
+            cache: None,
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+
         Self {
             pipeline,
             bind_group_layout,
+            backward_b_pipeline,
+            backward_a_pipeline,
             device: Arc::clone(device),
             queue: Arc::clone(queue),
         }
@@ -440,6 +609,120 @@ impl MatMulOp {
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1);
 
+        drop(pass);
+
+        Ok(())
+    }
+
+    /// Backward pass: compute dL/dA = dC × B^T
+    ///
+    /// Given forward C = A × B where A=[M,K], B=[K,N], C=[M,N]:
+    ///   dL/dA = dC × B^T  →  dL/dA[m,k] = Σ_n dC[m,n] * B[k,n]
+    ///
+    /// # Arguments
+    /// * `dC` — gradient w.r.t. output [M, N]
+    /// * `b` — weight matrix B from forward pass [K, N]
+    /// * `dA` — output gradient w.r.t. A [M, K]
+    pub fn dispatch_backward_a(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        dc: &GpuBuffer,
+        b: &GpuBuffer,
+        da: &GpuBuffer,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<()> {
+        let tile_size = 16u32;
+        let wg_x = (m + tile_size - 1) / tile_size;
+        let wg_y = (k + tile_size - 1) / tile_size;
+
+        // Params for transpose-B: A=[M,N], B=[K,N], C=[M,K]
+        // The kernel treats N as the shared (reduction) dimension
+        let params_data: [u32; 3] = [m, k, n];
+        let params_buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("MatMul Backward-A Params"),
+            size: 12,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params_data));
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MatMul Backward-A Bind Group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: dc.buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: b.buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: da.buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: params_buffer.as_entire_binding() },
+            ],
+        });
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("MatMul Backward-A Compute Pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.backward_b_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(wg_x, wg_y, 1);
+        drop(pass);
+
+        Ok(())
+    }
+
+    /// Backward pass: compute dL/dB = A^T × dC
+    ///
+    /// Given forward C = A × B where A=[M,K], B=[K,N], C=[M,N]:
+    ///   dL/dB = A^T × dC  →  dL/dB[k,n] = Σ_m A[m,k] * dC[m,n]
+    ///
+    /// # Arguments
+    /// * `a` — input matrix A from forward pass [M, K]
+    /// * `dC` — gradient w.r.t. output [M, N]
+    /// * `dB` — output gradient w.r.t. B [K, N]
+    pub fn dispatch_backward_b(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        a: &GpuBuffer,
+        dc: &GpuBuffer,
+        db: &GpuBuffer,
+        m: u32,
+        k: u32,
+        n: u32,
+    ) -> Result<()> {
+        let tile_size = 16u32;
+        let wg_x = (k + tile_size - 1) / tile_size;
+        let wg_y = (n + tile_size - 1) / tile_size;
+
+        // Params for transpose-A: A=[M,K], B=[M,N], C=[K,N]
+        // The kernel treats M as the shared (reduction) dimension
+        let params_data: [u32; 3] = [m, k, n];
+        let params_buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("MatMul Backward-B Params"),
+            size: 12,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params_data));
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MatMul Backward-B Bind Group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: a.buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: dc.buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: db.buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: params_buffer.as_entire_binding() },
+            ],
+        });
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("MatMul Backward-B Compute Pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.backward_a_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(wg_x, wg_y, 1);
         drop(pass);
 
         Ok(())
@@ -585,5 +868,113 @@ impl MatMulDoubleBufferOp {
         drop(pass);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[allow(unused_imports)]
+    use super::*;
+
+    fn matmul_ref(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        let mut c = vec![0.0f32; m * n];
+        for r in 0..m {
+            for col in 0..n {
+                let mut sum = 0.0f32;
+                for i in 0..k {
+                    sum += a[r * k + i] * b[i * n + col];
+                }
+                c[r * n + col] = sum;
+            }
+        }
+        c
+    }
+
+    fn matmul_backward_a_ref(dc: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+        let mut da = vec![0.0f32; m * k];
+        for r in 0..m {
+            for col in 0..k {
+                let mut sum = 0.0f32;
+                for i in 0..n {
+                    sum += dc[r * n + i] * b[col * n + i];
+                }
+                da[r * k + col] = sum;
+            }
+        }
+        da
+    }
+
+    fn matmul_backward_b_ref(a: &[f32], dc: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        let mut db = vec![0.0f32; k * n];
+        for r in 0..k {
+            for col in 0..n {
+                let mut sum = 0.0f32;
+                for i in 0..m {
+                    sum += a[i * k + r] * dc[i * n + col];
+                }
+                db[r * n + col] = sum;
+            }
+        }
+        db
+    }
+
+    #[test]
+    fn test_matmul_backward_a_identity() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let b = vec![1.0f32, 0.0, 0.0, 1.0];
+        let dc = a.clone();
+        let da = matmul_backward_a_ref(&dc, &b, 2, 2, 2);
+        for (i, (&got, &expected)) in da.iter().zip(a.iter()).enumerate() {
+            assert!((got - expected).abs() < 1e-5, "da[{}] = {} expected {}", i, got, expected);
+        }
+    }
+
+    #[test]
+    fn test_matmul_backward_b_identity() {
+        let a = vec![1.0f32, 0.0, 0.0, 1.0];
+        let dc = vec![1.0f32, 2.0, 3.0, 4.0];
+        let db = matmul_backward_b_ref(&a, &dc, 2, 2, 2);
+        for (i, (&got, &expected)) in db.iter().zip(dc.iter()).enumerate() {
+            assert!((got - expected).abs() < 1e-5, "db[{}] = {} expected {}", i, got, expected);
+        }
+    }
+
+    #[test]
+    fn test_matmul_backward_chain_rule() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let c = matmul_ref(&a, &b, 2, 3, 2);
+        assert_eq!(c.len(), 4);
+        let dc = vec![1.0f32, 0.0, 0.0, 1.0];
+        let da = matmul_backward_a_ref(&dc, &b, 2, 2, 3);
+        assert_eq!(da.len(), 6);
+        let db = matmul_backward_b_ref(&a, &dc, 2, 3, 2);
+        assert_eq!(db.len(), 6);
+        for &g in &da { assert!(g.is_finite()); }
+        for &g in &db { assert!(g.is_finite()); }
+        assert!(da.iter().sum::<f32>().abs() > 0.1);
+        assert!(db.iter().sum::<f32>().abs() > 0.1);
+    }
+
+    #[test]
+    fn test_matmul_backward_a_specific() {
+        let dc = vec![1.0f32, 0.0, 0.0, 0.0];
+        let b = vec![5.0f32, 6.0, 7.0, 8.0];
+        let da = matmul_backward_a_ref(&dc, &b, 2, 2, 2);
+        assert!((da[0] - 5.0).abs() < 1e-5);
+        assert!((da[1] - 7.0).abs() < 1e-5);
+        assert!((da[2] - 0.0).abs() < 1e-5);
+        assert!((da[3] - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_matmul_backward_b_specific() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let dc = vec![1.0f32, 0.0, 0.0, 0.0];
+        let db = matmul_backward_b_ref(&a, &dc, 2, 2, 2);
+        assert!((db[0] - 1.0).abs() < 1e-5);
+        assert!((db[1] - 0.0).abs() < 1e-5);
+        assert!((db[2] - 2.0).abs() < 1e-5);
+        assert!((db[3] - 0.0).abs() < 1e-5);
     }
 }
