@@ -29,6 +29,8 @@ pub mod gpu_forward;
 pub mod generation_head;
 pub mod checkpoint;
 pub mod ternary;
+pub mod ternary_linear;
+pub mod ternary_moe;
 
 pub use config::BlockAttnResConfig;
 pub use linear::Linear;
