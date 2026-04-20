@@ -14,6 +14,7 @@ pub mod turboquant_kernels;
 pub mod fft;
 pub mod conv3d;
 pub mod immediates;
+pub mod ternary_matmul;
 
 pub mod gpu_transformer;
 
