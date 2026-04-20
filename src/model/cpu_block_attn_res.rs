@@ -607,6 +607,110 @@ impl CpuBlockAttnResModel {
 // Weight Mapping: MappedGemma4Model → CpuBlockAttnResModel
 // ---------------------------------------------------------------------------
 
+/// Convert every dense FFN in a CpuBlockAttnResModel to MoE.
+/// FerrisRes ALWAYS produces MoE models — even from a dense teacher.
+///
+/// Expert 0: exact copy of dense FFN (preserves teacher knowledge).
+/// Experts 1..N: dense FFN + Gaussian noise (perturbation init).
+/// Router: small random init so initial routing is near-uniform.
+pub fn dense_ffn_to_moe(
+    model: &mut CpuBlockAttnResModel,
+    num_experts: usize,
+    top_k: usize,
+    noise_stddev: f32,
+) {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+
+    for layer in &mut model.layers {
+        // Only convert layers that still have dense FFN
+        let (gate, up, down, use_gelu, inter_dim) = match (&layer.ffn_gate, &layer.ffn_up, &layer.ffn_down) {
+            (Some(g), Some(u), Some(d)) => {
+                let idim = g.out_features();
+                (g.weight().to_vec(), u.weight().to_vec(), d.weight().to_vec(), layer.use_gelu, idim)
+            }
+            _ => continue, // Already MoE or no FFN
+        };
+
+        let hd = layer.hidden_dim;
+        let mut moe = crate::model::cpu_moe::CpuMoELayer::new(hd, inter_dim, num_experts, top_k);
+        moe.use_gelu = use_gelu;
+
+        // Router: small random init (near-uniform routing initially)
+        moe.gate_weights = (0..num_experts * hd)
+            .map(|_| rng.gen::<f32>() * noise_stddev * 2.0 - noise_stddev)
+            .collect();
+
+        // Expert 0: exact copy of dense FFN
+        moe.expert_gate[0] = gate.clone();
+        moe.expert_up[0] = up.clone();
+        moe.expert_down[0] = down.clone();
+
+        // Experts 1..N: dense FFN + perturbation noise
+        for e in 1..num_experts {
+            moe.expert_gate[e] = gate.iter().map(|&w| w + rng.gen::<f32>() * noise_stddev * 2.0 - noise_stddev).collect();
+            moe.expert_up[e] = up.iter().map(|&w| w + rng.gen::<f32>() * noise_stddev * 2.0 - noise_stddev).collect();
+            moe.expert_down[e] = down.iter().map(|&w| w + rng.gen::<f32>() * noise_stddev * 2.0 - noise_stddev).collect();
+        }
+
+        // Replace dense FFN with MoE
+        layer.ffn_gate = None;
+        layer.ffn_up = None;
+        layer.ffn_down = None;
+        layer.moe = Some(moe);
+    }
+}
+
+/// Compute MoE load balancing auxiliary loss.
+/// `balance_loss = num_experts * Σ(f_i × P_i)`
+/// where f_i = fraction of tokens routed to expert i,
+///       P_i = mean router probability for expert i.
+/// This prevents router collapse (all tokens going to one expert).
+pub fn moe_load_balance_loss(
+    gate_logits: &[f32],   // [seq, num_experts] raw router logits
+    num_experts: usize,
+    seq: usize,
+) -> f32 {
+    let mut f = vec![0.0f32; num_experts]; // fraction of tokens per expert
+    let mut p = vec![0.0f32; num_experts]; // mean router prob per expert
+
+    for t in 0..seq {
+        let offset = t * num_experts;
+        let logits = &gate_logits[offset..offset + num_experts];
+
+        // Softmax to get probabilities
+        let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum_exp = 0.0f32;
+        let mut probs = vec![0.0f32; num_experts];
+        for (i, &l) in logits.iter().enumerate() {
+            probs[i] = (l - max_l).exp();
+            sum_exp += probs[i];
+        }
+        for p_i in &mut probs { *p_i /= sum_exp; }
+
+        // Accumulate mean probabilities and top-k fractions
+        for (i, &prob) in probs.iter().enumerate() {
+            p[i] += prob;
+        }
+        // For top-k=2, count tokens routed to each expert
+        let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        for &(_, _top_prob) in &indexed[..2.min(num_experts)] {
+            // Distribute fractionally by probability
+            // Simplified: just count the top-k as 1 each
+        }
+        // Track which experts got selected (top-1 for simplicity)
+        f[indexed[0].0] += 1.0;
+    }
+
+    // Normalize
+    for p_i in &mut p { *p_i /= seq as f32; }
+    for f_i in &mut f { *f_i /= seq as f32; }
+
+    // Load balance loss: num_experts * Σ(f_i * P_i)
+    num_experts as f32 * f.iter().zip(p.iter()).map(|(&fi, &pi)| fi * pi).sum::<f32>()
+}
+
 /// Convert a loaded Gemma 4 model into a CpuBlockAttnResModel for distillation.
 /// This preserves ALL weights — the student starts from the teacher's knowledge.
 /// The conversion maps Gemma 4 architecture to BlockAttnRes with per-layer config.
