@@ -1403,6 +1403,11 @@ async fn cmd_distill(
     let mut student = ferrisres::model::cpu_block_attn_res::gemma4_to_block_attnres(&model2);
     info!(event = "student_ready", layers = student.layers.len(), "student CpuBlockAttnResModel created from teacher weights");
 
+    // Convert every dense FFN to MoE (FerrisRes ALWAYS produces MoE models)
+    ferrisres::model::cpu_block_attn_res::dense_ffn_to_moe(&mut student, 4, 2, 0.01);
+    let moe_layers = student.layers.iter().filter(|l| l.moe.is_some()).count();
+    info!(event = "moe_conversion", moe_layers = moe_layers, total_layers = student.layers.len(), "Converted dense FFN to MoE (4 experts, top-2)");
+
     // Attach LoRA adapters for training (rank 8, q_proj + v_proj)
     let lora_config = ferrisres::training::lora::LoraConfig::targeting(8, vec!["q_proj", "v_proj"]);
     student.attach_lora(lora_config);
@@ -1458,7 +1463,7 @@ async fn cmd_distill(
     }
 
     info!("");
-    info!(event = "distill_start", total_steps = steps, start_step = global_step, seq_len = seq_len, lr = learning_rate, temp = temperature, "starting distillation");
+    info!(event = "distill_start", total_steps = steps, start_step = global_step, seq_len = seq_len, lr = learning_rate, temp = temperature, optimizer = optimizer.name(), moe_layers = moe_layers, "starting distillation");
     info!("");
 
     // Since base weights don't change during training, we only need to run
@@ -1602,6 +1607,7 @@ async fn cmd_distill(
         };
 
         // Combined loss: KL + 0.5 * hidden_MSE
+        // TODO: add MoE load balance loss when gate_logits are collected during forward
         let loss = kl_loss + 0.5 * hidden_mse_loss;
 
         // Update EMA
