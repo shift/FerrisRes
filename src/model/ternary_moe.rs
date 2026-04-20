@@ -20,7 +20,7 @@ pub struct TernaryWeight {
     pub ternary: Vec<i8>,
     /// Original number of values.
     #[allow(dead_code)]
-    packed_len: usize,
+    pub packed_len: usize,
 }
 
 impl TernaryWeight {
