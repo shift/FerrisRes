@@ -76,3 +76,4 @@ pub use cognitive_pipeline::{CognitivePipeline, CognitivePipelineConfig, Cogniti
 pub mod prescope;
 pub mod buddy_moe;
 pub mod compressed_kv;
+pub mod covo;
