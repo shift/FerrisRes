@@ -28,6 +28,7 @@ pub mod gemma_mapper;
 pub mod gpu_forward;
 pub mod generation_head;
 pub mod checkpoint;
+pub mod ternary;
 
 pub use config::BlockAttnResConfig;
 pub use linear::Linear;
