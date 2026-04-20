@@ -74,3 +74,8 @@ path = "benches/turboquant_benchmarks.rs"
 name = "sparse_ternary_bench"
 harness = false
 path = "benches/sparse_ternary_bench.rs"
+
+[[bench]]
+name = "ternary_bench"
+harness = false
+path = "benches/ternary_bench.rs"
