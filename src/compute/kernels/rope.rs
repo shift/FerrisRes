@@ -42,8 +42,15 @@ fn rope_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let base = 10000.0;
     let freq = 1.0 / pow(base, f32(2u * pair_idx) / f32(head_dim));
     let theta = f32(pos) * freq;
-    let cos_t = cos(theta);
-    let sin_t = sin(theta);
+
+    // Cody-Waite range reduction for precision at high positions (>100k).
+    let TWO_PI_HI = 6.28125;
+    let TWO_PI_LO = 0.001935308;
+    let n = floor(theta / 6.283185307);
+    let theta_red = ((theta - n * TWO_PI_HI) - n * TWO_PI_LO);
+
+    let cos_t = cos(theta_red);
+    let sin_t = sin(theta_red);
 
     // Buffer index is always local — input/output sized for current batch only.
     // pos is used only for angle (theta) computation above; flat_idx addresses the buffer.
@@ -94,8 +101,15 @@ fn rope_inplace_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let base = 10000.0;
     let freq = 1.0 / pow(base, f32(2u * pair_idx) / f32(head_dim));
     let theta = f32(pos) * freq;
-    let cos_t = cos(theta);
-    let sin_t = sin(theta);
+
+    // Cody-Waite range reduction for precision at high positions (>100k).
+    let TWO_PI_HI = 6.28125;
+    let TWO_PI_LO = 0.001935308;
+    let n = floor(theta / 6.283185307);
+    let theta_red = ((theta - n * TWO_PI_HI) - n * TWO_PI_LO);
+
+    let cos_t = cos(theta_red);
+    let sin_t = sin(theta_red);
 
     let x0 = buf[flat_idx];
     let x1 = buf[flat_idx + 1u];
