@@ -1840,7 +1840,11 @@ async fn cmd_distill(
     }
 
     // TODO: Save CpuBlockAttnResModel as distilled checkpoint (d3777391)
-    info!(event = "distillation_model_save", "Student model save not yet implemented — needs LoRA adapter serialization");
+    // Save trained Block-MoE-Res model
+    match ferrisres::model::checkpoint::save_model(&student, &output_path) {
+        Ok(()) => info!(event = "model_saved", path = %output_path, "Trained model saved"),
+        Err(e) => warn!(event = "model_save_failed", error = %e, "Failed to save model"),
+    }
 
     // Save loss curve as CSV
     let csv_path = format!("{}.loss_curve.csv", output_path);
