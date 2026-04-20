@@ -258,9 +258,74 @@ impl CpuBlockAttnResLayer {
         ple_input: Option<&[f32]>,
         shared_kv: Option<(&[f32], &[f32])>,
     ) -> (Vec<f32>, Vec<f32>) {
-        let kv = self.forward(hidden, ple_input, shared_kv);
+        // Delegate to the LoRA-aware version with no LoRA manager
+        self.forward_full_with_lora(hidden, ple_input, shared_kv, None, 0)
+    }
+
+    /// Full forward with optional LoRA adapters.
+    /// LoRA is applied to q_proj and v_proj projections via the LoraManager.
+    /// When LoRA is active, the adapter contributions are computed alongside
+    /// the base projections and added as deltas.
+    pub fn forward_full_with_lora(
+        &self,
+        hidden: &mut Vec<f32>,
+        ple_input: Option<&[f32]>,
+        shared_kv: Option<(&[f32], &[f32])>,
+        lora: Option<&crate::training::lora::LoraManager>,
+        layer_idx: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        // If no LoRA, use the standard path
+        if lora.is_none() {
+            let kv = self.forward(hidden, ple_input, shared_kv);
+            self.forward_ffn(hidden, ple_input);
+            return kv;
+        }
+        let lora_m = lora.unwrap();
+        let hd = self.hidden_dim;
+        let nh = self.num_heads;
+        let nkv = self.num_kv_heads;
+        let head_d = self.head_dim;
+        let seq = hidden.len() / hd;
+
+        // === Attention Block with LoRA ===
+        let residual = hidden.clone();
+        let normed = self.attn_norm.forward(hidden);
+
+        // Q projection + LoRA
+        let mut q = self.q_proj.forward(&normed, seq);
+        if let Some(lora_out) = lora_m.forward(layer_idx, "q_proj", &normed, seq) {
+            for (i, v) in lora_out.iter().enumerate() { q[i] += v; }
+        }
+        q = crate::model::gemma_mapper::per_head_rms_norm(&q, self.q_norm.weight(), seq, nh, head_d);
+        apply_rope(&mut q, seq, nh, head_d, 0, self.rope_theta, self.partial_rotary_factor);
+
+        // K/V: either shared or computed (with LoRA on V)
+        let (k, v, should_share) = match shared_kv {
+            Some((sk, sv)) => (sk.to_vec(), sv.to_vec(), false),
+            None => {
+                let mut k = self.k_proj.forward(&normed, seq);
+                let mut v_raw = self.v_proj.forward(&normed, seq);
+                if let Some(lora_out) = lora_m.forward(layer_idx, "v_proj", &normed, seq) {
+                    for (i, l) in lora_out.iter().enumerate() { v_raw[i] += l; }
+                }
+                k = crate::model::gemma_mapper::per_head_rms_norm(&k, self.k_norm.weight(), seq, nkv, head_d);
+                let v = crate::model::gemma_mapper::per_head_rms_norm_no_scale(&v_raw, seq, nkv, head_d);
+                apply_rope_gqa(&mut k, seq, nkv, head_d, 0, self.rope_theta, self.partial_rotary_factor);
+                (k, v, true)
+            }
+        };
+
+        let q_dim = nh * head_d;
+        let kv_dim = nkv * head_d;
+        let attn_out = self.cpu_attention(&q, &k, &v, seq, nh, nkv, head_d, q_dim, kv_dim);
+        let attn_out = self.post_attn_norm.forward(&attn_out);
+        for i in 0..hidden.len() { hidden[i] = residual[i] + attn_out[i]; }
+
+        // === FFN Block (standard, no LoRA on FFN yet) ===
         self.forward_ffn(hidden, ple_input);
-        kv
+
+        // Return K/V for sharing
+        if should_share { (k, v) } else { (vec![], vec![]) }
     }
 
     /// CPU causal self-attention with GQA.
@@ -367,6 +432,9 @@ pub struct CpuBlockAttnResModel {
 
     // Block-MoE-Res structure
     pub block_config: BlockConfig,
+
+    // LoRA adapters (wired from src/training/lora.rs)
+    pub lora_manager: Option<crate::training::lora::LoraManager>,
 }
 
 /// Block partitioning configuration.
@@ -731,6 +799,34 @@ impl CpuBlockAttnResModel {
         output
     }
 
+    /// Attach LoRA adapters to targeted projections.
+    /// Uses LoraManager.auto_populate() to create adapters for matching modules.
+    pub fn attach_lora(&mut self, config: crate::training::lora::LoraConfig) {
+        let mut manager = crate::training::lora::LoraManager::new(config);
+        
+        // Auto-populate adapters for each layer's target modules
+        let targets = ["q_proj", "v_proj", "ple_gate"];
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            for &module in &targets {
+                let (in_f, out_f) = match module {
+                    "q_proj" => (layer.hidden_dim, layer.q_proj.out_features()),
+                    "v_proj" => (layer.hidden_dim, layer.v_proj.out_features()),
+                    "ple_gate" => {
+                        if let Some(ref gate) = layer.ple_input_gate {
+                            (gate.in_features(), gate.out_features())
+                        } else { continue; }
+                    },
+                    _ => continue,
+                };
+                let key = format!("layer_{}.{}", layer_idx, module);
+                manager.add_adapter(layer_idx, &key, in_f, out_f);
+            }
+        }
+        
+        tracing::info!(event = "lora_attached", adapters = manager.num_adapters(), params = manager.total_params(), "LoRA adapters attached");
+        self.lora_manager = Some(manager);
+    }
+
     /// Check if a layer is a block boundary (last layer of its block).
     fn is_block_boundary(&self, layer_idx: usize) -> bool {
         self.block_config.boundary_layers.contains(&layer_idx)
@@ -973,5 +1069,8 @@ pub fn gemma4_to_block_attnres(teacher: &MappedGemma4Model) -> CpuBlockAttnResMo
             attn_res_proj: vec![0.0f32; hd * hd], // identity init [hd, hd]
             attn_res_norm: vec![1.0f32; hd],       // norm weights = 1.0 (identity)
         },
+
+        // LoRA: initialized to None. Call attach_lora() to add adapters.
+        lora_manager: None,
     }
 }

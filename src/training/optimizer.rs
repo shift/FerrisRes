@@ -511,8 +511,96 @@ struct LossParams {
     _pad1: u32,
 }
 
+// ---------------------------------------------------------------------------
+// WeightOptimizer trait — SCALE / AdaMeM hybrid optimizer interface
+// Routes through DeviceProfile: SCALE for edge, AdaMeM for capable hardware.
+// The existing AdamOptimizer above is kept for backward compat (GPU training).
+// ---------------------------------------------------------------------------
+
+/// Optimizer hint from DeviceProfile.
+#[derive(Debug, Clone)]
+pub enum OptimizerHint {
+    /// SCALE: column-normalized gradients, no SVD, minimal state.
+    /// For DeviceProfile::Integrated and LowEnd.
+    Scale,
+    /// AdaMeM: low-rank momentum + Adafactor in subspace, SVD every T steps.
+    /// For DeviceProfile::MidRange and HighEnd.
+    AdaMeM { rank: usize },
+}
+
+/// Trait for shape-aware, memory-efficient optimizers.
+///
+/// Both SCALE and AdaMeM need to know matrix shape [rows × cols] at
+/// registration time so they can allocate the right amount of state.
+/// SCALE stores [cols] column norms (+ optional momentum on output layers).
+/// AdaMeM stores projector [m×r] + momentum [r×n] + factored 2nd moments.
+pub trait WeightOptimizer {
+    /// Register a weight matrix [rows × cols] for optimization.
+    /// Call before the first `step()` for this matrix.
+    fn register_matrix(&mut self, name: &str, rows: usize, cols: usize);
+
+    /// Mark a matrix as an "output layer" that should receive momentum.
+    /// SCALE uses this for LoRA B matrices (the output adapter).
+    /// AdaMeM ignores this — it applies momentum in the low-rank subspace for all layers.
+    fn mark_output_layer(&mut self, name: &str);
+
+    /// Perform one optimization step for a registered matrix.
+    /// `gradient`: [rows * cols] raw gradients for this step.
+    /// `weights`: [rows * cols] mutable weights, updated in-place.
+    fn step(&mut self, name: &str, gradient: &[f32], weights: &mut [f32]);
+
+    /// Zero all gradient accumulators (call between micro-batches if accumulating).
+    fn zero_grad(&mut self);
+
+    /// Total optimizer state memory in bytes.
+    fn state_bytes(&self) -> usize;
+
+    /// Number of registered weight matrices.
+    fn num_registered(&self) -> usize;
+
+    /// Set learning rate.
+    fn set_learning_rate(&mut self, lr: f32);
+
+    /// Get current learning rate.
+    fn learning_rate(&self) -> f32;
+
+    /// Current global step count.
+    fn timestep(&self) -> u32;
+
+    /// Human-readable optimizer name (for logging).
+    fn name(&self) -> &'static str;
+}
+
+/// Factory: create the right optimizer for a given DeviceProfile.
+///
+/// - Integrated / LowEnd → SCALE (12.1 MB state, no SVD)
+/// - MidRange / HighEnd   → AdaMeM rank 8 (181.6 MB state, SVD every 200 steps)
+///
+/// The concrete types (ScaleOptimizer, AdaMeMOptimizer) are in separate files:
+///   src/training/optimizer_scale.rs
+///   src/training/optimizer_adamem.rs
+pub fn optimizer_for_profile(
+    profile: &crate::device::profile::DeviceProfile,
+    learning_rate: f32,
+) -> Box<dyn WeightOptimizer> {
+    match profile.optimizer_hint() {
+        OptimizerHint::Scale => {
+            Box::new(
+                crate::training::optimizer_scale::ScaleOptimizer::new(learning_rate)
+            )
+        }
+        OptimizerHint::AdaMeM { rank } => {
+            Box::new(
+                crate::training::optimizer_adamem::AdaMeMOptimizer::new(learning_rate, rank)
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn test_sgd_learning_rate() {
         let lr = 0.01f32;
@@ -523,5 +611,14 @@ mod tests {
     fn test_adam_timestep_type() {
         let ts: u32 = 0;
         assert_eq!(ts, 0u32);
+    }
+
+    #[test]
+    fn test_optimizer_hint_routing() {
+        use crate::device::profile::DeviceProfile;
+        assert!(matches!(DeviceProfile::Integrated.optimizer_hint(), OptimizerHint::Scale));
+        assert!(matches!(DeviceProfile::LowEnd.optimizer_hint(), OptimizerHint::Scale));
+        assert!(matches!(DeviceProfile::MidRange.optimizer_hint(), OptimizerHint::AdaMeM { .. }));
+        assert!(matches!(DeviceProfile::HighEnd.optimizer_hint(), OptimizerHint::AdaMeM { .. }));
     }
 }

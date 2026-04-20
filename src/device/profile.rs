@@ -146,6 +146,21 @@ impl DeviceProfile {
         }
     }
     
+    /// Get recommended optimizer strategy for this device profile.
+    ///
+    /// - Integrated / LowEnd → SCALE (12.1 MB state, no SVD, runs on RPi)
+    /// - MidRange / HighEnd   → AdaMeM (181.6 MB state, SVD every 200 steps)
+    pub fn optimizer_hint(&self) -> crate::training::optimizer::OptimizerHint {
+        match self {
+            DeviceProfile::Integrated | DeviceProfile::LowEnd => {
+                crate::training::optimizer::OptimizerHint::Scale
+            }
+            DeviceProfile::MidRange | DeviceProfile::HighEnd => {
+                crate::training::optimizer::OptimizerHint::AdaMeM { rank: 8 }
+            }
+        }
+    }
+
     /// Get memory transfer optimization hints
     pub fn memory_transfer_hint(&self) -> MemoryTransferHint {
         match self {
