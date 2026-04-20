@@ -17,6 +17,8 @@ pub mod immediates;
 pub mod ternary_matmul;
 pub mod sparse_ternary;
 pub mod optimizer_scale;
+pub mod paged_attention;
+pub mod hull_kv;
 
 pub mod gpu_transformer;
 

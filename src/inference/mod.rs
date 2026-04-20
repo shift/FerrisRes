@@ -77,3 +77,8 @@ pub mod prescope;
 pub mod buddy_moe;
 pub mod compressed_kv;
 pub mod covo;
+pub mod skill_kb;
+pub mod fdal;
+pub mod elastic_expert;
+pub mod positional_uncertainty;
+pub mod adaptive_blocks;
