@@ -78,44 +78,118 @@ fn softmax_main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation
         output[row_offset + i] = output[row_offset + i] / row_sum;
     }
 }
+
 "#;
 
-/// Softmax backward: dL/dx_i = s_i * (dL/ds_i - sum_j(dL/ds_j * s_j))
-/// Uses workgroup reduction for the dot product term.
-const SOFTMAX_BACKWARD_WGSL: &str = r#"
+/// Immediate-data variant: params via var<immediate> instead of uniform buffer.
+/// Uses only 2 bindings (input, output) + immediate data for cols.
+const SOFTMAX_IMMEDIATE_WGSL: &str = r#"
 struct Params {
     cols: u32,
 }
 
-@group(0) @binding(0) var<storage, read> grad_output: array<f32>;
-@group(0) @binding(1) var<storage, read> softmax_output: array<f32>;
-@group(0) @binding(2) var<storage, read_write> grad_input: array<f32>;
-@group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+var<immediate> params: Params;
 
 const WG_SIZE: u32 = 256u;
 
-var<workgroup> shared_dot: array<f32, WG_SIZE>;
+var<workgroup> shared_max: array<f32, WG_SIZE>;
+var<workgroup> shared_sum: array<f32, WG_SIZE>;
 
 @compute @workgroup_size(WG_SIZE)
-fn softmax_backward_main(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_index) local_id: u32,
-) {
+fn softmax_main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) local_id: u32) {
     let row_idx = wid.x;
     let cols = params.cols;
     let row_offset = row_idx * cols;
 
-    // Phase 1: Compute partial sum of (dL/ds_j * s_j)
-    var partial_dot = 0.0;
+    var local_max: f32 = -3.4028235e+38;
+
     for (var i = local_id; i < cols; i += WG_SIZE) {
-        let idx = row_offset + i;
-        partial_dot = partial_dot + grad_output[idx] * softmax_output[idx];
+        let val = input[row_offset + i];
+        if (val > local_max) {
+            local_max = val;
+        }
     }
-    shared_dot[local_id] = partial_dot;
+
+    shared_max[local_id] = local_max;
+    workgroupBarrier();
+
+    var stride = WG_SIZE / 2u;
+    while (stride > 0u) {
+        if (local_id < stride) {
+            let a = shared_max[local_id];
+            let b = shared_max[local_id + stride];
+            if (b > a) {
+                shared_max[local_id] = b;
+            }
+        }
+        workgroupBarrier();
+        stride /= 2u;
+    }
+
+    let row_max = shared_max[0];
+
+    var local_sum: f32 = 0.0;
+
+    for (var i = local_id; i < cols; i += WG_SIZE) {
+        let val = exp(input[row_offset + i] - row_max);
+        output[row_offset + i] = val;
+        local_sum = local_sum + val;
+    }
+
+    shared_sum[local_id] = local_sum;
+    workgroupBarrier();
+
+    stride = WG_SIZE / 2u;
+    while (stride > 0u) {
+        if (local_id < stride) {
+            let a = shared_sum[local_id];
+            let b = shared_sum[local_id + stride];
+            shared_sum[local_id] = a + b;
+        }
+        workgroupBarrier();
+        stride /= 2u;
+    }
+
+    let row_sum = shared_sum[0];
+
+    for (var i = local_id; i < cols; i += WG_SIZE) {
+        output[row_offset + i] = output[row_offset + i] / row_sum;
+    }
+}
+
+"#;
+
+const SOFTMAX_BACKWARD_WGSL: &str = r#"
+struct Params {
+    rows: u32,
+    cols: u32,
+}
+
+@group(0) @binding(0) var<storage, read> dy: array<f32>;
+@group(0) @binding(1) var<storage, read> s: array<f32>;
+@group(0) @binding(2) var<storage, read_write> dx: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+var<workgroup> shared_dot: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn softmax_backward_main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) local_id: u32) {
+    let row_idx = wid.x;
+    let cols = params.cols;
+    let row_offset = row_idx * cols;
+
+    // Phase 1: Partial dot product: sum(dy * s) for this row
+    var local_dot: f32 = 0.0;
+    for (var i = local_id; i < cols; i += 256u) {
+        local_dot = local_dot + dy[row_offset + i] * s[row_offset + i];
+    }
+    shared_dot[local_id] = local_dot;
     workgroupBarrier();
 
     // Phase 2: Tree reduction
-    var stride = WG_SIZE / 2u;
+    var stride = 128u;
     while (stride > 0u) {
         if (local_id < stride) {
             shared_dot[local_id] = shared_dot[local_id] + shared_dot[local_id + stride];
@@ -124,13 +198,11 @@ fn softmax_backward_main(
         stride /= 2u;
     }
 
-    let dot_product = shared_dot[0];
+    let row_dot = shared_dot[0];
 
-    // Phase 3: dL/dx_i = s_i * (dL/ds_i - dot_product)
-    for (var i = local_id; i < cols; i += WG_SIZE) {
-        let idx = row_offset + i;
-        let s = softmax_output[idx];
-        grad_input[idx] = s * (grad_output[idx] - dot_product);
+    // Phase 3: dx = s * (dy - dot)
+    for (var i = local_id; i < cols; i += 256u) {
+        dx[row_offset + i] = s[row_offset + i] * (dy[row_offset + i] - row_dot);
     }
 }
 "#;
@@ -138,6 +210,10 @@ fn softmax_backward_main(
 pub struct SoftmaxOp {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    /// Immediate-data pipeline (no uniform buffer needed).
+    immediate_pipeline: Option<wgpu::ComputePipeline>,
+    /// BGL for immediate path (2 bindings: input, output).
+    immediate_bgl: Option<wgpu::BindGroupLayout>,
     backward_pipeline: wgpu::ComputePipeline,
     backward_bind_group_layout: wgpu::BindGroupLayout,
     device: Arc<Device>,
@@ -275,9 +351,65 @@ impl SoftmaxOp {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
+        // --- Immediate-data pipeline (no uniform buffer) ---
+        let (immediate_pipeline, immediate_bgl) =
+            if device.features().contains(wgpu::Features::IMMEDIATES) {
+                let imm_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("Softmax Immediate Shader"),
+                    source: wgpu::ShaderSource::Wgsl(SOFTMAX_IMMEDIATE_WGSL.into()),
+                });
+
+                let imm_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Softmax Immediate BGL"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+
+                let imm_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Softmax Immediate Pipeline Layout"),
+                    bind_group_layouts: &[Some(&imm_bgl)],
+                    immediate_size: 4, // sizeof(Params) = 4 bytes (1 × u32)
+                });
+
+                let imm_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("Softmax Immediate Pipeline"),
+                    layout: Some(&imm_layout),
+                    module: &imm_shader,
+                    entry_point: Some("softmax_main"),
+                    cache: None,
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                });
+
+                (Some(imm_pipeline), Some(imm_bgl))
+            } else {
+                (None, None)
+            };
+
         Ok(Self {
             pipeline,
             bind_group_layout,
+            immediate_pipeline,
+            immediate_bgl,
             backward_pipeline,
             backward_bind_group_layout: backward_bgl,
             device: Arc::clone(device),
@@ -297,44 +429,78 @@ impl SoftmaxOp {
             return Ok(());
         }
 
-        let params_data: [u32; 1] = [cols];
-        let params_buffer = self.device.create_buffer(&BufferDescriptor {
-            label: Some("Softmax Params"),
-            size: 4,
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue.write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params_data));
+        // Use immediate-data path if available (no uniform buffer needed)
+        if let (Some(ref pipeline), Some(ref bgl)) =
+            (&self.immediate_pipeline, &self.immediate_bgl)
+        {
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Softmax Immediate Bind Group"),
+                layout: bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: input.buffer().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: output.buffer().as_entire_binding(),
+                    },
+                ],
+            });
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Softmax Bind Group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input.buffer().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: output.buffer().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: params_buffer.as_entire_binding(),
-                },
-            ],
-        });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Softmax Immediate Compute Pass"),
+                timestamp_writes: None,
+            });
 
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("Softmax Compute Pass"),
-            timestamp_writes: None,
-        });
+            let params_data: [u32; 1] = [cols];
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_immediates(0, bytemuck::cast_slice(&params_data));
+            pass.dispatch_workgroups(rows, 1, 1);
 
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(rows, 1, 1);
+            drop(pass);
+        } else {
+            // Fallback: uniform buffer path
+            let params_data: [u32; 1] = [cols];
+            let params_buffer = self.device.create_buffer(&BufferDescriptor {
+                label: Some("Softmax Params"),
+                size: 4,
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params_data));
 
-        drop(pass);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Softmax Bind Group"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: input.buffer().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: output.buffer().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Softmax Compute Pass"),
+                timestamp_writes: None,
+            });
+
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(rows, 1, 1);
+
+            drop(pass);
+        }
 
         tracing::debug!(event = "softmaxop_dispatched_rows_cols", "SoftmaxOp dispatched: rows={} cols={}", rows, cols);
 

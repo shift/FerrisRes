@@ -13,6 +13,7 @@ pub mod prefill_attn;
 pub mod turboquant_kernels;
 pub mod fft;
 pub mod conv3d;
+pub mod immediates;
 
 pub mod gpu_transformer;
 
