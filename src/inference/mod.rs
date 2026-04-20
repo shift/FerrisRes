@@ -75,3 +75,4 @@ pub use diff_llm_computer::{DiffLlmComputer, DiffLlmComputerConfig, OpLogits, Di
 pub use cognitive_pipeline::{CognitivePipeline, CognitivePipelineConfig, CognitiveGenerationResult, ToolExecutionResult, CalmResult};
 pub mod prescope;
 pub mod buddy_moe;
+pub mod compressed_kv;

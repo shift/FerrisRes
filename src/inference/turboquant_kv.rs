@@ -341,6 +341,30 @@ impl TurboQuantKVCache {
         if actual_per_pos > 0.0 { fp32_per_pos as f32 / actual_per_pos } else { 1.0 }
     }
 
+    /// Current sequence length.
+    pub fn seq_len(&self) -> usize {
+        self.current_len
+    }
+
+    /// Number of layers.
+    pub fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
+    /// KV dimension per position.
+    pub fn kv_dim(&self) -> usize {
+        self.kv_dim
+    }
+
+    /// Reset the cache to empty.
+    pub fn reset(&mut self) {
+        for layer in &mut self.k_cache { layer.clear(); }
+        for layer in &mut self.v_cache { layer.clear(); }
+        for layer in &mut self.k_scales { layer.clear(); }
+        for layer in &mut self.v_scales { layer.clear(); }
+        self.current_len = 0;
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────
 
     fn quantize_vector(values: &[f32], group_size: usize) -> (Vec<u8>, Vec<f32>, Vec<f32>) {

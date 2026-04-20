@@ -190,6 +190,23 @@ impl RecurrentKVCache {
     pub fn recent_len(&self) -> usize {
         self.recent_kv.current_len
     }
+
+    /// Number of layers.
+    pub fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
+    /// KV dimension per position.
+    pub fn kv_dim(&self) -> usize {
+        self.recent_kv.kv_dim
+    }
+
+    /// Reset the cache to empty.
+    pub fn reset(&mut self) {
+        self.recent_kv.reset();
+        self.summaries.clear();
+        self.total_tokens = 0;
+    }
 }
 
 #[cfg(test)]
