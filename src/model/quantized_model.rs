@@ -13,7 +13,7 @@
 //! 5. Keep router in FP32 (tiny, critical for routing)
 //! 6. Optionally apply 2:4 sparsity for further compression
 
-use crate::model::cpu_block_attn_res::{CpuBlockAttnResModel, BlockConfig};
+use crate::model::cpu_block_attn_res::CpuBlockAttnResModel;
 use crate::model::sparse_ternary::{prune_fp32_to_sparse_ternary, SparseTernaryMatrix};
 
 /// Quantization options for the post-training pipeline.
@@ -192,7 +192,7 @@ pub fn quantize_sparse_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::cpu_block_attn_res::CpuBlockAttnResModel;
+    use crate::model::cpu_block_attn_res::{CpuBlockAttnResModel, BlockConfig};
 
     fn make_tiny_model() -> CpuBlockAttnResModel {
         // Minimal model for testing the pipeline
