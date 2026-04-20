@@ -36,6 +36,23 @@ fn relu_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let val = ew_a[idx];
     ew_c[idx] = select(0.0, val, val > 0.0);
 }
+
+@compute @workgroup_size(256)
+fn gelu_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let val = ew_a[idx];
+    // GELU tanh approximation
+    let sqrt_2_over_pi = 0.7978845608028654;
+    let coeff = 0.044715;
+    let inner = sqrt_2_over_pi * (val + coeff * val * val * val);
+    ew_c[idx] = 0.5 * val * (1.0 + tanh(inner));
+}
+
+@compute @workgroup_size(256)
+fn mul_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    ew_c[idx] = ew_a[idx] * ew_b[idx];
+}
 "#;
 
 pub struct ElementWiseOp {
@@ -47,6 +64,10 @@ pub struct ElementWiseOp {
     copy_bind_group_layout: wgpu::BindGroupLayout,
     relu_pipeline: wgpu::ComputePipeline,
     relu_bind_group_layout: wgpu::BindGroupLayout,
+    gelu_pipeline: wgpu::ComputePipeline,
+    gelu_bind_group_layout: wgpu::BindGroupLayout,
+    mul_pipeline: wgpu::ComputePipeline,
+    mul_bind_group_layout: wgpu::BindGroupLayout,
     device: Arc<Device>,
     queue: Arc<Queue>,
 }
@@ -184,6 +205,48 @@ impl ElementWiseOp {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
+        // GELU pipeline uses same BGL as ReLU (a + c bindings)
+        let gelu_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ElementWise GELU BGL"),
+            entries: &[read_entry.clone(), rw_entry.clone()],
+        });
+
+        let gelu_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ElementWise GELU Pipeline Layout"),
+            bind_group_layouts: &[Some(&gelu_bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let gelu_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("ElementWise GELU Pipeline"),
+            layout: Some(&gelu_pipeline_layout),
+            module: &shader,
+            entry_point: Some("gelu_main"),
+            cache: None,
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+
+        // Multiply pipeline uses a + b + c bindings (same as add)
+        let mul_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ElementWise Mul BGL"),
+            entries: &[read_entry.clone(), read_entry_b.clone(), rw_entry.clone()],
+        });
+
+        let mul_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ElementWise Mul Pipeline Layout"),
+            bind_group_layouts: &[Some(&mul_bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let mul_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("ElementWise Mul Pipeline"),
+            layout: Some(&mul_pipeline_layout),
+            module: &shader,
+            entry_point: Some("mul_main"),
+            cache: None,
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+
         tracing::debug!(event = "elementwiseop_pipelines_created_successfully", "ElementWiseOp pipelines created successfully");
 
         Self {
@@ -195,6 +258,10 @@ impl ElementWiseOp {
             copy_bind_group_layout,
             relu_pipeline,
             relu_bind_group_layout,
+            gelu_pipeline,
+            gelu_bind_group_layout,
+            mul_pipeline,
+            mul_bind_group_layout,
             device: Arc::clone(device),
             queue: Arc::clone(queue),
         }
@@ -519,6 +586,87 @@ impl ElementWiseOp {
         });
 
         pass.set_pipeline(&self.relu_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(workgroup_count, 1, 1);
+
+        drop(pass);
+
+        Ok(())
+    }
+
+    /// GELU activation (tanh approximation): c = 0.5 * a * (1 + tanh(sqrt(2/pi) * (a + 0.044715 * a³)))
+    pub fn dispatch_gelu(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        a: &GpuBuffer,
+        c: &GpuBuffer,
+        numel: u32,
+    ) -> Result<()> {
+        let workgroup_count = (numel + 255) / 256;
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ElementWise GELU Bind Group"),
+            layout: &self.gelu_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: c.buffer().as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("ElementWise GELU Compute Pass"),
+            timestamp_writes: None,
+        });
+
+        pass.set_pipeline(&self.gelu_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(workgroup_count, 1, 1);
+
+        drop(pass);
+
+        Ok(())
+    }
+
+    /// Element-wise multiply: c = a * b
+    pub fn dispatch_mul(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        a: &GpuBuffer,
+        b: &GpuBuffer,
+        c: &GpuBuffer,
+        numel: u32,
+    ) -> Result<()> {
+        let workgroup_count = (numel + 255) / 256;
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ElementWise Mul Bind Group"),
+            layout: &self.mul_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: b.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: c.buffer().as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("ElementWise Mul Compute Pass"),
+            timestamp_writes: None,
+        });
+
+        pass.set_pipeline(&self.mul_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(workgroup_count, 1, 1);
 
