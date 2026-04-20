@@ -3,6 +3,8 @@ pub mod two_phase;
 pub mod sampling;
 pub mod generator;
 pub mod logit_processors;
+pub mod turboquant_kv;
+pub mod recurrent_kv;
 pub mod prompt_templates;
 pub mod context_extension;
 pub mod rag;
