@@ -1,4 +1,6 @@
 pub mod optimizer;
+pub mod optimizer_scale;
+pub mod optimizer_adamem;
 pub mod checkpointing;
 pub mod cpu_offload;
 pub mod async_offload;
@@ -8,7 +10,9 @@ pub mod partial_backprop;
 pub mod qlora;
 pub mod tool_triggered_lora;
 
-pub use optimizer::{SgdOptimizer, AdamOptimizer, CrossEntropyLoss};
+pub use optimizer::{SgdOptimizer, AdamOptimizer, CrossEntropyLoss, WeightOptimizer, OptimizerHint, optimizer_for_profile};
+pub use optimizer_scale::ScaleOptimizer;
+pub use optimizer_adamem::AdaMeMOptimizer;
 pub use tool_triggered_lora::{ToolTriggeredLora, ToolTriggeredLoraConfig, StackedAdapter, FisherDiagonal, LearningEvent, ToolTriggeredLoraStats};
 pub use checkpointing::CheckpointStore;
 pub use cpu_offload::CpuGradientBuffer;

@@ -6,11 +6,13 @@
 
 | Metric | Value |
 |---|---|
-| Source code | ~65,000 lines across 118 modules |
-| Test suites | 1232 lib tests passing, 0 failures |
+| Source code | ~92,000 lines across 155 modules |
+| Test suites | 1370 lib tests passing, 0 failures |
 | Language | 100% Rust (safe + WGSL compute shaders) |
 | GPU backends | Vulkan, Metal, DX12, WebGPU via wgpu |
-| Tasks completed | **220 / 220 (all complete)** |
+| Tasks completed | **425 / 490** |
+| Tasks in progress | **2** |
+| Tasks planned | **58** |
 | License | AGPL-3.0-or-later |
 
 ---
@@ -170,10 +172,16 @@
 ### Training
 - **Gradient checkpointing**: closure-based recompute (ADR-010)
 - **LoRA**: merge/unmerge, auto-populate, hot-swap adapters
+- **QLoRA**: NF4 quantized base weights + LoRA adapters
 - **Autodiff**: ComputationGraph + backward pass
 - **Adam/SGD optimizers**
+- **SCALE optimizer**: 12 MB state for edge devices (column-normalized gradients, last-layer momentum)
+- **AdaMeM optimizer**: 181 MB state for capable hardware (power iteration SVD, low-rank momentum)
+- **WeightOptimizer trait**: `optimizer_for_profile(DeviceProfile)` factory routes SCALE vs AdaMeM
 - **Tile-based gradient accumulation**: memory-efficient large-batch training
 - **Partial backpropagation**: layer freeze, selective backward, gradual unfreezing
+- **1.58-bit ternary quantization**: absmean scaling, 2-bit packing (16× vs FP32), block-wise quantization, STE
+- **Block-MoE-Res distillation**: KL logits + MSE hidden states, dense→MoE conversion, checkpoint serialization
 
 ### Multimodal
 - **VisionEncoder**: implicit GEMM fused patch embedding + ToMe merge
@@ -248,8 +256,19 @@
 | 14 | ✅ Done | FerrisRes Armor: L0 regex+bloom, L1 neural scanner, L2 RepE probe, L3 sanitizer, GPU-accelerated distillation |
 | 15 | ✅ Done | Profile-driven dispatch: DispatchPlan per-op CPU/GPU, Intel iGPU detection, auto-tiling, --gpu flag removed |
 | 16 | ✅ Done | Real distillation verified: Gemma 4 27B on Intel HD 530, 27M tokens, checkpoint resilience |
+| 17 | ✅ Done | Cognitive architecture: Layer 0-4 (pipeline wiring, memory & learning, autonomy, self-improvement, emergence measurement) |
+| 18 | ✅ Done | Phase 8 integration: consolidation engine, quality propagation, uncertainty feedback, tool exploration, safe learn tool, GGUF CPU inference, API server |
+| 19 | 🚧 In Progress | Block-MoE-Res architecture: ternary quantization, SCALE/AdaMeM optimizers, inter-block attention, MoE conversion, distillation, checkpoint serialization |
+| 20 | 📝 Planned | 1.58-bit inference stack |
+| 21 | 📝 Planned | Edge I/O and KV compression |
+| 22 | 📝 Planned | Expert I/O Pipeline (PreScope + BuddyMoE) |
+| 23 | 📝 Planned | CPU/GPU Backend Abstraction (YaRN, capabilities, WGSL) |
+| 24 | 📝 Planned | Inference pipeline wiring |
+| 25 | 📝 Planned | Autonomous Learning Loop (CoVo + SkillKB + FDAL) |
+| 26 | 📝 Planned | Elastic Inference (E2B/E4B switching) |
+| 27 | 📝 Planned | GPU BlockAttnResLayer (Gemma 4 features + backward kernels) |
 
-**All tasks complete — 1189 tests passing, 0 failures.**
+**425 tasks done, 2 in progress, 58 planned — 1370 tests passing.**
 
 ## Cognitive Architecture
 
@@ -336,3 +355,124 @@ The cognitive pipeline orchestrates all cognitive components:
 - New `serve` subcommand with `--host`, `--port`, `--model-name`, `--model-path`, `--model-format`, `--tokenizer`
 - Real CPU inference on `/v1/chat/completions` and `/v1/completions` when model loaded
 - Placeholder responses with instructions when no model loaded
+
+---
+
+## Phase 19: Block-MoE-Res Architecture (In Progress)
+
+### Multimodal City of Experts
+The "Multimodal City of Experts" describes the system FerrisRes already is: many input encoders (vision, audio, text, video, cross-modal), many output heads (VisionHead, SpeechHead, VideoHead, TTS, ActionHead, MeshHead, TactileHead, GCode), MoE expert routing (top-2 from 4 experts per token), and resource-adaptive scaling via DeviceProfile.
+
+Phase 19 adds the Block-MoE-Res reasoning engine: inter-block attention for hierarchical reasoning, MoE conversion for expert specialization, ternary quantization for 16× compression, and hardware-aware optimizers for edge training.
+
+### Ternary Quantization (BitNet b1.58) — ✅ Done
+- **Absmean quantization**: α = mean(|W|) / √(2/π), W_q = clamp(round(W/α), -1, 0, +1)
+- **2-bit packing**: 4 values per byte, 16× size reduction vs FP32
+- **Block-wise scaling**: per-block scale for non-uniform weight distributions
+- **STE (Straight-Through Estimator)**: forward uses quantized, backward passes through FP32
+- **Quality metrics**: MSE, cosine similarity, SNR(dB)
+- 13 tests all passing
+
+### SCALE + AdaMeM Optimizers — ✅ Done
+- **SCALE**: 12.1 MB state for edge (column-normalized gradients, last-layer momentum)
+- **AdaMeM**: 181.6 MB state for capable hardware (power iteration SVD, low-rank momentum)
+- **DeviceProfile routing**: `optimizer_for_profile()` selects optimizer based on hardware
+- 14 optimizer tests all passing
+
+### Block-MoE-Res Model — ✅ Done
+- **CpuBlockAttnResLayer**: All 10 Gemma 4 features (PLE, GQA 8Q/1KV, KV sharing, logit softcapping, sliding/full attention, dual head_dim, dual RoPE theta, pre-norm, SwiGLU, double-wide MLP)
+- **CpuBlockAttnResModel**: 7×5 block structure, inter-block attention, PLE pre-computation
+- **CpuMoELayer**: 4-expert MoE with top-2 routing, load balance loss, SwiGLU/GeLU toggle
+- **Dense→MoE conversion**: every FFN becomes MoE; Expert 0 = exact copy, others = dense + noise
+
+### LoRA Wiring — ✅ Done
+- `attach_lora()` on CpuBlockAttnResModel (q_proj, v_proj)
+- `forward_full_with_lora()`, two-phase backward for borrow checker
+- LoRA A/B registered with optimizer via `register_matrix()`
+
+### Distillation Pipeline — ✅ Done
+- `gemma4_to_block_attnres()`: weight mapping with all Gemma 4 features
+- `dense_ffn_to_moe(4, 2)`: convert every FFN to 4-expert MoE
+- Multi-objective loss: KL(logits) + 0.5 × MSE(hidden_states)
+- Actual weight updates via optimizer.step()
+
+### Checkpoint Serialization — ✅ Done
+- `BlockMoeResConfig` + `LayerConfig`: serializable architecture metadata
+- BF16 safetensors output + JSON sidecar
+- Tensor naming: `layers.{i}.{q,k,v,out}_proj`, `layers.{i}.moe.expert.{e}.{gate,up,down}`
+
+---
+
+## Phase 20: 1.58-bit Inference Stack (Planned)
+
+The full inference stack for ternary-weighted models:
+
+- **Ternary matmul** (e2080d12): add/subtract only — no multiplies. `output = scale × Σ(sign × activation)` where sign ∈ {-1, 0, +1}
+- **2:4 sparse ternary** (97138344): guarantee 50% zeros, halve compute again. Effective ~1 bit/weight
+- **TernaryLinear** (f2124f4e): quantized linear layer wrapping packed ternary weights
+- **TernaryMoELayer** (c7e4d0b7): quantized MoE for fast inference — ternary experts with top-k routing
+- **STE training integration** (eeb0f414): forward in ternary, backward through FP32, weight update, re-quantize
+- **Post-training quantization pipeline** (0d0651c2): FP32 → ternary conversion with quality checkpoints
+- **Post-training pruning** (8ce99a48): FP32/ternary → 2:4 sparse structure
+- **WGSL GPU kernels** (48f9cfce, 903351d7): ternary matmul, sparse ternary matmul on GPU
+- **Benchmarks** (4d93e889, bd1811b2): FP32 vs NF4 vs ternary vs sparse ternary quality/latency comparison
+
+Target: ~700 MB model on disk, ~25 MB working set, ~20ms/token on RPi 5
+
+---
+
+## Phase 21: Edge I/O and KV Compression (Planned)
+
+- **Expert mmap loading** (28975a4f): per-token expert loading from disk via mmap. USB SSD (~5ms), NVMe (~1.2ms)
+- **3-bit TurboQuant KV cache** (4fbcad61): random orthogonal rotation → Lloyd-Max 3-bit codebook. 6× KV compression, training-free
+- **Recurrent KV with block summaries** (7aa4ae75): recent 512 tokens full KV, older context replaced by block summary representations. ~3.5 MB regardless of context length. Validated by PyramidKV, StreamingLLM, Memformer research
+
+---
+
+## Phase 22: Expert I/O Pipeline (Planned)
+
+- **PreScope predictive prefetch** (6975e040, ad091165): quasi-hidden state from post-attention residual predicts next-layer expert needs. Async mmap read overlaps I/O with compute
+- **BuddyMoE expert fallback** (9c539330, 09bf41d0): offline calibration identifies co-activation patterns. Prefetch miss → substitute buddy expert already in memory. Eliminates synchronous I/O stalls
+
+Source: arXiv:2509.23638 (PreScope), arXiv:2511.10054 (BuddyMoE)
+
+---
+
+## Phase 23: CPU/GPU Backend Abstraction (Planned)
+
+- **YaRN-aware RoPE WGSL shaders** (d7d9f140): NTK-aware frequency scaling for extended context on GPU
+- **GpuCapabilities** (7bccb096): expand capability detection for F64, SUBGROUPS, COOPERATIVE_MATRIX, storage buffer limits
+- **Cooperative matrix MatMul** (447008c4): exploit Intel/AMD/NVIDIA tensor core features where available
+- **Subgroup-aware FlashDecode** (89e83b10): subgroup-optimized decode kernel for capable GPUs
+- **WGSL backward passes** (eb600679, c14a8c52, f21de9f5, 4f4ad031, ba70a9dd): RMSNorm backward, softmax backward, matmul backward, RoPE backward, LoRA backward
+- **Parameter arena** (61208bb5): replace per-dispatch uniform buffers with single async arena
+
+---
+
+## Phase 24: Inference Pipeline Wiring (Planned)
+
+- **Wire CpuBlockAttnResModel into KV cache, prefill, decode** (9eb37569): incremental decode (one token at a time), prefill (parallel prompt processing), KV cache management, block structure in decode, YaRN context extension
+
+---
+
+## Phase 25: Autonomous Learning Loop (Planned)
+
+- **CoVo self-rewarding RL** (e751fbfa, b0aecc14): model evaluates reasoning trajectories via consistency + volatility. Rewards weight LoRA gradient updates. Implementation in `intrinsic_motivation.rs`
+- **SkillKB** (6b733946, acb4188c): three-tier hierarchical experience (strategic plans → functional skills → atomic skills). Storage as LoRA diffs or PLE edits. Cosine similarity retrieval
+- **FDAL active learning** (a02aa661, 9a71c993): small sampler network (~256 hidden, <1 MB) prioritizes high-uncertainty samples for edge LoRA training budget
+
+Source: NeurIPS 2025 (CoVo), ICCV 2025 (FDAL)
+
+---
+
+## Phase 26: Elastic Inference (Planned)
+
+- **Gemma 4 ISWA research** (45a51b6e): study how E2B/E4B share checkpoint but activate different parameter counts
+- **Elastic expert activation** (1962a899): DeviceProfile controls active expert count. Integrated → top-1 from 2, LowEnd → top-2 from 4, MidRange/HighEnd → full with prefetch. Runtime switching between forward passes
+
+---
+
+## Phase 27: GPU BlockAttnResLayer (Planned)
+
+- **GPU BlockAttnResLayer with all 10 Gemma 4 features** (66878bea): bring CPU features (PLE, GQA, KV sharing, logit softcapping, dual attention modes) to GPU compute shaders
+- **Wire CPU-trained model to GPU** (eb112113): upload distilled Block-MoE-Res model weights to GPU for inference

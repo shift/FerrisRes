@@ -2,7 +2,41 @@
 
 FerrisRes is a Rust-native AI inference and training engine built around **Block AttnRes** — a novel linear-time transformer architecture that replaces the quadratic attention bottleneck of standard transformers. It runs on any GPU or iGPU via [wgpu](https://github.com/gfx-rs/wgpu) (Vulkan, Metal, DX12, WebGPU), adapts automatically to the hardware it finds, and is written entirely in safe Rust with no Python dependency.
 
-> ⚠️ **v0.2.3 — near-production grade, not yet 1.0.** FerrisRes has 1232 passing tests, a full cognitive architecture with 5 layers (pipeline wiring, memory & learning, autonomy, self-improvement, emergence measurement), a verified Gemma 4 distillation pipeline (tested on real 27B model with Intel HD 530 iGPU), five output modalities (vision, speech, tactile, robotics, scientific), a 4-layer security proxy (FerrisRes Armor), and profile-driven GPU dispatch that automatically adapts from Intel iGPUs to H100s. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0. Suitable for research, high-performance prototyping, and early-adopter production workloads.
+> ⚠️ **v0.2.3 — near-production grade, not yet 1.0.** FerrisRes has 1370 passing tests (~92K lines across 155 modules), a Block-MoE-Res architecture with inter-block attention and ternary quantization, a full cognitive architecture with 5 layers, a verified Gemma 4 distillation pipeline, five output modalities, a 4-layer security proxy (FerrisRes Armor), and profile-driven GPU dispatch that adapts from Intel iGPUs to H100s. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0.
+
+---
+
+## Multimodal City of Experts
+
+FerrisRes is a **Multimodal City of Experts** — many input encoders, many output heads, MoE expert routing, all adapting to device resources in real-time.
+
+**Input ports** — vision (ViT + Implicit GEMM), audio (EnCodec RVQ), text (BPE/BLT/QA tokenizers), streaming image/audio/video I/O, cross-modal attention fusion.
+
+**Output factories** — VisionHead, SpeechHead, VideoHead, Streaming TTS, Robotics ActionHead, ChemicalValidator (SMILES), MeshHead (SDF + Marching Cubes), GCodeGenerator, TactileHead (6-actuator haptics).
+
+**Expert specialists** — MoE routing activates domain-specific experts per token. Combined with 1.58-bit ternary quantization (16× smaller weights), the model packs more expertise into less memory. Tiered precision: NF4 for encoders/LM head, ternary for MoE experts, BF16 for router/norms.
+
+**Adaptive power** — DeviceProfile scales everything from Raspberry Pi (top-1 expert, SCALE optimizer, 12 MB state) to multi-GPU (top-2 experts, AdaMeM optimizer, expert prefetch). Elastic inference dynamically adjusts active parameter count based on load.
+
+```
+┌─────────────────────────────────────────────────────┐
+│           Multimodal City of Experts                │
+│                                                     │
+│  Inputs:  Vision ──→  Audio ──→  Text ──→           │
+│           Video ──→  Stream ──→ Cross-modal ──→     │
+│                                                     │
+│  Experts: [E0][E1]..[EN]  MoE router selects top-2  │
+│           1.58-bit ternary │ NF4 encoders/LM head    │
+│           BF16 router/norms │ 3-bit KV cache         │
+│                                                     │
+│  Outputs: VisionHead SpeechHead VideoHead TTS        │
+│           ActionHead MeshHead TactileHead GCode      │
+│                                                     │
+│  Elastic: RPi (top-1, SCALE) ←→ GPU (top-2, AdaMeM) │
+└─────────────────────────────────────────────────────┘
+```
+
+---
 
 ---
 
@@ -120,6 +154,8 @@ FerrisRes includes a full cognitive architecture for self-improving AI:
 
 - **Autodiff engine** — computation graph, reverse-mode backward pass, gradient accumulation
 - **SGD / Adam optimizers** — GPU-side parameter updates
+- **SCALE optimizer** — 12 MB state for edge devices; column-normalized gradients, last-layer momentum only
+- **AdaMeM optimizer** — 181 MB state for capable hardware; power iteration SVD, low-rank momentum, orthogonal residuals
 - **Cross-entropy loss** — GPU loss computation
 - **LoRA adapters** — low-rank fine-tuning with merge/unmerge, auto-populate, hot-swap, merge_all()
 - **QLoRA** — quantized-weight training: NF4 base + LoRA adapters, only adapters trainable
@@ -127,6 +163,7 @@ FerrisRes includes a full cognitive architecture for self-improving AI:
 - **CPU/Async gradient offload** — CPU-side accumulation and async GPU→CPU transfer for iGPUs
 - **Tile-based gradient accumulation** — split batch into GPU-sized tiles, accumulate partials
 - **Partial backpropagation** — layer freeze, selective backward, gradual unfreezing, LoRA integration
+- **1.58-bit ternary quantization** — BitNet b1.58 absmean, 2-bit packing (16× vs FP32), block-wise scaling, STE for training
 - **Profile-driven dispatch** — `DispatchPlan` computes per-op CPU/GPU decisions from model size + GPU limits. No manual `--gpu` flag.
 - **Intel iGPU detection** — Gen9/Gen11 iGPUs that misreport buffer limits are auto-detected and capped.
 - **GPU matmul auto-tiling** — large weight matrices (LM head) are automatically chunked into GPU-buffer-sized column tiles.
@@ -458,7 +495,7 @@ FerrisRes requires a working Vulkan driver. On Linux the recommended path is thr
 ```bash
 nix develop          # enters the dev shell with Rust + Vulkan layers
 cargo build
-cargo test            # 1232 tests
+cargo test            # 1370 tests
 cargo bench
 ```
 
@@ -529,6 +566,11 @@ src/
 ├── model/
 │   ├── model.rs          # BlockAttnResModel (forward + backward)
 │   ├── block_attn_res.rs # BlockAttnResLayer
+│   ├── cpu_block_attn_res.rs # CPU BlockAttnRes with Gemma 4 features (PLE, GQA, KV sharing, logit softcapping)
+│   ├── cpu_linear.rs     # CPU-only linear layer with SIMD matmul
+│   ├── cpu_moe.rs        # CPU MoE layer with SwiGLU/GeLU, top-k routing, load balance loss
+│   ├── ternary.rs        # 1.58-bit ternary quantization (absmean, 2-bit packing, STE)
+│   ├── checkpoint.rs     # BlockMoeResConfig serialization (safetensors + JSON)
 │   ├── standard_transformer.rs  # O(n²) compatibility mode
 │   ├── dispatcher.rs     # Architecture auto-detection (AnyModel)
 │   ├── gemma_mapper.rs   # Gemma 4 weight mapper, GQA, distillation training
@@ -555,9 +597,12 @@ src/
 │   └── armor_l3.rs       # PII redaction output sanitizer
 ├── tensor/               # GpuTensor
 └── training/
-    ├── optimizer.rs      # SGD, Adam, CrossEntropyLoss
+    ├── optimizer.rs      # SGD, Adam, CrossEntropyLoss, WeightOptimizer trait, optimizer_for_profile()
+    ├── optimizer_scale.rs  # SCALE optimizer (12 MB state, edge devices)
+    ├── optimizer_adamem.rs # AdaMeM optimizer (181 MB state, capable hardware)
     ├── checkpointing.rs  # CheckpointStore (recompute_block)
-    ├── lora.rs           # LoRA adapter
+    ├── lora.rs           # LoRA adapter + LoraManager
+    ├── qlora.rs          # QLoRA: NF4 base weights + LoRA adapters
     ├── gradient_accum.rs # Tile-based gradient accumulation
     ├── partial_backprop  # Layer freeze, selective backward
     ├── cpu_offload.rs / async_offload.rs
@@ -586,8 +631,17 @@ src/
 | 16 | ✅ Done | Real distillation verified: Gemma 4 27B on Intel HD 530, 27M tokens, checkpoint resilience |
 | 17 | ✅ Done | Cognitive architecture: Layer 0-4 (pipeline wiring, memory & learning, autonomy, self-improvement, emergence measurement) |
 | 18 | ✅ Done | Phase 8 integration: consolidation engine, quality propagation, uncertainty feedback, tool exploration, safe learn tool, GGUF CPU inference, API server |
+| 19 | 🚧 In Progress | Block-MoE-Res: ternary quantization, SCALE/AdaMeM optimizers, inter-block attention, MoE conversion, distillation pipeline, checkpoint serialization |
+| 20 | 📝 Planned | 1.58-bit inference stack: ternary matmul, 2:4 sparse ternary, TernaryMoELayer, TernaryLinear, STE training integration, GPU kernels |
+| 21 | 📝 Planned | Edge I/O: expert mmap loading, 3-bit TurboQuant KV cache, block summary recurrent KV, post-training pruning pipeline |
+| 22 | 📝 Planned | Expert I/O Pipeline: PreScope predictive prefetch, BuddyMoE fallback |
+| 23 | 📝 Planned | CPU/GPU Backend Abstraction: YaRN WGSL shaders, GPU capabilities, cooperative matrix MatMul, subgroup FlashDecode, WGSL backward passes |
+| 24 | 📝 Planned | Inference pipeline: wire CpuBlockAttnResModel into KV cache, prefill, decode |
+| 25 | 📝 Planned | Autonomous Learning: CoVo self-rewarding RL, SkillKB hierarchical experience, FDAL active learning |
+| 26 | 📝 Planned | Elastic Inference: dynamic E2B/E4B path switching per DeviceProfile |
+| 27 | 📝 Planned | GPU BlockAttnResLayer: all 10 Gemma 4 features on GPU, LoRA backward, matmul/RoPE/softmax/RMSNorm backward kernels |
 
-**All tasks complete — 1232 tests passing.**
+**1370 tests passing. 425 tasks done, 2 in progress, 58 planned.**
 
 See [ROADMAP.md](ROADMAP.md) for full technical details.
 

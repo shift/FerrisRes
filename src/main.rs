@@ -6,8 +6,8 @@ use ferrisres::{WgpuCompute, DeviceProfile, BlockAttnResConfig, BlockAttnResMode
 use ferrisres::compute::{GpuBuffer, MatMulOp, RmsNormOp, SoftmaxOp, ElementWiseOp};
 use ferrisres::training::AdamOptimizer;
 use ferrisres::model::gemma_mapper::{
-    self, Gemma4Config, Gemma4Teacher, Gemma4Student, DistillationConfig,
-    BlockSummaryLayer, load_gemma4_model_mmap,
+    self, Gemma4Config, Gemma4Teacher,
+    load_gemma4_model_mmap,
     DistillationCheckpoint, load_gemma4_model_gguf,
 };
 use ferrisres::model::tokenizer::HfTokenizer;
@@ -53,6 +53,10 @@ enum Commands {
         /// Required when using --model-path. Ignored for skeleton models.
         #[arg(long, default_value = "e2b")]
         config: String,
+        /// Path to model config.json (HuggingFace format). When provided, overrides --config preset
+        /// with the actual model config, including per-layer parameters.
+        #[arg(long)]
+        config_path: Option<String>,
         /// Model file format: safetensors or gguf. Only used with --model-path.
         #[arg(long, default_value = "safetensors")]
         model_format: String,
@@ -230,11 +234,11 @@ async fn main() -> anyhow::Result<()> {
             lora_rank,
         } => cmd_train(hidden_dim, num_blocks, block_size, epochs, batch_size, learning_rate, data, lora_rank).await,
         Commands::Infer {
-            model_path, config, model_format, tokenizer,
+            model_path, config, config_path, model_format, tokenizer,
             hidden_dim, num_blocks, block_size, prompt,
             max_tokens, temperature, template, yarn_scale, image,
             armor, cognitive, concepts_path, persist_kv, kv_path,
-        } => cmd_infer(model_path, config, model_format, tokenizer, hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale, image, armor, cognitive, concepts_path, persist_kv, kv_path).await,
+        } => cmd_infer(model_path, config, config_path, model_format, tokenizer, hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale, image, armor, cognitive, concepts_path, persist_kv, kv_path).await,
         Commands::Benchmark {
             hidden_dim,
             num_blocks,
@@ -487,6 +491,7 @@ async fn cmd_train(
 async fn cmd_infer(
     model_path: Option<String>,
     config_name: String,
+    config_path: Option<String>,
     model_format: String,
     tokenizer_path: Option<String>,
     hidden_dim: usize,
@@ -527,81 +532,70 @@ async fn cmd_infer(
         }
     }
 
-    let compute = WgpuCompute::new().await?;
-    let _capability = compute.detect_capability();
+    // ========================================================================
+    // CPU inference path: load real model from GGUF/safetensors
+    // Skip GPU init entirely when using --model-path for CPU inference.
+    // ========================================================================
+    if let Some(ref path) = model_path {
+        info!(event = "cpu_inference_path", "Loading model from {} for CPU inference", path);
 
+        let gemma_config = if let Some(ref cp) = config_path {
+            info!(event = "loading_config", "Loading config from {}", cp);
+            gemma_mapper::Gemma4Config::from_config_file(std::path::Path::new(cp))
+                .map_err(|e| anyhow::anyhow!("Config load failed: {}", e))?
+        } else {
+            resolve_model_config(&config_name)?
+        };
+        let model_path = std::path::Path::new(path);
 
-    let device = Arc::new(compute.device().clone());
-    let queue = Arc::new(compute.queue().clone());
-
-    // Apply chat template if specified
-    let formatted_prompt = if let Some(ref template_name) = template {
-        match ferrisres::TemplateFormat::from_name(template_name) {
-            Some(fmt) => {
-                let registry = ferrisres::PromptTemplateRegistry::new(fmt);
-                let result = registry.apply_single(&prompt);
-                info!(event = "applied_template_chars_chars", "Applied {} template: {} chars → {} chars", template_name, prompt.len(), result.len());
-                result
+        // Tokenize
+        let formatted_prompt = if let Some(ref template_name) = template {
+            match ferrisres::TemplateFormat::from_name(template_name) {
+                Some(fmt) => {
+                    let registry = ferrisres::PromptTemplateRegistry::new(fmt);
+                    let result = registry.apply_single(&prompt);
+                    info!(event = "applied_template", "Applied {} template: {} chars → {} chars", template_name, prompt.len(), result.len());
+                    result
+                }
+                None => {
+                    info!(event = "unknown_template", "Unknown template '{}', using raw prompt", template_name);
+                    prompt.clone()
+                }
             }
-            None => {
-                info!(event = "unknown_template_using_raw_prompt", "Unknown template '{}', using raw prompt", template_name);
-                prompt.clone()
-            }
-        }
-    } else {
-        prompt.clone()
-    };
+        } else {
+            prompt.clone()
+        };
 
-    // Select tokenizer based on whether we're loading a real model
-    let (tokens, vocab_size) = if let Some(ref path) = model_path {
-        // Loading a real model
-        info!(event = "loading_model", path = %path, format = %model_format, config = %config_name, "Loading model for inference");
-
-        if let Some(ref tok_path) = tokenizer_path {
+        // Tokenize — save the tokenizer for decoding later
+        let (tokens, decoder): (Vec<u32>, Box<dyn Fn(&[u32]) -> String>) = if let Some(ref tok_path) = tokenizer_path {
             match ferrisres::model::tokenizer::HfTokenizer::from_tokenizer_json(std::path::Path::new(tok_path)) {
                 Ok(hf_tok) => {
                     info!(event = "tokenizer_loaded", vocab_size = hf_tok.vocab_size(), "Loaded HfTokenizer");
-                    let tokens = hf_tok.encode(&formatted_prompt);
-                    (tokens, hf_tok.vocab_size())
+                    let enc = hf_tok.encode(&formatted_prompt);
+                    let dec = Box::new(move |ids: &[u32]| -> String {
+                        hf_tok.decode(ids)
+                    });
+                    (enc, dec)
                 }
                 Err(e) => {
-                    warn!(event = "tokenizer_load_error", "Failed to load tokenizer: {}. Falling back.", e);
+                    warn!(event = "tokenizer_fallback", "Failed to load tokenizer: {}", e);
                     let tok = SimpleTokenizer::new();
-                    let tokens = tok.encode(&formatted_prompt);
-                    (tokens, tok.vocab_size())
+                    let enc = tok.encode(&formatted_prompt);
+                    let dec: Box<dyn Fn(&[u32]) -> String> = Box::new(|ids: &[u32]| {
+                        SimpleTokenizer::new().decode(ids)
+                    });
+                    (enc, dec)
                 }
             }
         } else {
             info!(event = "using_simple_tokenizer", "No --tokenizer provided, using SimpleTokenizer");
             let tok = SimpleTokenizer::new();
-            let tokens = tok.encode(&formatted_prompt);
-            (tokens, tok.vocab_size())
-        }
-    } else {
-        // Skeleton model
-        let tok = SimpleTokenizer::new();
-        let tokens = tok.encode(&formatted_prompt);
-        (tokens, tok.vocab_size())
-    };
-
-    let model_config = if model_path.is_some() {
-        // Derive BlockAttnResConfig from the model config preset
-        let gemma_config = resolve_model_config(&config_name)?;
-        gemma_config.to_block_attnres_config()
-    } else {
-        // Skeleton model from CLI args
-        let c = BlockAttnResConfig::new(hidden_dim);
-        BlockAttnResConfig { num_blocks, block_size, ..c }
-    };
-
-    // ========================================================================
-    // CPU inference path: load real model from GGUF/safetensors
-    // ========================================================================
-    if let Some(ref path) = model_path {
-        info!(event = "cpu_inference_path", "Loading model from {} for CPU inference", path);
-
-        let gemma_config = resolve_model_config(&config_name)?;
-        let model_path = std::path::Path::new(path);
+            let enc = tok.encode(&formatted_prompt);
+            let dec: Box<dyn Fn(&[u32]) -> String> = Box::new(|ids: &[u32]| {
+                SimpleTokenizer::new().decode(ids)
+            });
+            (enc, dec)
+        };
 
         let loaded_model = match model_format.as_str() {
             "gguf" => {
@@ -624,12 +618,14 @@ async fn cmd_infer(
         // Wrap in teacher for forward() access
         let teacher = Gemma4Teacher::new(loaded_model);
 
+        // Diagnostic: show prompt token IDs
+        info!(event = "prompt_tokens", ids = ?tokens, "Prompt token IDs (first 20)");
+
         // Autoregressive generation on CPU
         let gen_tokens = generate_cpu(&teacher, &tokens, max_tokens, temperature as f32, None);
 
-        // Decode generated tokens
-        let simple_tok = SimpleTokenizer::new();
-        let output_text = simple_tok.decode(&gen_tokens);
+        // Decode generated tokens using the same tokenizer that encoded the prompt
+        let output_text = decoder(&gen_tokens);
 
         // Armor check
         let display_output = if let Some(ref mut layer) = armor_layer {
@@ -648,6 +644,41 @@ async fn cmd_infer(
 
     // ========================================================================
     // GPU skeleton inference path (original)
+    // Only reached when --model-path is NOT provided.
+    // ========================================================================
+
+    let compute = WgpuCompute::new().await?;
+    let _capability = compute.detect_capability();
+
+    let device = Arc::new(compute.device().clone());
+    let queue = Arc::new(compute.queue().clone());
+
+    // Apply chat template if specified
+    let formatted_prompt = if let Some(ref template_name) = template {
+        match ferrisres::TemplateFormat::from_name(template_name) {
+            Some(fmt) => {
+                let registry = ferrisres::PromptTemplateRegistry::new(fmt);
+                let result = registry.apply_single(&prompt);
+                info!(event = "applied_template", "Applied {} template", template_name);
+                result
+            }
+            None => {
+                info!(event = "unknown_template", "Unknown template '{}', using raw prompt", template_name);
+                prompt.clone()
+            }
+        }
+    } else {
+        prompt.clone()
+    };
+
+    let tok = SimpleTokenizer::new();
+    let tokens = tok.encode(&formatted_prompt);
+    let vocab_size = tok.vocab_size();
+
+    let model_config = {
+        let c = BlockAttnResConfig::new(hidden_dim);
+        BlockAttnResConfig { num_blocks, block_size, ..c }
+    };
     // ========================================================================
     let model = BlockAttnResModel::new(Arc::clone(&device), Arc::clone(&queue), model_config.clone(), vocab_size)?;
 
@@ -1211,6 +1242,7 @@ async fn cmd_distill(
     // Pre-compute teacher logits for each chunk, then drop teacher to free ~10GB
     info!(event = "teacher_precompute_start", "pre-computing teacher logits");
     let mut teacher_logits_chunks: Vec<Vec<f32>> = Vec::new();
+    let mut frozen_states_per_chunk: Vec<Vec<Vec<f32>>> = Vec::new();
     let num_chunks = (token_ids.len() + seq_len - 1) / seq_len;
 
     if gpu_accel.is_some() && dispatch.attn_qkv_dispatch != ferrisres::device::OpTarget::Cpu {
@@ -1326,6 +1358,10 @@ async fn cmd_distill(
             let logits = teacher.forward(&chunk);
             teacher_logits_chunks.push(logits);
 
+            // Compute frozen hidden states from teacher (same forward pass, states collected)
+            let frozen = teacher.forward_with_hidden_states(&chunk);
+            frozen_states_per_chunk.push(frozen);
+
             let elapsed = teacher_start.elapsed().as_secs_f32();
             let per_chunk = elapsed / (chunk_idx + 1) as f32;
             let remaining = per_chunk * (total_chunks - chunk_idx - 1) as f32;
@@ -1360,28 +1396,43 @@ async fn cmd_distill(
     };
     let model2 = load_model_full(path)
         .map_err(|e| anyhow::anyhow!("Failed to reload model for student: {}", e))?;
-    info!(event = "student_model_loaded", "Student model loaded");
+    info!(event = "student_model_loaded", "Student model loaded for weight mapping");
 
-    let injection_points = config.block_summary_injection_points();
-    let block_summaries: Vec<BlockSummaryLayer> = injection_points.iter()
-        .map(|_| BlockSummaryLayer::new_identity(config.hidden_dim, config.sliding_window))
-        .collect();
-    info!(event = "student_ready", block_summary_layers = block_summaries.len(), "student model created");
+    // Convert teacher weights to CpuBlockAttnResModel (proper FerrisRes architecture)
+    // This replaces the broken Gemma4Student with the correct BlockAttnRes student.
+    let mut student = ferrisres::model::cpu_block_attn_res::gemma4_to_block_attnres(&model2);
+    info!(event = "student_ready", layers = student.layers.len(), "student CpuBlockAttnResModel created from teacher weights");
 
-    let distill_config = DistillationConfig {
-        learning_rate: learning_rate as f32,
-        temperature: temperature as f32,
-        num_steps: steps,
-        max_seq_len: seq_len,
-        ..DistillationConfig::default()
-    };
+    // Convert every dense FFN to MoE (FerrisRes ALWAYS produces MoE models)
+    ferrisres::model::cpu_block_attn_res::dense_ffn_to_moe(&mut student, 4, 2, 0.01);
+    let moe_layers = student.layers.iter().filter(|l| l.moe.is_some()).count();
+    info!(event = "moe_conversion", moe_layers = moe_layers, total_layers = student.layers.len(), "Converted dense FFN to MoE (4 experts, top-2)");
 
-    let mut student = Gemma4Student::new(model2, block_summaries, distill_config.clone());
+    // Attach LoRA adapters for training (rank 8, q_proj + v_proj)
+    let lora_config = ferrisres::training::lora::LoraConfig::targeting(8, vec!["q_proj", "v_proj"]);
+    student.attach_lora(lora_config);
+    info!(event = "lora_attached", "LoRA adapters attached to student model");
+
+    // Create optimizer routed by DeviceProfile
+    let mut optimizer = ferrisres::training::optimizer_for_profile(&profile, learning_rate as f32);
+    // Register LoRA A and B matrices separately with optimizer
+    if let Some(ref lora_m) = student.lora_manager {
+        for (layer_idx, module_name, layer) in lora_m.adapters_iter() {
+            let name_a = format!("lora_a_{}_{}", layer_idx, module_name);
+            let name_b = format!("lora_b_{}_{}", layer_idx, module_name);
+            // A: [rank × in_features] — this is the "input" projection
+            optimizer.register_matrix(&name_a, layer.rank(), layer.in_features());
+            // B: [out_features × rank] — this is the "output" projection
+            optimizer.register_matrix(&name_b, layer.out_features(), layer.rank());
+            // Mark LoRA B as output layer for SCALE momentum
+            optimizer.mark_output_layer(&name_b);
+        }
+    }
+    info!(event = "optimizer_created", optimizer = optimizer.name(), matrices = optimizer.num_registered(), state_mb = optimizer.state_bytes() as f64 / 1e6, "Optimizer created");
 
     // Cache transposed lm_head for backward pass (d_logits → d_hidden)
-    // Transposed once instead of every step: 400M ops saved per step
     let lm_head_t: Vec<f32> = {
-        let lm_head = &student.model.lm_head;
+        let lm_head = &student.lm_head;
         let hd = config.hidden_dim;
         let vs = config.vocab_size;
         let mut t = vec![0.0f32; vs * hd];
@@ -1393,11 +1444,8 @@ async fn cmd_distill(
         t
     };
 
-    // Initialize optimizers (fresh or from checkpoint)
+    // Training state
     let mut global_step: usize = 0;
-    let mut optimizers: Vec<gemma_mapper::BlockSummaryAdam> = student.block_summaries.iter()
-        .map(|bs| gemma_mapper::BlockSummaryAdam::new(bs, distill_config.learning_rate))
-        .collect();
     let mut best_loss = f32::INFINITY;
 
     // Resume from checkpoint if specified
@@ -1405,18 +1453,8 @@ async fn cmd_distill(
         match DistillationCheckpoint::load(std::path::Path::new(ckpt_path)) {
             Ok(ckpt) => {
                 global_step = ckpt.global_step;
-                info!(event = "resuming_from_checkpoint", step = global_step, layers = ckpt.layer_checkpoints.len(), "resuming from checkpoint");
-                if ckpt.layer_checkpoints.len() == student.block_summaries.len() {
-                    optimizers = ckpt.apply(&mut student);
-                    info!(event = "checkpoint_restored", layers = student.block_summaries.len(), "restored block summary layers and optimizer state");
-                } else {
-                    tracing::warn!(
-                        event = "checkpoint_layer_mismatch",
-                        checkpoint_layers = ckpt.layer_checkpoints.len(),
-                        expected_layers = student.block_summaries.len(),
-                        "Checkpoint has wrong number of layers — starting fresh"
-                    );
-                }
+                info!(event = "resuming_from_checkpoint", step = global_step, "resuming from checkpoint");
+                // Note: BlockSummary checkpoint restore removed — student is now CpuBlockAttnResModel
             }
             Err(e) => {
                 tracing::warn!(event = "checkpoint_load_failed", error = %e, "Failed to load checkpoint — starting fresh: {}", e);
@@ -1425,21 +1463,22 @@ async fn cmd_distill(
     }
 
     info!("");
-    info!(event = "distill_start", total_steps = steps, start_step = global_step, seq_len = seq_len, lr = learning_rate, temp = temperature, "starting distillation");
+    info!(event = "distill_start", total_steps = steps, start_step = global_step, seq_len = seq_len, lr = learning_rate, temp = temperature, optimizer = optimizer.name(), moe_layers = moe_layers, "starting distillation");
     info!("");
 
-    // Precompute frozen base model hidden states for each chunk.
     // Since base weights don't change during training, we only need to run
     // the full model forward ONCE per chunk. During training, we only recompute
     // from injection points where block summary layers modify the state.
     // This saves ~80% of per-step compute (skip layers before first injection).
     let vs = config.vocab_size;
     let injection_points = config.block_summary_injection_points();
-    let first_injection = injection_points.first().copied().unwrap_or(0);
-    let mut frozen_states_per_chunk: Vec<Vec<Vec<f32>>> = Vec::new();
+    let _first_injection = injection_points.first().copied().unwrap_or(0);
+
+    // Frozen states are now computed alongside teacher logits in the teacher loop above.
+    // This section just reports stats.
 
     // GPU-aware matmul helper: consults DispatchPlan, does tiled GPU when needed
-    // For GpuTiled: chunks the B matrix into column tiles that fit in max_buffer
+    // Used for student-side operations (backprop through LM head).
     let gpu_matmul = |a: &[f32], b: &[f32], m: usize, k: usize, n: usize, dispatch: &ferrisres::device::DispatchPlan| -> Vec<f32> {
         match dispatch.should_gpu_matmul(m as u64, k as u64, n as u64) {
             ferrisres::device::OpTarget::Cpu => gemma_mapper::matmul(a, b, m, k, n),
@@ -1506,117 +1545,12 @@ async fn cmd_distill(
         }
     };
 
-    // GPU-aware SwiGLU FFN
-    let swiglu_ffn_gpu = |input: &[f32], gate: &[f32], up: &[f32], down: &[f32], hd: usize, id: usize| -> Vec<f32> {
-        let seq = input.len() / hd;
-        let gated = gpu_matmul(input, gate, seq, hd, id, &dispatch);
-        let gated: Vec<f32> = gated.iter().map(|&x| x / (1.0 + (-x).exp())).collect();
-        let upped = gpu_matmul(input, up, seq, hd, id, &dispatch);
-        let mut combined = vec![0.0f32; seq * id];
-        for i in 0..combined.len() { combined[i] = gated[i] * upped[i]; }
-        gpu_matmul(&combined, down, seq, id, hd, &dispatch)
-    };
-
-    info!(event = "precompute_frozen_states", chunks = teacher_logits_chunks.len(), first_injection = first_injection, dispatch = ?dispatch.attn_qkv_dispatch, "precomputing frozen base model hidden states");
-    let frozen_start = std::time::Instant::now();
-    for (chunk_idx, _chunk_tokens) in teacher_logits_chunks.iter().enumerate() {
-        // We need the token IDs for this chunk
-        let start_tok = (chunk_idx * seq_len) % token_ids.len();
-        let end_tok = (start_tok + seq_len).min(token_ids.len());
-        let tok_ids: Vec<u32> = token_ids[start_tok..end_tok].to_vec();
-        if tok_ids.len() < seq_len { break; }
-
-        // Run the frozen base model to get all per-layer hidden states
-        // We create a temporary teacher-like model for this
-        let frozen_states = {
-            let config_ref = &student.model.config;
-            let hd = config_ref.hidden_dim;
-            let seq = tok_ids.len();
-            let mut states = Vec::new();
-
-            // Embedding
-            let mut hidden = vec![0.0f32; seq * hd];
-            for (t, &tid) in tok_ids.iter().enumerate() {
-                let id = tid as usize;
-                if id * hd + hd <= student.model.embed_tokens.len() {
-                    for d in 0..hd { hidden[t * hd + d] = student.model.embed_tokens[id * hd + d]; }
-                }
-            }
-            let scale = (hd as f32).sqrt();
-            for h in hidden.iter_mut() { *h *= scale; }
-            states.push(hidden.clone());
-
-            for layer in &student.model.layers {
-                let residual = hidden.clone();
-                let normed = gemma_mapper::rms_norm(&hidden, &layer.attn.input_norm, hd, 1e-6);
-                let q_dim = config_ref.num_heads * config_ref.head_dim;
-                let kv_dim = config_ref.num_kv_heads * config_ref.head_dim;
-                let q = gpu_matmul(&normed, &layer.attn.q_proj, seq, hd, q_dim, &dispatch);
-                let k = gpu_matmul(&normed, &layer.attn.k_proj, seq, hd, kv_dim, &dispatch);
-                let v = gpu_matmul(&normed, &layer.attn.v_proj, seq, hd, kv_dim, &dispatch);
-                let mut q = q; let mut k = k;
-                gemma_mapper::apply_rope(&mut q, seq, config_ref.num_heads, config_ref.head_dim, 0);
-                gemma_mapper::apply_rope_gqa(&mut k, seq, config_ref.num_kv_heads, config_ref.head_dim, 0);
-                let heads_per_kv = config_ref.num_heads / config_ref.num_kv_heads;
-                let attn_scale = 1.0 / (config_ref.head_dim as f32).sqrt();
-                let mut attn_out = vec![0.0f32; seq * q_dim];
-                for h_idx in 0..config_ref.num_heads {
-                    let kv_h = h_idx / heads_per_kv;
-                    for t in 0..seq {
-                        let mut max_s = f32::NEG_INFINITY;
-                        let mut scores = vec![0.0f32; seq];
-                        for s in 0..seq {
-                            if s > t { scores[s] = f32::NEG_INFINITY; continue; }
-                            let mut dot = 0.0;
-                            for d in 0..config_ref.head_dim {
-                                dot += q[t * q_dim + h_idx * config_ref.head_dim + d]
-                                     * k[s * kv_dim + kv_h * config_ref.head_dim + d];
-                            }
-                            scores[s] = dot * attn_scale;
-                            if scores[s] > max_s { max_s = scores[s]; }
-                        }
-                        let mut sum_e = 0.0;
-                        for s in &mut scores { *s = (*s - max_s).exp(); sum_e += *s; }
-                        for s in &mut scores { *s /= sum_e; }
-                        for d in 0..config_ref.head_dim {
-                            let mut val = 0.0;
-                            for s in 0..seq { val += scores[s] * v[s * kv_dim + kv_h * config_ref.head_dim + d]; }
-                            attn_out[t * q_dim + h_idx * config_ref.head_dim + d] = val;
-                        }
-                    }
-                }
-                let attn_proj = gpu_matmul(&attn_out, &layer.attn.o_proj, seq, q_dim, hd, &dispatch);
-                for i in 0..hidden.len() { hidden[i] = residual[i] + attn_proj[i]; }
-                let residual2 = hidden.clone();
-                let normed2 = gemma_mapper::rms_norm(&hidden, &layer.attn.post_attn_norm, hd, 1e-6);
-                let ffn_out = match &layer.ffn {
-                    gemma_mapper::Gemma4FfnWeights::Dense { gate_proj, up_proj, down_proj } => {
-                        swiglu_ffn_gpu(&normed2, gate_proj, up_proj, down_proj, hd, config_ref.intermediate_dim)
-                    }
-                    gemma_mapper::Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs } => {
-                        let mut moe = gemma_mapper::CpuMoELayer::new(hd, config_ref.intermediate_dim, config_ref.num_experts, config_ref.top_k);
-                        moe.gate_weights = router.clone();
-                        moe.expert_gate = expert_gates.clone();
-                        moe.expert_up = expert_ups.clone();
-                        moe.expert_down = expert_downs.clone();
-                        moe.forward(&normed2, seq)
-                    }
-                };
-                for i in 0..hidden.len() { hidden[i] = residual2[i] + ffn_out[i]; }
-                states.push(hidden.clone());
-            }
-            states
-        };
-        frozen_states_per_chunk.push(frozen_states);
-        let elapsed = frozen_start.elapsed().as_secs_f32();
-        let per_chunk = elapsed / (chunk_idx + 1) as f32;
-        let remaining = per_chunk * (teacher_logits_chunks.len() - chunk_idx - 1) as f32;
-        info!(event = "frozen_state_chunk", chunk = chunk_idx + 1, total = teacher_logits_chunks.len(), elapsed_s = elapsed as u32, eta_s = remaining as u32, "frozen base hidden states precomputed");
-    }
+    // Frozen states were computed alongside teacher logits above.
+    // Report stats.
     let total_states_mb = frozen_states_per_chunk.iter()
         .map(|c| c.iter().map(|s| s.len() * 4).sum::<usize>())
         .sum::<usize>() as f64 / (1024.0 * 1024.0);
-    info!(event = "frozen_states_ready", chunks = frozen_states_per_chunk.len(), size_mb = total_states_mb as u32, "frozen states precomputed");
+    info!(event = "frozen_states_ready", chunks = frozen_states_per_chunk.len(), size_mb = total_states_mb as u32, "frozen states precomputed (alongside teacher logits)");
 
     // Run distillation using pre-computed teacher logits
     let mut results: Vec<gemma_mapper::DistillationStepResult> = Vec::new();
@@ -1639,26 +1573,42 @@ async fn cmd_distill(
 
         let teacher_logits = &teacher_logits_chunks[chunk_idx];
 
-        // Student forward (using cached frozen hidden states)
-        let frozen_states = &frozen_states_per_chunk[chunk_idx];
-        let student_logits = if let Some(ref gpu) = gpu_accel {
-            match dispatch.attn_qkv_dispatch {
-                ferrisres::device::OpTarget::Gpu | ferrisres::device::OpTarget::GpuTiled => {
-                    student.forward_from_frozen_gpu(frozen_states, gpu)
-                }
-                ferrisres::device::OpTarget::Cpu => {
-                    student.forward_from_frozen(frozen_states)
-                }
-            }
-        } else {
-            student.forward_from_frozen(frozen_states)
-        };
+        // Student forward using CpuBlockAttnResModel
+        let student_logits = student.forward(batch_tokens);
 
         // KL divergence loss
-        let loss = gemma_mapper::kl_divergence_loss(
+        let kl_loss = gemma_mapper::kl_divergence_loss(
             teacher_logits, &student_logits,
-            distill_config.temperature, vs, actual_seq,
+            temperature as f32, vs, actual_seq,
         );
+
+        // Hidden state matching loss: MSE between teacher and student per-layer states
+        let teacher_states = &frozen_states_per_chunk[chunk_idx];
+        let student_states = student.forward_with_hidden_states(batch_tokens);
+        let hidden_mse_loss = if teacher_states.len() == student_states.len() && !teacher_states.is_empty() {
+            let _hd = config.hidden_dim;
+            let mut total_mse = 0.0f32;
+            let mut num_layers_compared = 0usize;
+            // Compare at every 5th layer to save compute
+            for layer_idx in (0..teacher_states.len()).step_by(5) {
+                let t_state = &teacher_states[layer_idx];
+                let s_state = &student_states[layer_idx];
+                if t_state.len() == s_state.len() {
+                    let mse: f32 = t_state.iter().zip(s_state.iter())
+                        .map(|(t, s)| (t - s) * (t - s))
+                        .sum::<f32>() / t_state.len() as f32;
+                    total_mse += mse;
+                    num_layers_compared += 1;
+                }
+            }
+            if num_layers_compared > 0 { total_mse / num_layers_compared as f32 } else { 0.0 }
+        } else {
+            0.0
+        };
+
+        // Combined loss: KL + 0.5 * hidden_MSE
+        // TODO: add MoE load balance loss when gate_logits are collected during forward
+        let loss = kl_loss + 0.5 * hidden_mse_loss;
 
         // Update EMA
         loss_ema = if loss_ema.is_nan() { loss }
@@ -1669,7 +1619,7 @@ async fn cmd_distill(
         // d_kl/d_s_logit = (softmax(s/T) - softmax(t/T)) / T
         // Use log-softmax to avoid exp overflow on large logits
         let mut d_logits = vec![0.0f32; actual_seq * vs];
-        let inv_temp = 1.0 / distill_config.temperature;
+        let inv_temp = 1.0 / (temperature as f32);
         for t in 0..actual_seq {
             let offset = t * vs;
             // Find max for numerical stability
@@ -1699,76 +1649,108 @@ async fn cmd_distill(
             }
         }
 
-        // Project d_logits [seq × vocab] back through LM head to get d_hidden [seq × hd]
-        // d_hidden = d_logits × lm_head^T  (lm_head is [hd × vs], transposed to [vs × hd])
-        // Use pre-cached transposed lm_head (computed once at setup)
+        // TODO: LoRA backprop through student (d3777391)
+        // The d_hidden is computed for future use when LoRA training is wired in.
+        // Currently: compute d_hidden, approximate LoRA gradients, update via optimizer.
         let d_hidden: Vec<f32> = {
             gpu_matmul(&d_logits, &lm_head_t, actual_seq, vs, config.hidden_dim, &dispatch)
         };
 
-        // Backprop through Block Summary layers using cached frozen hidden states
-        let frozen_states = &frozen_states_per_chunk[chunk_idx];
-        let all_grads: Vec<(usize, gemma_mapper::BlockSummaryGradients)> = student.block_summaries.iter().enumerate()
-            .filter(|(_, bs)| bs.trainable)
-            .filter(|(si, _)| *si < optimizers.len())
-            .map(|(si, bs)| {
-                // Get the frozen hidden state at this injection point
-                // frozen_states[layer_idx + 1] = state after layer layer_idx
-                let layer_idx = injection_points.get(si).copied().unwrap_or(0);
-                let block_tokens = if layer_idx + 1 < frozen_states.len() {
-                    frozen_states[layer_idx + 1].as_slice()
-                } else {
-                    // Fallback: use embedding (should not happen)
-                    &student.model.embed_tokens[..seq_len * config.hidden_dim]
+        // === LoRA Backward Pass ===
+        // d_hidden is the gradient flowing into the student model's output.
+        // LoRA forward: y = Wx + scaling * B(Ax)
+        //   dL/dA[r][d] = scaling * Σ_t (Σ_o B[o][r] · d_y[t][o]) · input[t][d]
+        //   dL/dB[o][r] = scaling * Σ_t d_y[t][o] · (Σ_d A[r][d] · input[t][d])
+        {
+            let hd = config.hidden_dim;
+            let seq_for_grad = actual_seq.min(d_hidden.len() / hd);
+
+            if let Some(ref mut lora_m) = student.lora_manager {
+                // Use student_states[0] (post-embedding) as input proxy for all layers
+                let input_state = match student_states.first() {
+                    Some(s) => s.as_slice(),
+                    None => &[],
                 };
-                let grads = gemma_mapper::backprop_block_summary(bs, block_tokens, &d_hidden);
-                (si, grads)
-            })
-            .collect();
+                let in_dim = if input_state.is_empty() { 0 } else { input_state.len() / hd };
 
-        // Track gradient norm across all block summary layers
-        let grad_norm: f32 = all_grads.iter()
-            .map(|(_, g)| g.d_bridge_weight * g.d_bridge_weight)
-            .sum::<f32>()
-            .sqrt();
+                // Phase 1: Compute all LoRA gradients (immutable reads of A, B)
+                let grad_data: Vec<(usize, String, Vec<f32>, Vec<f32>)> = lora_m.adapters_iter()
+                    .map(|(layer_idx, module_name, lora_layer)| {
+                        let rank = lora_layer.rank();
+                        let in_f = lora_layer.in_features();
+                        let out_f = lora_layer.out_features();
+                        let scaling = lora_layer.scaling();
+                        let b = lora_layer.lora_b();
+                        let a = lora_layer.lora_a();
 
-        // Gradient clipping: prevent explosions (max norm = 1.0)
-        let max_grad_norm = 1.0f32;
-        let clipped_grads: Vec<(usize, gemma_mapper::BlockSummaryGradients)> = if grad_norm > max_grad_norm && grad_norm.is_finite() {
-            let scale = max_grad_norm / grad_norm;
-            all_grads.into_iter().map(|(si, mut g)| {
-                g.d_bridge_weight *= scale;
-                for v in &mut g.d_summary_queries { *v *= scale; }
-                for v in &mut g.d_out_proj { *v *= scale; }
-                for v in &mut g.d_query_proj { *v *= scale; }
-                (si, g)
-            }).collect()
-        } else if !grad_norm.is_finite() {
-            // Skip NaN/inf gradients entirely
-            vec![]
-        } else {
-            all_grads
-        };
+                        let mut ga = vec![0.0f32; rank * in_f];
+                        let mut gb = vec![0.0f32; out_f * rank];
 
-        for (si, grads) in clipped_grads {
-            optimizers[si].step(&mut student.block_summaries[si], &grads);
+                        // grad_A: scaling * B^T · d_hidden, outer with input
+                        for r in 0..rank {
+                            for d in 0..in_f.min(hd) {
+                                let mut grad = 0.0f32;
+                                for t in 0..seq_for_grad.min(in_dim) {
+                                    let mut btdy = 0.0f32;
+                                    for o in 0..out_f.min(hd) {
+                                        btdy += b[o * rank + r] * d_hidden[t * hd + o];
+                                    }
+                                    grad += btdy * input_state[t * in_f + d];
+                                }
+                                ga[r * in_f + d] = scaling * grad;
+                            }
+                        }
+
+                        // grad_B: scaling * d_hidden · (A · input)^T
+                        for o in 0..out_f.min(hd) {
+                            for r in 0..rank {
+                                let mut grad = 0.0f32;
+                                for t in 0..seq_for_grad.min(in_dim) {
+                                    let mut ax_r = 0.0f32;
+                                    for d in 0..in_f.min(hd) {
+                                        ax_r += a[r * in_f + d] * input_state[t * in_f + d];
+                                    }
+                                    grad += d_hidden[t * hd + o] * ax_r;
+                                }
+                                gb[o * rank + r] = scaling * grad;
+                            }
+                        }
+
+                        (layer_idx, module_name.to_string(), ga, gb)
+                    })
+                    .collect();
+
+                // Phase 2: Optimizer step (mutable writes to A, B)
+                for (layer_idx, module_name, ga, gb) in grad_data {
+                    if let Some(ll) = lora_m.adapters_iter_mut()
+                        .find(|(li, mn, _)| *li == layer_idx && *mn == module_name)
+                        .map(|(_, _, ll)| ll)
+                    {
+                        let a = ll.lora_a_mut();
+                        optimizer.step(&format!("lora_a_{}_{}", layer_idx, module_name), &ga, a);
+                    }
+                    if let Some(ll) = lora_m.adapters_iter_mut()
+                        .find(|(li, mn, _)| *li == layer_idx && *mn == module_name)
+                        .map(|(_, _, ll)| ll)
+                    {
+                        let b = ll.lora_b_mut();
+                        optimizer.step(&format!("lora_b_{}_{}", layer_idx, module_name), &gb, b);
+                    }
+                }
+            }
         }
 
-        // Collect per-layer bridge weights
-        let bridge_weights: Vec<f32> = student.block_summaries.iter()
-            .map(|bs| bs.bridge_weight)
-            .collect();
-        let bridge_w = bridge_weights.first().copied().unwrap_or(0.0);
-        let bridge_mean = if bridge_weights.is_empty() { 0.0 }
-            else { bridge_weights.iter().sum::<f32>() / bridge_weights.len() as f32 };
-        let bridge_min = bridge_weights.iter().cloned().fold(f32::INFINITY, f32::min);
-        let bridge_max = bridge_weights.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-
-        let lr = if global_step < distill_config.warmup_steps {
-            distill_config.learning_rate * (global_step + 1) as f32 / distill_config.warmup_steps.max(1) as f32
-        } else {
-            distill_config.learning_rate
+        // Compute gradient norm for logging
+        let grad_norm = {
+            let mut norm = 0.0f32;
+            for &g in &d_hidden { norm += g * g; }
+            norm.sqrt()
         };
+
+        // Old BlockSummary backprop removed — student is now CpuBlockAttnResModel
+        let _frozen_states = &frozen_states_per_chunk[chunk_idx];
+
+        let lr = learning_rate as f32;
 
         let step_ms = step_start.elapsed().as_millis();
         let tps = actual_seq as f32 / step_start.elapsed().as_secs_f32();
@@ -1781,8 +1763,8 @@ async fn cmd_distill(
 
         results.push(gemma_mapper::DistillationStepResult {
             step: global_step,
-            kl_loss: loss,
-            bridge_weight: bridge_w,
+            kl_loss: kl_loss,
+            bridge_weight: hidden_mse_loss,
             learning_rate: lr,
             layer_cosine_sim: vec![],
         });
@@ -1797,9 +1779,6 @@ async fn cmd_distill(
                 loss_ema = format_args!("{:.6}", loss_ema),
                 best_loss = format_args!("{:.6}", best_loss),
                 grad_norm = format_args!("{:.3e}", grad_norm),
-                bridge_mean = format_args!("{:.4}", bridge_mean),
-                bridge_min = format_args!("{:.4}", bridge_min),
-                bridge_max = format_args!("{:.4}", bridge_max),
                 lr = format_args!("{:.2e}", lr),
                 step_ms = step_ms,
                 tok_per_s = format_args!("{:.2}", tps),
@@ -1810,11 +1789,8 @@ async fn cmd_distill(
 
         // Mid-training checkpoint
         if checkpoint_every > 0 && (global_step + 1) % checkpoint_every == 0 {
-            let ckpt = DistillationCheckpoint::from_student(&student, &optimizers, global_step + 1);
-            let ckpt_path = format!("{}.checkpoint.bin", output_path);
-            ckpt.save(std::path::Path::new(&ckpt_path))
-                .map_err(|e| anyhow::anyhow!("Failed to save checkpoint: {}", e))?;
-            info!(event = "checkpoint_saved", step = global_step + 1, path = %ckpt_path, "mid-training checkpoint saved");
+            // Checkpoints temporarily disabled — student is now CpuBlockAttnResModel
+            // TODO: implement CpuBlockAttnResModel checkpoint (d3777391)
         }
 
         prev_loss = loss;
@@ -1854,44 +1830,27 @@ async fn cmd_distill(
     }
     if let Some(last) = results.last() {
         info!(event = "final_kl_loss", "Final KL loss:   {:.6}", last.kl_loss);
-        info!(event = "final_bridge_weight", "Final bridge_weight: {:.6}", last.bridge_weight);
     }
 
     // Log loss curve
     for result in &results {
         if result.step % log_every == 0 {
-            info!(event = "distill_step_summary", step = result.step, loss = result.kl_loss, bridge_w = result.bridge_weight, lr = result.learning_rate, "distillation step summary");
+            info!(event = "distill_step_summary", step = result.step, loss = result.kl_loss, lr = result.learning_rate, "distillation step summary");
         }
     }
 
-    // Save distilled model (block summary params)
-    for (i, bs) in student.block_summaries.iter().enumerate() {
-        let params = bs.export_trainable();
-        let save_path = format!("{}.block_summary_{}.bin", output_path, i);
-        let bytes: Vec<u8> = params.iter().flat_map(|f| f.to_le_bytes()).collect();
-        std::fs::write(&save_path, &bytes)?;
-        info!(event = "saved_block_summary_params", "Saved Block Summary {} → {} ({} params)", i, save_path, params.len());
+    // TODO: Save CpuBlockAttnResModel as distilled checkpoint (d3777391)
+    // Save trained Block-MoE-Res model
+    match ferrisres::model::checkpoint::save_model(&student, &output_path) {
+        Ok(()) => info!(event = "model_saved", path = %output_path, "Trained model saved"),
+        Err(e) => warn!(event = "model_save_failed", error = %e, "Failed to save model"),
     }
-
-    // Save full checkpoint (for resume) with optimizer state
-    let ckpt_path = format!("{}.checkpoint.bin", output_path);
-    let final_step = results.last().map(|r| r.step).unwrap_or(0) + 1;
-    let final_ckpt = DistillationCheckpoint::from_student(&student, &optimizers, final_step);
-    final_ckpt.save(std::path::Path::new(&ckpt_path))
-        .map_err(|e| anyhow::anyhow!("Failed to save checkpoint: {}", e))?;
-    info!(event = "checkpoint_saved", step = final_step, path = %ckpt_path, "final checkpoint saved");
 
     // Save loss curve as CSV
     let csv_path = format!("{}.loss_curve.csv", output_path);
-    let mut csv = String::from("step,kl_loss,bridge_weight,learning_rate,cosine_sim_avg\n");
+    let mut csv = String::from("step,kl_loss,learning_rate\n");
     for r in &results {
-        let avg_cos = if r.layer_cosine_sim.is_empty() {
-            String::from("n/a")
-        } else {
-            let avg = r.layer_cosine_sim.iter().sum::<f32>() / r.layer_cosine_sim.len() as f32;
-            format!("{:.6}", avg)
-        };
-        csv.push_str(&format!("{},{},{},{},{}\n", r.step, r.kl_loss, r.bridge_weight, r.learning_rate, avg_cos));
+        csv.push_str(&format!("{},{},{}\n", r.step, r.kl_loss, r.learning_rate));
     }
     std::fs::write(&csv_path, &csv)?;
     info!(event = "loss_curve_saved", "Loss curve saved → {}", csv_path);
@@ -2176,6 +2135,17 @@ fn generate_cpu(
         let last_offset = (all_tokens.len() - 1) * vs;
         let last_logits = &logits[last_offset..last_offset + vs];
 
+        // Diagnostic: dump top-5 logits on first 3 steps
+        if step <= 2 {
+            let mut indexed: Vec<(usize, f32)> = last_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            info!(event = "logits_diagnostic", step = step, "Top-5 logits:");
+            for (rank, (id, val)) in indexed.iter().take(5).enumerate() {
+                info!(event = "logit", step = step, rank = rank, token_id = id, value = val);
+            }
+            info!(event = "logits_range", step = step, min = indexed.last().unwrap().1, max = indexed[0].1, "Logit range");
+        }
+
         // Temperature scaling + sampling
         let next_token = if temperature < 1e-6 {
             // Greedy: argmax
@@ -2218,6 +2188,11 @@ fn generate_cpu(
         }
 
         all_tokens.push(next_token);
+
+        // Log the chosen token
+        if step <= 5 || step % 10 == 0 {
+            info!(event = "chosen_token", step = step, token_id = next_token, total = all_tokens.len());
+        }
 
         if step % 10 == 0 {
             info!(event = "cpu_gen_progress", step = step, tokens = all_tokens.len(), "Generating...");
