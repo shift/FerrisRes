@@ -16,6 +16,7 @@ pub mod conv3d;
 pub mod immediates;
 pub mod ternary_matmul;
 pub mod sparse_ternary;
+pub mod optimizer_scale;
 
 pub mod gpu_transformer;
 
