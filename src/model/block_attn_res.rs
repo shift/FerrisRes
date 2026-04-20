@@ -394,6 +394,48 @@ impl BlockAttnResLayer {
         self.kv_shared
     }
 
+    // --- Weight accessors for upload (used by upload.rs) ---
+
+    pub fn q_proj_accessor(&self) -> &Linear {
+        &self.q_proj
+    }
+
+    pub fn k_proj_accessor(&self) -> &Linear {
+        &self.k_proj
+    }
+
+    pub fn v_proj_accessor(&self) -> &Linear {
+        &self.v_proj
+    }
+
+    pub fn out_proj_accessor(&self) -> &Linear {
+        &self.out_proj
+    }
+
+    pub fn ffn_gate_accessor(&self) -> Option<&Linear> {
+        self.ff_gate.as_ref()
+    }
+
+    pub fn ffn_up_accessor(&self) -> Option<&Linear> {
+        self.ff_up.as_ref()
+    }
+
+    pub fn ffn_down_accessor(&self) -> Option<&Linear> {
+        self.ff_down.as_ref()
+    }
+
+    pub fn moe_accessor(&self) -> Option<&RefCell<crate::model::moe_linear::MoELinear>> {
+        self.moe_linear.as_ref()
+    }
+
+    pub fn ple_input_gate_accessor(&self) -> Option<&Linear> {
+        self.ple_input_gate.as_ref()
+    }
+
+    pub fn ple_projection_accessor(&self) -> Option<&Linear> {
+        self.ple_projection.as_ref()
+    }
+
     pub fn forward_intra_block(
         &self,
         encoder: &mut wgpu::CommandEncoder,
