@@ -8,6 +8,7 @@ pub mod async_pipeline;
 pub mod distributed;
 pub mod hardware;
 pub mod transport;
+pub mod adapter;
 
 pub use pipeline::WgpuCompute;
 pub use buffer::GpuBuffer;
