@@ -1440,7 +1440,7 @@ async fn cmd_distill(
     info!(event = "moe_conversion", moe_layers = moe_layers, total_layers = student.layers.len(), "Converted dense FFN to MoE (4 experts, top-2)");
 
     // Attach LoRA adapters for training (rank 8, q_proj + v_proj)
-    let lora_config = ferrisres::training::lora::LoraConfig::targeting(8, vec!["q_proj", "v_proj"]);
+    let lora_config = ferrisres::training::lora::LoraConfig::targeting(8, vec!["q_proj", "k_proj", "v_proj", "o_proj"]);
     student.attach_lora(lora_config);
     info!(event = "lora_attached", "LoRA adapters attached to student model");
 
@@ -1457,6 +1457,14 @@ async fn cmd_distill(
             optimizer.register_matrix(&name_b, layer.out_features(), layer.rank());
             // Mark LoRA B as output layer for SCALE momentum
             optimizer.mark_output_layer(&name_b);
+        }
+    }
+
+    // Register MoE router weights with optimizer (Task 1)
+    for (layer_idx, layer) in student.layers.iter().enumerate() {
+        if let Some(ref moe) = layer.moe {
+            let name = format!("router_{}", layer_idx);
+            optimizer.register_matrix(&name, moe.num_experts, moe.hidden_dim);
         }
     }
     info!(event = "optimizer_created", optimizer = optimizer.name(), matrices = optimizer.num_registered(), state_mb = optimizer.state_bytes() as f64 / 1e6, "Optimizer created");
@@ -1776,6 +1784,41 @@ async fn cmd_distill(
                     {
                         let b = ll.lora_b_mut();
                         optimizer.step(&format!("lora_b_{}_{}", layer_idx, module_name), &gb, b);
+                    }
+                }
+            }
+        }
+
+        // === MoE Router Gradient (Task 1) ===
+        // d_hidden flows into each layer. For MoE layers, the gradient
+        // through the expert outputs tells the router which experts helped.
+        // Simplified: router_grad[e, d] = Σ_t d_hidden[t, d] · expert_contribution_e(t)
+        // Using d_hidden as a proxy signal (same approximation as LoRA backward).
+        {
+            let hd = config.hidden_dim;
+            for (layer_idx, layer) in student.layers.iter_mut().enumerate() {
+                if let Some(ref moe) = layer.moe {
+                    let num_experts = moe.num_experts;
+                    let mut router_grad = vec![0.0f32; num_experts * hd];
+                    let seq_for_grad = actual_seq.min(d_hidden.len() / hd);
+                    for t in 0..seq_for_grad {
+                        for e in 0..num_experts {
+                            let mut dot = 0.0f32;
+                            for d in 0..hd {
+                                dot += d_hidden[t * hd + d] * moe.gate_weights[e * hd + d];
+                            }
+                            for d in 0..hd {
+                                router_grad[e * hd + d] += dot * d_hidden[t * hd + d];
+                            }
+                        }
+                    }
+                    let inv_seq = 1.0 / seq_for_grad.max(1) as f32;
+                    for g in router_grad.iter_mut() { *g *= inv_seq; }
+
+                    // Update router weights
+                    let name = format!("router_{}", layer_idx);
+                    if let Some(ref mut moe_mut) = layer.moe {
+                        optimizer.step(&name, &router_grad, &mut moe_mut.gate_weights);
                     }
                 }
             }

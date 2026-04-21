@@ -299,11 +299,14 @@ impl CpuBlockAttnResLayer {
         q = crate::model::gemma_mapper::per_head_rms_norm(&q, self.q_norm.weight(), seq, nh, head_d);
         apply_rope(&mut q, seq, nh, head_d, 0, self.rope_theta, self.partial_rotary_factor);
 
-        // K/V: either shared or computed (with LoRA on V)
+        // K/V: either shared or computed (with LoRA on K and V)
         let (k, v, should_share) = match shared_kv {
             Some((sk, sv)) => (sk.to_vec(), sv.to_vec(), false),
             None => {
                 let mut k = self.k_proj.forward(&normed, seq);
+                if let Some(lora_out) = lora_m.forward(layer_idx, "k_proj", &normed, seq) {
+                    for (i, l) in lora_out.iter().enumerate() { k[i] += l; }
+                }
                 let mut v_raw = self.v_proj.forward(&normed, seq);
                 if let Some(lora_out) = lora_m.forward(layer_idx, "v_proj", &normed, seq) {
                     for (i, l) in lora_out.iter().enumerate() { v_raw[i] += l; }
@@ -317,7 +320,11 @@ impl CpuBlockAttnResLayer {
 
         let q_dim = nh * head_d;
         let kv_dim = nkv * head_d;
-        let attn_out = self.cpu_attention(&q, &k, &v, seq, nh, nkv, head_d, q_dim, kv_dim);
+        let mut attn_out = self.cpu_attention(&q, &k, &v, seq, nh, nkv, head_d, q_dim, kv_dim);
+        // LoRA on output projection
+        if let Some(lora_out) = lora_m.forward(layer_idx, "o_proj", &attn_out, seq) {
+            for (i, l) in lora_out.iter().enumerate() { attn_out[i] += l; }
+        }
         let attn_out = self.post_attn_norm.forward(&attn_out);
         for i in 0..hidden.len() { hidden[i] = residual[i] + attn_out[i]; }
 
@@ -1017,12 +1024,14 @@ impl CpuBlockAttnResModel {
         let mut manager = crate::training::lora::LoraManager::new(config);
         
         // Auto-populate adapters for each layer's target modules
-        let targets = ["q_proj", "v_proj", "ple_gate"];
+        let targets = ["q_proj", "k_proj", "v_proj", "o_proj", "ple_gate"];
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             for &module in &targets {
                 let (in_f, out_f) = match module {
                     "q_proj" => (layer.hidden_dim, layer.q_proj.out_features()),
+                    "k_proj" => (layer.hidden_dim, layer.k_proj.out_features()),
                     "v_proj" => (layer.hidden_dim, layer.v_proj.out_features()),
+                    "o_proj" => (layer.q_proj.out_features(), layer.out_proj.out_features()),
                     "ple_gate" => {
                         if let Some(ref gate) = layer.ple_input_gate {
                             (gate.in_features(), gate.out_features())
