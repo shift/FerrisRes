@@ -1416,6 +1416,12 @@ async fn cmd_distill(
     let mut student = ferrisres::model::cpu_block_attn_res::gemma4_to_block_attnres(&model2);
     info!(event = "student_ready", layers = student.layers.len(), "student CpuBlockAttnResModel created from teacher weights");
 
+    // Drop mmap IMMEDIATELY after copying weights to student.
+    // On low-RAM systems (Colab T4: 12GB), the mmap (10GB virtual) + student (4GB)
+    // + MoE conversion (quadruples FFN) would OOM otherwise.
+    drop(model2);
+    info!(event = "mmap_dropped", "Teacher mmap dropped, RAM freed for MoE conversion");
+
     // Convert every dense FFN to MoE (FerrisRes ALWAYS produces MoE models)
     ferrisres::model::cpu_block_attn_res::dense_ffn_to_moe(&mut student, 4, 2, 0.01);
     let moe_layers = student.layers.iter().filter(|l| l.moe.is_some()).count();
