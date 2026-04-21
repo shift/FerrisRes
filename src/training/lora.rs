@@ -574,6 +574,94 @@ impl LoraManager {
             .find(|(idx, name, _)| *idx == layer_idx && name == module_name)
             .map(|(_, _, layer)| layer)
     }
+
+    /// Serialize all LoRA adapters to bytes.
+    /// Format: [num_adapters: u32] for each: [layer_idx: u32] [name_len: u16] [name] [rank: u32]
+    ///   [in_f: u32] [out_f: u32] [scaling: f32] [A data] [B data]
+    pub fn serialize_adapters(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(self.adapters.len() as u32).to_le_bytes());
+
+        for (layer_idx, name, layer) in &self.adapters {
+            buf.extend_from_slice(&(*layer_idx as u32).to_le_bytes());
+            let name_bytes = name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+            buf.extend_from_slice(&(layer.rank() as u32).to_le_bytes());
+            buf.extend_from_slice(&(layer.in_features() as u32).to_le_bytes());
+            buf.extend_from_slice(&(layer.out_features() as u32).to_le_bytes());
+            buf.extend_from_slice(&layer.scaling().to_le_bytes());
+
+            let a = layer.lora_a();
+            for &v in a { buf.extend_from_slice(&v.to_le_bytes()); }
+            let b = layer.lora_b();
+            for &v in b { buf.extend_from_slice(&v.to_le_bytes()); }
+        }
+
+        buf
+    }
+
+    /// Deserialize LoRA adapters from bytes, replacing all current adapters.
+    pub fn deserialize_adapters(&mut self, data: &[u8]) -> Result<(), String> {
+        let mut pos = 0usize;
+
+        let read_u32 = |data: &[u8], pos: &mut usize| -> Result<u32, String> {
+            if *pos + 4 > data.len() { return Err("Truncated".into()); }
+            let v = u32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap());
+            *pos += 4; Ok(v)
+        };
+        let read_u16 = |data: &[u8], pos: &mut usize| -> Result<u16, String> {
+            if *pos + 2 > data.len() { return Err("Truncated".into()); }
+            let v = u16::from_le_bytes(data[*pos..*pos+2].try_into().unwrap());
+            *pos += 2; Ok(v)
+        };
+        let read_f32 = |data: &[u8], pos: &mut usize| -> Result<f32, String> {
+            if *pos + 4 > data.len() { return Err("Truncated".into()); }
+            let v = f32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap());
+            *pos += 4; Ok(v)
+        };
+
+        let num = read_u32(data, &mut pos)? as usize;
+        self.adapters.clear();
+
+        for _ in 0..num {
+            let layer_idx = read_u32(data, &mut pos)? as usize;
+            let name_len = read_u16(data, &mut pos)? as usize;
+            if pos + name_len > data.len() { return Err("Truncated name".into()); }
+            let name = String::from_utf8_lossy(&data[pos..pos+name_len]).into_owned();
+            pos += name_len;
+
+            let rank = read_u32(data, &mut pos)? as usize;
+            let in_f = read_u32(data, &mut pos)? as usize;
+            let out_f = read_u32(data, &mut pos)? as usize;
+            let _scaling = read_f32(data, &mut pos)?;
+
+            let a_count = rank * in_f;
+            if pos + a_count * 4 > data.len() { return Err("Truncated A".into()); }
+            let mut a_data = vec![0.0f32; a_count];
+            for i in 0..a_count { a_data[i] = f32::from_le_bytes(data[pos+i*4..pos+i*4+4].try_into().unwrap()); }
+            pos += a_count * 4;
+
+            let b_count = out_f * rank;
+            if pos + b_count * 4 > data.len() { return Err("Truncated B".into()); }
+            let mut b_data = vec![0.0f32; b_count];
+            for i in 0..b_count { b_data[i] = f32::from_le_bytes(data[pos+i*4..pos+i*4+4].try_into().unwrap()); }
+            pos += b_count * 4;
+
+            // Reconstruct LoraLayer
+            let config = LoraConfig::targeting(rank, vec![name.as_str()]);
+            let mut layer = LoraLayer::new(in_f, out_f, &config);
+            // Copy deserialized weights
+            let a_mut = layer.lora_a_mut();
+            a_mut.copy_from_slice(&a_data);
+            let b_mut = layer.lora_b_mut();
+            b_mut.copy_from_slice(&b_data);
+
+            self.adapters.push((layer_idx, name, layer));
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

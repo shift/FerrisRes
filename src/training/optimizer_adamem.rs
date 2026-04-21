@@ -192,6 +192,114 @@ impl WeightOptimizer for AdaMeMOptimizer {
     fn name(&self) -> &'static str {
         "AdaMeM"
     }
+
+    fn serialize_state(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // Header: [magic: u32 = 0x41444D45 ('ADME'), version: u32 = 1, timestep: u32]
+        buf.extend_from_slice(&0x41444D45u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&self.timestep.to_le_bytes());
+        buf.extend_from_slice(&(self.matrices.len() as u32).to_le_bytes());
+
+        for (name, state) in &self.matrices {
+            let name_bytes = name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+            buf.extend_from_slice(&(state.rows as u32).to_le_bytes());
+            buf.extend_from_slice(&(state.cols as u32).to_le_bytes());
+            buf.extend_from_slice(&state.local_step.to_le_bytes());
+            buf.extend_from_slice(&[if state.needs_svd { 1u8 } else { 0u8 }]);
+
+            // projector [rows × rank]
+            for &v in &state.projector { buf.extend_from_slice(&v.to_le_bytes()); }
+            // momentum [rank × cols]
+            for &v in &state.momentum { buf.extend_from_slice(&v.to_le_bytes()); }
+            // af_row [rank]
+            for &v in &state.af_row { buf.extend_from_slice(&v.to_le_bytes()); }
+            // af_col [cols]
+            for &v in &state.af_col { buf.extend_from_slice(&v.to_le_bytes()); }
+            // os_col [cols]
+            for &v in &state.os_col { buf.extend_from_slice(&v.to_le_bytes()); }
+        }
+
+        buf
+    }
+
+    fn deserialize_state(&mut self, data: &[u8]) -> crate::error::Result<()> {
+        self.deserialize_state_inner(data)
+            .map_err(|e| crate::error::FerrisResError::Shape(e))
+    }
+}
+
+impl AdaMeMOptimizer {
+    fn deserialize_state_inner(&mut self, data: &[u8]) -> Result<(), String> {
+        if data.len() < 16 { return Err("Data too short".into()); }
+        let mut pos = 0usize;
+
+        let read_u32 = |data: &[u8], pos: &mut usize| -> Result<u32, String> {
+            if *pos + 4 > data.len() { return Err("Truncated".into()); }
+            let v = u32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap());
+            *pos += 4; Ok(v)
+        };
+        let read_u16 = |data: &[u8], pos: &mut usize| -> Result<u16, String> {
+            if *pos + 2 > data.len() { return Err("Truncated".into()); }
+            let v = u16::from_le_bytes(data[*pos..*pos+2].try_into().unwrap());
+            *pos += 2; Ok(v)
+        };
+
+        let magic = read_u32(data, &mut pos)?;
+        if magic != 0x41444D45 { return Err(format!("Invalid magic: {:08X}", magic)); }
+        let version = read_u32(data, &mut pos)?;
+        if version != 1 { return Err(format!("Unsupported version: {}", version)); }
+        self.timestep = read_u32(data, &mut pos)?;
+        let num = read_u32(data, &mut pos)?;
+
+        for _ in 0..num {
+            let nl = read_u16(data, &mut pos)? as usize;
+            if pos + nl > data.len() { return Err("Truncated".into()); }
+            let name = String::from_utf8_lossy(&data[pos..pos+nl]).into_owned();
+            pos += nl;
+            let rows = read_u32(data, &mut pos)? as usize;
+            let cols = read_u32(data, &mut pos)? as usize;
+            let local_step = read_u32(data, &mut pos)?;
+            if pos >= data.len() { return Err("Truncated".into()); }
+            let needs_svd = data[pos] == 1; pos += 1;
+
+            let rank = self.rank;
+            let read_vec = |data: &[u8], pos: &mut usize, count: usize| -> Result<Vec<f32>, String> {
+                if *pos + count * 4 > data.len() { return Err("Truncated vec".into()); }
+                let v: Vec<f32> = (0..count).map(|i| {
+                    f32::from_le_bytes(data[*pos + i*4..*pos + i*4 + 4].try_into().unwrap())
+                }).collect();
+                *pos += count * 4;
+                Ok(v)
+            };
+
+            let projector = read_vec(data, &mut pos, rows * rank)?;
+            let momentum = read_vec(data, &mut pos, rank * cols)?;
+            let af_row = read_vec(data, &mut pos, rank)?;
+            let af_col = read_vec(data, &mut pos, cols)?;
+            let os_col = read_vec(data, &mut pos, cols)?;
+
+            if let Some(st) = self.matrices.get_mut(&name) {
+                st.projector = projector;
+                st.momentum = momentum;
+                st.af_row = af_row;
+                st.af_col = af_col;
+                st.os_col = os_col;
+                st.local_step = local_step;
+                st.needs_svd = needs_svd;
+            } else {
+                self.matrices.insert(name, AdaMeMMatrixState {
+                    rows, cols, projector, momentum, af_row, af_col, os_col,
+                    local_step, needs_svd,
+                });
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

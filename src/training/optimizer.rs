@@ -569,6 +569,15 @@ pub trait WeightOptimizer {
 
     /// Human-readable optimizer name (for logging).
     fn name(&self) -> &'static str;
+
+    /// Serialize optimizer state to bytes for checkpointing.
+    /// Returns a byte vector containing all per-matrix states (momentum, column norms, etc).
+    fn serialize_state(&self) -> Vec<u8>;
+
+    /// Deserialize optimizer state from bytes.
+    /// Restores all per-matrix states (momentum, column norms, timestep).
+    /// Returns an error if the data is invalid or incompatible.
+    fn deserialize_state(&mut self, data: &[u8]) -> crate::error::Result<()>;
 }
 
 /// Factory: create the right optimizer for a given DeviceProfile.
