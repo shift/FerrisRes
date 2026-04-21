@@ -1338,6 +1338,12 @@ async fn cmd_distill(
             };
             teacher_logits_chunks.push(logits);
 
+            // Compute frozen hidden states from teacher (same forward pass)
+            // GPU path falls through to CPU for hidden state collection
+            // (GPU forward doesn't expose per-layer states, so use CPU)
+            let frozen = teacher.forward_with_hidden_states(&chunk);
+            frozen_states_per_chunk.push(frozen);
+
             let elapsed = teacher_start.elapsed().as_secs_f32();
             let per_chunk = elapsed / (chunk_idx + 1) as f32;
             let remaining = per_chunk * (total_chunks - chunk_idx - 1) as f32;
@@ -1602,27 +1608,32 @@ async fn cmd_distill(
         );
 
         // Hidden state matching loss: MSE between teacher and student per-layer states
-        let teacher_states = &frozen_states_per_chunk[chunk_idx];
-        let student_states = student.forward_with_hidden_states(batch_tokens);
-        let hidden_mse_loss = if teacher_states.len() == student_states.len() && !teacher_states.is_empty() {
-            let _hd = config.hidden_dim;
-            let mut total_mse = 0.0f32;
-            let mut num_layers_compared = 0usize;
-            // Compare at every 5th layer to save compute
-            for layer_idx in (0..teacher_states.len()).step_by(5) {
-                let t_state = &teacher_states[layer_idx];
-                let s_state = &student_states[layer_idx];
-                if t_state.len() == s_state.len() {
-                    let mse: f32 = t_state.iter().zip(s_state.iter())
-                        .map(|(t, s)| (t - s) * (t - s))
-                        .sum::<f32>() / t_state.len() as f32;
-                    total_mse += mse;
-                    num_layers_compared += 1;
+        let (hidden_mse_loss, student_states) = if chunk_idx < frozen_states_per_chunk.len() {
+            let teacher_states = &frozen_states_per_chunk[chunk_idx];
+            let student_states = student.forward_with_hidden_states(batch_tokens);
+            let mse = if teacher_states.len() == student_states.len() && !teacher_states.is_empty() {
+                let _hd = config.hidden_dim;
+                let mut total_mse = 0.0f32;
+                let mut num_layers_compared = 0usize;
+                // Compare at every 5th layer to save compute
+                for layer_idx in (0..teacher_states.len()).step_by(5) {
+                    let t_state = &teacher_states[layer_idx];
+                    let s_state = &student_states[layer_idx];
+                    if t_state.len() == s_state.len() {
+                        let mse: f32 = t_state.iter().zip(s_state.iter())
+                            .map(|(t, s)| (t - s) * (t - s))
+                            .sum::<f32>() / t_state.len() as f32;
+                        total_mse += mse;
+                        num_layers_compared += 1;
+                    }
                 }
-            }
-            if num_layers_compared > 0 { total_mse / num_layers_compared as f32 } else { 0.0 }
+                if num_layers_compared > 0 { total_mse / num_layers_compared as f32 } else { 0.0 }
+            } else {
+                0.0
+            };
+            (mse, Some(student_states))
         } else {
-            0.0
+            (0.0, None)
         };
 
         // Combined loss: KL + 0.5 * hidden_MSE
@@ -1686,9 +1697,9 @@ async fn cmd_distill(
 
             if let Some(ref mut lora_m) = student.lora_manager {
                 // Use student_states[0] (post-embedding) as input proxy for all layers
-                let input_state = match student_states.first() {
-                    Some(s) => s.as_slice(),
-                    None => &[],
+                let input_state = match &student_states {
+                    Some(s) if !s.is_empty() => s[0].as_slice(),
+                    _ => &[],
                 };
                 let in_dim = if input_state.is_empty() { 0 } else { input_state.len() / hd };
 
@@ -1767,7 +1778,7 @@ async fn cmd_distill(
         };
 
         // Old BlockSummary backprop removed — student is now CpuBlockAttnResModel
-        let _frozen_states = &frozen_states_per_chunk[chunk_idx];
+        // Frozen states access is guarded by the chunk_idx check above
 
         let lr = learning_rate as f32;
 

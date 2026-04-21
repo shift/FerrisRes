@@ -818,8 +818,14 @@ impl CpuBlockAttnResModel {
                     },
                     _ => continue,
                 };
-                let key = format!("layer_{}.{}", layer_idx, module);
-                manager.add_adapter(layer_idx, &key, in_f, out_f);
+                if in_f == 0 || out_f == 0 {
+                    tracing::debug!(event = "lora_skip", layer_idx, module, in_f, out_f, "Skipping LoRA adapter with zero dimensions");
+                    continue;
+                }
+                let _key = format!("layer_{}.{}", layer_idx, module);
+                // is_target checks against bare module name (e.g. "q_proj"),
+                // but the key includes layer prefix. Pass bare name for matching.
+                manager.add_adapter(layer_idx, module, in_f, out_f);
             }
         }
         
