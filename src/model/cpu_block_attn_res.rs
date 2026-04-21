@@ -192,6 +192,19 @@ impl CpuBlockAttnResLayer {
         hidden: &mut Vec<f32>,
         ple_input: Option<&[f32]>,
     ) {
+        self.forward_ffn_with_routing(hidden, ple_input, None, 0);
+    }
+
+    /// FFN forward with optional MoE routing data collection.
+    /// `routing_collector`: if Some, appends MoERoutingData for this layer's MoE.
+    /// `layer_idx`: layer number for routing metadata.
+    pub fn forward_ffn_with_routing(
+        &self,
+        hidden: &mut Vec<f32>,
+        ple_input: Option<&[f32]>,
+        routing_collector: Option<&mut Vec<crate::model::cpu_moe::MoERoutingData>>,
+        layer_idx: usize,
+    ) {
         let hd = self.hidden_dim;
         let seq = hidden.len() / hd;
 
@@ -203,7 +216,11 @@ impl CpuBlockAttnResLayer {
 
         // FFN (feature 10: GELU vs SwiGLU)
         let ffn_out = if let Some(ref moe) = self.moe {
-            moe.forward(&normed2, seq)
+            if routing_collector.is_some() {
+                moe.forward_with_routing(&normed2, seq, routing_collector, layer_idx, layer_idx).0
+            } else {
+                moe.forward(&normed2, seq)
+            }
         } else {
             self.cpu_ffn(&normed2, seq)
         };
@@ -791,6 +808,155 @@ impl CpuBlockAttnResModel {
             for l in logits.iter_mut() { *l = (*l / cap).tanh() * cap; }
         }
         logits
+    }
+
+    /// Forward pass that also collects MoE routing data for loss/gradient computation.
+    /// Returns (logits, routing_data_per_moe_layer).
+    ///
+    /// This is the ONLY forward that should be used during distillation training.
+    /// It separates attention from FFN internally so routing is collected inline
+    /// — no extra forward pass, no redundant computation.
+    pub fn forward_with_routing(
+        &self,
+        token_ids: &[u32],
+    ) -> (Vec<f32>, Vec<crate::model::cpu_moe::MoERoutingData>) {
+        let seq = token_ids.len();
+        let hd = self.hidden_dim;
+        let vs = self.vocab_size;
+
+        // 1. Embedding (Gemma scales by sqrt(hidden_dim))
+        let mut hidden = vec![0.0f32; seq * hd];
+        for (t, &tid) in token_ids.iter().enumerate() {
+            let id = tid as usize;
+            if id * hd + hd <= self.embed_tokens.len() {
+                for d in 0..hd {
+                    hidden[t * hd + d] = self.embed_tokens[id * hd + d];
+                }
+            }
+        }
+        let scale = (hd as f32).sqrt();
+        for h in hidden.iter_mut() { *h *= scale; }
+
+        // 2. Pre-compute PLE inputs
+        let ple_dim = self.hidden_size_per_layer_input;
+        let ple_precomputed = self.precompute_ple(&hidden, token_ids, seq, hd, ple_dim);
+
+        // 3. Per-layer transformer — attention + FFN separated for routing collection
+        let first_shared_layer = self.num_layers.saturating_sub(self.num_kv_shared_layers);
+        let mut shared_kv: std::collections::HashMap<usize, (Vec<f32>, Vec<f32>)> = std::collections::HashMap::new();
+        let mut block_reps: Vec<Vec<f32>> = Vec::new();
+        let mut partial_sum = vec![0.0f32; hd];
+        for t in 0..seq { for d in 0..hd { partial_sum[d] += hidden[t * hd + d]; } }
+        for d in 0..hd { partial_sum[d] /= seq as f32; }
+        block_reps.push(partial_sum.clone());
+
+        let mut routing_data = Vec::new();
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let ple_slice = ple_precomputed.as_ref().map(|pre| {
+                let mut slice = vec![0.0f32; seq * ple_dim];
+                for t in 0..seq {
+                    let src = t * self.num_layers * ple_dim + layer_idx * ple_dim;
+                    let dst = t * ple_dim;
+                    for d in 0..ple_dim { slice[dst + d] = pre[src + d]; }
+                }
+                slice
+            });
+
+            let (kv, should_store) = if layer_idx >= first_shared_layer && first_shared_layer > 0 && layer.kv_shared {
+                let kv_source = Self::kv_shared_source_layer(layer_idx, first_shared_layer, &self.layers);
+                if let Some((sk, sv)) = shared_kv.get(&kv_source) {
+                    (Some((sk.as_slice(), sv.as_slice())), false)
+                } else { (None, false) }
+            } else { (None, true) };
+
+            // === Attention (always CPU) ===
+            let lora_m = self.lora_manager.as_ref();
+            let residual = hidden.clone();
+            let normed = layer.attn_norm.forward(&hidden);
+
+            let nh = layer.num_heads;
+            let nkv = layer.num_kv_heads;
+            let head_d = layer.head_dim;
+            let q_dim = nh * head_d;
+            let kv_dim_out = nkv * head_d;
+
+            // Q + LoRA
+            let mut q = layer.q_proj.forward(&normed, seq);
+            if let Some(ref lm) = lora_m {
+                if let Some(lo) = lm.forward(layer_idx, "q_proj", &normed, seq) {
+                    for (i, v) in lo.iter().enumerate() { q[i] += v; }
+                }
+            }
+            q = crate::model::gemma_mapper::per_head_rms_norm(&q, layer.q_norm.weight(), seq, nh, head_d);
+            apply_rope(&mut q, seq, nh, head_d, 0, layer.rope_theta, layer.partial_rotary_factor);
+
+            // K/V + LoRA
+            let (k, v) = match kv {
+                Some((sk, sv)) => (sk.to_vec(), sv.to_vec()),
+                None => {
+                    let mut k = layer.k_proj.forward(&normed, seq);
+                    if let Some(ref lm) = lora_m {
+                        if let Some(lo) = lm.forward(layer_idx, "k_proj", &normed, seq) {
+                            for (i, l) in lo.iter().enumerate() { k[i] += l; }
+                        }
+                    }
+                    let mut v_raw = layer.v_proj.forward(&normed, seq);
+                    if let Some(ref lm) = lora_m {
+                        if let Some(lo) = lm.forward(layer_idx, "v_proj", &normed, seq) {
+                            for (i, l) in lo.iter().enumerate() { v_raw[i] += l; }
+                        }
+                    }
+                    k = crate::model::gemma_mapper::per_head_rms_norm(&k, layer.k_norm.weight(), seq, nkv, head_d);
+                    let v = crate::model::gemma_mapper::per_head_rms_norm_no_scale(&v_raw, seq, nkv, head_d);
+                    apply_rope_gqa(&mut k, seq, nkv, head_d, 0, layer.rope_theta, layer.partial_rotary_factor);
+                    (k, v)
+                }
+            };
+
+            // Attention scores (CPU — O(seq²) but small per-head dim)
+            let mut attn_out = layer.cpu_attention(&q, &k, &v, seq, nh, nkv, head_d, q_dim, kv_dim_out);
+            // LoRA on O projection
+            if let Some(ref lm) = lora_m {
+                if let Some(lo) = lm.forward(layer_idx, "o_proj", &attn_out, seq) {
+                    for (i, l) in lo.iter().enumerate() { attn_out[i] += l; }
+                }
+            }
+            let attn_out = layer.post_attn_norm.forward(&attn_out);
+            for i in 0..hidden.len() { hidden[i] = residual[i] + attn_out[i]; }
+
+            // Store K/V for sharing
+            if should_store && first_shared_layer > 0 && !k.is_empty() {
+                shared_kv.insert(layer_idx, (k, v));
+            }
+
+            // === FFN with routing collection ===
+            layer.forward_ffn_with_routing(
+                &mut hidden,
+                ple_slice.as_ref().map(|s| s.as_slice()),
+                Some(&mut routing_data),
+                layer_idx,
+            );
+
+            // Block boundary
+            for t in 0..seq { for d in 0..hd { partial_sum[d] += hidden[t * hd + d]; } }
+            if self.is_block_boundary(layer_idx) {
+                for d in 0..hd { partial_sum[d] /= ((seq) * (self.block_config.layers_per_block)) as f32; }
+                block_reps.push(partial_sum.clone());
+                let inter_out = self.inter_block_attention(&hidden, &block_reps, seq);
+                for t in 0..seq { for d in 0..hd { hidden[t * hd + d] += inter_out[d]; } }
+                partial_sum = vec![0.0f32; hd];
+            }
+        }
+
+        // 4. Final norm + LM head
+        hidden = crate::model::gemma_mapper::rms_norm(&hidden, &self.final_norm, hd, 1e-6);
+        let mut logits = crate::model::gemma_mapper::matmul(&hidden, &self.lm_head, seq, hd, vs);
+        if let Some(cap) = self.final_logit_softcapping {
+            for l in logits.iter_mut() { *l = (*l / cap).tanh() * cap; }
+        }
+
+        (logits, routing_data)
     }
 
     /// Forward pass returning per-layer hidden states for distillation.
