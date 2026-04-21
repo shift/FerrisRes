@@ -311,6 +311,9 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> c: array<f32>;  // [K, N]
 @group(0) @binding(3) var<uniform> params: Params;
 
+var<workgroup> tile_a: array<f32, 16 * 16>;
+var<workgroup> tile_b: array<f32, 16 * 16>;
+
 @compute @workgroup_size(16, 16)
 fn matmul_ta(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let row = gid.x;  // output row = K dim
