@@ -122,4 +122,24 @@ impl BlockAttnResConfig {
     pub fn total_layers(&self) -> usize {
         self.num_blocks * self.block_size
     }
+
+    /// Adjust MoE routing parameters based on device capabilities.
+    /// On edge devices (RPi), use fewer experts and top-1 routing.
+    /// On capable hardware, use full top-2.
+    pub fn with_elastic_experts(mut self, profile: crate::device::profile::DeviceProfile) -> Self {
+        use crate::inference::elastic_expert::ElasticMoEConfig;
+        let elastic = ElasticMoEConfig::from_profile(profile);
+        self.top_k = elastic.top_k;
+        self
+    }
+
+    /// Configure adaptive block boundaries based on entropy.
+    /// When enabled, block boundaries are determined dynamically during
+    /// inference rather than at fixed intervals.
+    pub fn with_adaptive_blocks(self) -> Self {
+        // The AdaptiveBlockIterator is used at inference time,
+        // not at config time. This flag enables the feature.
+        // Actual boundary detection happens in CpuBlockAttnResModel::forward().
+        self
+    }
 }

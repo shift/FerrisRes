@@ -775,3 +775,52 @@ mod tests {
         assert!(!zpd.iter().any(|(id, _)| id == "mastered"));
     }
 }
+
+// --- Phase 19-27: PositionalUncertainty integration ---
+
+impl IntrinsicMotivation {
+    /// Feed per-position entropy from a forward pass to the
+    /// PositionalUncertaintyTracker and retrieve practice goals.
+    ///
+    /// Returns practice goals for high-uncertainty positions.
+    /// Wire this after model forward pass when logit entropy is available.
+    pub fn observe_positional_entropy(
+        &mut self,
+        entropies: &[f32],
+        tracker: &mut crate::inference::positional_uncertainty::PositionalUncertaintyTracker,
+    ) -> Vec<crate::inference::positional_uncertainty::PracticeGoal> {
+        let _seq_id = tracker.observe_sequence(entropies);
+        let mut goals = Vec::new();
+
+        // Find high-uncertainty bins
+        let num_bins = entropies.len().min(16);
+        for bin in 0..num_bins {
+            if let Some(stats) = tracker.get_stats(bin) {
+                if stats.mean_entropy > 1.5 && stats.count > 3 {
+                    let goal = crate::inference::positional_uncertainty::PracticeGoal {
+                        description: format!("Reduce entropy at position bin {}", bin),
+                        position_range: (bin, bin + 1),
+                        current_entropy: stats.mean_entropy,
+                        baseline_entropy: stats.mean_entropy * 0.7,
+                        degradation: 1.0,
+                        priority: stats.mean_entropy / 2.0,
+                    };
+                    goals.push(goal);
+                }
+            }
+        }
+
+        goals.sort_by(|a, b| b.priority.partial_cmp(&a.priority).unwrap_or(std::cmp::Ordering::Equal));
+        goals.truncate(3);
+
+        tracing::debug!(
+            event = "positional_uncertainty_observed",
+            goals = goals.len(),
+            "Observed {} positions, generated {} practice goals",
+            entropies.len(),
+            goals.len()
+        );
+
+        goals
+    }
+}
