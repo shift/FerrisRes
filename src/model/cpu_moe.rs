@@ -76,7 +76,7 @@ impl CpuMoELayer {
     /// Forward pass: route tokens to top-k experts, compute weighted output.
     /// Input: [seq, hidden_dim], Output: [seq, hidden_dim].
     pub fn forward(&self, input: &[f32], seq: usize) -> Vec<f32> {
-        self.forward_with_routing(input, seq, None, 0, 0).0
+        self.forward_with_routing(input, seq, None, 0, None).0
     }
 
     /// Forward pass that also collects routing data for loss/gradient computation.
@@ -93,7 +93,7 @@ impl CpuMoELayer {
         seq: usize,
         routing_collector: Option<&mut Vec<MoERoutingData>>,
         layer_idx: usize,
-        _lora_layer_idx: usize,
+        lora_manager: Option<&crate::training::lora::LoraManager>,
     ) -> (Vec<f32>, Option<&mut Vec<MoERoutingData>>) {
         let h = self.hidden_dim;
         let ne = self.num_experts;
@@ -121,7 +121,7 @@ impl CpuMoELayer {
                 if weight.abs() < 1e-8 { continue; }
 
                 let token = &input[t * h..(t + 1) * h];
-                let expert_out = self.expert_forward(expert_idx, token);
+                let expert_out = self.expert_forward_with_lora(expert_idx, token, lora_manager, layer_idx);
 
                 // Store expert output for routing collector
                 if !expert_outputs.is_empty() {
@@ -197,26 +197,49 @@ impl CpuMoELayer {
         (selected, weights, all_probs)
     }
 
-    /// Single expert forward: activation(gate(x)) * up(x) → down.
-    fn expert_forward(&self, expert_idx: usize, token: &[f32]) -> Vec<f32> {
+    /// Single expert forward with optional LoRA adapters on gate/up/down.
+    /// `lora_manager`: if Some, apply LoRA deltas to expert projections.
+    /// `layer_idx`: layer number for LoRA lookup.
+    ///
+    /// LoRA target names: "moe.expert.{e}.gate", "moe.expert.{e}.up", "moe.expert.{e}.down"
+    fn expert_forward_with_lora(
+        &self,
+        expert_idx: usize,
+        token: &[f32],
+        lora_manager: Option<&crate::training::lora::LoraManager>,
+        layer_idx: usize,
+    ) -> Vec<f32> {
         let h = self.hidden_dim;
         let id = self.intermediate_dim;
-        let gate = &self.expert_gate[expert_idx]; // [id * h] stored as [h, id] for matmul
-        let up = &self.expert_up[expert_idx];     // [id * h] stored as [h, id] for matmul
-        let down = &self.expert_down[expert_idx]; // [h * id] stored as [id, h] for matmul
+        let gate = &self.expert_gate[expert_idx];
+        let up = &self.expert_up[expert_idx];
+        let down = &self.expert_down[expert_idx];
 
         // gate projection: [1, h] @ [h, id] = [1, id]
-        let gated = matmul(token, gate, 1, h, id);
+        let mut gated = matmul(token, gate, 1, h, id);
+        // Apply LoRA to gate
+        if let Some(lm) = lora_manager {
+            let name = format!("moe.expert.{}.gate", expert_idx);
+            if let Some(lo) = lm.forward(layer_idx, &name, token, 1) {
+                for (i, v) in lo.iter().enumerate() { gated[i] += v; }
+            }
+        }
         // Apply activation
         let gated: Vec<f32> = if self.use_gelu {
             gated.iter().map(|&x| crate::model::gemma_mapper::gelu_tanh(x)).collect()
         } else {
-            // SwiGLU: silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
             gated.iter().map(|&x| x / (1.0 + (-x).exp())).collect()
         };
 
         // up projection: [1, h] @ [h, id] = [1, id]
-        let upped = matmul(token, up, 1, h, id);
+        let mut upped = matmul(token, up, 1, h, id);
+        // Apply LoRA to up
+        if let Some(lm) = lora_manager {
+            let name = format!("moe.expert.{}.up", expert_idx);
+            if let Some(lo) = lm.forward(layer_idx, &name, token, 1) {
+                for (i, v) in lo.iter().enumerate() { upped[i] += v; }
+            }
+        }
 
         // Element-wise multiply
         let mut combined = vec![0.0; id];
@@ -225,7 +248,16 @@ impl CpuMoELayer {
         }
 
         // down projection: [1, id] @ [id, h] = [1, h]
-        matmul(&combined, down, 1, id, h)
+        let mut down_out = matmul(&combined, down, 1, id, h);
+        // Apply LoRA to down
+        if let Some(lm) = lora_manager {
+            let name = format!("moe.expert.{}.down", expert_idx);
+            if let Some(lo) = lm.forward(layer_idx, &name, &combined, 1) {
+                for (i, v) in lo.iter().enumerate() { down_out[i] += v; }
+            }
+        }
+
+        down_out
     }
 }
 

@@ -1440,7 +1440,11 @@ async fn cmd_distill(
     info!(event = "moe_conversion", moe_layers = moe_layers, total_layers = student.layers.len(), "Converted dense FFN to MoE (4 experts, top-2)");
 
     // Attach LoRA adapters for training (rank 8, q_proj + v_proj)
-    let lora_config = ferrisres::training::lora::LoraConfig::targeting(8, vec!["q_proj", "k_proj", "v_proj", "o_proj"]);
+    // Attention LoRA rank 8, expert FFN LoRA rank 4 (via separate config)
+    let lora_config = ferrisres::training::lora::LoraConfig::targeting(8, vec![
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "moe.expert.*",  // wildcard: matches all expert gate/up/down
+    ]);
     student.attach_lora(lora_config);
     info!(event = "lora_attached", "LoRA adapters attached to student model");
 

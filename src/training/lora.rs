@@ -57,8 +57,16 @@ impl LoraConfig {
     }
 
     /// Check if a module name is a LoRA target.
+    /// Supports exact match and wildcard prefix: if target is "moe.expert.*",
+    /// it matches any module starting with "moe.expert.".
     pub fn is_target(&self, module_name: &str) -> bool {
-        self.target_modules.iter().any(|m| m == module_name)
+        self.target_modules.iter().any(|m| {
+            if m.ends_with('*') {
+                module_name.starts_with(&m[..m.len()-1])
+            } else {
+                m == module_name
+            }
+        })
     }
 }
 

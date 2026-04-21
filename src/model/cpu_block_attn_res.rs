@@ -192,7 +192,7 @@ impl CpuBlockAttnResLayer {
         hidden: &mut Vec<f32>,
         ple_input: Option<&[f32]>,
     ) {
-        self.forward_ffn_with_routing(hidden, ple_input, None, 0);
+        self.forward_ffn_with_routing(hidden, ple_input, None, 0, None);
     }
 
     /// FFN forward with optional MoE routing data collection.
@@ -204,6 +204,7 @@ impl CpuBlockAttnResLayer {
         ple_input: Option<&[f32]>,
         routing_collector: Option<&mut Vec<crate::model::cpu_moe::MoERoutingData>>,
         layer_idx: usize,
+        lora_manager: Option<&crate::training::lora::LoraManager>,
     ) {
         let hd = self.hidden_dim;
         let seq = hidden.len() / hd;
@@ -216,8 +217,8 @@ impl CpuBlockAttnResLayer {
 
         // FFN (feature 10: GELU vs SwiGLU)
         let ffn_out = if let Some(ref moe) = self.moe {
-            if routing_collector.is_some() {
-                moe.forward_with_routing(&normed2, seq, routing_collector, layer_idx, layer_idx).0
+            if routing_collector.is_some() || lora_manager.is_some() {
+                moe.forward_with_routing(&normed2, seq, routing_collector, layer_idx, lora_manager).0
             } else {
                 moe.forward(&normed2, seq)
             }
@@ -936,6 +937,7 @@ impl CpuBlockAttnResModel {
                 ple_slice.as_ref().map(|s| s.as_slice()),
                 Some(&mut routing_data),
                 layer_idx,
+                self.lora_manager.as_ref(),
             );
 
             // Block boundary
@@ -1190,9 +1192,10 @@ impl CpuBlockAttnResModel {
         let mut manager = crate::training::lora::LoraManager::new(config);
         
         // Auto-populate adapters for each layer's target modules
-        let targets = ["q_proj", "k_proj", "v_proj", "o_proj", "ple_gate"];
+        let attention_targets = ["q_proj", "k_proj", "v_proj", "o_proj", "ple_gate"];
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            for &module in &targets {
+            // Attention + PLE targets
+            for &module in &attention_targets {
                 let (in_f, out_f) = match module {
                     "q_proj" => (layer.hidden_dim, layer.q_proj.out_features()),
                     "k_proj" => (layer.hidden_dim, layer.k_proj.out_features()),
@@ -1209,10 +1212,21 @@ impl CpuBlockAttnResModel {
                     tracing::debug!(event = "lora_skip", layer_idx, module, in_f, out_f, "Skipping LoRA adapter with zero dimensions");
                     continue;
                 }
-                let _key = format!("layer_{}.{}", layer_idx, module);
-                // is_target checks against bare module name (e.g. "q_proj"),
-                // but the key includes layer prefix. Pass bare name for matching.
                 manager.add_adapter(layer_idx, module, in_f, out_f);
+            }
+
+            // Expert FFN LoRA (rank 4 — lower than attention's rank 8 to save memory)
+            if let Some(ref moe) = layer.moe {
+                for e in 0..moe.num_experts {
+                    let hd = layer.hidden_dim;
+                    let id = moe.intermediate_dim;
+                    // gate: [hd, id] — input=hd, output=id
+                    manager.add_adapter(layer_idx, &format!("moe.expert.{}.gate", e), hd, id);
+                    // up: [hd, id] — input=hd, output=id
+                    manager.add_adapter(layer_idx, &format!("moe.expert.{}.up", e), hd, id);
+                    // down: [id, hd] — input=id, output=hd
+                    manager.add_adapter(layer_idx, &format!("moe.expert.{}.down", e), id, hd);
+                }
             }
         }
         
