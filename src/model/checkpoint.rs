@@ -315,6 +315,165 @@ pub fn save_model(model: &CpuBlockAttnResModel, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Load a complete Block-MoE-Res model from disk.
+///
+/// Reads:
+/// - `{path}.safetensors` — model weights
+/// - `{path}.json` — model configuration
+pub fn load_model(path: &str) -> Result<CpuBlockAttnResModel> {
+    use crate::model::safetensors::MmapedSafetensors;
+    use crate::model::cpu_linear::{CpuLinear, CpuRmsNorm};
+    use crate::model::cpu_moe::CpuMoELayer;
+    use crate::model::cpu_block_attn_res::{CpuBlockAttnResLayer, BlockConfig};
+
+    let st_path = format!("{}.safetensors", path);
+    let json_path = format!("{}.json", path);
+
+    // Read config
+    let config_json = std::fs::read_to_string(&json_path)
+        .map_err(|e| FerrisResError::Shape(format!("Failed to read config {}: {}", json_path, e)))?;
+    let config: BlockMoeResConfig = serde_json::from_str(&config_json)
+        .map_err(|e| FerrisResError::Shape(format!("Failed to parse config: {}", e)))?;
+
+    // Mmap safetensors
+    let mmap = MmapedSafetensors::open(Path::new(&st_path))
+        .map_err(|e| FerrisResError::Shape(format!("Failed to open {}: {:?}", st_path, e)))?;
+
+    // Helper: load tensor as Vec<f32>
+    let load = |name: &str| -> Result<Vec<f32>> {
+        mmap.get_tensor_f32(name)
+            .map_err(|e| FerrisResError::Shape(format!("Tensor '{}' not found: {:?}", name, e)))
+    };
+
+    // Helper: try loading a tensor (returns None if not found)
+    let try_load = |name: &str| -> Option<Vec<f32>> {
+        mmap.get_tensor_f32(name).ok()
+    };
+
+    // Embedding
+    let embed_tokens = load("embed_tokens")?;
+    let lm_head = load("lm_head")?;
+    let final_norm = load("final_norm")?;
+
+    // Block config
+    let attn_res_proj = load("block_config.attn_res_proj")?;
+    let attn_res_norm = load("block_config.attn_res_norm")?;
+
+    // PLE model-level
+    let ple_model_projection = try_load("ple_model_projection");
+    let ple_projection_norm = try_load("ple_projection_norm");
+
+    // Per-layer
+    let mut layers = Vec::with_capacity(config.num_layers);
+    for (i, lc) in config.layer_configs.iter().enumerate() {
+        let pfx = format!("layers.{}", i);
+
+        let q_proj = CpuLinear::from_weight(load(&format!("{}.q_proj", pfx))?, config.hidden_dim, config.num_heads * config.head_dim);
+        let k_proj = CpuLinear::from_weight(load(&format!("{}.k_proj", pfx))?, config.hidden_dim, config.num_kv_heads * config.head_dim);
+        let v_proj = CpuLinear::from_weight(load(&format!("{}.v_proj", pfx))?, config.hidden_dim, config.num_kv_heads * config.head_dim);
+        let out_proj = CpuLinear::from_weight(load(&format!("{}.out_proj", pfx))?, config.num_heads * config.head_dim, config.hidden_dim);
+
+        let attn_norm = CpuRmsNorm::from_weight(load(&format!("{}.attn_norm", pfx))?, 1e-6);
+        let post_attn_norm = CpuRmsNorm::from_weight(load(&format!("{}.post_attn_norm", pfx))?, 1e-6);
+        let pre_ffn_norm = CpuRmsNorm::from_weight(load(&format!("{}.pre_ffn_norm", pfx))?, 1e-6);
+        let post_ffn_norm = CpuRmsNorm::from_weight(load(&format!("{}.post_ffn_norm", pfx))?, 1e-6);
+
+        let q_norm = CpuRmsNorm::from_weight(load(&format!("{}.q_norm", pfx))?, 1e-6);
+        let k_norm = CpuRmsNorm::from_weight(load(&format!("{}.k_norm", pfx))?, 1e-6);
+        // v_norm — may not be stored, create default
+        let v_norm_data = mmap.get_tensor_f32(&format!("{}.v_norm", pfx))
+            .unwrap_or_else(|_| vec![1.0f32; config.num_kv_heads * config.head_dim]);
+        let v_norm = CpuRmsNorm::from_weight(v_norm_data, 1e-6);
+
+        // MoE or dense FFN
+        let moe = if lc.has_moe {
+            let gate_weights = load(&format!("{}.moe.router", pfx))?;
+            let mut expert_gate = Vec::with_capacity(lc.num_experts);
+            let mut expert_up = Vec::with_capacity(lc.num_experts);
+            let mut expert_down = Vec::with_capacity(lc.num_experts);
+            for e in 0..lc.num_experts {
+                expert_gate.push(load(&format!("{}.moe.expert.{}.gate", pfx, e))?);
+                expert_up.push(load(&format!("{}.moe.expert.{}.up", pfx, e))?);
+                expert_down.push(load(&format!("{}.moe.expert.{}.down", pfx, e))?);
+            }
+            Some(CpuMoELayer {
+                gate_weights,
+                expert_gate,
+                expert_up,
+                expert_down,
+                num_experts: lc.num_experts,
+                top_k: lc.top_k,
+                intermediate_dim: lc.inter_dim,
+                hidden_dim: config.hidden_dim,
+                use_gelu: lc.use_gelu,
+            })
+        } else {
+            None
+        };
+
+        let ffn_gate = if !lc.has_moe { try_load(&format!("{}.ffn_gate", pfx)).map(|w| CpuLinear::from_weight(w, config.hidden_dim, lc.inter_dim)) } else { None };
+        let ffn_up = if !lc.has_moe { try_load(&format!("{}.ffn_up", pfx)).map(|w| CpuLinear::from_weight(w, config.hidden_dim, lc.inter_dim)) } else { None };
+        let ffn_down = if !lc.has_moe { try_load(&format!("{}.ffn_down", pfx)).map(|w| CpuLinear::from_weight(w, lc.inter_dim, config.hidden_dim)) } else { None };
+
+        // PLE
+        let ple_input_gate = try_load(&format!("{}.ple_gate", pfx)).map(|w| CpuLinear::from_weight(w, config.hidden_dim, config.hidden_size_per_layer_input));
+        let ple_projection = try_load(&format!("{}.ple_proj", pfx)).map(|w| CpuLinear::from_weight(w, config.hidden_size_per_layer_input, config.hidden_dim));
+        let ple_post_norm = try_load(&format!("{}.ple_norm", pfx)).map(|w| CpuRmsNorm::from_weight(w, 1e-6));
+
+        layers.push(CpuBlockAttnResLayer {
+            layer_number: i,
+            hidden_dim: config.hidden_dim,
+            num_heads: config.num_heads,
+            num_kv_heads: config.num_kv_heads,
+            head_dim: config.head_dim,
+            intermediate_dim: lc.inter_dim,
+            attn_norm, q_proj, k_proj, v_proj, out_proj,
+            q_norm, k_norm, v_norm,
+            post_attn_norm,
+            pre_ffn_norm, ffn_gate, ffn_up, ffn_down, moe, post_ffn_norm,
+            layer_scalar: lc.layer_scalar,
+            ple_input_gate, ple_projection, ple_post_norm,
+            rope_theta: lc.rope_theta,
+            partial_rotary_factor: lc.partial_rotary_factor,
+            use_gelu: lc.use_gelu,
+            kv_shared: lc.kv_shared,
+        });
+    }
+
+    let model = CpuBlockAttnResModel {
+        embed_tokens,
+        lm_head,
+        final_norm,
+        hidden_dim: config.hidden_dim,
+        vocab_size: config.vocab_size,
+        num_layers: config.num_layers,
+        final_logit_softcapping: config.final_logit_softcapping,
+        hidden_size_per_layer_input: config.hidden_size_per_layer_input,
+        num_kv_shared_layers: config.num_kv_shared_layers,
+        block_config: BlockConfig {
+            num_blocks: config.num_blocks,
+            layers_per_block: config.layers_per_block,
+            boundary_layers: config.boundary_layers,
+            attn_res_proj,
+            attn_res_norm,
+        },
+        layers,
+        ple_model_projection,
+        ple_projection_norm,
+        embed_tokens_per_layer: None,
+        lora_manager: None,
+    };
+
+    tracing::info!(
+        event = "checkpoint_loaded",
+        path = %st_path,
+        layers = model.num_layers,
+        "Block-MoE-Res model loaded"
+    );
+
+    Ok(model)
+}
+
 /// Extract serializable config from model.
 fn serialize_config(model: &CpuBlockAttnResModel) -> BlockMoeResConfig {
     let layer_configs: Vec<LayerConfig> = model.layers.iter().map(|layer| {
