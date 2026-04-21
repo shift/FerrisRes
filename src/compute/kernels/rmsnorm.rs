@@ -5,7 +5,7 @@ use wgpu::{
 use crate::compute::GpuBuffer;
 use crate::error::{FerrisResError, Result};
 
-const RMSNORM_WGSL: &str = r#"
+pub const RMSNORM_WGSL: &str = r#"
 struct Params {
     hidden_dim: u32,
     rows: u32,
@@ -65,7 +65,7 @@ fn rmsnorm_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_in
 ///
 /// Inputs: grad_output [rows, hidden], input_x [rows, hidden]
 /// Output: grad_input [rows, hidden]
-const RMSNORM_BACKWARD_WGSL: &str = r#"
+pub const RMSNORM_BACKWARD_WGSL: &str = r#"
 struct Params {
     hidden_dim: u32,
     rows: u32,

@@ -14,7 +14,7 @@ use crate::error::Result;
 /// Each invocation handles one (query_pos, head) pair.
 /// The kernel applies causal masking (positions after the query get -inf),
 /// online softmax (numerically stable), and produces the weighted V sum.
-const PREFILL_ATTN_WGSL: &str = r#"
+pub const PREFILL_ATTN_WGSL: &str = r#"
     struct Params {
         seq_len:  u32,
         num_heads: u32,

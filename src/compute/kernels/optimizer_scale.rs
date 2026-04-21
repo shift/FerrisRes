@@ -17,7 +17,7 @@ use crate::error::Result;
 /// Compute column norms: for each column j, compute sqrt(Σ_i g_ij²).
 /// Input: gradient [rows × cols] f32
 /// Output: column_norms [cols] f32
-const COLUMN_NORMS_WGSL: &str = r#"
+pub const COLUMN_NORMS_WGSL: &str = r#"
     struct Params {
         rows: u32,
         cols: u32,
@@ -46,7 +46,7 @@ const COLUMN_NORMS_WGSL: &str = r#"
 /// Scale update: W -= lr * g / max(column_norm, epsilon)
 /// Input: weights [rows × cols], gradient [rows × cols], column_norms [cols]
 /// Output: weights updated in-place
-const SCALE_UPDATE_WGSL: &str = r#"
+pub const SCALE_UPDATE_WGSL: &str = r#"
     struct Params {
         rows: u32,
         cols: u32,
@@ -80,7 +80,7 @@ const SCALE_UPDATE_WGSL: &str = r#"
 /// Momentum update: m = β₁ * m + g (for output layers only)
 /// Input: momentum [rows × cols], gradient [rows × cols]
 /// Output: momentum updated in-place
-const SCALE_MOMENTUM_WGSL: &str = r#"
+pub const SCALE_MOMENTUM_WGSL: &str = r#"
     struct Params {
         total: u32,
         beta1: u32,        // bitcast<f32>

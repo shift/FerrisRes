@@ -3,7 +3,7 @@ use wgpu::{Device, Queue, BufferDescriptor, BufferUsages, BindGroupLayoutEntry, 
 use crate::compute::GpuBuffer;
 use crate::error::Result;
 
-const SOFTMAX_WGSL: &str = r#"
+pub const SOFTMAX_WGSL: &str = r#"
 struct Params {
     cols: u32,
 }
@@ -83,7 +83,7 @@ fn softmax_main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation
 
 /// Immediate-data variant: params via var<immediate> instead of uniform buffer.
 /// Uses only 2 bindings (input, output) + immediate data for cols.
-const SOFTMAX_IMMEDIATE_WGSL: &str = r#"
+pub const SOFTMAX_IMMEDIATE_WGSL: &str = r#"
 struct Params {
     cols: u32,
 }
@@ -161,7 +161,7 @@ fn softmax_main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation
 
 "#;
 
-const SOFTMAX_BACKWARD_WGSL: &str = r#"
+pub const SOFTMAX_BACKWARD_WGSL: &str = r#"
 struct Params {
     rows: u32,
     cols: u32,

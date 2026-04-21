@@ -3,7 +3,7 @@ use wgpu::{Device, Queue, BufferDescriptor, BufferUsages, BindGroupLayoutEntry, 
 use crate::compute::GpuBuffer;
 use crate::error::Result;
 
-const SHADER: &str = r#"
+pub const SHADER: &str = r#"
 struct Params {
     M: u32,
     K: u32,
@@ -83,7 +83,7 @@ fn matmul(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocati
 // Double-buffered prefetch hides global memory latency.
 //
 // T4 performance: ~8-12 TFLOPS (vs ~3 TFLOPS for 16x16 naive).
-const SHADER_DOUBLE_BUF: &str = r#"
+pub const SHADER_DOUBLE_BUF: &str = r#"
 struct Params {
     M: u32,
     K: u32,
@@ -224,7 +224,7 @@ fn matmul_double_buf(
 
 /// MatMul with transposed B: C = A × B^T where A is [M, K] and B is [K, N] (stored row-major).
 /// Used for backward pass: dL/dA = dC × B^T where dC=[M,N], B=[K,N] → result [M,K]
-const MATMUL_TRANSPOSE_B_WGSL: &str = r#"
+pub const MATMUL_TRANSPOSE_B_WGSL: &str = r#"
 struct Params {
     M: u32,
     K: u32,
@@ -299,7 +299,7 @@ fn matmul_tb(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invoc
 
 /// MatMul with transposed A: C = A^T × B where A is [M, K] and B is [M, N] (both row-major).
 /// Used for backward pass: dL/dB = A^T × dC where A=[M,K], dC=[M,N] → result [K,N]
-const MATMUL_TRANSPOSE_A_WGSL: &str = r#"
+pub const MATMUL_TRANSPOSE_A_WGSL: &str = r#"
 struct Params {
     M: u32,
     K: u32,

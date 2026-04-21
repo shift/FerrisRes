@@ -3,7 +3,7 @@ use wgpu::{Device, Queue, BufferDescriptor, BufferUsages, BindGroupLayoutEntry, 
 use crate::compute::GpuBuffer;
 use crate::error::Result;
 
-const ELEMENTWISE_WGSL: &str = r#"
+pub const ELEMENTWISE_WGSL: &str = r#"
 @group(0) @binding(0) var<storage, read> ew_a: array<f32>;
 @group(0) @binding(1) var<storage, read> ew_b: array<f32>;
 @group(0) @binding(2) var<storage, read_write> ew_c: array<f32>;

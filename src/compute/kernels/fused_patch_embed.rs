@@ -36,7 +36,7 @@ use crate::error::Result;
 //   row  = patch_idx row of the virtual im2col matrix (P*P*C pixels)
 //   col  = embed_idx column of the weight matrix [P*P*C, D]
 // ---------------------------------------------------------------------------
-const FUSED_PATCH_EMBED_WGSL: &str = r#"
+pub const FUSED_PATCH_EMBED_WGSL: &str = r#"
 struct Params {
     height:    u32,   // image H (pixels)
     width:     u32,   // image W (pixels)

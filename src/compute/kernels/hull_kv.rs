@@ -11,7 +11,7 @@
 /// WGSL kernel for 2D projection: hidden states → 2D points.
 /// Input: hidden [seq, hidden_dim], proj_x [hidden_dim], proj_y [hidden_dim]
 /// Output: points [seq, 2] (x, y coordinates)
-const HULL_PROJECT_2D_WGSL: &str = r#"
+pub const HULL_PROJECT_2D_WGSL: &str = r#"
     struct Params {
         seq_len: u32,
         hidden_dim: u32,
@@ -46,7 +46,7 @@ const HULL_PROJECT_2D_WGSL: &str = r#"
 /// Input: query_point [2], hull_vertices [hull_size, 2]
 /// Output: nearest_index [1], nearest_weight [1]
 #[allow(dead_code)]
-const HULL_SEARCH_WGSL: &str = r#"
+pub const HULL_SEARCH_WGSL: &str = r#"
     struct Params {
         hull_size: u32,
     }

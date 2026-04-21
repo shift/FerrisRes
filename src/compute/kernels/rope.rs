@@ -3,7 +3,7 @@ use wgpu::{Device, BufferDescriptor, BufferUsages, BindGroupLayoutEntry, ShaderS
 use crate::compute::GpuBuffer;
 use crate::error::Result;
 
-const ROPE_WGSL: &str = r#"
+pub const ROPE_WGSL: &str = r#"
 struct Params {
     seq_len: u32,
     num_heads: u32,
@@ -64,7 +64,7 @@ fn rope_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 /// In-place RoPE: reads and writes the same buffer.
 /// Each invocation only accesses its own pair of elements, so there's no hazard.
-const ROPE_INPLACE_WGSL: &str = r#"
+pub const ROPE_INPLACE_WGSL: &str = r#"
 struct Params {
     seq_len: u32,
     num_heads: u32,
@@ -123,7 +123,7 @@ fn rope_inplace_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// Params: seq_len, num_heads, head_dim, start_pos, base_theta(f32 bits), scale_factor(f32 bits),
 ///         low_freq_factor(f32 bits), high_freq_factor(f32 bits)
 /// Total: 8 u32s = 32 bytes
-const YARN_ROPE_WGSL: &str = r#"
+pub const YARN_ROPE_WGSL: &str = r#"
 struct YarnParams {
     seq_len: u32,
     num_heads: u32,
@@ -183,9 +183,9 @@ fn yarn_rope_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         scaled_freq = freq / params.scale_factor;
     } else {
         // Smooth interpolation between high and low
-        let smooth = (wavelength - low_freq_wavelength) / (high_freq_wavelength - low_freq_wavelength);
-        // Mix: (1-smooth) * original + smooth * scaled
-        scaled_freq = (1.0 - smooth) * freq + smooth * (freq / params.scale_factor);
+        let blend_factor = (wavelength - low_freq_wavelength) / (high_freq_wavelength - low_freq_wavelength);
+        // Mix: (1-blend_factor) * original + blend_factor * scaled
+        scaled_freq = (1.0 - blend_factor) * freq + blend_factor * (freq / params.scale_factor);
     }
 
     let theta = f32(pos) * scaled_freq;
@@ -210,7 +210,7 @@ fn yarn_rope_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// RoPE backward: transposed rotation (negate sin).
 /// Since RoPE applies orthogonal rotation, dL/dx = R^T × dL/dy where R^T negates sin.
 /// Uses the same Cody-Waite range reduction as forward.
-const ROPE_BACKWARD_WGSL: &str = r#"
+pub const ROPE_BACKWARD_WGSL: &str = r#"
 struct Params {
     seq_len: u32,
     num_heads: u32,

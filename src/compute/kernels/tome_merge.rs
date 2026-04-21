@@ -23,7 +23,7 @@ use wgpu::{
 use crate::compute::GpuBuffer;
 use crate::error::Result;
 
-const TOME_MERGE_WGSL: &str = r#"
+pub const TOME_MERGE_WGSL: &str = r#"
 struct Params {
     n_out:   u32,   // number of output tokens (after merging)
     dim:     u32,   // token embedding dimension (hidden_dim)

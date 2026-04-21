@@ -26,7 +26,7 @@ const PATTERN_LUT: [(usize, usize); 6] = [
     (2, 3), // pattern 5: positions 2,3
 ];
 
-const SPARSE_TERNARY_MATMUL_WGSL: &str = r#"
+pub const SPARSE_TERNARY_MATMUL_WGSL: &str = r#"
     struct Params {
         seq_len: u32,
         in_cols: u32,

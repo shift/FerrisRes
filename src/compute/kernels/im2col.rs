@@ -3,7 +3,7 @@ use wgpu::{Device, Queue, BufferDescriptor, BufferUsages, BindGroupLayoutEntry, 
 use crate::compute::GpuBuffer;
 use crate::error::Result;
 
-const IM2COL_WGSL: &str = r#"
+pub const IM2COL_WGSL: &str = r#"
 struct Params {
     height: u32,
     width: u32,

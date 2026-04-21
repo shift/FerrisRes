@@ -21,7 +21,7 @@ use crate::error::Result;
 // ========================================================================
 
 /// RMSNorm with learned weight: output[i] = input[i] * inv_rms * weight[i]
-const RMSNORM_WEIGHTED_WGSL: &str = r#"
+pub const RMSNORM_WEIGHTED_WGSL: &str = r#"
 struct Params {
     hidden_dim: u32,
     rows: u32,
@@ -77,7 +77,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
 
 /// SiLU activation followed by elementwise multiply: silu(x) * y
 /// Used for SwiGLU: gate_proj output is SiLU'd, then multiplied by up_proj output.
-const SILU_MULTIPLY_WGSL: &str = r#"
+pub const SILU_MULTIPLY_WGSL: &str = r#"
 struct Params {
     n: u32,
 }
@@ -98,7 +98,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 /// Elementwise residual add: output = a + b
-const RESIDUAL_ADD_WGSL: &str = r#"
+pub const RESIDUAL_ADD_WGSL: &str = r#"
 struct Params {
     n: u32,
 }
@@ -118,7 +118,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 /// Embedding gather: token_ids → hidden states, scaled by sqrt(hidden_dim)
 /// Each invocation handles one (token, dim) pair.
-const EMBEDDING_GATHER_WGSL: &str = r#"
+pub const EMBEDDING_GATHER_WGSL: &str = r#"
 struct Params {
     seq_len: u32,
     hidden_dim: u32,
@@ -156,7 +156,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// Q: [seq × num_heads × head_dim], K: [seq × num_kv_heads × head_dim], V: same as K
 /// Output: [seq × num_heads × head_dim]
 /// Uses online softmax for numerical stability.
-const CAUSAL_ATTENTION_GQA_WGSL: &str = r#"
+pub const CAUSAL_ATTENTION_GQA_WGSL: &str = r#"
 struct Params {
     seq_len: u32,
     num_heads: u32,
@@ -235,7 +235,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 /// RoPE (Rotary Position Embeddings) applied to Q or K.
 /// Each invocation handles one (token, head, dim_pair).
-const ROPE_WGSL: &str = r#"
+pub const ROPE_WGSL: &str = r#"
 struct Params {
     seq_len: u32,
     num_heads: u32,

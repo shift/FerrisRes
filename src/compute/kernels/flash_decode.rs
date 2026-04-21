@@ -6,7 +6,7 @@ use wgpu::{
 use crate::compute::GpuBuffer;
 use crate::error::Result;
 
-const FLASH_DECODE_WGSL: &str = r#"
+pub const FLASH_DECODE_WGSL: &str = r#"
     struct Params {
         seq_len: u32,
         num_heads: u32,
@@ -280,7 +280,7 @@ pub fn dispatch_flash_decode(
 // Task: f4c0a839 — see papers_research/flashattn3_async_wgsl_research.md
 // ---------------------------------------------------------------------------
 
-const FLASH_DECODE_TILED_WGSL: &str = r#"
+pub const FLASH_DECODE_TILED_WGSL: &str = r#"
     struct Params {
         seq_len:   u32,
         num_heads: u32,
@@ -563,7 +563,7 @@ impl FlashDecodeTiledOp {
 /// Requires: Features::SUBGROUPS
 /// Speedup: ~2x on desktop GPUs (Intel, NVIDIA, AMD) and Apple Metal.
 #[allow(dead_code)]
-const FLASH_DECODE_SUBGROUP_WGSL: &str = r#"
+pub const FLASH_DECODE_SUBGROUP_WGSL: &str = r#"
     struct Params {
         seq_len: u32,
         num_heads: u32,

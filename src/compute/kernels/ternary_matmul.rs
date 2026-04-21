@@ -15,7 +15,7 @@ use wgpu::{Device, Queue, CommandEncoder, BindGroupLayoutEntry, ShaderStages, Bi
 use crate::compute::GpuBuffer;
 use crate::error::Result;
 
-const TERNARY_MATMUL_WGSL: &str = r#"
+pub const TERNARY_MATMUL_WGSL: &str = r#"
     struct Params {
         seq_len: u32,
         in_cols: u32,

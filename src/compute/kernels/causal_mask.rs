@@ -5,7 +5,7 @@ use wgpu::{
 use crate::compute::GpuBuffer;
 use crate::error::Result;
 
-const CAUSAL_MASK_WGSL: &str = r#"
+pub const CAUSAL_MASK_WGSL: &str = r#"
 struct Params {
     rows: u32,
     cols: u32,

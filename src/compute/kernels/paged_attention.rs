@@ -24,7 +24,7 @@ pub const BLOCK_SIZE: u32 = 16;
 ///   weights × V [heads, seq_len, head_dim] → output [heads, head_dim]
 ///
 /// With block table indirection for K and V access.
-const PAGED_ATTENTION_DECODE_WGSL: &str = r#"
+pub const PAGED_ATTENTION_DECODE_WGSL: &str = r#"
     struct Params {
         num_heads: u32,
         head_dim: u32,
