@@ -386,9 +386,11 @@ impl CpuBlockAttnResLayer {
 
         let q_dim = nh * head_d;
         let kv_dim = nkv * head_d;
-        let mut attn_out = self.cpu_attention(&q, &k, &v, seq, nh, nkv, head_d, q_dim, kv_dim);
-        // LoRA on output projection
-        if let Some(lora_out) = lora_m.forward(layer_idx, "o_proj", &attn_out, seq) {
+        // Raw attention output (before out_proj) — LoRA needs the same input as the base weight
+        let attn_raw = self.cpu_attention_raw(&q, &k, &v, seq, nh, nkv, head_d, q_dim, kv_dim);
+        // Apply out_proj + LoRA on O projection
+        let mut attn_out = self.out_proj.forward(&attn_raw, seq);
+        if let Some(lora_out) = lora_m.forward(layer_idx, "o_proj", &attn_raw, seq) {
             for (i, l) in lora_out.iter().enumerate() { attn_out[i] += l; }
         }
         let attn_out = self.post_attn_norm.forward(&attn_out);
@@ -403,7 +405,10 @@ impl CpuBlockAttnResLayer {
 
     /// CPU causal self-attention with GQA.
     /// scale = 1.0 (after per-head RMSNorm, no 1/sqrt(d) needed).
-    pub fn cpu_attention(
+    /// Raw attention computation (before output projection).
+    /// Returns [seq × q_dim] — the concatenation of all head outputs.
+    /// Use `out_proj.forward(result, seq)` to get the final attention output.
+    pub fn cpu_attention_raw(
         &self,
         q: &[f32],
         k: &[f32],
@@ -449,7 +454,24 @@ impl CpuBlockAttnResLayer {
             }
         }
 
-        // Output projection
+        attn_out
+    }
+
+    /// Full attention computation including output projection.
+    /// Returns [seq × hidden_dim].
+    pub fn cpu_attention(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        q_dim: usize,
+        kv_dim: usize,
+    ) -> Vec<f32> {
+        let attn_out = self.cpu_attention_raw(q, k, v, seq, num_heads, num_kv_heads, head_dim, q_dim, kv_dim);
         self.out_proj.forward(&attn_out, seq)
     }
 
@@ -964,10 +986,12 @@ impl CpuBlockAttnResModel {
             };
 
             // Attention scores (CPU — O(seq²) but small per-head dim)
-            let mut attn_out = layer.cpu_attention(&q, &k, &v, seq, nh, nkv, head_d, q_dim, kv_dim_out);
+            // Raw attention (before out_proj) — LoRA on O needs same input as base weight
+            let attn_raw = layer.cpu_attention_raw(&q, &k, &v, seq, nh, nkv, head_d, q_dim, kv_dim_out);
+            let mut attn_out = layer.out_proj.forward(&attn_raw, seq);
             // LoRA on O projection
             if let Some(ref lm) = lora_m {
-                if let Some(lo) = lm.forward(layer_idx, "o_proj", &attn_out, seq) {
+                if let Some(lo) = lm.forward(layer_idx, "o_proj", &attn_raw, seq) {
                     for (i, l) in lo.iter().enumerate() { attn_out[i] += l; }
                 }
             }

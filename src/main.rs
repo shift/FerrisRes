@@ -1434,10 +1434,47 @@ async fn cmd_distill(
     drop(model2);
     info!(event = "mmap_dropped", "Teacher mmap dropped, RAM freed for MoE conversion");
 
+    // Estimate student model size after MoE expansion to choose expert count.
+    // 4 full-size experts quadruples FFN params: ~7.3B total (29 GB as f32).
+    // 2 experts doubles: ~4.2B total (17 GB as f32).
+    // On 32 GB systems, 4 experts leaves <3 GB for optimizer/activations → OOM.
+    let student_params_pre_moe: usize = student.layers.iter().map(|l| {
+        l.q_proj.weight().len() + l.k_proj.weight().len() + l.v_proj.weight().len() + l.out_proj.weight().len()
+        + l.ffn_gate.as_ref().map_or(0, |g| g.weight().len())
+        + l.ffn_up.as_ref().map_or(0, |u| u.weight().len())
+        + l.ffn_down.as_ref().map_or(0, |d| d.weight().len())
+    }).sum::<usize>() + student.embed_tokens.len() + student.lm_head.len() + student.final_norm.len();
+    let ffn_params: usize = student.layers.iter().map(|l| {
+        l.ffn_gate.as_ref().map_or(0, |g| g.weight().len())
+        + l.ffn_up.as_ref().map_or(0, |u| u.weight().len())
+        + l.ffn_down.as_ref().map_or(0, |d| d.weight().len())
+    }).sum();
+    let available_gb = {
+        // Read total RAM from /proc/meminfo (Linux)
+        let total_kb: u64 = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1)
+                .and_then(|v| v.parse::<u64>().ok())))
+            .unwrap_or(32 * 1024 * 1024) // fallback: assume 32GB
+            / (1024 * 1024); // KB → GB
+        total_kb
+    };
+    // Each expert adds ffn_params worth of memory (f32 × 4 bytes)
+    let est_4exp_gb = (student_params_pre_moe + 3 * ffn_params) as f64 * 4.0 / 1e9;
+    let est_2exp_gb = (student_params_pre_moe + 1 * ffn_params) as f64 * 4.0 / 1e9;
+    let num_experts = if est_4exp_gb > available_gb as f64 * 0.7 {
+        info!(event = "moe_ram_adapt", available_gb, est_4exp_gb = format!("{:.1}", est_4exp_gb), est_2exp_gb = format!("{:.1}", est_2exp_gb), "Using 2 experts (4 experts would exceed 70% RAM)");
+        2
+    } else {
+        info!(event = "moe_ram_adapt", available_gb, est_4exp_gb = format!("{:.1}", est_4exp_gb), "Using 4 experts (fits in RAM)");
+        4
+    };
+
     // Convert every dense FFN to MoE (FerrisRes ALWAYS produces MoE models)
-    ferrisres::model::cpu_block_attn_res::dense_ffn_to_moe(&mut student, 4, 2, 0.01);
+    ferrisres::model::cpu_block_attn_res::dense_ffn_to_moe(&mut student, num_experts, 2, 0.01);
     let moe_layers = student.layers.iter().filter(|l| l.moe.is_some()).count();
-    info!(event = "moe_conversion", moe_layers = moe_layers, total_layers = student.layers.len(), "Converted dense FFN to MoE (4 experts, top-2)");
+    info!(event = "moe_conversion", moe_layers = moe_layers, total_layers = student.layers.len(), experts = num_experts, "Converted dense FFN to MoE");
 
     // Attach LoRA adapters for training (rank 8, q_proj + v_proj)
     // Attention LoRA rank 8, expert FFN LoRA rank 4 (via separate config)

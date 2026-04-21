@@ -123,11 +123,12 @@ impl CpuBlockAttnResModel {
                 }
             };
 
-            // Attention scores
-            let mut attn_out = layer.cpu_attention(&q, &k, &v, seq, nh, nkv, head_d, q_dim, kv_dim_out);
-            let post_attn_raw = attn_out.clone();
+            // Attention scores — raw (before out_proj) for correct LoRA application
+            let attn_raw = layer.cpu_attention_raw(&q, &k, &v, seq, nh, nkv, head_d, q_dim, kv_dim_out);
+            let post_attn_raw = attn_raw.clone(); // Store for O-LoRA backward (input to out_proj)
+            let mut attn_out = layer.out_proj.forward(&attn_raw, seq);
             if let Some(ref lm) = lora_m {
-                if let Some(lo) = lm.forward(layer_idx, "o_proj", &attn_out, seq) {
+                if let Some(lo) = lm.forward(layer_idx, "o_proj", &attn_raw, seq) {
                     for (i, l) in lo.iter().enumerate() { attn_out[i] += l; }
                 }
             }
