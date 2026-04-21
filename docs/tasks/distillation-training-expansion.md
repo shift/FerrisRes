@@ -8,7 +8,7 @@
 
 ---
 
-## Task 1: Trainable MoE Router Weights
+## Task 1: Trainable MoE Router Weights — ✅ DONE
 
 **Problem**: Router weights (`gate_weights: Vec<f32>` on `CpuMoELayer`) are frozen. Expert 1-3 get random noise initialization and never learn to specialize.
 
@@ -27,7 +27,7 @@
 
 ---
 
-## Task 2: LoRA on Expert FFN (gate/up/down per expert)
+## Task 2: LoRA on Expert FFN (gate/up/down per expert) — ✅ DONE
 
 **Problem**: Expert FFN weights (gate, up, down projections for each of 4 experts × 35 layers) are frozen. LoRA only touches q_proj/v_proj.
 
@@ -50,7 +50,7 @@
 
 ---
 
-## Task 3: Proper Layer-by-Layer Backward Pass
+## Task 3: Proper Layer-by-Layer Backward Pass — 📝 IN PROGRESS
 
 **Problem**: Current backward pass is an approximation — computes `d_hidden` from lm_head, then uses it as a proxy gradient for ALL LoRA adapters. No actual per-layer gradient computation. No gradient flow through attention → FFN → MoE routing chain.
 
@@ -74,7 +74,7 @@
 
 ---
 
-## Task 4: MoE Load Balance Loss Integration
+## Task 4: MoE Load Balance Loss Integration — ✅ DONE
 
 **Problem**: `moe_load_balance_loss()` exists but isn't wired into the distillation loss. Without it, router collapse is likely (all tokens route to same expert).
 
@@ -90,7 +90,7 @@
 
 ---
 
-## Task 5: LoRA on Attention O-Projection and K-Projection
+## Task 5: LoRA on Attention O-Projection and K-Projection — ✅ DONE
 
 **Problem**: Only q_proj and v_proj have LoRA. K and O projections are frozen.
 
@@ -108,7 +108,7 @@
 
 ---
 
-## Task 6: Checkpoint Resume with Optimizer State
+## Task 6: Checkpoint Resume with Optimizer State — 📝 PLANNED
 
 **Problem**: Mid-training checkpoints save model weights but not optimizer state (SCALE momentum). Resuming from checkpoint would lose training progress.
 
@@ -149,8 +149,7 @@ Tasks 1+4 can ship together. Task 2+3 should ship together. Task 6 can be done a
 
 | Config | Trainable | Convergence | Steps to good distill |
 |---|---|---|---|
-| Current (LoRA q/v) | 1.6M (0.06%) | Cannot converge | ∞ |
-| + Task 1+4 (router) | 1.8M (0.07%) | Slow, limited | 50,000+ |
-| + Task 5 (LoRA K/O) | 3.6M (0.14%) | Slow | 20,000+ |
-| + Task 2 (LoRA experts, r=4) | ~25M (0.9%) | Feasible | 5,000-10,000 |
-| + Task 3 (proper backward) | same | Much faster convergence | 2,000-5,000 |
+| ~~LoRA q/v only~~ | ~~1.6M~~ | ~~Cannot converge~~ | ~~∞~~ |
+| ✅ Tasks 1+4+5 (router + K/O + balance) | 3.6M (0.14%) | Slow | 20,000+ |
+| ✅ + Task 2 (LoRA experts r=8) | **~26M (1.0%)** | **Feasible** | **5,000-10,000** |
+| 📝 + Task 3 (proper backward) | same | Much faster convergence | 2,000-5,000 |
