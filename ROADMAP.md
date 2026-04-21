@@ -6,8 +6,8 @@
 
 | Metric | Value |
 |---|---|
-| Source code | ~94,000 lines across 158 modules |
-| Test suites | 1569 lib tests passing, 0 failures, 2 benchmark suites |
+| Source code | ~106,000 lines across 181 modules |
+| Test suites | 1574 lib tests passing, 0 failures, 4 benchmark suites |
 | Language | 100% Rust (safe + WGSL compute shaders) |
 | GPU backends | Vulkan, Metal, DX12, WebGPU via wgpu |
 | Tasks completed | **484 / 493** |
@@ -268,7 +268,7 @@
 | 26 | 📝 Planned | Elastic Inference (E2B/E4B switching) |
 | 27 | 📝 Planned | GPU BlockAttnResLayer (Gemma 4 features + backward kernels) |
 
-**484 tasks done, 0 in progress, 1 planned (blocked on external dependency) — 1569 tests passing.**
+**484 tasks done, 0 in progress, 1 planned (blocked on external dependency) — 1574 tests passing.**
 
 ## Cognitive Architecture
 

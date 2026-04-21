@@ -2,7 +2,7 @@
 
 FerrisRes is a Rust-native AI inference and training engine built around **Block AttnRes** — a novel linear-time transformer architecture that replaces the quadratic attention bottleneck of standard transformers. It runs on any GPU or iGPU via [wgpu](https://github.com/gfx-rs/wgpu) (Vulkan, Metal, DX12, WebGPU), adapts automatically to the hardware it finds, and is written entirely in safe Rust with no Python dependency.
 
-> ⚠️ **v0.2.3 — near-production grade, not yet 1.0.** FerrisRes has 1434 passing tests (~94K lines across 158 modules), a Block-MoE-Res architecture with inter-block attention, 1.58-bit ternary quantization, 2:4 sparse ternary, TurboQuant 3-bit KV cache, expert mmap loading, and recurrent block summaries for unlimited context length. a full cognitive architecture with 5 layers, a verified Gemma 4 distillation pipeline, five output modalities, a 4-layer security proxy (FerrisRes Armor), and profile-driven GPU dispatch that adapts from Intel iGPUs to H100s. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0.
+> ⚠️ **v0.2.3 — near-production grade, not yet 1.0.** FerrisRes has 1574 passing tests (~106K lines across 181 modules), a Block-MoE-Res architecture with inter-block attention, 1.58-bit ternary quantization, 2:4 sparse ternary, TurboQuant 3-bit KV cache, expert mmap loading, and recurrent block summaries for unlimited context length. a full cognitive architecture with 5 layers, a verified Gemma 4 distillation pipeline, five output modalities, a 4-layer security proxy (FerrisRes Armor), and profile-driven GPU dispatch that adapts from Intel iGPUs to H100s. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0.
 
 ---
 
@@ -192,25 +192,33 @@ FerrisRes includes a full cognitive architecture for self-improving AI:
 
 ### Compute Kernels (WGSL)
 
-| Kernel | Purpose |
-|---|---|
-| Tiled MatMul | 16×16 workgroup tiling + double-buffer variant |
-| RMSNorm | Row-wise normalization |
-| Softmax | Numerically stable online softmax |
-| RoPE | Rotary position embeddings |
-| FlashDecode + Tiled | Single-query decode attention, tiled with online softmax |
-| CausalMask | Upper-triangular masking |
-| Elementwise | Add, scale, ReLU, copy |
-| im2col | Image patch extraction (legacy) |
-| FusedPatchEmbed | Implicit GEMM — fused patch extraction + projection, 0 MB intermediate |
-| MoE | Expert routing and gather |
-| TurboQuant | Rotation, quantize, dequantize, QJL projection |
-| ToMeMerge | Scatter-merge for token reduction |
-| FFT | Fast Fourier Transform for audio spectrograms |
-| Mel-spectrogram | Log-mel filterbank from FFT output |
-| Temporal/Spatial Conv | 3D factored convolution (video processing) |
-| Circular KV | Virtual circular buffer for KV cache |
-| TurboQuant kernels | Rotation, quantize, dequantize, QJL projection |
+24 WGSL compute shaders across `src/compute/kernels/`:
+
+| Kernel | File | Purpose |
+|---|---|---|
+| Tiled MatMul | `matmul.rs` | 16×16 workgroup tiling + double-buffer variant + backward |
+| RMSNorm | `rmsnorm.rs` | Row-wise normalization + backward |
+| Softmax | `softmax.rs` | Numerically stable online softmax + backward + immediate-data variant |
+| RoPE | `rope.rs` | Rotary position embeddings with Cody-Waite precision + YaRN + backward |
+| FlashDecode | `flash_decode.rs` | Single-query decode attention, tiled with online softmax, subgroup variant |
+| Prefill Attention | `prefill_attn.rs` | Batched prefill attention |
+| CausalMask | `causal_mask.rs` | Upper-triangular masking |
+| Elementwise | `elementwise.rs` | Add, scale, ReLU, GELU, mul, copy |
+| im2col | `im2col.rs` | Image patch extraction (legacy) |
+| FusedPatchEmbed | `fused_patch_embed.rs` | Implicit GEMM — fused patch extraction + projection |
+| MoE | `moe.rs` | Expert routing and gather |
+| GPU Transformer | `gpu_transformer.rs` | Full transformer layer forward on GPU |
+| TurboQuant | `turboquant_kernels.rs` | Rotation, quantize, dequantize, QJL projection |
+| ToMeMerge | `tome_merge.rs` | Scatter-merge for token reduction |
+| FFT | `fft.rs` | Fast Fourier Transform + mel-spectrogram for audio |
+| 3D Conv | `conv3d.rs` | Temporal + spatial factored convolution (video) |
+| Ternary MatMul | `ternary_matmul.rs` | 2-bit packed {-1,0,+1} matmul, conditional add/subtract only |
+| Sparse Ternary | `sparse_ternary.rs` | 2:4 sparsity with 5-bit encoding (3-bit pattern + 2-bit signs) |
+| SCALE Optimizer | `optimizer_scale.rs` | Column norms, scale update, momentum (GPU LoRA training) |
+| Paged Attention | `paged_attention.rs` | Block-table indirection for non-contiguous KV cache |
+| HullKV GPU | `hull_kv.rs` | 2D projection + convex hull binary search |
+| Cooperative MatMul | `coop_matmul.rs` | 16×16 tiled fallback + cooperative matrix placeholder |
+| Immediate Data | `immediates.rs` | wgpu 29 `var<immediate>` optimization for small params |
 
 ### Hardware Adaptation
 
@@ -495,7 +503,7 @@ FerrisRes requires a working Vulkan driver. On Linux the recommended path is thr
 ```bash
 nix develop          # enters the dev shell with Rust + Vulkan layers
 cargo build
-cargo test            # 1434 tests
+cargo test            # 1574 tests
 cargo bench
 ```
 
@@ -509,13 +517,8 @@ src/
 ├── lib.rs               # Public API re-exports
 ├── autodiff/             # Reverse-mode autodiff graph
 ├── compute/
-│   ├── kernels/          # 17+ WGSL compute shaders
-│   │   ├── matmul.rs     # Tiled + double-buffer matmul
-│   │   ├── flash_decode  # Single-query decode attention
-│   │   ├── rope.rs       # RoPE in-place
-│   │   ├── fft.rs        # FFT for audio
-│   │   ├── conv3d.rs     # 3D factored convolution (temporal + spatial)
-│   │   └── ...           # RMSNorm, softmax, causal, elementwise, etc.
+│   ├── kernels/          # 24 WGSL compute shaders (see table above)
+│   ├── adapter.rs        # wgpu adapter selection (Vulkan→Metal→DX12→GL+software fallback)
 │   ├── buffer.rs         # GpuBuffer
 │   ├── turboquant.rs     # TurboQuant engine
 │   ├── distributed.rs    # Tensor/pipeline parallelism, weight sharding
@@ -523,7 +526,7 @@ src/
 │   └── async_pipeline.rs # FA3 double-buffer dispatch
 ├── device/
 │   ├── profile.rs        # DeviceProfile (Integrated/LowEnd/MidRange/HighEnd)
-│   ├── capability.rs     # GPU capability detection
+│   ├── capability.rs     # GpuCapabilities: wgpu feature flags, kernel routing
 │   └── dispatch.rs       # DispatchPlan: model-size-aware per-op CPU/GPU decisions
 ├── inference/
 │   ├── generator.rs      # TokenGenerator (generate/stream/rag/tools)
@@ -563,19 +566,48 @@ src/
 │   ├── scientific.rs      # SMILES validator, Marching Cubes, G-Code validator/generator
 │   ├── tactile.rs         # TactileHead haptics + VisualTactileBridge
 │   └── kv_cache.rs / sampling.rs
+│   # Phase 19-27 additions:
+│   ├── covo.rs              # CoVo consistency+volatility reward for self-supervised training
+│   ├── skill_kb.rs          # 3-level hierarchical skill knowledge base
+│   ├── fdal.rs              # Feature-Distillation Active Learning sampler
+│   ├── elastic_expert.rs    # DeviceProfile-routed dynamic top-k expert activation
+│   ├── adaptive_blocks.rs   # EntropyPredictor-based variable block boundaries
+│   ├── positional_uncertainty.rs # Track entropy at sequence positions, generate practice goals
+│   ├── prescope.rs          # PreScope predictive expert prefetching
+│   ├── buddy_moe.rs         # BuddyMoE expert redundancy substitution
+│   ├── compressed_kv.rs     # KVCacheBackend trait + Basic/TurboQuant/Recurrent adapters
+│   ├── cpu_generator.rs     # CpuTokenGenerator: prefill+decode+KV caching
+│   ├── domain_detector.rs   # Prompt domain classification (code/math/language/reasoning/creative)
+│   ├── plan_cache.rs        # Plan storage, similarity retrieval, adaptation
+│   ├── self_modification_guard.rs # Safe weight change protocol with rollback
+│   ├── subgoal_generator.rs # Hierarchical AND/OR goal decomposition
+│   ├── tool_bootstrapper.rs # Recursive tool improvement
+│   ├── turboquant_kv.rs     # 3-bit TurboQuant compressed KV cache
+│   └── recurrent_kv.rs      # Recurrent block summary KV cache
 ├── model/
 │   ├── model.rs          # BlockAttnResModel (forward + backward)
-│   ├── block_attn_res.rs # BlockAttnResLayer
-│   ├── cpu_block_attn_res.rs # CPU BlockAttnRes with Gemma 4 features (PLE, GQA, KV sharing, logit softcapping)
+│   ├── block_attn_res.rs # BlockAttnResLayer (GPU)
+│   ├── cpu_block_attn_res.rs # CPU model: Gemma 4 features (PLE, GQA, KV sharing, logit softcapping)
 │   ├── cpu_linear.rs     # CPU-only linear layer with SIMD matmul
 │   ├── cpu_moe.rs        # CPU MoE layer with SwiGLU/GeLU, top-k routing, load balance loss
 │   ├── ternary.rs        # 1.58-bit ternary quantization (absmean, 2-bit packing, STE)
-│   ├── checkpoint.rs     # BlockMoeResConfig serialization (safetensors + JSON)
+│   ├── ternary_linear.rs # TernaryLinear: ternary weight linear layer
+│   ├── ternary_moe.rs    # TernaryMoELayer: ternary MoE with ternary experts
+│   ├── sparse_ternary.rs # 2:4 sparse ternary quantization + pruning pipeline
+│   ├── checkpoint.rs     # BlockMoeResConfig serialization (save_model)
+│   ├── config.rs         # AdaptivePatchingConfig, EntropyPredictor, BlockAttnResConfig
+│   ├── upload.rs         # CPU→GPU weight upload (linear layers, model-level weights)
+│   ├── expert_loader.rs  # Per-expert mmap loading (.stm format)
+│   ├── quantized_model.rs # QuantizedBlockAttnResModel
 │   ├── standard_transformer.rs  # O(n²) compatibility mode
 │   ├── dispatcher.rs     # Architecture auto-detection (AnyModel)
 │   ├── gemma_mapper.rs   # Gemma 4 weight mapper, GQA, distillation training
-│   ├── gpu_forward.rs     # GPU-accelerated forward pass with auto-tiling + Intel iGPU detection
-│   ├── safetensors.rs     # Safetensors + MmapedSafetensors loader
+│   ├── gpu_forward.rs    # GPU-accelerated forward pass with auto-tiling + Intel iGPU detection
+│   ├── moe_linear.rs     # GPU MoE layer with swap_expert()
+│   ├── linear.rs         # GPU linear layer with set_weight()
+│   ├── embedding.rs      # Token embedding
+│   ├── lm_head.rs        # LM head projection
+│   ├── safetensors.rs    # Safetensors + MmapedSafetensors loader
 │   ├── gguf.rs           # GGUF v2/v3 loader
 │   ├── tokenizer.rs      # BPE + DomainVocabulary
 │   ├── blt.rs            # Byte Latent Transformer tokenizer
@@ -641,7 +673,7 @@ src/
 | 26 | 📝 Planned | Elastic Inference: dynamic E2B/E4B path switching per DeviceProfile |
 | 27 | 📝 Planned | GPU BlockAttnResLayer: all 10 Gemma 4 features on GPU, LoRA backward, matmul/RoPE/softmax/RMSNorm backward kernels |
 
-**1434 tests passing. 437 tasks done, 2 in progress, 47 planned.**
+**1574 tests passing. 484 tasks done, 0 in progress, 1 planned (blocked on external dependency).**
 
 See [ROADMAP.md](ROADMAP.md) for full technical details.
 
