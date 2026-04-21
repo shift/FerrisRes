@@ -567,6 +567,13 @@ impl LoraManager {
     pub fn adapters_iter_mut(&mut self) -> impl Iterator<Item = (usize, &str, &mut LoraLayer)> {
         self.adapters.iter_mut().map(|(idx, name, layer)| (*idx, name.as_str(), layer))
     }
+
+    /// Get a specific adapter by layer_idx and module_name.
+    pub fn get(&self, layer_idx: usize, module_name: &str) -> Option<&LoraLayer> {
+        self.adapters.iter()
+            .find(|(idx, name, _)| *idx == layer_idx && name == module_name)
+            .map(|(_, _, layer)| layer)
+    }
 }
 
 #[cfg(test)]
