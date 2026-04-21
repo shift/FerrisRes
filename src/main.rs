@@ -1493,14 +1493,48 @@ async fn cmd_distill(
 
     // Resume from checkpoint if specified
     if let Some(ref ckpt_path) = resume_path {
-        match DistillationCheckpoint::load(std::path::Path::new(ckpt_path)) {
-            Ok(ckpt) => {
-                global_step = ckpt.global_step;
-                info!(event = "resuming_from_checkpoint", step = global_step, "resuming from checkpoint");
-                // Note: BlockSummary checkpoint restore removed — student is now CpuBlockAttnResModel
+        // Try new format first (model + LoRA + optimizer + meta)
+        let meta_path = format!("{}.meta.json", ckpt_path);
+        let lora_path = format!("{}.lora.bin", ckpt_path);
+        let opt_path = format!("{}.opt.bin", ckpt_path);
+
+        if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
+            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+                global_step = meta["global_step"].as_u64().unwrap_or(0) as usize;
+                info!(event = "resuming_meta", step = global_step);
             }
-            Err(e) => {
-                tracing::warn!(event = "checkpoint_load_failed", error = %e, "Failed to load checkpoint — starting fresh: {}", e);
+        }
+
+        // Load LoRA adapters
+        if let Ok(lora_data) = std::fs::read(&lora_path) {
+            if let Some(ref mut lora_m) = student.lora_manager {
+                match lora_m.deserialize_adapters(&lora_data) {
+                    Ok(()) => info!(event = "lora_restored", adapters = lora_m.adapters_iter().count()),
+                    Err(e) => warn!(event = "lora_restore_failed", error = %e),
+                }
+            }
+        }
+
+        // Load optimizer state
+        if let Ok(opt_data) = std::fs::read(&opt_path) {
+            match optimizer.deserialize_state(&opt_data) {
+                Ok(()) => info!(event = "optimizer_restored", timestep = optimizer.timestep()),
+                Err(e) => warn!(event = "optimizer_restore_failed", error = %e),
+            }
+        }
+
+        if global_step > 0 {
+            info!(event = "resuming_from_checkpoint", step = global_step, optimizer = optimizer.name(), "Resumed from full checkpoint");
+        } else {
+            // Fall back to old DistillationCheckpoint format
+            match DistillationCheckpoint::load(std::path::Path::new(ckpt_path)) {
+                Ok(ckpt) => {
+                    global_step = ckpt.global_step;
+                    info!(event = "resuming_from_checkpoint", step = global_step, "resuming from old checkpoint format");
+                }
+                Err(e) => {
+                    tracing::warn!(event = "checkpoint_load_failed", error = %e, "Failed to load checkpoint — starting fresh: {}", e);
+                }
             }
         }
     }
@@ -2070,7 +2104,32 @@ async fn cmd_distill(
         if checkpoint_every > 0 && (global_step + 1) % checkpoint_every == 0 {
             let ckpt_path = format!("{}_step{}", output_path, global_step + 1);
             match ferrisres::model::checkpoint::save_model(&student, &ckpt_path) {
-                Ok(()) => info!(event = "checkpoint_saved", step = global_step + 1, path = %ckpt_path, "Mid-training checkpoint saved"),
+                Ok(()) => {
+                    // Save LoRA adapters alongside model weights
+                    if let Some(ref lora_m) = student.lora_manager {
+                        let lora_path = format!("{}.lora.bin", ckpt_path);
+                        let lora_data = lora_m.serialize_adapters();
+                        match std::fs::write(&lora_path, &lora_data) {
+                            Ok(()) => info!(event = "lora_saved", bytes = lora_data.len(), path = %lora_path),
+                            Err(e) => warn!(event = "lora_save_failed", error = %e),
+                        }
+                    }
+                    // Save optimizer state
+                    let opt_path = format!("{}.opt.bin", ckpt_path);
+                    let opt_data = optimizer.serialize_state();
+                    match std::fs::write(&opt_path, &opt_data) {
+                        Ok(()) => info!(event = "optimizer_saved", bytes = opt_data.len(), path = %opt_path),
+                        Err(e) => warn!(event = "optimizer_save_failed", error = %e),
+                    }
+                    // Save training metadata (global step)
+                    let meta_path = format!("{}.meta.json", ckpt_path);
+                    let meta = serde_json::json!({"global_step": global_step + 1});
+                    match std::fs::write(&meta_path, meta.to_string()) {
+                        Ok(()) => {},
+                        Err(e) => warn!(event = "meta_save_failed", error = %e),
+                    }
+                    info!(event = "checkpoint_saved", step = global_step + 1, path = %ckpt_path, "Full checkpoint saved (model + LoRA + optimizer)");
+                }
                 Err(e) => warn!(event = "checkpoint_save_failed", step = global_step + 1, error = %e, "Failed to save checkpoint"),
             }
         }
@@ -2123,7 +2182,32 @@ async fn cmd_distill(
 
     // Save trained Block-MoE-Res model
     match ferrisres::model::checkpoint::save_model(&student, &output_path) {
-        Ok(()) => info!(event = "model_saved", path = %output_path, "Trained model saved"),
+        Ok(()) => {
+            info!(event = "model_saved", path = %output_path, "Trained model saved");
+            // Save final LoRA adapters
+            if let Some(ref lora_m) = student.lora_manager {
+                let lora_path = format!("{}.lora.bin", output_path);
+                let lora_data = lora_m.serialize_adapters();
+                match std::fs::write(&lora_path, &lora_data) {
+                    Ok(()) => info!(event = "lora_saved", bytes = lora_data.len()),
+                    Err(e) => warn!(event = "lora_save_failed", error = %e),
+                }
+            }
+            // Save final optimizer state
+            let opt_path = format!("{}.opt.bin", output_path);
+            let opt_data = optimizer.serialize_state();
+            match std::fs::write(&opt_path, &opt_data) {
+                Ok(()) => info!(event = "optimizer_saved", bytes = opt_data.len()),
+                Err(e) => warn!(event = "optimizer_save_failed", error = %e),
+            }
+            // Save final training metadata
+            let meta_path = format!("{}.meta.json", output_path);
+            let meta = serde_json::json!({"global_step": global_step});
+            match std::fs::write(&meta_path, meta.to_string()) {
+                Ok(()) => {},
+                Err(e) => warn!(event = "meta_save_failed", error = %e),
+            }
+        }
         Err(e) => warn!(event = "model_save_failed", error = %e, "Failed to save model"),
     }
 

@@ -151,6 +151,128 @@ impl WeightOptimizer for ScaleOptimizer {
     fn name(&self) -> &'static str {
         "SCALE"
     }
+
+    fn serialize_state(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // Header: [magic: u32 = 0x5343414C ('SCAL'), version: u32 = 1, timestep: u32]
+        buf.extend_from_slice(&0x5343414Cu32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&self.timestep.to_le_bytes());
+        buf.extend_from_slice(&(self.matrices.len() as u32).to_le_bytes());
+
+        for (name, state) in &self.matrices {
+            // Name: [len: u16] [bytes]
+            let name_bytes = name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+
+            // Dimensions
+            buf.extend_from_slice(&(state.rows as u32).to_le_bytes());
+            buf.extend_from_slice(&(state.cols as u32).to_le_bytes());
+
+            // Column norms [cols]
+            for &v in &state.column_norms {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+
+            // Momentum: [has_momentum: u8] [data if 1]
+            if let Some(ref mom) = state.momentum {
+                buf.push(1u8);
+                for &v in mom {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+            } else {
+                buf.push(0u8);
+            }
+        }
+
+        buf
+    }
+
+    fn deserialize_state(&mut self, data: &[u8]) -> crate::error::Result<()> {
+        self.deserialize_state_inner(data)
+            .map_err(|e| crate::error::FerrisResError::Shape(e))
+    }
+}
+
+impl ScaleOptimizer {
+    fn deserialize_state_inner(&mut self, data: &[u8]) -> Result<(), String> {
+        if data.len() < 16 {
+            return Err("Data too short for SCALE state".into());
+        }
+        let mut pos = 0usize;
+
+        let read_u32 = |data: &[u8], pos: &mut usize| -> Result<u32, String> {
+            if *pos + 4 > data.len() { return Err("Truncated".into()); }
+            let v = u32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap());
+            *pos += 4;
+            Ok(v)
+        };
+        let read_u16 = |data: &[u8], pos: &mut usize| -> Result<u16, String> {
+            if *pos + 2 > data.len() { return Err("Truncated".into()); }
+            let v = u16::from_le_bytes(data[*pos..*pos+2].try_into().unwrap());
+            *pos += 2;
+            Ok(v)
+        };
+
+        let magic = read_u32(data, &mut pos)?;
+        if magic != 0x5343414C {
+            return Err(format!("Invalid magic: {:08X}", magic));
+        }
+        let version = read_u32(data, &mut pos)?;
+        if version != 1 {
+            return Err(format!("Unsupported version: {}", version));
+        }
+        self.timestep = read_u32(data, &mut pos)?;
+        let num_matrices = read_u32(data, &mut pos)?;
+
+        for _ in 0..num_matrices {
+            let name_len = read_u16(data, &mut pos)? as usize;
+            if pos + name_len > data.len() { return Err("Truncated name".into()); }
+            let name = String::from_utf8_lossy(&data[pos..pos+name_len]).into_owned();
+            pos += name_len;
+
+            let rows = read_u32(data, &mut pos)? as usize;
+            let cols = read_u32(data, &mut pos)? as usize;
+
+            let cn_count = cols.min(data.len().saturating_sub(pos) / 4);
+            let mut column_norms = vec![0.0f32; cols];
+            for j in 0..cn_count {
+                column_norms[j] = f32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                pos += 4;
+            }
+            pos += (cols.saturating_sub(cn_count)) * 4;
+
+            if pos >= data.len() { return Err("Truncated momentum flag".into()); }
+            let has_mom = data[pos];
+            pos += 1;
+            let momentum = if has_mom == 1 {
+                let count = rows * cols;
+                let read_count = count.min(data.len().saturating_sub(pos) / 4);
+                let mut mom = vec![0.0f32; count];
+                for i in 0..read_count {
+                    mom[i] = f32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                    pos += 4;
+                }
+                pos += (count.saturating_sub(read_count)) * 4;
+                Some(mom)
+            } else {
+                None
+            };
+
+            if let Some(state) = self.matrices.get_mut(&name) {
+                state.column_norms = column_norms;
+                state.momentum = momentum;
+            } else {
+                self.matrices.insert(name, ScaleMatrixState {
+                    rows, cols, column_norms, momentum,
+                });
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
