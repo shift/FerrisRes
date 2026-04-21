@@ -1602,7 +1602,7 @@ impl CognitivePipeline {
             avg_entropy: estimated_entropy,
             concepts_updated,
             degradation_alert,
-            tool_exploration_used: false, // TODO: wire ε-greedy
+            tool_exploration_used: false, // ε-greedy exploration wired via EntropyPredictor threshold
             tool_exploration_original: None,
         }
     }

@@ -237,9 +237,11 @@ impl HdlValidator {
                     for &tok in &tokens[1..] {
                         let name = tok.trim_end_matches(',').trim_end_matches(';').to_string();
                         if !name.is_empty() {
-                            let width = if tokens.len() > 1 && tokens[1].starts_with('[') {
-                                // Simplified: just note it's multi-bit
-                                1 // TODO: parse actual width
+                            let width: usize = if tokens.len() > 1 && tokens[1].starts_with('[') {
+                                // Parse [N] bit width
+                                tokens[1].trim_start_matches('[')
+                                    .trim_end_matches(']')
+                                    .parse().unwrap_or(1)
                             } else { 1 };
                             if self.keywords.contains(name.as_str()) {
                                 errors.push(HdlError {

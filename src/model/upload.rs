@@ -36,12 +36,47 @@ pub fn upload_layer(
 
     // FFN projections
     match (&cpu_layer.moe, gpu_layer.moe_accessor()) {
-        (Some(_cpu_moe), Some(_gpu_moe)) => {
-            // MoE weight upload — expert weights, router, gate
-            // TODO: upload MoE experts when MoELinear has weight setters
-            tracing::warn!(
-                "MoE weight upload not yet implemented for layer {}",
-                cpu_layer.layer_number
+        (Some(cpu_moe), Some(gpu_moe)) => {
+            // Upload MoE router weights
+            let cpu_router = CpuLinear::from_weight(
+                cpu_moe.gate_weights.clone(),
+                cpu_moe.hidden_dim,
+                cpu_moe.num_experts,
+            );
+            {
+                let gpu_moe_ref = gpu_moe.borrow();
+                let router = gpu_moe_ref.gate_proj();
+                upload_linear(router, &cpu_router, queue);
+            }
+
+            // Upload each expert's gate/up/down weights
+            let mut gpu_moe_mut = gpu_moe.borrow_mut();
+            for expert_idx in 0..cpu_moe.num_experts {
+                let id = cpu_moe.intermediate_dim;
+                let hd = cpu_moe.hidden_dim;
+
+                // Flatten gate + up + down for swap_expert
+                let gate = &cpu_moe.expert_gate[expert_idx];
+                let up = &cpu_moe.expert_up[expert_idx];
+                let down = &cpu_moe.expert_down[expert_idx];
+
+                let mut flat = Vec::with_capacity(id * hd * 3);
+                flat.extend_from_slice(gate);
+                flat.extend_from_slice(up);
+                flat.extend_from_slice(down);
+
+                if let Err(e) = gpu_moe_mut.swap_expert(expert_idx, &flat) {
+                    tracing::warn!(
+                        "Failed to upload expert {} for layer {}: {}",
+                        expert_idx, cpu_layer.layer_number, e
+                    );
+                }
+            }
+            drop(gpu_moe_mut);
+
+            tracing::info!(
+                "Uploaded {} MoE experts for layer {}",
+                cpu_moe.num_experts, cpu_layer.layer_number
             );
         }
         (None, None) => {

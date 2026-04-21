@@ -1170,24 +1170,86 @@ impl TernaryBlockAttnResLayer {
             }
         };
 
-        // Attention (FP32 — activation-bound, not weight-bound)
-        // Simplified: just do standard attention
-        // TODO: wire through full GQA + RoPE + sliding window
+        // Apply RoPE to Q and K
+        let num_heads = self.num_heads;
+        let num_kv_heads = self.num_kv_heads;
+        let head_dim = self.head_dim;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        // Reshape Q/K into [seq, heads, head_dim]
+        let mut q_rope = vec![0.0f32; seq * q_dim];
+        let mut k_rope = vec![0.0f32; seq * kv_dim];
+        q_rope.copy_from_slice(&q);
+        k_rope.copy_from_slice(&k);
+
+        // Apply RoPE (use layer-specific theta)
+        let partial_rot = self.partial_rotary_factor;
+        for s in 0..seq {
+            // Apply RoPE to Q: [num_heads, head_dim]
+            let q_slice = &mut q_rope[s * q_dim..(s + 1) * q_dim];
+            apply_rope_gqa(q_slice, 1, num_heads, head_dim, 0, self.rope_theta, partial_rot);
+            // Apply RoPE to K: [num_kv_heads, head_dim]
+            let k_slice = &mut k_rope[s * kv_dim..(s + 1) * kv_dim];
+            apply_rope_gqa(k_slice, 1, num_kv_heads, head_dim, s, self.rope_theta, partial_rot);
+        }
+
+        // GQA attention: [seq, num_heads, head_dim] × [seq, num_kv_heads, head_dim]
+        // Expand K/V for GQA (repeat each KV head for num_heads/num_kv_heads query heads)
+        let heads_per_kv = num_heads / num_kv_heads;
+        let mut attn_out = vec![0.0f32; seq * q_dim];
+        for s in 0..seq {
+            for qh in 0..num_heads {
+                let kv_h = qh / heads_per_kv;
+                let q_base = s * q_dim + qh * head_dim;
+
+                // Compute attention scores against all positions
+                let mut scores = Vec::new();
+                let mut max_score = f32::NEG_INFINITY;
+                for t in 0..=s { // Causal: only up to current position
+                    let k_base = t * kv_dim + kv_h * head_dim;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q_rope[q_base + d] * k_rope[k_base + d];
+                    }
+                    let score = dot / (head_dim as f32).sqrt();
+                    scores.push((t, score));
+                    if score > max_score { max_score = score; }
+                }
+
+                // Softmax
+                let sum_exp: f32 = scores.iter().map(|&(_, s)| (s - max_score).exp()).sum();
+                let inv_sum = if sum_exp > 0.0 { 1.0 / sum_exp } else { 0.0 };
+
+                // Weighted sum of V
+                let out_base = s * q_dim + qh * head_dim;
+                for d in 0..head_dim { attn_out[out_base + d] = 0.0; }
+                for (t, score) in &scores {
+                    let weight = (score - max_score).exp() * inv_sum;
+                    let v_base = t * kv_dim + kv_h * head_dim;
+                    for d in 0..head_dim {
+                        attn_out[out_base + d] += weight * v[v_base + d];
+                    }
+                }
+            }
+        }
+
+        // Reshape attn_out from [seq, num_heads, head_dim] to [seq, q_dim]
+        // (already in that layout)
 
         // Output projection: ternary
-        // Placeholder: use out_proj ternary matmul on residual
-        let mut attn_out = self.out_proj.forward(&q, seq); // simplified
+        let mut proj_out = self.out_proj.forward(&attn_out, seq);
 
         // Post-attention norm
         for s in 0..seq {
-            let row = &mut attn_out[s * hd..(s + 1) * hd];
+            let row = &mut proj_out[s * hd..(s + 1) * hd];
             let mean_sq: f32 = row.iter().map(|x| x * x).sum::<f32>() / hd as f32;
             let inv_rms = 1.0 / (mean_sq + eps).sqrt();
             for j in 0..hd { row[j] = row[j] * inv_rms * self.post_attn_norm[j]; }
         }
 
         // Residual
-        for i in 0..hidden.len() { hidden[i] = residual[i] + attn_out[i]; }
+        for i in 0..hidden.len() { hidden[i] = residual[i] + proj_out[i]; }
 
         if shared_kv.is_some() { (vec![], vec![]) } else { (k, v) }
     }
