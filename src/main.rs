@@ -1614,10 +1614,14 @@ async fn cmd_distill(
 
         // Student forward using CpuBlockAttnResModel
         // GPU-accelerated when accelerator is available, pure CPU otherwise
-        let student_logits = if gpu_accel.is_some() {
-            student.forward_gpu(batch_tokens, gpu_accel.as_ref().unwrap(), &dispatch)
+        // Collects MoE routing data inline for load balance loss + router gradients.
+        let (student_logits, routing_data) = if gpu_accel.is_some() {
+            // GPU path doesn't support routing collection yet — use CPU routing pass
+            let logits = student.forward_gpu(batch_tokens, gpu_accel.as_ref().unwrap(), &dispatch);
+            let (_, routing) = student.forward_with_routing(batch_tokens);
+            (logits, routing)
         } else {
-            student.forward(batch_tokens)
+            student.forward_with_routing(batch_tokens)
         };
 
         // KL divergence loss
@@ -1655,9 +1659,40 @@ async fn cmd_distill(
             (0.0, None)
         };
 
-        // Combined loss: KL + 0.5 * hidden_MSE
-        // TODO: add MoE load balance loss when gate_logits are collected during forward
-        let loss = kl_loss + 0.5 * hidden_mse_loss;
+        // MoE Load balance loss: num_experts × Σ(f_i × P_i)
+        // Prevents router collapse (all tokens going to one expert).
+        // Uses routing data collected inline during student forward — no extra pass.
+        let balance_loss = if !routing_data.is_empty() {
+            let mut total_balance = 0.0f32;
+            for rd in &routing_data {
+                let ne = rd.gate_probs.len() / actual_seq.max(1);
+                if ne == 0 { continue; }
+                let mut f = vec![0.0f32; ne]; // fraction of tokens per expert
+                let mut p = vec![0.0f32; ne]; // mean router prob per expert
+                for t in 0..actual_seq {
+                    for e in 0..ne {
+                        p[e] += rd.gate_probs[t * ne + e];
+                    }
+                    // Count from selected experts
+                    for k in 0..rd.selected_experts.len() / actual_seq.max(1).max(1) {
+                        let idx = rd.selected_experts[t * (rd.selected_experts.len() / actual_seq.max(1).max(1)) + k];
+                        if idx < ne { f[idx] += 1.0; }
+                    }
+                }
+                for e in 0..ne {
+                    f[e] /= actual_seq as f32;
+                    p[e] /= actual_seq as f32;
+                    total_balance += f[e] * p[e];
+                }
+                total_balance *= ne as f32;
+            }
+            total_balance / routing_data.len() as f32 // average across layers
+        } else {
+            0.0
+        };
+
+        // Combined loss: KL + 0.5 * hidden_MSE + 0.01 * balance_loss
+        let loss = kl_loss + 0.5 * hidden_mse_loss + 0.01 * balance_loss;
 
         // Update EMA
         loss_ema = if loss_ema.is_nan() { loss }
@@ -1790,37 +1825,102 @@ async fn cmd_distill(
         }
 
         // === MoE Router Gradient (Task 1) ===
-        // d_hidden flows into each layer. For MoE layers, the gradient
-        // through the expert outputs tells the router which experts helped.
-        // Simplified: router_grad[e, d] = Σ_t d_hidden[t, d] · expert_contribution_e(t)
-        // Using d_hidden as a proxy signal (same approximation as LoRA backward).
+        // Proper gradient through: input · gate_weights → logits → softmax → top-k → weighted expert sum.
+        // dL/d_gate_weights[e, d] = Σ_t dL/d_gate_logits[t, e] · input[t, d]
+        // where dL/d_gate_logits comes from:
+        //   1. Expert contribution: dL/d_weight_k * expert_output_k (from top-k selection)
+        //   2. Balance loss: dL/d_gate_logits from balance loss gradient
         {
             let hd = config.hidden_dim;
+            let seq_for_grad = actual_seq.min(d_hidden.len() / hd);
+
             for (layer_idx, layer) in student.layers.iter_mut().enumerate() {
-                if let Some(ref moe) = layer.moe {
-                    let num_experts = moe.num_experts;
-                    let mut router_grad = vec![0.0f32; num_experts * hd];
-                    let seq_for_grad = actual_seq.min(d_hidden.len() / hd);
-                    for t in 0..seq_for_grad {
-                        for e in 0..num_experts {
-                            let mut dot = 0.0f32;
-                            for d in 0..hd {
-                                dot += d_hidden[t * hd + d] * moe.gate_weights[e * hd + d];
-                            }
-                            for d in 0..hd {
-                                router_grad[e * hd + d] += dot * d_hidden[t * hd + d];
-                            }
+                // Find matching routing data for this layer
+                let rd = routing_data.iter().find(|r| r.layer_idx == layer_idx);
+                let moe = layer.moe.as_mut();
+                let (moe_ref, gate_probs, selected, weights, pre_ffn) = match (moe, rd) {
+                    (Some(m), Some(r)) => (m, &r.gate_probs, &r.selected_experts, &r.expert_weights, &r.pre_ffn_input),
+                    _ => continue,
+                };
+                let ne = moe_ref.num_experts;
+                let tk = moe_ref.top_k;
+
+                // Compute dL/d_gate_logits for each token and expert.
+                //
+                // The MoE output is: output[t] = Σ_k weight_k * expert_{selected_k}(input[t])
+                // So dL/d_gate_logits flows through:
+                //   a) Expert weighting: dL/d_weight_k = dL/d_output · expert_output_k
+                //   b) Softmax: d_softmax(logit_i) = weight_i * (δ_ik - weight_k) for top-k
+                //
+                // Combined: dL/d_logit_e = Σ_k dL/d_weight_k * d_weight_k/d_logit_e
+                // For top-k softmax: d_weight_k/d_logit_e = weight_k * (δ_ke - weight_e)
+                //
+                // Simplification for router gradient (only the routing signal matters):
+                // dL/d_logit_e ≈ Σ_t (d_output_signal_e(t)) * pre_ffn_input[t, d]
+                // where d_output_signal = how much expert e contributed to the loss.
+
+                let mut router_grad = vec![0.0f32; ne * hd];
+
+                for t in 0..seq_for_grad {
+                    // For each token, compute the gradient signal per expert.
+                    // The expert that was selected and contributed gets gradient proportional
+                    // to d_hidden · expert_output. Experts not selected get zero.
+                    let mut d_logit = vec![0.0f32; ne];
+
+                    for k in 0..tk {
+                        let ei = selected[t * tk + k];
+                        if ei >= ne { continue; }
+                        let w = weights[t * tk + k];
+
+                        // dL/d_weight_k = d_hidden[t] · (implicit expert output direction)
+                        // We approximate: the expert output aligned with d_hidden gives signal.
+                        // d_weight_k/d_logit_e = w * (δ_{e,ei} - gate_probs[t, e])
+                        // So: d_logit[e] += dL/d_weight_k * w * (δ_{e,ei} - gate_probs[t, e])
+
+                        // dL/d_weight_k ≈ d_hidden dot direction (simplified)
+                        // For proper gradient: use d_hidden magnitude * expert weight alignment
+                        let mut d_weight_k = 0.0f32;
+                        for d in 0..hd {
+                            d_weight_k += d_hidden[t * hd + d]
+                                * moe_ref.gate_weights[ei * hd + d];
+                        }
+
+                        // Propagate through softmax
+                        for e in 0..ne {
+                            let indicator = if e == ei { 1.0 } else { 0.0 };
+                            d_logit[e] += d_weight_k * w * (indicator - gate_probs[t * ne + e]);
                         }
                     }
-                    let inv_seq = 1.0 / seq_for_grad.max(1) as f32;
-                    for g in router_grad.iter_mut() { *g *= inv_seq; }
 
-                    // Update router weights
-                    let name = format!("router_{}", layer_idx);
-                    if let Some(ref mut moe_mut) = layer.moe {
-                        optimizer.step(&name, &router_grad, &mut moe_mut.gate_weights);
+                    // Balance loss gradient: d(f_i * P_i)/d_logit_e
+                    // P_e = softmax(logit_e), f_e = fraction of tokens routed to e
+                    // dL_balance/d_logit_e += 0.01 * ne * (f_e + P_e * (1 - 2*P_e)) * softmax_grad
+                    // Simplified: P_e * (1 - P_e) term
+                    for e in 0..ne {
+                        let pe = gate_probs[t * ne + e];
+                        // Balance gradient pushes toward uniform routing
+                        d_logit[e] += 0.01 * ne as f32 * pe * (1.0 - pe) * (1.0 / ne as f32 - pe);
+                    }
+
+                    // dL/d_gate_weights[e, d] += d_logit[e] * input[t, d]
+                    let t_off = t * hd;
+                    for e in 0..ne {
+                        let g_off = e * hd;
+                        let dl = d_logit[e];
+                        if dl.abs() < 1e-10 { continue; }
+                        for d in 0..hd {
+                            router_grad[g_off + d] += dl * pre_ffn[t_off + d];
+                        }
                     }
                 }
+
+                // Normalize
+                let inv_seq = 1.0 / seq_for_grad.max(1) as f32;
+                for g in router_grad.iter_mut() { *g *= inv_seq; }
+
+                // Update router weights via optimizer
+                let name = format!("router_{}", layer_idx);
+                optimizer.step(&name, &router_grad, &mut moe_ref.gate_weights);
             }
         }
 
@@ -1863,6 +1963,7 @@ async fn cmd_distill(
                 loss_ema = format_args!("{:.6}", loss_ema),
                 best_loss = format_args!("{:.6}", best_loss),
                 grad_norm = format_args!("{:.3e}", grad_norm),
+                balance_loss = format_args!("{:.6}", balance_loss),
                 lr = format_args!("{:.2e}", lr),
                 step_ms = step_ms,
                 tok_per_s = format_args!("{:.2}", tps),

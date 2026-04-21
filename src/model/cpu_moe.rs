@@ -1,5 +1,25 @@
 use crate::model::gemma_mapper::matmul;
 
+/// Routing data collected during MoE forward pass.
+/// Used for load balance loss computation and router gradient.
+#[derive(Clone, Debug)]
+pub struct MoERoutingData {
+    /// Layer index this routing data came from.
+    pub layer_idx: usize,
+    /// Raw router logits: [seq, num_experts] (pre-softmax).
+    pub gate_logits: Vec<f32>,
+    /// Softmax probabilities over ALL experts: [seq, num_experts].
+    pub gate_probs: Vec<f32>,
+    /// Selected expert indices: [seq, top_k].
+    pub selected_experts: Vec<usize>,
+    /// Expert weights after top-k softmax: [seq, top_k].
+    pub expert_weights: Vec<f32>,
+    /// Pre-FFN normalized input: [seq, hidden_dim].
+    pub pre_ffn_input: Vec<f32>,
+    /// Expert outputs per token: [seq, top_k, hidden_dim].
+    pub expert_outputs: Vec<f32>,
+}
+
 /// CPU-only Mixture of Experts layer. Stores all weights as `Vec<f32>`.
 /// Used by CpuBlockAttnResLayer for MoE FFN.
 ///
@@ -53,27 +73,61 @@ impl CpuMoELayer {
 
     /// Forward pass: route tokens to top-k experts, compute weighted output.
     /// Input: [seq, hidden_dim], Output: [seq, hidden_dim].
+    /// Forward pass: route tokens to top-k experts, compute weighted output.
+    /// Input: [seq, hidden_dim], Output: [seq, hidden_dim].
     pub fn forward(&self, input: &[f32], seq: usize) -> Vec<f32> {
+        self.forward_with_routing(input, seq, None, 0, 0).0
+    }
+
+    /// Forward pass that also collects routing data for loss/gradient computation.
+    /// Returns (output [seq, hidden_dim], Option<MoERoutingData>).
+    ///
+    /// When `routing_collector` is Some, routing data is appended to it.
+    /// This avoids a separate forward pass — routing is collected inline.
+    ///
+    /// `layer_idx`: layer number for routing data metadata.
+    /// `lora_manager` / `lora_layer_idx`: if Some, apply LoRA to expert projections.
+    pub fn forward_with_routing(
+        &self,
+        input: &[f32],
+        seq: usize,
+        routing_collector: Option<&mut Vec<MoERoutingData>>,
+        layer_idx: usize,
+        _lora_layer_idx: usize,
+    ) -> (Vec<f32>, Option<&mut Vec<MoERoutingData>>) {
         let h = self.hidden_dim;
+        let ne = self.num_experts;
+        let tk = self.top_k;
 
         // 1. Compute gate logits: [seq, num_experts]
-        let gate_logits = matmul(input, &self.gate_weights, seq, h, self.num_experts);
+        let gate_logits = matmul(input, &self.gate_weights, seq, h, ne);
 
-        // 2. Top-k selection with softmax weighting
-        let (selected_experts, expert_weights) = self.top_k_select(&gate_logits, seq);
+        // 2. Top-k selection with softmax weighting + collect full softmax probs
+        let (selected_experts, expert_weights, gate_probs) = self.top_k_select_with_probs(&gate_logits, seq);
 
         // 3. Compute expert outputs and accumulate
-        let mut output = vec![0.0; seq * h];
+        let mut output = vec![0.0f32; seq * h];
+        let mut expert_outputs = if routing_collector.is_some() {
+            vec![0.0f32; seq * tk * h]
+        } else {
+            Vec::new()
+        };
 
         for t in 0..seq {
-            for k_idx in 0..self.top_k {
-                let expert_idx = selected_experts[t * self.top_k + k_idx];
-                let weight = expert_weights[t * self.top_k + k_idx];
+            for k_idx in 0..tk {
+                let expert_idx = selected_experts[t * tk + k_idx];
+                let weight = expert_weights[t * tk + k_idx];
 
                 if weight.abs() < 1e-8 { continue; }
 
                 let token = &input[t * h..(t + 1) * h];
                 let expert_out = self.expert_forward(expert_idx, token);
+
+                // Store expert output for routing collector
+                if !expert_outputs.is_empty() {
+                    let dst = t * tk * h + k_idx * h;
+                    expert_outputs[dst..dst + h].copy_from_slice(&expert_out);
+                }
 
                 for (i, &v) in expert_out.iter().enumerate() {
                     output[t * h + i] += weight * v;
@@ -81,41 +135,66 @@ impl CpuMoELayer {
             }
         }
 
-        output
+        // 4. Collect routing data
+        if let Some(collector) = routing_collector {
+            collector.push(MoERoutingData {
+                layer_idx,
+                gate_logits: gate_logits.clone(),
+                gate_probs,
+                selected_experts: selected_experts.clone(),
+                expert_weights: expert_weights.clone(),
+                pre_ffn_input: input.to_vec(),
+                expert_outputs,
+            });
+        }
+
+        (output, None)
     }
 
     /// Top-k expert selection with softmax normalization.
     /// Returns (selected_expert_indices[seq * top_k], weights[seq * top_k]).
-    fn top_k_select(&self, gate_logits: &[f32], seq: usize) -> (Vec<usize>, Vec<f32>) {
+    /// Top-k selection with softmax, also returns full softmax probabilities.
+    /// Returns (selected[seq*top_k], weights[seq*top_k], probs[seq*num_experts]).
+    fn top_k_select_with_probs(&self, gate_logits: &[f32], seq: usize) -> (Vec<usize>, Vec<f32>, Vec<f32>) {
         let ne = self.num_experts;
         let tk = self.top_k;
         let mut selected = vec![0usize; seq * tk];
         let mut weights = vec![0.0f32; seq * tk];
+        let mut all_probs = vec![0.0f32; seq * ne];
 
         for t in 0..seq {
             let logits = &gate_logits[t * ne..(t + 1) * ne];
+
+            // Full softmax for load balance loss
+            let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum_exp = 0.0f32;
+            for (e, &l) in logits.iter().enumerate() {
+                all_probs[t * ne + e] = (l - max_logit).exp();
+                sum_exp += all_probs[t * ne + e];
+            }
+            if sum_exp > 0.0 {
+                for e in 0..ne { all_probs[t * ne + e] /= sum_exp; }
+            }
 
             // Find top-k
             let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
             // Softmax over top-k logits for weight normalization
-            let max_logit = indexed[0].1;
-            let mut sum_exp = 0.0f32;
+            let max_l = indexed[0].1;
+            let mut top_sum = 0.0f32;
             for k in 0..tk.min(ne) {
-                let exp_val = (indexed[k].1 - max_logit).exp();
-                sum_exp += exp_val;
+                let exp_val = (indexed[k].1 - max_l).exp();
+                top_sum += exp_val;
                 selected[t * tk + k] = indexed[k].0;
                 weights[t * tk + k] = exp_val;
             }
-            if sum_exp > 0.0 {
-                for k in 0..tk.min(ne) {
-                    weights[t * tk + k] /= sum_exp;
-                }
+            if top_sum > 0.0 {
+                for k in 0..tk.min(ne) { weights[t * tk + k] /= top_sum; }
             }
         }
 
-        (selected, weights)
+        (selected, weights, all_probs)
     }
 
     /// Single expert forward: activation(gate(x)) * up(x) → down.
