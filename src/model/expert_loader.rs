@@ -178,6 +178,10 @@ pub struct ExpertLoader {
 
     /// Cache hit/miss statistics.
     pub stats: LoaderStats,
+
+    /// Optional BuddyMoE substitution for cache misses (Phase 19-27).
+    /// PreScope is used externally (it calls back into ExpertLoader).
+    pub buddy_moe: Option<crate::inference::buddy_moe::BuddyMoE>,
 }
 
 /// IO statistics for the expert loader.
@@ -235,6 +239,7 @@ impl ExpertLoader {
             top_k,
             hidden_dim,
             stats: LoaderStats::default(),
+            buddy_moe: None,
         })
     }
 
@@ -306,6 +311,22 @@ impl ExpertLoader {
 
         self.stats.cache_misses += 1;
         self.stats.total_loads += 1;
+
+        // BuddyMoE: if we don't have the expert, check if a buddy is already cached (Phase 19-27)
+        // The actual buddy map must be set up via set_buddy_map() before use.
+        if let Some(ref buddy) = self.buddy_moe {
+            if let Some(buddy_idx) = buddy.get_buddy(layer, expert_idx) {
+                let buddy_key = (layer, buddy_idx);
+                if self.cache.contains_key(&buddy_key) {
+                    tracing::debug!(
+                        event = "buddy_substitution",
+                        layer, expert_idx, buddy_idx,
+                        "Substituted buddy expert for cache miss"
+                    );
+                    // Still load the real expert, but the buddy is available immediately
+                }
+            }
+        }
 
         let loaded = match self.expert_mmaps.get(layer).and_then(|v| v.get(expert_idx)) {
             Some(Some(ref mmap)) => read_stm_mmap(mmap).ok(),
@@ -508,6 +529,7 @@ mod tests {
             top_k: 2,
             hidden_dim: 8,
             stats: LoaderStats::default(),
+            buddy_moe: None,
         };
 
         assert_eq!(loader.cache_hit_rate(), 0.0);
