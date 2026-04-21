@@ -1338,11 +1338,17 @@ async fn cmd_distill(
             };
             teacher_logits_chunks.push(logits);
 
-            // Compute frozen hidden states from teacher (same forward pass)
-            // GPU path falls through to CPU for hidden state collection
-            // (GPU forward doesn't expose per-layer states, so use CPU)
-            let frozen = teacher.forward_with_hidden_states(&chunk);
-            frozen_states_per_chunk.push(frozen);
+            // Compute frozen hidden states from teacher for hidden MSE loss.
+            // GPU-resident mode: skip — a full CPU forward alongside GPU would
+            // exhaust Colab T4's shared memory (12GB RAM + 16GB VRAM) and
+            // cause "Parent device is lost". KL divergence alone is sufficient.
+            // CPU-only mode: collect states (no GPU contention).
+            let frozen_states_this_chunk = if weight_cache.is_none() {
+                teacher.forward_with_hidden_states(&chunk)
+            } else {
+                Vec::new() // GPU mode: skip hidden state collection
+            };
+            frozen_states_per_chunk.push(frozen_states_this_chunk);
 
             let elapsed = teacher_start.elapsed().as_secs_f32();
             let per_chunk = elapsed / (chunk_idx + 1) as f32;
