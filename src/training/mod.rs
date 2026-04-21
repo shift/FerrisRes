@@ -9,6 +9,7 @@ pub mod gradient_accum;
 pub mod partial_backprop;
 pub mod qlora;
 pub mod tool_triggered_lora;
+pub mod backward;
 
 pub use optimizer::{SgdOptimizer, AdamOptimizer, CrossEntropyLoss, WeightOptimizer, OptimizerHint, optimizer_for_profile};
 pub use optimizer_scale::ScaleOptimizer;

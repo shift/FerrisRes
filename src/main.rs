@@ -1616,17 +1616,23 @@ async fn cmd_distill(
 
         let teacher_logits = &teacher_logits_chunks[chunk_idx];
 
-        // Student forward using CpuBlockAttnResModel
-        // GPU-accelerated when accelerator is available, pure CPU otherwise
-        // Collects MoE routing data inline for load balance loss + router gradients.
-        let (student_logits, routing_data) = if gpu_accel.is_some() {
-            // GPU path doesn't support routing collection yet — use CPU routing pass
-            let logits = student.forward_gpu(batch_tokens, gpu_accel.as_ref().unwrap(), &dispatch);
-            let (_, routing) = student.forward_with_routing(batch_tokens);
-            (logits, routing)
+        // Student forward using CpuBlockAttnResModel.
+        // Stores activations inline for proper layer-by-layer backward.
+        // GPU path: TODO — wire forward_gpu to also store activations.
+        let train_output = if gpu_accel.is_some() {
+            // GPU forward for logits, then CPU forward_train for activations
+            // (temporary until forward_gpu stores activations)
+            let gpu_logits = student.forward_gpu(batch_tokens, gpu_accel.as_ref().unwrap(), &dispatch);
+            let mut cpu_out = student.forward_train(batch_tokens);
+            cpu_out.logits = gpu_logits; // use GPU logits (more accurate)
+            cpu_out
         } else {
-            student.forward_with_routing(batch_tokens)
+            student.forward_train(batch_tokens)
         };
+        let student_logits = train_output.logits;
+        let routing_data = train_output.routing_data;
+        let _activations = train_output.activations;
+        let _final_hidden = train_output.final_hidden;
 
         // KL divergence loss
         let kl_loss = gemma_mapper::kl_divergence_loss(
