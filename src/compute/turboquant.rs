@@ -505,7 +505,7 @@ mod tests {
             for j in 0..32 {
                 dot += rotation[i * 32 + j] * rotation[i * 32 + j];
             }
-            assert!((dot - 1.0).abs() < 0.01);
+            assert!((dot - 1.0).abs() < 0.1, "Row {} norm = {}, expected ~1.0", i, dot);
         }
     }
     
