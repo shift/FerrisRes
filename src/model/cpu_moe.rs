@@ -155,7 +155,7 @@ impl CpuMoELayer {
     /// Returns (selected_expert_indices[seq * top_k], weights[seq * top_k]).
     /// Top-k selection with softmax, also returns full softmax probabilities.
     /// Returns (selected[seq*top_k], weights[seq*top_k], probs[seq*num_experts]).
-    fn top_k_select_with_probs(&self, gate_logits: &[f32], seq: usize) -> (Vec<usize>, Vec<f32>, Vec<f32>) {
+    pub fn top_k_select_with_probs(&self, gate_logits: &[f32], seq: usize) -> (Vec<usize>, Vec<f32>, Vec<f32>) {
         let ne = self.num_experts;
         let tk = self.top_k;
         let mut selected = vec![0usize; seq * tk];
@@ -258,6 +258,60 @@ impl CpuMoELayer {
         }
 
         down_out
+    }
+
+    /// Expert forward that returns intermediate activations for backward pass.
+    /// Returns (output [hd], gated [id], upped [id], combined [id]).
+    pub fn expert_forward_store_act(
+        &self,
+        expert_idx: usize,
+        token: &[f32],
+        lora_manager: Option<&crate::training::lora::LoraManager>,
+        layer_idx: usize,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let h = self.hidden_dim;
+        let id = self.intermediate_dim;
+        let gate = &self.expert_gate[expert_idx];
+        let up = &self.expert_up[expert_idx];
+        let down = &self.expert_down[expert_idx];
+
+        // gate: [1, h] @ [h, id]
+        let mut gated = matmul(token, gate, 1, h, id);
+        if let Some(lm) = lora_manager {
+            let name = format!("moe.expert.{}.gate", expert_idx);
+            if let Some(lo) = lm.forward(layer_idx, &name, token, 1) {
+                for (i, v) in lo.iter().enumerate() { gated[i] += v; }
+            }
+        }
+        let gated: Vec<f32> = if self.use_gelu {
+            gated.iter().map(|&x| crate::model::gemma_mapper::gelu_tanh(x)).collect()
+        } else {
+            gated.iter().map(|&x| x / (1.0 + (-x).exp())).collect()
+        };
+
+        // up: [1, h] @ [h, id]
+        let mut upped = matmul(token, up, 1, h, id);
+        if let Some(lm) = lora_manager {
+            let name = format!("moe.expert.{}.up", expert_idx);
+            if let Some(lo) = lm.forward(layer_idx, &name, token, 1) {
+                for (i, v) in lo.iter().enumerate() { upped[i] += v; }
+            }
+        }
+
+        // combined = gated * upped
+        let mut combined = vec![0.0; id];
+        for i in 0..id { combined[i] = gated[i] * upped[i]; }
+
+        // down: [1, id] @ [id, h]
+        let mut down_out = matmul(&combined, down, 1, id, h);
+        if let Some(lm) = lora_manager {
+            let name = format!("moe.expert.{}.down", expert_idx);
+            if let Some(lo) = lm.forward(layer_idx, &name, &combined, 1) {
+                for (i, v) in lo.iter().enumerate() { down_out[i] += v; }
+            }
+        }
+
+        (down_out, gated, upped, combined)
     }
 }
 
