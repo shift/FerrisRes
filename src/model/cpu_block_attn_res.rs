@@ -3,6 +3,54 @@ use crate::model::cpu_moe::CpuMoELayer;
 use crate::model::gemma_mapper::{matmul, rms_norm, apply_rope, apply_rope_gqa, gelu_tanh};
 use crate::model::gemma_mapper::{MappedGemma4Model, Gemma4FfnWeights};
 
+/// Stored activations from a forward pass, used for proper backward.
+///
+/// Rather than storing ALL intermediate tensors (which would be ~4GB for 35 layers),
+/// we store only what's needed for gradient computation:
+/// - pre-attention normed input (for LoRA grad on Q/K/V/O)
+/// - pre-FFN normed input (for expert LoRA grad)
+/// - attention output (for LoRA grad on O)
+/// - per-expert intermediate activations (gate, up, combined — for expert backward)
+///
+/// Memory: ~2 × seq × hidden_dim per layer (pre-attn + pre-ffn norms) ≈ 2×32×1536×35×4 ≈ 14MB
+/// Plus expert intermediates: 2 × seq × inter_dim per expert per layer.
+#[derive(Clone, Debug, Default)]
+pub struct LayerActivations {
+    /// Pre-attention RMSNorm output: [seq, hidden_dim]
+    pub pre_attn_normed: Vec<f32>,
+    /// Post-attention output (before O projection + LoRA): [seq, q_dim]
+    pub post_attn_raw: Vec<f32>,
+    /// Pre-FFN RMSNorm output: [seq, hidden_dim]
+    pub pre_ffn_normed: Vec<f32>,
+    /// Per-expert activations: gate, up, combined for each selected expert.
+    /// Stored as: [seq][top_k] → ExpertActivation
+    pub expert_activations: Vec<Vec<ExpertActivation>>,
+}
+
+/// Intermediate activations for a single expert evaluation.
+#[derive(Clone, Debug)]
+pub struct ExpertActivation {
+    pub expert_idx: usize,
+    /// Gate projection output (after activation): [intermediate_dim]
+    pub gated: Vec<f32>,
+    /// Up projection output: [intermediate_dim]
+    pub upped: Vec<f32>,
+    /// Element-wise combined (gated * upped): [intermediate_dim]
+    pub combined: Vec<f32>,
+    /// Input token: [hidden_dim]
+    pub input: Vec<f32>,
+}
+
+/// Full forward output including routing data, activations for backward, and logits.
+#[derive(Clone, Debug)]
+pub struct ForwardOutput {
+    pub logits: Vec<f32>,
+    pub routing_data: Vec<crate::model::cpu_moe::MoERoutingData>,
+    pub activations: Vec<LayerActivations>,
+    /// Post-final-norm hidden states (input to lm_head): [seq, hidden_dim]
+    pub final_hidden: Vec<f32>,
+}
+
 /// CPU-only BlockAttnResLayer with full Gemma 4 architectural support.
 ///
 /// This is the student model layer for distillation. It mirrors the GPU
