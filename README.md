@@ -2,7 +2,7 @@
 
 FerrisRes is a Rust-native AI inference and training engine built around **Block AttnRes** — a novel linear-time transformer architecture that replaces the quadratic attention bottleneck of standard transformers. It runs on any GPU or iGPU via [wgpu](https://github.com/gfx-rs/wgpu) (Vulkan, Metal, DX12, WebGPU), adapts automatically to the hardware it finds, and is written entirely in safe Rust with no Python dependency.
 
-> ⚠️ **v0.2.3 — near-production grade, not yet 1.0.** FerrisRes has 1434 passing tests (~94K lines across 158 modules), a Block-MoE-Res architecture with inter-block attention, 1.58-bit ternary quantization, 2:4 sparse ternary, TurboQuant 3-bit KV cache, expert mmap loading, and recurrent block summaries for unlimited context length. a full cognitive architecture with 5 layers, a verified Gemma 4 distillation pipeline, five output modalities, a 4-layer security proxy (FerrisRes Armor), and profile-driven GPU dispatch that adapts from Intel iGPUs to H100s. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0.
+> ⚠️ **v0.2.3 — near-production grade, not yet 1.0.** FerrisRes has 1575 passing tests (~100K+ lines across 158+ modules), a Block-MoE-Res architecture with inter-block attention, 1.58-bit ternary quantization, 2:4 sparse ternary, TurboQuant 3-bit KV cache, expert mmap loading, and recurrent block summaries for unlimited context length. a full cognitive architecture with 5 layers, a verified Gemma 4 distillation pipeline, five output modalities, a 4-layer security proxy (FerrisRes Armor), and profile-driven GPU dispatch that adapts from Intel iGPUs to H100s. Public APIs follow `0.x` semver — breaking changes may occur before 1.0.0.
 
 ---
 
@@ -238,46 +238,225 @@ Auto-detects at startup. Override via `FERRIS_DEVICE_PROFILE=integrated cargo ru
 ## CLI
 
 ```
-# Inference
+ferrisres <COMMAND>
+
+Commands:
+  info        Print device capabilities and exit
+  infer       Run inference on a prompt
+  train       Train a BlockAttnRes model from scratch
+  distill     Distill a Gemma 4/LLaMA/Mistral model into Block AttnRes
+  evaluate    Evaluate teacher/student perplexity
+  benchmark   Run performance benchmarks
+  serve       Start OpenAI-compatible API server
+```
+
+### `ferrisres info`
+
+Print GPU adapter info, device capabilities, and supported wgpu features. No arguments.
+
+### `ferrisres infer`
+
+```
+ferrisres infer [OPTIONS] --prompt <PROMPT>
+
+Required:
+  --prompt <STRING>             Input prompt text
+
+Model loading:
+  --model-path <PATH>           Path to model file (omit for skeleton/random-weight model)
+  --config <PRESET>             Model config preset [default: e2b]
+                                 Values: e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b,
+                                          llama3-8b, llama3-70b, mistral-7b,
+                                          mixtral-8x7b, phi3-mini, qwen2-7b
+  --config-path <PATH>          Path to HuggingFace config.json (overrides --config)
+  --model-format <FORMAT>       File format: safetensors | gguf [default: safetensors]
+  --tokenizer <PATH>            Path to tokenizer.json (recommended with --model-path)
+
+Generation:
+  --max-tokens <N>              Maximum tokens to generate [default: 64]
+  --temperature <FLOAT>         Sampling temperature [default: 0.7]
+  --template <NAME>             Prompt template: chatml | llama2 | mistral | alpaca | raw
+  --yarn-scale <FLOAT>          YaRN context extension scale factor (e.g. 4.0 for 4×)
+  --image <PATH>                Image file for multimodal input
+
+Architecture (skeleton model only):
+  --hidden-dim <N>              Hidden dimension [default: 512]
+  --num-blocks <N>              Number of blocks [default: 8]
+  --block-size <N>              Tokens per block [default: 8]
+
+Features:
+  --armor                       Enable FerrisRes Armor security filtering
+  --cognitive                   Enable cognitive pipeline (concept memory + self-evaluation)
+  --concepts-path <PATH>        Path to persist concept memory
+  --persist-kv                  Enable Hull-KV cache persistence
+  --kv-path <PATH>              Path to persist KV cache
+```
+
+**Examples:**
+
+```bash
 # Skeleton model (random weights, for testing)
-cargo run -- infer --prompt "Explain transformers" --template chatml --max-tokens 128
+ferrisres infer --prompt "Explain transformers" --template chatml --max-tokens 128
 
 # Real model from GGUF (CPU inference)
-cargo run -- infer \
+ferrisres infer \
   --model-path gemma-4-E2B-it-Q4_K_M.gguf \
   --model-format gguf \
   --config e2b \
   --prompt "Explain transformers"
 
 # Multimodal
-cargo run -- infer --prompt "Describe this image" --image photo.jpg
+ferrisres infer --prompt "Describe this image" --image photo.jpg
 
-# Extended context
-cargo run -- infer --prompt "Long document..." --yarn-scale 4.0
+# Extended context (4× YaRN)
+ferrisres infer --prompt "Long document..." --yarn-scale 4.0
 
-# Training with LoRA
-cargo run -- train --epochs 3 --lora-rank 8 --data training.txt
+# With cognitive pipeline + concept memory
+ferrisres infer --model-path model.gguf --model-format gguf --config e2b \
+  --prompt "Explain Rust" --cognitive --concepts-path ./concepts.json
+```
 
-# Benchmark
-cargo run -- benchmark --iterations 100 --hidden-dim 512
+### `ferrisres distill`
 
-# Distillation (full pipeline — GPU auto-detected)
-cargo run -- distill \
+```bash
+ferrisres distill [OPTIONS] --model-path <PATH>
+
+Required:
+  --model-path <PATH>           Path to teacher model (safetensors or GGUF)
+
+Model config:
+  --config <PRESET>             Model config preset [default: e2b]
+  --model-format <FORMAT>       File format: safetensors | gguf [default: safetensors]
+  --tokenizer <PATH>            Path to tokenizer.json
+
+Training:
+  --steps <N>                   Number of distillation steps [default: 1000]
+  --seq-len <N>                 Training sequence length [default: 512]
+  --learning-rate <FLOAT>       Learning rate [default: 0.0001]
+  --temperature <FLOAT>         KL divergence temperature [default: 2.0]
+  --data <PATH>                 Training data (text file, one doc per line)
+
+Output:
+  --output <PATH>               Output model path [default: distilled_model.bin]
+  --log-every <N>               Log loss every N steps [default: 1]
+  --checkpoint-every <N>        Save checkpoint every N steps [default: 100]
+
+Resume:
+  --resume <PATH>               Resume from checkpoint file
+
+Convergence:
+  --converge <FLOAT>            Auto-stop when loss doesn't improve by this fraction [default: 0.0]
+  --converge-patience <N>       Steps with no improvement before stopping [default: 50]
+
+Security:
+  --armor                       Enable FerrisRes Armor
+  --armor-config <PATH>         Armor config file path
+```
+
+**Examples:**
+
+```bash
+# Full distillation with real data and auto-convergence
+ferrisres distill \
   --model-path ./model.safetensors \
   --config 27b-mm \
   --steps 10000 \
+  --seq-len 32 \
   --tokenizer ./tokenizer.json \
   --data training_data.txt \
   --converge 0.001 \
-  --converge-patience 100
+  --converge-patience 100 \
+  --checkpoint-every 100
 
-# Resume distillation
-cargo run -- distill \
+# Resume from checkpoint
+ferrisres distill \
   --model-path ./model.safetensors \
   --config 27b-mm \
   --steps 5000 \
   --resume distilled_model.bin.checkpoint.bin
+
+# Smaller model for testing
+ferrisres distill \
+  --model-path ./model.safetensors \
+  --config e2b \
+  --steps 1000
 ```
+
+### `ferrisres evaluate`
+
+```bash
+ferrisres evaluate --model-path <PATH> --config <PRESET> --text <STRING>
+
+  --model-path <PATH>           Path to model file
+  --config <PRESET>             Model config preset [default: e2b]
+  --text <STRING>               Text to evaluate perplexity on
+```
+
+### `ferrisres train`
+
+```bash
+ferrisres train [OPTIONS]
+
+  --hidden-dim <N>              Hidden dimension [default: 512]
+  --num-blocks <N>              Number of blocks [default: 8]
+  --block-size <N>              Tokens per block [default: 8]
+  --epochs <N>                  Number of epochs [default: 1]
+  --batch-size <N>              Batch size [default: 32]
+  --learning-rate <FLOAT>       Learning rate [default: 0.001]
+  --data <PATH>                 Training data file
+  --lora-rank <N>               LoRA rank for fine-tuning
+```
+
+### `ferrisres benchmark`
+
+```bash
+ferrisres benchmark [OPTIONS]
+
+  --hidden-dim <N>              Hidden dimension [default: 512]
+  --num-blocks <N>              Number of blocks [default: 8]
+  --block-size <N>              Tokens per block [default: 8]
+  --iterations <N>              Number of benchmark iterations [default: 100]
+```
+
+### `ferrisres serve`
+
+```bash
+ferrisres serve [OPTIONS]
+
+Model loading:
+  --model-path <PATH>           Path to model file (omit for placeholder responses)
+  --config <PRESET>             Model config preset [default: e2b]
+  --model-format <FORMAT>       File format: safetensors | gguf [default: safetensors]
+  --tokenizer <PATH>            Path to tokenizer.json
+
+Server:
+  --host <ADDR>                 Host to bind to [default: 0.0.0.0]
+  --port <PORT>                 Port to listen on [default: 8080]
+  --model-name <NAME>           Model name in API responses [default: ferrisres]
+
+Features:
+  --armor                       Enable FerrisRes Armor
+  --cognitive                   Enable cognitive pipeline
+  --concepts-path <PATH>        Path to persist concept memory
+```
+
+**Endpoints:**
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/v1/chat/completions` | POST | Chat with messages (real CPU inference when model loaded) |
+| `/v1/completions` | POST | Text completion |
+| `/v1/models` | GET | List available models |
+| `/health` | GET | Health check |
+
+Supports SSE streaming, CORS for browser integration, works with any OpenAI-compatible client.
+
+### Environment Variables
+
+| Variable | Description |
+|---|---|
+| `FERRIS_DEVICE_PROFILE` | Override auto-detected device profile. Values: `integrated`, `lowend`, `midrange`, `highend` |
+| `FERRIS_DEVICE_PROFILE=integrated cargo run` | Example: force integrated GPU profile |
 
 ---
 
@@ -495,7 +674,7 @@ FerrisRes requires a working Vulkan driver. On Linux the recommended path is thr
 ```bash
 nix develop          # enters the dev shell with Rust + Vulkan layers
 cargo build
-cargo test            # 1434 tests
+cargo test            # 1575 tests
 cargo bench
 ```
 
@@ -634,14 +813,14 @@ src/
 | 19 | 🚧 In Progress | Block-MoE-Res: ternary quantization, SCALE/AdaMeM optimizers, inter-block attention, MoE conversion, distillation pipeline, checkpoint serialization |
 | 20 | ✅ Done | 1.58-bit inference stack: ternary matmul (6 variants), TernaryLinear, TernaryMoELayer, STE integration, TernaryBlockAttnResModel |
 | 21 | ✅ Done | Edge I/O: 2:4 sparse ternary, expert mmap loader (.stm format), 3-bit TurboQuant KV, recurrent block summary KV, pruning pipeline |
-| 22 | 📝 Planned | Expert I/O Pipeline: PreScope predictive prefetch, BuddyMoE fallback |
-| 23 | 📝 Planned | CPU/GPU Backend Abstraction: YaRN WGSL shaders, GPU capabilities, cooperative matrix MatMul, subgroup FlashDecode, WGSL backward passes |
-| 24 | 📝 Planned | Inference pipeline: wire CpuBlockAttnResModel into KV cache, prefill, decode |
-| 25 | 📝 Planned | Autonomous Learning: CoVo self-rewarding RL, SkillKB hierarchical experience, FDAL active learning |
-| 26 | 📝 Planned | Elastic Inference: dynamic E2B/E4B path switching per DeviceProfile |
-| 27 | 📝 Planned | GPU BlockAttnResLayer: all 10 Gemma 4 features on GPU, LoRA backward, matmul/RoPE/softmax/RMSNorm backward kernels |
+| 22 | ✅ Done | Expert I/O Pipeline: PreScope predictive prefetch, BuddyMoE fallback |
+| 23 | ✅ Done | CPU/GPU Backend Abstraction: YaRN WGSL shaders, GPU capabilities, cooperative matrix MatMul, subgroup FlashDecode, WGSL backward passes |
+| 24 | ✅ Done | Inference pipeline: CpuBlockAttnResModel with KV cache, prefill, decode, CPU generator |
+| 25 | ✅ Done | Autonomous Learning: CoVo self-rewarding RL, SkillKB hierarchical experience, FDAL active learning |
+| 26 | ✅ Done | Elastic Inference: dynamic expert activation per DeviceProfile |
+| 27 | ✅ Done | GPU BlockAttnResLayer: all 10 Gemma 4 features on GPU, LoRA backward, matmul/RoPE/softmax/RMSNorm backward kernels |
 
-**1434 tests passing. 437 tasks done, 2 in progress, 47 planned.**
+**1575 tests passing. 484 tasks done, 0 in progress, 1 planned (blocked on external dependency).**
 
 See [ROADMAP.md](ROADMAP.md) for full technical details.
 

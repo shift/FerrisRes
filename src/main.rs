@@ -1651,6 +1651,7 @@ async fn cmd_distill(
 
         // LoRA backprop through student
         // d_hidden is the gradient flowing into the student model's output.
+        let d_hidden: Vec<f32> = {
             gpu_matmul(&d_logits, &lm_head_t, actual_seq, vs, config.hidden_dim, &dispatch)
         };
 
