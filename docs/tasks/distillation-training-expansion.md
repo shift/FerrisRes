@@ -50,25 +50,23 @@
 
 ---
 
-## Task 3: Proper Layer-by-Layer Backward Pass — 📝 IN PROGRESS
+## Task 3: Proper Layer-by-Layer Backward Pass — ✅ DONE
 
 **Problem**: Current backward pass is an approximation — computes `d_hidden` from lm_head, then uses it as a proxy gradient for ALL LoRA adapters. No actual per-layer gradient computation. No gradient flow through attention → FFN → MoE routing chain.
 
 **Implementation**:
-- Implement proper reverse-mode autodiff through the student forward:
-  1. `d_logits` → lm_head backward → `d_hidden_final`
-  2. For each layer (reverse order):
-     a. Layer scalar: `d_hidden *= scalar`
-     b. PLE backward: `d_hidden` through ple_proj, ple_gate
-     c. FFN/MoE backward:
-        - Dense: `d_down = d_out`, `d_combined = down^T · d_down`, `d_gated = combined * d_combined`, `d_gate = d_gated * gelu'`, `d_up = d_combined * gated`, `d_input += gate^T · d_gate + up^T · d_up + down^T · d_down`
-        - MoE: per-expert gradient + routing gradient
-     d. Attention backward: `d_attn_out` → `d_V`, `d_K`, `d_Q` → `d_q_proj`, `d_k_proj`, `d_v_proj` → `d_normed`
-     e. Residual: `d_input += d_residual`
-  3. For each LoRA adapter: extract gradient from the per-layer d activations
-- This replaces the current approximate gradient computation
+- `forward_train()` stores per-layer activations inline during forward:
+  - `pre_attn_normed` (input to Q/K/V/O projections)
+  - `post_attn_raw` (attention output before O-LoRA)
+  - `pre_ffn_normed` (input to MoE)
+  - `expert_activations` (per-token per-expert gated/upped/combined)
+- Backward processes layers in reverse order:
+  - Attention LoRA: O gets `post_attn_raw` as input, Q/K/V get `pre_attn_normed`
+  - Expert FFN: backward through down → combined → gate/up with stored intermediates
+  - Router: proper softmax→top-k chain gradient (unchanged)
+- Helper functions: `compute_lora_grad`, `compute_lora_grad_single`, `accumulate_lora_grad`, `truncate_grad`
 
-**Files**: `src/main.rs` (distillation backward section), potentially new `src/training/backward.rs`
+**Files**: `src/training/backward.rs`, `src/main.rs`, `src/model/cpu_moe.rs`, `src/training/lora.rs`
 
 **Estimated effort**: Large — proper backprop through 35 MoE layers with all Gemma 4 features
 
@@ -108,17 +106,24 @@
 
 ---
 
-## Task 6: Checkpoint Resume with Optimizer State — 📝 PLANNED
+## Task 6: Checkpoint Resume with Optimizer State — ✅ DONE
 
-**Problem**: Mid-training checkpoints save model weights but not optimizer state (SCALE momentum). Resuming from checkpoint would lose training progress.
+**Problem**: Mid-training checkpoints save model weights but not optimizer state (SCALE momentum) or LoRA adapters. Resuming from checkpoint would lose training progress.
 
 **Implementation**:
-- Extend `BlockMoeResConfig` or add separate optimizer state file
-- Save: `{path}_stepN.optimizer.json` with SCALE momentum buffers
-- On resume: reload optimizer state alongside model weights
-- Or simpler: save optimizer state as safetensors alongside model
+- `WeightOptimizer::serialize_state()` / `deserialize_state()` trait methods
+  - SCALE: column norms + momentum per matrix (magic `SCAL`, version 1)
+  - AdaMeM: projector + momentum + Adafactor state per matrix (magic `ADME`, version 1)
+- `LoraManager::serialize_adapters()` / `deserialize_adapters()`
+  - Stores A/B weights, rank, in/out dimensions per adapter
+- Checkpoint file format (4 files):
+  - `{name}.safetensors` — model weights
+  - `{name}.lora.bin` — LoRA adapter A/B weights
+  - `{name}.opt.bin` — optimizer state
+  - `{name}.meta.json` — global_step + metadata
+- Resume loads meta → LoRA → optimizer, falls back to old DistillationCheckpoint format
 
-**Files**: `src/model/checkpoint.rs`, `src/main.rs` (resume logic)
+**Files**: `src/main.rs`, `src/training/optimizer.rs`, `src/training/optimizer_scale.rs`, `src/training/optimizer_adamem.rs`, `src/training/lora.rs`
 
 **Estimated effort**: Medium
 
@@ -152,4 +157,4 @@ Tasks 1+4 can ship together. Task 2+3 should ship together. Task 6 can be done a
 | ~~LoRA q/v only~~ | ~~1.6M~~ | ~~Cannot converge~~ | ~~∞~~ |
 | ✅ Tasks 1+4+5 (router + K/O + balance) | 3.6M (0.14%) | Slow | 20,000+ |
 | ✅ + Task 2 (LoRA experts r=8) | **~26M (1.0%)** | **Feasible** | **5,000-10,000** |
-| 📝 + Task 3 (proper backward) | same | Much faster convergence | 2,000-5,000 |
+| ✅ + Task 3 (proper backward) | same | Much faster convergence | 2,000-5,000 |
