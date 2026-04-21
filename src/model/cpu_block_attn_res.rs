@@ -574,6 +574,218 @@ impl CpuBlockAttnResModel {
         logits
     }
 
+    /// GPU-accelerated forward: routes heavy matmuls through GpuMatmulAccelerator.
+    /// Embedding, norms, attention scores, RoPE stay on CPU (cheap ops).
+    /// Q/K/V/O projections, FFN gate/up/down, MoE experts, LM head go to GPU.
+    pub fn forward_gpu(
+        &self,
+        token_ids: &[u32],
+        gpu: &crate::model::gpu_forward::GpuMatmulAccelerator,
+        dispatch: &crate::device::DispatchPlan,
+    ) -> Vec<f32> {
+        let seq = token_ids.len();
+        let hd = self.hidden_dim;
+        let vs = self.vocab_size;
+
+        // Helper: GPU matmul with CPU fallback
+        let gpu_mm = |a: &[f32], b: &[f32], m: usize, k: usize, n: usize| -> Vec<f32> {
+            if matches!(dispatch.should_gpu_matmul(m as u64, k as u64, n as u64), crate::device::OpTarget::Gpu) {
+                match gpu.gpu_matmul_cpu_b(a, b, m, k, n) {
+                    Ok(r) => return r,
+                    Err(e) => {
+                        tracing::debug!(event = "gpu_matmul_fallback", error = ?e, m, k, n, "GPU matmul failed, falling back to CPU");
+                    }
+                }
+            }
+            matmul(a, b, m, k, n)
+        };
+
+        // 1. Embedding (CPU — just a lookup)
+        let mut hidden = vec![0.0f32; seq * hd];
+        for (t, &tid) in token_ids.iter().enumerate() {
+            let id = tid as usize;
+            if id * hd + hd <= self.embed_tokens.len() {
+                for d in 0..hd {
+                    hidden[t * hd + d] = self.embed_tokens[id * hd + d];
+                }
+            }
+        }
+        let scale = (hd as f32).sqrt();
+        for h in hidden.iter_mut() { *h *= scale; }
+
+        // 2. Pre-compute PLE inputs
+        let ple_dim = self.hidden_size_per_layer_input;
+        let ple_precomputed = self.precompute_ple(&hidden, token_ids, seq, hd, ple_dim);
+
+        // 3. Per-layer transformer
+        let first_shared_layer = self.num_layers.saturating_sub(self.num_kv_shared_layers);
+        let mut shared_kv: std::collections::HashMap<usize, (Vec<f32>, Vec<f32>)> = std::collections::HashMap::new();
+        let mut block_reps: Vec<Vec<f32>> = Vec::new();
+        let mut partial_sum = vec![0.0f32; hd];
+        for t in 0..seq { for d in 0..hd { partial_sum[d] += hidden[t * hd + d]; } }
+        for d in 0..hd { partial_sum[d] /= seq as f32; }
+        block_reps.push(partial_sum.clone());
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            // PLE slice
+            let ple_slice = ple_precomputed.as_ref().map(|pre| {
+                let mut slice = vec![0.0f32; seq * ple_dim];
+                for t in 0..seq {
+                    let src = t * self.num_layers * ple_dim + layer_idx * ple_dim;
+                    let dst = t * ple_dim;
+                    for d in 0..ple_dim { slice[dst + d] = pre[src + d]; }
+                }
+                slice
+            });
+
+            // KV sharing
+            let (kv, should_store) = if layer_idx >= first_shared_layer && first_shared_layer > 0 && layer.kv_shared {
+                let kv_source = Self::kv_shared_source_layer(layer_idx, first_shared_layer, &self.layers);
+                if let Some((sk, sv)) = shared_kv.get(&kv_source) {
+                    (Some((sk.as_slice(), sv.as_slice())), false)
+                } else { (None, false) }
+            } else { (None, true) };
+
+            // === Attention (matmuls on GPU, rest CPU) ===
+            let residual = hidden.clone();
+            let normed = layer.attn_norm.forward(&hidden);
+            let lora_m = self.lora_manager.as_ref();
+
+            // Q projection
+            let q_dim = layer.q_proj.out_features();
+            let kv_dim_out = layer.v_proj.out_features();
+            let mut q = gpu_mm(&normed, layer.q_proj.weight(), seq, hd, q_dim);
+            if let Some(ref lora_m) = lora_m {
+                if let Some(lora_out) = lora_m.forward(layer_idx, "q_proj", &normed, seq) {
+                    for (i, v) in lora_out.iter().enumerate() { q[i] += v; }
+                }
+            }
+            q = crate::model::gemma_mapper::per_head_rms_norm(&q, layer.q_norm.weight(), seq, layer.num_heads, layer.head_dim);
+            apply_rope(&mut q, seq, layer.num_heads, layer.head_dim, 0, layer.rope_theta, layer.partial_rotary_factor);
+
+            // K/V
+            let (k, v) = match kv {
+                Some((sk, sv)) => (sk.to_vec(), sv.to_vec()),
+                None => {
+                    let mut k = gpu_mm(&normed, layer.k_proj.weight(), seq, hd, layer.k_proj.out_features());
+                    let mut v_raw = gpu_mm(&normed, layer.v_proj.weight(), seq, hd, layer.v_proj.out_features());
+                    if let Some(ref lora_m) = lora_m {
+                        if let Some(lora_out) = lora_m.forward(layer_idx, "v_proj", &normed, seq) {
+                            for (i, l) in lora_out.iter().enumerate() { v_raw[i] += l; }
+                        }
+                    }
+                    k = crate::model::gemma_mapper::per_head_rms_norm(&k, layer.k_norm.weight(), seq, layer.num_kv_heads, layer.head_dim);
+                    let v = crate::model::gemma_mapper::per_head_rms_norm_no_scale(&v_raw, seq, layer.num_kv_heads, layer.head_dim);
+                    apply_rope_gqa(&mut k, seq, layer.num_kv_heads, layer.head_dim, 0, layer.rope_theta, layer.partial_rotary_factor);
+                    (k, v)
+                }
+            };
+
+            // Attention scores (CPU — O(seq²) but small dimensions)
+            let attn_out = layer.cpu_attention(&q, &k, &v, seq, layer.num_heads, layer.num_kv_heads, layer.head_dim, q_dim, kv_dim_out);
+            let attn_out = layer.post_attn_norm.forward(&attn_out);
+            for i in 0..hidden.len() { hidden[i] = residual[i] + attn_out[i]; }
+
+            // Store K/V
+            if should_store && first_shared_layer > 0 && !k.is_empty() {
+                shared_kv.insert(layer_idx, (k, v));
+            }
+
+            // === FFN / MoE ===
+            let ffn_residual = hidden.clone();
+            let normed2 = layer.pre_ffn_norm.forward(&hidden);
+
+            if let Some(ref moe) = layer.moe {
+                // MoE routing (CPU — small matmul + softmax)
+                let mut router_out = vec![0.0f32; seq * moe.num_experts];
+                for t in 0..seq {
+                    for e in 0..moe.num_experts {
+                        let mut dot = 0.0f32;
+                        for d in 0..hd { dot += normed2[t * hd + d] * moe.gate_weights[e * hd + d]; }
+                        router_out[t * moe.num_experts + e] = dot;
+                    }
+                }
+                // Softmax + top-k
+                let mut expert_outputs = vec![0.0f32; seq * hd];
+                for t in 0..seq {
+                    let r_off = t * moe.num_experts;
+                    let max_r = (0..moe.num_experts).map(|e| router_out[r_off + e]).fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum_e = 0.0f32;
+                    for e in 0..moe.num_experts { router_out[r_off + e] = (router_out[r_off + e] - max_r).exp(); sum_e += router_out[r_off + e]; }
+                    for e in 0..moe.num_experts { router_out[r_off + e] /= sum_e; }
+                    // Find top-k
+                    let mut indices: Vec<usize> = (0..moe.num_experts).collect();
+                    indices.sort_by(|&a, &b| router_out[r_off + b].partial_cmp(&router_out[r_off + a]).unwrap());
+                    let top_k_sum: f32 = indices[..moe.top_k].iter().map(|&e| router_out[r_off + e]).sum();
+                    for &ei in &indices[..moe.top_k] {
+                        let w = router_out[r_off + ei] / top_k_sum;
+                        let input_t = &normed2[t * hd..(t + 1) * hd];
+                        let gated = gpu_mm(input_t, &moe.expert_gate[ei], 1, hd, moe.intermediate_dim);
+                        let upped = gpu_mm(input_t, &moe.expert_up[ei], 1, hd, moe.intermediate_dim);
+                        let gated: Vec<f32> = if moe.use_gelu { gated.iter().map(|&x| gelu_tanh(x)).collect() } else { gated.iter().map(|&x| x * (1.0 / (1.0 + (-x).exp()))).collect() };
+                        let combined: Vec<f32> = gated.iter().zip(upped.iter()).map(|(&g, &u)| g * u).collect();
+                        let down = gpu_mm(&combined, &moe.expert_down[ei], 1, moe.intermediate_dim, hd);
+                        for d in 0..hd { expert_outputs[t * hd + d] += w * down[d]; }
+                    }
+                }
+                let normed_ffn = layer.post_ffn_norm.forward(&expert_outputs);
+                for i in 0..hidden.len() { hidden[i] = ffn_residual[i] + normed_ffn[i] * layer.layer_scalar; }
+            } else {
+                // Dense FFN
+                let id = layer.intermediate_dim;
+                let (gate_w, up_w, down_w) = match (&layer.ffn_gate, &layer.ffn_up, &layer.ffn_down) {
+                    (Some(g), Some(u), Some(d)) => (g.weight(), u.weight(), d.weight()),
+                    _ => { continue; }
+                };
+                let gated = gpu_mm(&normed2, gate_w, seq, hd, id);
+                let upped = gpu_mm(&normed2, up_w, seq, hd, id);
+                let gated: Vec<f32> = if layer.use_gelu { gated.iter().map(|&x| gelu_tanh(x)).collect() } else { gated.iter().map(|&x| x * (1.0 / (1.0 + (-x).exp()))).collect() };
+                let combined: Vec<f32> = gated.iter().zip(upped.iter()).map(|(&g, &u)| g * u).collect();
+                let ffn_out = gpu_mm(&combined, down_w, seq, id, hd);
+                let normed_ffn = layer.post_ffn_norm.forward(&ffn_out);
+                for i in 0..hidden.len() { hidden[i] = ffn_residual[i] + normed_ffn[i] * layer.layer_scalar; }
+            }
+
+            // PLE residual
+            if let Some(ref ple_s) = ple_slice {
+                // PLE injection (gate → GELU → element-wise multiply → project → norm → residual)
+                if let (Some(ref gate), Some(ref proj), Some(ref norm)) =
+                    (&layer.ple_input_gate, &layer.ple_projection, &layer.ple_post_norm)
+                {
+                    let ple_dim = ple_s.len() / seq;
+                    let gate_out = gate.forward(&hidden, seq);
+                    let gate_gelu: Vec<f32> = gate_out.iter().map(|&x| gelu_tanh(x)).collect();
+                    let mut gated = vec![0.0f32; seq * ple_dim];
+                    for i in 0..seq * ple_dim { gated[i] = gate_gelu[i] * ple_s[i]; }
+                    let proj_out = gpu_mm(&gated, proj.weight(), seq, ple_dim, hd);
+                    let ple_final = norm.forward(&proj_out);
+                    for i in 0..hidden.len() { hidden[i] += ple_final[i]; }
+                }
+            }
+
+            // Block boundary
+            for t in 0..seq { for d in 0..hd { partial_sum[d] += hidden[t * hd + d]; } }
+            if self.is_block_boundary(layer_idx) {
+                for d in 0..hd { partial_sum[d] /= ((seq) * (self.block_config.layers_per_block)) as f32; }
+                block_reps.push(partial_sum.clone());
+                let inter_out = self.inter_block_attention(&hidden, &block_reps, seq);
+                for t in 0..seq { for d in 0..hd { hidden[t * hd + d] += inter_out[d]; } }
+                partial_sum = vec![0.0f32; hd];
+            }
+        }
+
+        // 4. Final norm + LM head
+        hidden = rms_norm(&hidden, &self.final_norm, hd, 1e-6);
+        let logits = gpu_mm(&hidden, &self.lm_head, seq, hd, vs);
+
+        // 5. Logit softcapping
+        let mut logits = logits;
+        if let Some(cap) = self.final_logit_softcapping {
+            for l in logits.iter_mut() { *l = (*l / cap).tanh() * cap; }
+        }
+        logits
+    }
+
     /// Forward pass returning per-layer hidden states for distillation.
     /// Returns Vec where [0] = post-embedding, [1] = post-layer0, etc.
     pub fn forward_with_hidden_states(&self, token_ids: &[u32]) -> Vec<Vec<f32>> {
