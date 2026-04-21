@@ -1605,7 +1605,12 @@ async fn cmd_distill(
         let teacher_logits = &teacher_logits_chunks[chunk_idx];
 
         // Student forward using CpuBlockAttnResModel
-        let student_logits = student.forward(batch_tokens);
+        // GPU-accelerated when accelerator is available, pure CPU otherwise
+        let student_logits = if gpu_accel.is_some() {
+            student.forward_gpu(batch_tokens, gpu_accel.as_ref().unwrap(), &dispatch)
+        } else {
+            student.forward(batch_tokens)
+        };
 
         // KL divergence loss
         let kl_loss = gemma_mapper::kl_divergence_loss(
@@ -1825,8 +1830,11 @@ async fn cmd_distill(
 
         // Mid-training checkpoint
         if checkpoint_every > 0 && (global_step + 1) % checkpoint_every == 0 {
-            // Checkpoints temporarily disabled — student is now CpuBlockAttnResModel
-            // TODO: implement CpuBlockAttnResModel checkpoint (d3777391)
+            let ckpt_path = format!("{}_step{}", output_path, global_step + 1);
+            match ferrisres::model::checkpoint::save_model(&student, &ckpt_path) {
+                Ok(()) => info!(event = "checkpoint_saved", step = global_step + 1, path = %ckpt_path, "Mid-training checkpoint saved"),
+                Err(e) => warn!(event = "checkpoint_save_failed", step = global_step + 1, error = %e, "Failed to save checkpoint"),
+            }
         }
 
         prev_loss = loss;
@@ -1875,7 +1883,6 @@ async fn cmd_distill(
         }
     }
 
-    // TODO: Save CpuBlockAttnResModel as distilled checkpoint (d3777391)
     // Save trained Block-MoE-Res model
     match ferrisres::model::checkpoint::save_model(&student, &output_path) {
         Ok(()) => info!(event = "model_saved", path = %output_path, "Trained model saved"),
