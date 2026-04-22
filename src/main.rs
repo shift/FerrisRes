@@ -103,6 +103,10 @@ enum Commands {
         /// Number of MoE experts per layer when using --student (default: 2 for RAM efficiency).
         #[arg(long, default_value_t = 2)]
         moe_experts: usize,
+        /// Path to LoRA adapters (.lora.bin) to merge into student model before inference.
+        /// Dequantize → merge LoRA → re-quantize, then run at full decode speed.
+        #[arg(long)]
+        lora_path: Option<String>,
     },
 
     Benchmark {
@@ -245,8 +249,8 @@ async fn main() -> anyhow::Result<()> {
             hidden_dim, num_blocks, block_size, prompt,
             max_tokens, temperature, template, yarn_scale, image,
             armor, cognitive, concepts_path, persist_kv, kv_path,
-            student, moe_experts,
-        } => cmd_infer(model_path, config, config_path, model_format, tokenizer, hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale, image, armor, cognitive, concepts_path, persist_kv, kv_path, student, moe_experts).await,
+            student, moe_experts, lora_path,
+        } => cmd_infer(model_path, config, config_path, model_format, tokenizer, hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale, image, armor, cognitive, concepts_path, persist_kv, kv_path, student, moe_experts, lora_path).await,
         Commands::Benchmark {
             hidden_dim,
             num_blocks,
@@ -518,6 +522,7 @@ async fn cmd_infer(
     kv_path: Option<String>,
     student: bool,
     moe_experts: usize,
+    lora_path: Option<String>,
 ) -> anyhow::Result<()> {
     info!(event = "initializing_inference_pipeline", "Initializing inference pipeline");
 
@@ -652,6 +657,32 @@ async fn cmd_infer(
             }).sum();
             let embed_kb = student_model.embed_tokens.len() * 1 + student_model.lm_head.len() * 1; // ternary = 1 byte/value
             info!(event = "student_memory", ternary_kb = total_ternary_kb / 1024, embed_kb = embed_kb / 1024, "Ternary student memory estimate");
+
+            // Load and merge LoRA adapters if specified
+            if let Some(ref lp) = lora_path {
+                info!(event = "lora_merging", path = %lp, "Loading LoRA adapters for merge-then-quantize");
+                // Attach LoRA with same config as training
+                let lora_config = ferrisres::training::lora::LoraConfig::targeting(8, vec![
+                    "q_proj", "k_proj", "v_proj", "o_proj",
+                    "moe.expert.*",
+                ]);
+                student_model.attach_lora(lora_config);
+                // Load trained adapter weights
+                match std::fs::read(lp) {
+                    Ok(lora_data) => {
+                        if let Some(ref mut lora_m) = student_model.lora_manager {
+                            match lora_m.deserialize_adapters(&lora_data) {
+                                Ok(()) => info!(event = "lora_loaded", bytes = lora_data.len()),
+                                Err(e) => { warn!(event = "lora_deserialize_failed", error = %e); }
+                            }
+                        }
+                    }
+                    Err(e) => { warn!(event = "lora_read_failed", error = %e); }
+                }
+                // Merge LoRA into ternary weights (dequantize → merge → re-quantize)
+                student_model.merge_lora();
+                info!(event = "lora_merged", "LoRA merged into ternary base weights, adapters removed");
+            }
 
             // Autoregressive generation on student model
             let gen_tokens = generate_student(&student_model, &tokens, max_tokens, temperature as f32, None);

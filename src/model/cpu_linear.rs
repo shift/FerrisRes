@@ -151,6 +151,13 @@ impl CpuLinear {
     pub fn fp32_equivalent_bytes(&self) -> usize {
         self.in_features * self.out_features * 4
     }
+
+    /// Update ternary weights in-place (used for LoRA merge).
+    pub fn update_weights(&mut self, new_ternary: Vec<i8>, new_packed: Vec<u8>, new_scale: f32) {
+        self.ternary = new_ternary;
+        self.packed = new_packed;
+        self.scale = new_scale;
+    }
 }
 
 /// CPU-only RMS normalization. Stores weights as `Vec<f32>`.
