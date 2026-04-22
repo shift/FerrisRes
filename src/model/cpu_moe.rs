@@ -68,6 +68,14 @@ impl TernaryExpert {
     pub fn memory_bytes(&self) -> usize {
         self.values.len() + self.packed.len() + 4
     }
+
+    /// GPU-ready packed weights: u32 format and per-row scales.
+    pub fn gpu_packed(&self) -> (Vec<u32>, Vec<f32>) {
+        let total = self.rows * self.cols;
+        let packed_u32 = crate::model::ternary::pack_ternary_u32(&self.packed, total);
+        let scales = vec![self.scale; self.rows];
+        (packed_u32, scales)
+    }
 }
 
 /// CPU-only Mixture of Experts layer with ternary expert weights.

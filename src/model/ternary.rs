@@ -1311,3 +1311,18 @@ mod tests {
         assert!((output_packed[0] - (-3.0)).abs() < 1e-5);
     }
 }
+
+/// Repack 2-bit ternary from u8 (4 values/byte) to u32 (16 values/u32)
+/// for the GPU ternary matmul kernel. Little-endian: byte0 → bits 0-7, etc.
+pub fn pack_ternary_u32(packed_u8: &[u8], total_values: usize) -> Vec<u32> {
+    let cols_packed_u32 = (total_values + 15) / 16;
+    let mut packed = vec![0u32; cols_packed_u32];
+    for i in 0..cols_packed_u32 {
+        let b0 = packed_u8.get(i * 4 + 0).copied().unwrap_or(0) as u32;
+        let b1 = packed_u8.get(i * 4 + 1).copied().unwrap_or(0) as u32;
+        let b2 = packed_u8.get(i * 4 + 2).copied().unwrap_or(0) as u32;
+        let b3 = packed_u8.get(i * 4 + 3).copied().unwrap_or(0) as u32;
+        packed[i] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    }
+    packed
+}
