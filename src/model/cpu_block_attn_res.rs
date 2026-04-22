@@ -1,6 +1,5 @@
 use crate::model::cpu_linear::{CpuLinear, CpuRmsNorm};
 use crate::model::cpu_moe::CpuMoELayer;
-use rayon::prelude::*;
 use crate::model::gemma_mapper::{matmul, rms_norm, apply_rope, apply_rope_gqa, gelu_tanh};
 use crate::model::gemma_mapper::{MappedGemma4Model, Gemma4FfnWeights};
 
@@ -2148,7 +2147,7 @@ pub fn gemma4_to_block_attnres(teacher: &MappedGemma4Model) -> CpuBlockAttnResMo
     let vs = config.vocab_size;
     let first_shared_layer = config.num_layers.saturating_sub(config.num_kv_shared_layers);
 
-    let layers: Vec<CpuBlockAttnResLayer> = teacher.layers.par_iter().enumerate().map(|(layer_idx, layer_weights)| {
+    let layers: Vec<CpuBlockAttnResLayer> = teacher.layers.iter().enumerate().map(|(layer_idx, layer_weights)| {
         let layer_head_dim = layer_weights.attn.head_dim;
         let layer_q_dim = layer_weights.attn.q_dim;
         let layer_kv_dim = layer_weights.attn.kv_dim;
