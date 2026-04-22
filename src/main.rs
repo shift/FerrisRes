@@ -2679,60 +2679,52 @@ fn generate_student(
 ) -> Vec<u32> {
     let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
     let vs = model.vocab_size;
+    let hd = model.hidden_dim;
 
-    info!(event = "student_gen_start", prompt_len = prompt_tokens.len(), max_new_tokens, "Starting student model generation");
+    // Collect per-layer KV dims
+    let kv_dims: Vec<usize> = model.layers.iter().map(|l| l.num_kv_heads * l.head_dim).collect();
+    let layers_per_block = model.block_config.layers_per_block;
+    let ple_dim = model.hidden_size_per_layer_input;
 
-    for step in 0..max_new_tokens {
+    // Create KV cache
+    let mut cache = ferrisres::inference::student_kv_cache::ModelKVCache::new(
+        model.layers.len(), hd, &kv_dims, layers_per_block, ple_dim,
+    );
+
+    info!(event = "student_gen_start", prompt_len = prompt_tokens.len(), max_new_tokens, "Starting student model generation (KV-cached)");
+
+    // === Prefill phase: process all prompt tokens at once ===
+    let t0 = std::time::Instant::now();
+    let logits = model.forward_prefill(prompt_tokens, &mut cache);
+    let prefill_ms = t0.elapsed().as_millis();
+    info!(event = "student_prefill", prompt_len = prompt_tokens.len(), prefill_ms, cache_mb = cache.total_memory_bytes() / (1024*1024), "Prefill complete");
+
+    // Take logits for last position
+    let last_logits = &logits[(prompt_tokens.len() - 1) * vs..prompt_tokens.len() * vs];
+
+    // Sample first token from prefill
+    let first_token = sample_token(last_logits, temperature);
+    all_tokens.push(first_token);
+
+    // === Decode phase: one token at a time using KV cache ===
+    for step in 1..max_new_tokens {
         let t0 = std::time::Instant::now();
 
-        // Full forward pass on all tokens so far
-        let logits = model.forward(&all_tokens);
-
+        let logits = model.forward_decode(all_tokens[all_tokens.len() - 1], &mut cache);
         let forward_ms = t0.elapsed().as_millis();
 
-        // Take logits for the last token position
-        let last_offset = (all_tokens.len() - 1) * vs;
-        let last_logits = &logits[last_offset..last_offset + vs];
+        let last_logits = &logits; // decode returns only last token's logits
 
-        // Diagnostic: dump top-5 logits on first 3 steps
-        if step <= 2 {
+        if step <= 3 {
             let mut indexed: Vec<(usize, f32)> = last_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             info!(event = "student_logits", step, "Top-5 logits:");
             for (rank, (id, val)) in indexed.iter().take(5).enumerate() {
                 info!(event = "student_logit", step, rank, token_id = id, value = val);
             }
-            info!(event = "student_logit_range", step, min = indexed.last().unwrap().1, max = indexed[0].1);
         }
 
-        // Temperature scaling + sampling
-        let next_token = if temperature < 1e-6 {
-            last_logits.iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i as u32)
-                .unwrap_or(0)
-        } else {
-            let scaled: Vec<f32> = last_logits.iter()
-                .map(|&l| l / temperature)
-                .collect();
-            let max_val = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let exps: Vec<f32> = scaled.iter().map(|&s| (s - max_val).exp()).collect();
-            let sum: f32 = exps.iter().sum();
-            let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
-
-            let r: f32 = rand_in_range(0.0, 1.0);
-            let mut cumsum = 0.0f32;
-            let mut chosen = 0u32;
-            for (i, &p) in probs.iter().enumerate() {
-                cumsum += p;
-                if cumsum >= r {
-                    chosen = i as u32;
-                    break;
-                }
-            }
-            chosen
-        };
+        let next_token = sample_token(last_logits, temperature);
 
         if step % 10 == 0 || step == max_new_tokens - 1 {
             info!(event = "student_gen_step", step, tokens_so_far = all_tokens.len(), forward_ms, next_token, "Generation progress");
@@ -2748,8 +2740,36 @@ fn generate_student(
         }
     }
 
-    // Return only generated tokens
     all_tokens[prompt_tokens.len()..].to_vec()
+}
+
+/// Sample a token from logits with temperature.
+fn sample_token(logits: &[f32], temperature: f32) -> u32 {
+    if temperature < 1e-6 {
+        logits.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0)
+    } else {
+        let scaled: Vec<f32> = logits.iter().map(|&l| l / temperature).collect();
+        let max_val = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = scaled.iter().map(|&s| (s - max_val).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
+
+        let r: f32 = rand_in_range(0.0, 1.0);
+        let mut cumsum = 0.0f32;
+        let mut chosen = 0u32;
+        for (i, &p) in probs.iter().enumerate() {
+            cumsum += p;
+            if cumsum >= r {
+                chosen = i as u32;
+                break;
+            }
+        }
+        chosen
+    }
 }
 
 fn rand_in_range(lo: f32, hi: f32) -> f32 {
