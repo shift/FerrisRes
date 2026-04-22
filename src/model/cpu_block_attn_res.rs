@@ -1682,6 +1682,62 @@ impl CpuBlockAttnResModel {
         self.block_config.boundary_layers.contains(&layer_idx)
     }
 
+    /// Merge LoRA adapters into ternary base weights.
+    ///
+    /// For each LoRA target: dequantize ternary → FP32, merge LoRA delta,
+    /// re-quantize to ternary. After this, LoRA adapters can be removed
+    /// and the model runs with merged weights at full decode speed.
+    pub fn merge_lora(&mut self) {
+        if self.lora_manager.is_none() { return; }
+        let lora_m = self.lora_manager.as_ref().unwrap();
+
+        for (layer_idx, module_name, lora_layer) in lora_m.adapters_iter() {
+            let layer = match self.layers.get_mut(layer_idx) {
+                Some(l) => l,
+                None => continue,
+            };
+
+            match module_name {
+                "q_proj" => merge_lora_into_linear(&mut layer.q_proj, lora_layer),
+                "k_proj" => merge_lora_into_linear(&mut layer.k_proj, lora_layer),
+                "v_proj" => merge_lora_into_linear(&mut layer.v_proj, lora_layer),
+                "o_proj" => merge_lora_into_linear(&mut layer.out_proj, lora_layer),
+                name if name.starts_with("moe.expert.") => {
+                    // Parse "moe.expert.{e}.{gate|up|down}"
+                    let parts: Vec<&str> = name.split('.').collect();
+                    if parts.len() == 4 {
+                        if let Ok(ei) = parts[2].parse::<usize>() {
+                            if let Some(ref mut moe) = layer.moe {
+                                match parts[3] {
+                                    "gate" => {
+                                        if let Some(expert) = moe.expert_gate.get_mut(ei) {
+                                            merge_lora_into_expert(expert, lora_layer);
+                                        }
+                                    }
+                                    "up" => {
+                                        if let Some(expert) = moe.expert_up.get_mut(ei) {
+                                            merge_lora_into_expert(expert, lora_layer);
+                                        }
+                                    }
+                                    "down" => {
+                                        if let Some(expert) = moe.expert_down.get_mut(ei) {
+                                            merge_lora_into_expert(expert, lora_layer);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Drop LoRA manager after merge
+        self.lora_manager = None;
+    }
+
     /// Quantize all base weights to ternary for inference.
     ///
     /// Returns a `TernaryBlockAttnResModel` that uses ternary matmul
@@ -2327,4 +2383,82 @@ pub fn gemma4_to_block_attnres(teacher: &MappedGemma4Model) -> CpuBlockAttnResMo
         // LoRA: initialized to None. Call attach_lora() to add adapters.
         lora_manager: None,
     }
+}
+
+/// Merge LoRA delta into a CpuLinear's ternary weights.
+/// Dequantize → merge → re-quantize in-place.
+
+/// Apply LoRA delta (A @ B * scaling) to FP32 weights in-place.
+fn apply_lora_delta(
+    fp32_weights: &mut [f32],
+    lora_layer: &crate::training::lora::LoraLayer,
+) {
+    let a = lora_layer.lora_a();
+    let b = lora_layer.lora_b();
+    let rank = lora_layer.rank();
+    let in_f = lora_layer.in_features();
+    let out_f = lora_layer.out_features();
+    let scaling = lora_layer.scaling();
+
+    // ΔW = B @ A * scaling, shape [out_f × in_f]
+    for o in 0..out_f {
+        for d in 0..in_f {
+            let mut delta = 0.0f32;
+            for r in 0..rank {
+                delta += b[o * rank + r] * a[r * in_f + d];
+            }
+            fp32_weights[o * in_f + d] += delta * scaling;
+        }
+    }
+}
+
+/// Merge LoRA delta into a CpuLinear's ternary weights.
+fn merge_lora_into_linear(
+    linear: &mut crate::model::cpu_linear::CpuLinear,
+    lora_layer: &crate::training::lora::LoraLayer,
+) {
+    use crate::model::ternary::{quantize_ternary, pack_ternary};
+
+    let scale = linear.scale();
+
+    // Dequantize: FP32 = ternary_i8 * scale
+    let mut fp32_weights: Vec<f32> = linear.ternary_values()
+        .iter()
+        .map(|&v| v as f32 * scale)
+        .collect();
+
+    // Merge LoRA delta
+    apply_lora_delta(&mut fp32_weights, lora_layer);
+
+    // Re-quantize to ternary
+    let (new_ternary, new_scale) = quantize_ternary(&fp32_weights);
+    let new_packed = pack_ternary(&new_ternary);
+
+    linear.update_weights(new_ternary, new_packed, new_scale);
+}
+
+/// Merge LoRA delta into a TernaryExpert's weights.
+fn merge_lora_into_expert(
+    expert: &mut crate::model::cpu_moe::TernaryExpert,
+    lora_layer: &crate::training::lora::LoraLayer,
+) {
+    use crate::model::ternary::{quantize_ternary, pack_ternary};
+
+    let scale = expert.scale;
+
+    // Dequantize
+    let mut fp32_weights: Vec<f32> = expert.values.iter()
+        .map(|&v| v as f32 * scale)
+        .collect();
+
+    // Merge LoRA delta
+    apply_lora_delta(&mut fp32_weights, lora_layer);
+
+    // Re-quantize
+    let (new_ternary, new_scale) = quantize_ternary(&fp32_weights);
+    let new_packed = pack_ternary(&new_ternary);
+
+    expert.values = new_ternary;
+    expert.packed = new_packed;
+    expert.scale = new_scale;
 }
