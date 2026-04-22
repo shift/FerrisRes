@@ -158,6 +158,15 @@ impl CpuLinear {
         self.packed = new_packed;
         self.scale = new_scale;
     }
+
+    /// GPU-ready packed weights: u32 format (16 values/u32) and per-row scales.
+    /// Since all rows share one absmean scale, scales = [scale; out_features].
+    pub fn gpu_packed(&self) -> (Vec<u32>, Vec<f32>) {
+        let total = self.in_features * self.out_features;
+        let packed_u32 = crate::model::ternary::pack_ternary_u32(&self.packed, total);
+        let scales = vec![self.scale; self.out_features];
+        (packed_u32, scales)
+    }
 }
 
 /// CPU-only RMS normalization. Stores weights as `Vec<f32>`.

@@ -2897,13 +2897,15 @@ async fn cmd_evaluate(
 /// dL/dB[o][r] = scaling * Σ_t d_y[t][o] · (Σ_d A[r][d] · x[t][d])
 ///
 /// `input`: [seq * in_f] — input to the projection
-/// `d_output`: [seq * hd] — gradient signal (d_hidden or truncated)
+/// Compute LoRA gradients for a single adapter.
+/// `input`: [seq * in_f] — activations from forward pass
+/// `d_output`: [seq * out_f] — gradient signal (may be truncated from d_hidden)
 fn compute_lora_grad(
     lora_layer: &ferrisres::training::lora::LoraLayer,
     input: &[f32],
     d_output: &[f32],
     seq: usize,
-    hd: usize,
+    _hd: usize,
 ) -> (Vec<f32>, Vec<f32>) {
     let rank = lora_layer.rank();
     let in_f = lora_layer.in_features();
@@ -2915,17 +2917,16 @@ fn compute_lora_grad(
     let mut ga = vec![0.0f32; rank * in_f];
     let mut gb = vec![0.0f32; out_f * rank];
 
-    let actual_out = out_f.min(hd);
-    let actual_in = in_f.min(hd);
-    let actual_seq = seq.min(input.len() / in_f.max(1)).min(d_output.len() / actual_out.max(1));
+    // d_output has stride out_f (possibly truncated from hd)
+    let actual_seq = seq.min(input.len() / in_f.max(1)).min(d_output.len() / out_f.max(1));
 
     for r in 0..rank {
-        for d in 0..actual_in {
+        for d in 0..in_f {
             let mut grad = 0.0f32;
             for t in 0..actual_seq {
                 let mut btdy = 0.0f32;
-                for o in 0..actual_out {
-                    btdy += b[o * rank + r] * d_output[t * hd + o];
+                for o in 0..out_f {
+                    btdy += b[o * rank + r] * d_output[t * out_f + o];
                 }
                 grad += btdy * input[t * in_f + d];
             }
@@ -2933,15 +2934,15 @@ fn compute_lora_grad(
         }
     }
 
-    for o in 0..actual_out {
+    for o in 0..out_f {
         for r in 0..rank {
             let mut grad = 0.0f32;
             for t in 0..actual_seq {
                 let mut ax_r = 0.0f32;
-                for d in 0..actual_in {
+                for d in 0..in_f {
                     ax_r += a[r * in_f + d] * input[t * in_f + d];
                 }
-                grad += d_output[t * hd + o] * ax_r;
+                grad += d_output[t * out_f + o] * ax_r;
             }
             gb[o * rank + r] = scaling * grad;
         }
