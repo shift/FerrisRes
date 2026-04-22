@@ -143,6 +143,16 @@ impl CpuRmsNorm {
         crate::model::gemma_mapper::rms_norm(input, &self.weight, self.hidden_dim, self.eps)
     }
 
+    /// RMS norm for a single token (avoids unnecessary allocation).
+    pub fn forward_single(&self, input: &[f32]) -> Vec<f32> {
+        let dim = self.hidden_dim;
+        let mean_sq: f32 = input[..dim].iter().map(|x| x * x).sum::<f32>() / dim as f32;
+        let inv_rms = 1.0 / (mean_sq + self.eps).sqrt();
+        input[..dim].iter().enumerate().map(|(d, &x)| {
+            x * inv_rms * self.weight.get(d).copied().unwrap_or(1.0)
+        }).collect()
+    }
+
     pub fn weight(&self) -> &[f32] { &self.weight }
     pub fn weight_mut(&mut self) -> &mut Vec<f32> { &mut self.weight }
     pub fn hidden_dim(&self) -> usize { self.hidden_dim }

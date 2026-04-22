@@ -669,7 +669,264 @@ impl CpuBlockAttnResModel {
         logits
     }
 
-    /// GPU-accelerated forward: routes heavy matmuls through GpuMatmulAccelerator.
+    /// Prefill forward: processes all prompt tokens, populates KV cache.
+    ///
+    /// This is the first phase of cached inference. It runs the full forward
+    /// pass on all prompt tokens and stores K/V projections in the cache.
+    /// Returns logits for the last position.
+    ///
+    /// After this call, use `forward_decode()` for each subsequent token.
+    pub fn forward_prefill(
+        &self,
+        token_ids: &[u32],
+        cache: &mut crate::inference::student_kv_cache::ModelKVCache,
+    ) -> Vec<f32> {
+        let seq = token_ids.len();
+        let hd = self.hidden_dim;
+        let vs = self.vocab_size;
+
+        // Store token IDs for PLE recomputation during decode
+        cache.cached_token_ids = token_ids.to_vec();
+
+        // 1. Embedding
+        let mut hidden = vec![0.0f32; seq * hd];
+        for (t, &tid) in token_ids.iter().enumerate() {
+            let id = tid as usize;
+            if id * hd + hd <= self.embed_tokens.len() {
+                for d in 0..hd {
+                    hidden[t * hd + d] = self.embed_tokens[id * hd + d];
+                }
+            }
+        }
+        let scale = (hd as f32).sqrt();
+        for h in hidden.iter_mut() { *h *= scale; }
+
+        // 2. Pre-compute PLE
+        let ple_dim = self.hidden_size_per_layer_input;
+        let ple_precomputed = self.precompute_ple(&hidden, token_ids, seq, hd, ple_dim);
+        cache.ple_prefix = ple_precomputed.clone();
+
+        // 3. Per-layer forward, caching K/V
+        let first_shared_layer = self.num_layers.saturating_sub(self.num_kv_shared_layers);
+        let mut shared_kv: std::collections::HashMap<usize, (Vec<f32>, Vec<f32>)> = std::collections::HashMap::new();
+
+        // Block tracking
+        cache.block_reps.clear();
+        cache.partial_sum = vec![0.0f32; hd];
+        cache.block_token_count = seq;
+        // Initialize block_rep[0] = mean of embeddings
+        for t in 0..seq {
+            for d in 0..hd {
+                cache.partial_sum[d] += hidden[t * hd + d];
+            }
+        }
+        let mut init_rep = cache.partial_sum.clone();
+        for d in 0..hd { init_rep[d] /= seq as f32; }
+        cache.block_reps.push(init_rep);
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let ple_slice = ple_precomputed.as_ref().map(|pre| {
+                let mut slice = vec![0.0f32; seq * ple_dim];
+                for t in 0..seq {
+                    let src = t * self.num_layers * ple_dim + layer_idx * ple_dim;
+                    let dst = t * ple_dim;
+                    for d in 0..ple_dim { slice[dst + d] = pre[src + d]; }
+                }
+                slice
+            });
+
+            let (kv, should_store) = if layer_idx >= first_shared_layer && first_shared_layer > 0 && layer.kv_shared {
+                let kv_source = Self::kv_shared_source_layer(layer_idx, first_shared_layer, &self.layers);
+                if let Some((sk, sv)) = shared_kv.get(&kv_source) {
+                    (Some((sk.as_slice(), sv.as_slice())), false)
+                } else { (None, false) }
+            } else { (None, true) };
+
+            let (k_states, v_states) = layer.forward_full(
+                &mut hidden,
+                ple_slice.as_ref().map(|s| s.as_slice()),
+                kv,
+            );
+
+            // Cache K/V for this layer
+            if should_store && !k_states.is_empty() {
+                shared_kv.insert(layer_idx, (k_states.clone(), v_states.clone()));
+                cache.layers[layer_idx].append_batch(&k_states, &v_states, seq);
+            } else if !should_store && !k_states.is_empty() {
+                // Shared KV layer — still cache for reference
+                cache.layers[layer_idx].append_batch(&k_states, &v_states, seq);
+            }
+
+            // Block tracking
+            for t in 0..seq {
+                for d in 0..hd {
+                    cache.partial_sum[d] += hidden[t * hd + d];
+                }
+            }
+            if self.is_block_boundary(layer_idx) {
+                let mut block_rep = cache.partial_sum.clone();
+                for d in 0..hd { block_rep[d] /= (seq * self.block_config.layers_per_block) as f32; }
+                cache.block_reps.push(block_rep);
+                cache.partial_sum = vec![0.0f32; hd];
+
+                let inter_out = self.inter_block_attention(&hidden, &cache.block_reps, seq);
+                for t in 0..seq {
+                    for d in 0..hd { hidden[t * hd + d] += inter_out[d]; }
+                }
+            }
+        }
+
+        // 4. Final norm + LM head
+        hidden = rms_norm(&hidden, &self.final_norm, hd, 1e-6);
+        let mut logits = matmul(&hidden, &self.lm_head, seq, hd, vs);
+        if let Some(cap) = self.final_logit_softcapping {
+            for l in logits.iter_mut() { *l = (*l / cap).tanh() * cap; }
+        }
+        logits
+    }
+
+    /// Decode forward: processes a single new token using cached K/V.
+    ///
+    /// This is the fast path — O(1) per token instead of O(n).
+    /// Only computes Q/K/V for the new token, attends against cached K/V.
+    ///
+    /// Must call `forward_prefill()` first to populate the cache.
+    pub fn forward_decode(
+        &self,
+        new_token_id: u32,
+        cache: &mut crate::inference::student_kv_cache::ModelKVCache,
+    ) -> Vec<f32> {
+        let hd = self.hidden_dim;
+        let vs = self.vocab_size;
+        let pos = cache.seq_len(); // Current position before appending
+
+        cache.cached_token_ids.push(new_token_id);
+
+        // 1. Embedding for new token only
+        let mut hidden = vec![0.0f32; hd];
+        let id = new_token_id as usize;
+        if id * hd + hd <= self.embed_tokens.len() {
+            for d in 0..hd {
+                hidden[d] = self.embed_tokens[id * hd + d];
+            }
+        }
+        let scale = (hd as f32).sqrt();
+        for h in hidden.iter_mut() { *h *= scale; }
+
+        // 2. PLE: compute PLE input for just this token at this position
+        let ple_dim = self.hidden_size_per_layer_input;
+
+        // 3. Per-layer decode
+        let first_shared_layer = self.num_layers.saturating_sub(self.num_kv_shared_layers);
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            // PLE for this layer, single token
+            let ple_input = cache.ple_prefix.as_ref().and_then(|pre| {
+                // Recompute PLE for this single token at this layer
+                // PLE index: token_pos * num_layers * ple_dim + layer_idx * ple_dim
+                let all_tokens = &cache.cached_token_ids;
+                let t = all_tokens.len() - 1; // Last token
+                let idx = t * self.num_layers * ple_dim + layer_idx * ple_dim;
+                if idx + ple_dim <= pre.len() {
+                    Some(pre[idx..idx + ple_dim].to_vec())
+                } else {
+                    None
+                }
+            });
+
+            let kv_dim = layer.num_kv_heads * layer.head_dim;
+            let q_dim = layer.num_heads * layer.head_dim;
+
+            // === Attention for single new token ===
+            let residual = hidden.clone();
+            let normed = layer.attn_norm.forward_single(&hidden);
+
+            // Q for new token
+            let mut q = layer.q_proj.forward(&normed, 1);
+            q = crate::model::gemma_mapper::per_head_rms_norm(&q, layer.q_norm.weight(), 1, layer.num_heads, layer.head_dim);
+            apply_rope(&mut q, 1, layer.num_heads, layer.head_dim, pos, layer.rope_theta, layer.partial_rotary_factor);
+
+            // K/V for new token
+            let is_shared = layer_idx >= first_shared_layer && first_shared_layer > 0 && layer.kv_shared;
+            let (new_k, new_v) = if is_shared {
+                // Use shared K/V — get from source layer cache
+                let kv_source = Self::kv_shared_source_layer(layer_idx, first_shared_layer, &self.layers);
+                if let Some(source_kv) = cache.layers.get(kv_source) {
+                    let (_sk, _sv) = source_kv.get();
+                    // Still need to compute new K/V for this position
+                    let mut k_new = layer.k_proj.forward(&normed, 1);
+                    let v_new = layer.v_proj.forward(&normed, 1);
+                    k_new = crate::model::gemma_mapper::per_head_rms_norm(&k_new, layer.k_norm.weight(), 1, layer.num_kv_heads, layer.head_dim);
+                    apply_rope_gqa(&mut k_new, 1, layer.num_kv_heads, layer.head_dim, pos, layer.rope_theta, layer.partial_rotary_factor);
+                    // But use source layer's full cache for attention
+                    // Actually for shared layers, the spec says they reuse source K/V entirely
+                    // So we use source_kv for attention but still append to our cache
+                    (k_new, v_new)
+                } else {
+                    let mut k_new = layer.k_proj.forward(&normed, 1);
+                    let v_new = layer.v_proj.forward(&normed, 1);
+                    k_new = crate::model::gemma_mapper::per_head_rms_norm(&k_new, layer.k_norm.weight(), 1, layer.num_kv_heads, layer.head_dim);
+                    apply_rope_gqa(&mut k_new, 1, layer.num_kv_heads, layer.head_dim, pos, layer.rope_theta, layer.partial_rotary_factor);
+                    (k_new, v_new)
+                }
+            } else {
+                let mut k_new = layer.k_proj.forward(&normed, 1);
+                let v_new = layer.v_proj.forward(&normed, 1);
+                k_new = crate::model::gemma_mapper::per_head_rms_norm(&k_new, layer.k_norm.weight(), 1, layer.num_kv_heads, layer.head_dim);
+                apply_rope_gqa(&mut k_new, 1, layer.num_kv_heads, layer.head_dim, pos, layer.rope_theta, layer.partial_rotary_factor);
+                let v_normed = crate::model::gemma_mapper::per_head_rms_norm_no_scale(&v_new, 1, layer.num_kv_heads, layer.head_dim);
+                (k_new, v_normed)
+            };
+
+            // Append new K/V to cache
+            cache.layers[layer_idx].append(&new_k, &new_v);
+
+            // Get full cached K/V for attention
+            let (full_k, full_v) = if is_shared {
+                let kv_source = Self::kv_shared_source_layer(layer_idx, first_shared_layer, &self.layers);
+                if let Some(source_kv) = cache.layers.get(kv_source) {
+                    source_kv.get()
+                } else {
+                    cache.layers[layer_idx].get()
+                }
+            } else {
+                cache.layers[layer_idx].get()
+            };
+            let _total_seq = full_k.len() / kv_dim;
+
+            // Attention: Q[1, heads, head_dim] × K[total_seq, kv_heads, head_dim]
+            let attn_out = layer.cpu_attention(&q, full_k, full_v, 1, layer.num_heads, layer.num_kv_heads, layer.head_dim, q_dim, kv_dim);
+
+            // Post-attention norm + residual
+            let attn_out = layer.post_attn_norm.forward_single(&attn_out);
+            for i in 0..hd { hidden[i] = residual[i] + attn_out[i]; }
+
+            // === FFN for single token ===
+            layer.forward_ffn(&mut hidden, ple_input.as_ref().map(|p| p.as_slice()));
+
+            // Block tracking
+            for d in 0..hd { cache.partial_sum[d] += hidden[d]; }
+            if self.is_block_boundary(layer_idx) {
+                cache.block_token_count += 1;
+                let mut block_rep = cache.partial_sum.clone();
+                for d in 0..hd { block_rep[d] /= (cache.block_token_count * self.block_config.layers_per_block) as f32; }
+                cache.block_reps.push(block_rep);
+                cache.partial_sum = vec![0.0f32; hd];
+                cache.block_token_count = 0;
+
+                let inter_out = self.inter_block_attention_single(&hidden, &cache.block_reps);
+                for d in 0..hd { hidden[d] += inter_out[d]; }
+            }
+        }
+
+        // 4. Final norm + LM head
+        hidden = crate::model::gemma_mapper::rms_norm(&hidden, &self.final_norm, hd, 1e-6);
+        let mut logits = matmul(&hidden, &self.lm_head, 1, hd, vs);
+        if let Some(cap) = self.final_logit_softcapping {
+            for l in logits.iter_mut() { *l = (*l / cap).tanh() * cap; }
+        }
+        logits
+    }
     /// Embedding, norms, attention scores, RoPE stay on CPU (cheap ops).
     /// Q/K/V/O projections, FFN gate/up/down, MoE experts, LM head go to GPU.
     pub fn forward_gpu(
@@ -1262,6 +1519,52 @@ impl CpuBlockAttnResModel {
             }
         }
 
+        output
+    }
+
+    /// Inter-block attention for a single token (decode mode).
+    /// Same as inter_block_attention but hidden is [hd] not [seq × hd].
+    pub fn inter_block_attention_single(
+        &self,
+        hidden: &[f32],       // [hidden_dim] single token
+        block_reps: &[Vec<f32>],
+    ) -> Vec<f32> {
+        let hd = self.hidden_dim;
+        let num_entries = block_reps.len();
+        if num_entries == 0 { return vec![0.0; hd]; }
+
+        // Query is the hidden state directly (single token, no mean pooling needed)
+        let query = hidden;
+
+        // Normalize block representations
+        let norm_weights = &self.block_config.attn_res_norm;
+        let mut normed_reps = Vec::with_capacity(num_entries);
+        for rep in block_reps {
+            let normed = crate::model::gemma_mapper::rms_norm(rep, norm_weights, hd, 1e-6);
+            normed_reps.push(normed);
+        }
+
+        let mut flat_keys = vec![0.0f32; num_entries * hd];
+        for (i, nr) in normed_reps.iter().enumerate() {
+            flat_keys[i * hd..(i + 1) * hd].copy_from_slice(nr);
+        }
+
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let scores = crate::model::gemma_mapper::matmul(query, &flat_keys, 1, hd, num_entries);
+
+        let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut weights = vec![0.0f32; num_entries];
+        let mut sum_exp = 0.0f32;
+        for (i, &s) in scores.iter().enumerate() {
+            weights[i] = ((s - max_score) * scale).exp();
+            sum_exp += weights[i];
+        }
+        for w in &mut weights { *w /= sum_exp; }
+
+        let mut output = vec![0.0f32; hd];
+        for (i, &w) in weights.iter().enumerate() {
+            for d in 0..hd { output[d] += w * normed_reps[i][d]; }
+        }
         output
     }
 
