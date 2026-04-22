@@ -96,6 +96,13 @@ enum Commands {
         /// Path to persist KV cache.
         #[arg(long)]
         kv_path: Option<String>,
+        /// Load as FerrisRes student model (Block AttnRes + MoE with ternary weights).
+        /// Converts Gemma 4 weights to student architecture on load.
+        #[arg(long)]
+        student: bool,
+        /// Number of MoE experts per layer when using --student (default: 2 for RAM efficiency).
+        #[arg(long, default_value_t = 2)]
+        moe_experts: usize,
     },
 
     Benchmark {
@@ -238,7 +245,8 @@ async fn main() -> anyhow::Result<()> {
             hidden_dim, num_blocks, block_size, prompt,
             max_tokens, temperature, template, yarn_scale, image,
             armor, cognitive, concepts_path, persist_kv, kv_path,
-        } => cmd_infer(model_path, config, config_path, model_format, tokenizer, hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale, image, armor, cognitive, concepts_path, persist_kv, kv_path).await,
+            student, moe_experts,
+        } => cmd_infer(model_path, config, config_path, model_format, tokenizer, hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale, image, armor, cognitive, concepts_path, persist_kv, kv_path, student, moe_experts).await,
         Commands::Benchmark {
             hidden_dim,
             num_blocks,
@@ -508,6 +516,8 @@ async fn cmd_infer(
     concepts_path: Option<String>,
     persist_kv: bool,
     kv_path: Option<String>,
+    student: bool,
+    moe_experts: usize,
 ) -> anyhow::Result<()> {
     info!(event = "initializing_inference_pipeline", "Initializing inference pipeline");
 
@@ -615,6 +625,55 @@ async fn cmd_infer(
 
         info!(event = "model_loaded", "Model loaded: {} layers, {} vocab", loaded_model.layers.len(), loaded_model.config.vocab_size);
 
+        // ========================================================================
+        // Student (ternary Block AttnRes + MoE) inference path
+        // ========================================================================
+        if student {
+            info!(event = "student_inference_path", "Converting to FerrisRes student model (ternary Block AttnRes)");
+
+            let mut student_model = ferrisres::model::cpu_block_attn_res::gemma4_to_block_attnres(&loaded_model);
+            info!(event = "student_created", layers = student_model.layers.len(), "Student model created from teacher weights");
+
+            // Optional MoE conversion
+            if moe_experts > 1 {
+                ferrisres::model::cpu_block_attn_res::dense_ffn_to_moe(&mut student_model, moe_experts, 2, 0.01);
+                let moe_layers = student_model.layers.iter().filter(|l| l.moe.is_some()).count();
+                info!(event = "student_moe", moe_layers, experts = moe_experts, "MoE conversion complete");
+            }
+
+            // Estimate memory usage
+            let total_ternary_kb: usize = student_model.layers.iter().map(|l| {
+                l.q_proj.memory_bytes() + l.k_proj.memory_bytes()
+                + l.v_proj.memory_bytes() + l.out_proj.memory_bytes()
+                + l.moe.as_ref().map_or(0, |m| m.expert_memory_bytes())
+                + l.ffn_gate.as_ref().map_or(0, |g| g.memory_bytes())
+                + l.ffn_up.as_ref().map_or(0, |u| u.memory_bytes())
+                + l.ffn_down.as_ref().map_or(0, |d| d.memory_bytes())
+            }).sum();
+            let embed_kb = student_model.embed_tokens.len() * 1 + student_model.lm_head.len() * 1; // ternary = 1 byte/value
+            info!(event = "student_memory", ternary_kb = total_ternary_kb / 1024, embed_kb = embed_kb / 1024, "Ternary student memory estimate");
+
+            // Autoregressive generation on student model
+            let gen_tokens = generate_student(&student_model, &tokens, max_tokens, temperature as f32, None);
+
+            let output_text = decoder(&gen_tokens);
+            let display_output = if let Some(ref mut layer) = armor_layer {
+                match layer.sanitize_output(&output_text) {
+                    ferrisres::SecurityVerdict::Redact(sanitized) => sanitized,
+                    _ => output_text.clone(),
+                }
+            } else {
+                output_text.clone()
+            };
+
+            info!(event = "student_inference_complete", prompt_tokens = tokens.len(), generated_tokens = gen_tokens.len(), "Student model inference complete");
+            println!("{}", display_output);
+            return Ok(());
+        }
+
+        // ========================================================================
+        // Standard teacher inference path
+        // ========================================================================
         // Wrap in teacher for forward() access
         let teacher = Gemma4Teacher::new(loaded_model);
 
@@ -2606,6 +2665,93 @@ fn generate_cpu(
 }
 
 /// Simple random float in [lo, hi).
+/// Autoregressive generation using FerrisRes student model (ternary base).
+///
+/// This is the inference path for the Block AttnRes + MoE student model.
+/// All base weights are ternary {-1, 0, +1} with absmean scaling.
+/// Memory footprint: ~2.1 GB for 2-expert MoE vs ~17 GB for FP32.
+fn generate_student(
+    model: &ferrisres::model::cpu_block_attn_res::CpuBlockAttnResModel,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    temperature: f32,
+    eos_token_id: Option<u32>,
+) -> Vec<u32> {
+    let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
+    let vs = model.vocab_size;
+
+    info!(event = "student_gen_start", prompt_len = prompt_tokens.len(), max_new_tokens, "Starting student model generation");
+
+    for step in 0..max_new_tokens {
+        let t0 = std::time::Instant::now();
+
+        // Full forward pass on all tokens so far
+        let logits = model.forward(&all_tokens);
+
+        let forward_ms = t0.elapsed().as_millis();
+
+        // Take logits for the last token position
+        let last_offset = (all_tokens.len() - 1) * vs;
+        let last_logits = &logits[last_offset..last_offset + vs];
+
+        // Diagnostic: dump top-5 logits on first 3 steps
+        if step <= 2 {
+            let mut indexed: Vec<(usize, f32)> = last_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            info!(event = "student_logits", step, "Top-5 logits:");
+            for (rank, (id, val)) in indexed.iter().take(5).enumerate() {
+                info!(event = "student_logit", step, rank, token_id = id, value = val);
+            }
+            info!(event = "student_logit_range", step, min = indexed.last().unwrap().1, max = indexed[0].1);
+        }
+
+        // Temperature scaling + sampling
+        let next_token = if temperature < 1e-6 {
+            last_logits.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0)
+        } else {
+            let scaled: Vec<f32> = last_logits.iter()
+                .map(|&l| l / temperature)
+                .collect();
+            let max_val = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scaled.iter().map(|&s| (s - max_val).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
+
+            let r: f32 = rand_in_range(0.0, 1.0);
+            let mut cumsum = 0.0f32;
+            let mut chosen = 0u32;
+            for (i, &p) in probs.iter().enumerate() {
+                cumsum += p;
+                if cumsum >= r {
+                    chosen = i as u32;
+                    break;
+                }
+            }
+            chosen
+        };
+
+        if step % 10 == 0 || step == max_new_tokens - 1 {
+            info!(event = "student_gen_step", step, tokens_so_far = all_tokens.len(), forward_ms, next_token, "Generation progress");
+        }
+
+        all_tokens.push(next_token);
+
+        if let Some(eos) = eos_token_id {
+            if next_token == eos {
+                info!(event = "student_gen_eos", step, "Hit EOS token");
+                break;
+            }
+        }
+    }
+
+    // Return only generated tokens
+    all_tokens[prompt_tokens.len()..].to_vec()
+}
+
 fn rand_in_range(lo: f32, hi: f32) -> f32 {
     use std::time::SystemTime;
     let ns = SystemTime::now()
