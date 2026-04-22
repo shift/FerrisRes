@@ -243,6 +243,50 @@ impl CpuBlockAttnResLayer {
         self.forward_ffn_with_routing(hidden, ple_input, None, 0, None);
     }
 
+    /// Parallel FFN forward using rayon — use for decode path.
+    pub fn forward_ffn_parallel(
+        &self,
+        hidden: &mut Vec<f32>,
+        ple_input: Option<&[f32]>,
+    ) {
+        let hd = self.hidden_dim;
+        let seq = hidden.len() / hd;
+
+        let residual2 = hidden.clone();
+        let normed2 = self.pre_ffn_norm.forward(hidden);
+
+        let ffn_out = if let Some(ref moe) = self.moe {
+            moe.forward_parallel(&normed2, seq)
+        } else {
+            self.cpu_ffn(&normed2, seq)
+        };
+
+        let ffn_out = self.post_ffn_norm.forward(&ffn_out);
+        for i in 0..hidden.len() {
+            hidden[i] = residual2[i] + ffn_out[i];
+        }
+
+        // PLE injection
+        if let Some(ple_slice) = ple_input {
+            if let (Some(ref gate), Some(ref proj), Some(ref norm)) =
+                (&self.ple_input_gate, &self.ple_projection, &self.ple_post_norm)
+            {
+                let ple_dim = ple_slice.len() / seq;
+                let gate_out = gate.forward_parallel(hidden, seq);
+                let gate_gelu: Vec<f32> = gate_out.iter().map(|&x| crate::model::gemma_mapper::gelu_tanh(x)).collect();
+                let mut gated = vec![0.0f32; seq * ple_dim];
+                for i in 0..seq * ple_dim { gated[i] = gate_gelu[i] * ple_slice[i]; }
+                let proj_out = proj.forward_parallel(&gated, seq);
+                let ple_final = norm.forward(&proj_out);
+                for i in 0..hidden.len() { hidden[i] += ple_final[i]; }
+            }
+        }
+
+        if self.layer_scalar != 1.0 {
+            for h in hidden.iter_mut() { *h *= self.layer_scalar; }
+        }
+    }
+
     /// FFN forward with optional MoE routing data collection.
     /// `routing_collector`: if Some, appends MoERoutingData for this layer's MoE.
     /// `layer_idx`: layer number for routing metadata.
@@ -842,7 +886,7 @@ impl CpuBlockAttnResModel {
             let normed = layer.attn_norm.forward_single(&hidden);
 
             // Q for new token
-            let mut q = layer.q_proj.forward(&normed, 1);
+            let mut q = layer.q_proj.forward_parallel(&normed, 1);
             q = crate::model::gemma_mapper::per_head_rms_norm(&q, layer.q_norm.weight(), 1, layer.num_heads, layer.head_dim);
             apply_rope(&mut q, 1, layer.num_heads, layer.head_dim, pos, layer.rope_theta, layer.partial_rotary_factor);
 
@@ -854,8 +898,8 @@ impl CpuBlockAttnResModel {
                 if let Some(source_kv) = cache.layers.get(kv_source) {
                     let (_sk, _sv) = source_kv.get();
                     // Still need to compute new K/V for this position
-                    let mut k_new = layer.k_proj.forward(&normed, 1);
-                    let v_new = layer.v_proj.forward(&normed, 1);
+                    let mut k_new = layer.k_proj.forward_parallel(&normed, 1);
+                    let v_new = layer.v_proj.forward_parallel(&normed, 1);
                     k_new = crate::model::gemma_mapper::per_head_rms_norm(&k_new, layer.k_norm.weight(), 1, layer.num_kv_heads, layer.head_dim);
                     apply_rope_gqa(&mut k_new, 1, layer.num_kv_heads, layer.head_dim, pos, layer.rope_theta, layer.partial_rotary_factor);
                     // But use source layer's full cache for attention
@@ -863,15 +907,15 @@ impl CpuBlockAttnResModel {
                     // So we use source_kv for attention but still append to our cache
                     (k_new, v_new)
                 } else {
-                    let mut k_new = layer.k_proj.forward(&normed, 1);
-                    let v_new = layer.v_proj.forward(&normed, 1);
+                    let mut k_new = layer.k_proj.forward_parallel(&normed, 1);
+                    let v_new = layer.v_proj.forward_parallel(&normed, 1);
                     k_new = crate::model::gemma_mapper::per_head_rms_norm(&k_new, layer.k_norm.weight(), 1, layer.num_kv_heads, layer.head_dim);
                     apply_rope_gqa(&mut k_new, 1, layer.num_kv_heads, layer.head_dim, pos, layer.rope_theta, layer.partial_rotary_factor);
                     (k_new, v_new)
                 }
             } else {
-                let mut k_new = layer.k_proj.forward(&normed, 1);
-                let v_new = layer.v_proj.forward(&normed, 1);
+                let mut k_new = layer.k_proj.forward_parallel(&normed, 1);
+                let v_new = layer.v_proj.forward_parallel(&normed, 1);
                 k_new = crate::model::gemma_mapper::per_head_rms_norm(&k_new, layer.k_norm.weight(), 1, layer.num_kv_heads, layer.head_dim);
                 apply_rope_gqa(&mut k_new, 1, layer.num_kv_heads, layer.head_dim, pos, layer.rope_theta, layer.partial_rotary_factor);
                 let v_normed = crate::model::gemma_mapper::per_head_rms_norm_no_scale(&v_new, 1, layer.num_kv_heads, layer.head_dim);
@@ -901,8 +945,8 @@ impl CpuBlockAttnResModel {
             let attn_out = layer.post_attn_norm.forward_single(&attn_out);
             for i in 0..hd { hidden[i] = residual[i] + attn_out[i]; }
 
-            // === FFN for single token ===
-            layer.forward_ffn(&mut hidden, ple_input.as_ref().map(|p| p.as_slice()));
+            // === FFN for single token (parallel) ===
+            layer.forward_ffn_parallel(&mut hidden, ple_input.as_ref().map(|p| p.as_slice()));
 
             // Block tracking
             for d in 0..hd { cache.partial_sum[d] += hidden[d]; }
