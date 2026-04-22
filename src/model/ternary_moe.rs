@@ -36,6 +36,17 @@ impl TernaryWeight {
         }
     }
 
+    /// Create from pre-quantized ternary values (no FP32 round-trip).
+    pub fn from_ternary(ternary: Vec<i8>, scale: f32, len: usize) -> Self {
+        let packed = pack_ternary(&ternary);
+        TernaryWeight {
+            packed,
+            scale,
+            ternary,
+            packed_len: len,
+        }
+    }
+
     /// Forward: `output = scale * ternary @ input`.
     pub fn matmul(&self, input: &[f32], out_rows: usize, in_cols: usize, seq: usize) -> Vec<f32> {
         ternary_matmul(&self.ternary, self.scale, input, out_rows, in_cols, seq)
@@ -95,22 +106,23 @@ impl TernaryMoELayer {
     /// Quantizes each expert's gate/up/down weight matrices to ternary.
     /// Router weights are copied as-is (FP32).
     pub fn from_cpu_moe(moe: &CpuMoELayer) -> Self {
+        // Direct ternary copy — no FP32 round-trip.
         let expert_gate: Vec<TernaryWeight> = moe
             .expert_gate
             .iter()
-            .map(|w| TernaryWeight::from_fp32(w))
+            .map(|w| TernaryWeight::from_ternary(w.values.clone(), w.scale, w.rows * w.cols))
             .collect();
 
         let expert_up: Vec<TernaryWeight> = moe
             .expert_up
             .iter()
-            .map(|w| TernaryWeight::from_fp32(w))
+            .map(|w| TernaryWeight::from_ternary(w.values.clone(), w.scale, w.rows * w.cols))
             .collect();
 
         let expert_down: Vec<TernaryWeight> = moe
             .expert_down
             .iter()
-            .map(|w| TernaryWeight::from_fp32(w))
+            .map(|w| TernaryWeight::from_ternary(w.values.clone(), w.scale, w.rows * w.cols))
             .collect();
 
         TernaryMoELayer {
@@ -250,7 +262,7 @@ impl TernaryMoELayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::cpu_moe::CpuMoELayer;
+    use crate::model::cpu_moe::{CpuMoELayer, TernaryExpert};
 
     fn make_test_moe() -> CpuMoELayer {
         let hidden_dim = 8;
@@ -266,14 +278,21 @@ mod tests {
             (0..size).map(|i| ((i as f32 + base) * 0.05).sin()).collect()
         };
 
-        let expert_gate: Vec<Vec<f32>> = (0..num_experts)
-            .map(|e| make_expert_weights(e as f32 * 0.1, intermediate_dim * hidden_dim))
+        let expert_gate: Vec<TernaryExpert> = (0..num_experts)
+            .map(|e| {
+                let w = make_expert_weights(e as f32 * 0.1, intermediate_dim * hidden_dim);
+                TernaryExpert::from_fp32(&w, intermediate_dim, hidden_dim)
+            })
             .collect();
-        let expert_up: Vec<Vec<f32>> = (0..num_experts)
-            .map(|e| make_expert_weights(e as f32 * 0.1 + 0.5, intermediate_dim * hidden_dim))
+        let expert_up: Vec<TernaryExpert> = (0..num_experts)
+            .map(|e| {
+                let w = make_expert_weights(e as f32 * 0.1 + 0.5, intermediate_dim * hidden_dim);
+                TernaryExpert::from_fp32(&w, intermediate_dim, hidden_dim)
+            })
             .collect();
-        let expert_down: Vec<Vec<f32>> = (0..num_experts)
+        let expert_down: Vec<TernaryExpert> = (0..num_experts)
             .map(|e| make_expert_weights(e as f32 * 0.1 + 1.0, hidden_dim * intermediate_dim))
+            .map(|w| TernaryExpert::from_fp32(&w, hidden_dim, intermediate_dim))
             .collect();
 
         CpuMoELayer {
@@ -373,9 +392,18 @@ mod tests {
             (0..size).map(|i| ((i as f32 + base) * 0.1).sin()).collect()
         };
 
-        let expert_gate = vec![make_weights(0.0, intermediate_dim * hidden_dim), make_weights(1.0, intermediate_dim * hidden_dim)];
-        let expert_up = vec![make_weights(0.5, intermediate_dim * hidden_dim), make_weights(1.5, intermediate_dim * hidden_dim)];
-        let expert_down = vec![make_weights(0.0, hidden_dim * intermediate_dim), make_weights(1.0, hidden_dim * intermediate_dim)];
+        let expert_gate = vec![
+            TernaryExpert::from_fp32(&make_weights(0.0, intermediate_dim * hidden_dim), intermediate_dim, hidden_dim),
+            TernaryExpert::from_fp32(&make_weights(1.0, intermediate_dim * hidden_dim), intermediate_dim, hidden_dim),
+        ];
+        let expert_up = vec![
+            TernaryExpert::from_fp32(&make_weights(0.5, intermediate_dim * hidden_dim), intermediate_dim, hidden_dim),
+            TernaryExpert::from_fp32(&make_weights(1.5, intermediate_dim * hidden_dim), intermediate_dim, hidden_dim),
+        ];
+        let expert_down = vec![
+            TernaryExpert::from_fp32(&make_weights(0.0, hidden_dim * intermediate_dim), hidden_dim, intermediate_dim),
+            TernaryExpert::from_fp32(&make_weights(1.0, hidden_dim * intermediate_dim), hidden_dim, intermediate_dim),
+        ];
 
         let moe_gelu = CpuMoELayer {
             gate_weights: gate_weights.clone(),

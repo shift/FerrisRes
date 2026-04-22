@@ -197,13 +197,13 @@ pub fn save_model(model: &CpuBlockAttnResModel, path: &str) -> Result<()> {
                 dtype: SafeDtype::BF16,
                 data_f32: moe.gate_weights.clone(),
             });
-            // Experts
+            // Experts (dequantize from ternary for saving)
             for (e, expert_gate) in moe.expert_gate.iter().enumerate() {
                 tensors.push(TensorToWrite {
                     name: format!("{}.moe.expert.{}.gate", pfx, e),
                     shape: vec![moe.intermediate_dim, model.hidden_dim],
                     dtype: SafeDtype::BF16,
-                    data_f32: expert_gate.clone(),
+                    data_f32: expert_gate.to_fp32(),
                 });
             }
             for (e, expert_up) in moe.expert_up.iter().enumerate() {
@@ -211,7 +211,7 @@ pub fn save_model(model: &CpuBlockAttnResModel, path: &str) -> Result<()> {
                     name: format!("{}.moe.expert.{}.up", pfx, e),
                     shape: vec![moe.intermediate_dim, model.hidden_dim],
                     dtype: SafeDtype::BF16,
-                    data_f32: expert_up.clone(),
+                    data_f32: expert_up.to_fp32(),
                 });
             }
             for (e, expert_down) in moe.expert_down.iter().enumerate() {
@@ -219,7 +219,7 @@ pub fn save_model(model: &CpuBlockAttnResModel, path: &str) -> Result<()> {
                     name: format!("{}.moe.expert.{}.down", pfx, e),
                     shape: vec![model.hidden_dim, moe.intermediate_dim],
                     dtype: SafeDtype::BF16,
-                    data_f32: expert_down.clone(),
+                    data_f32: expert_down.to_fp32(),
                 });
             }
         } else {
@@ -392,9 +392,12 @@ pub fn load_model(path: &str) -> Result<CpuBlockAttnResModel> {
             let mut expert_up = Vec::with_capacity(lc.num_experts);
             let mut expert_down = Vec::with_capacity(lc.num_experts);
             for e in 0..lc.num_experts {
-                expert_gate.push(load(&format!("{}.moe.expert.{}.gate", pfx, e))?);
-                expert_up.push(load(&format!("{}.moe.expert.{}.up", pfx, e))?);
-                expert_down.push(load(&format!("{}.moe.expert.{}.down", pfx, e))?);
+                let gate_fp32: Vec<f32> = load(&format!("{}.moe.expert.{}.gate", pfx, e))?;
+                let up_fp32: Vec<f32> = load(&format!("{}.moe.expert.{}.up", pfx, e))?;
+                let down_fp32: Vec<f32> = load(&format!("{}.moe.expert.{}.down", pfx, e))?;
+                expert_gate.push(crate::model::cpu_moe::TernaryExpert::from_fp32(&gate_fp32, lc.inter_dim, config.hidden_dim));
+                expert_up.push(crate::model::cpu_moe::TernaryExpert::from_fp32(&up_fp32, lc.inter_dim, config.hidden_dim));
+                expert_down.push(crate::model::cpu_moe::TernaryExpert::from_fp32(&down_fp32, config.hidden_dim, lc.inter_dim));
             }
             Some(CpuMoELayer {
                 gate_weights,

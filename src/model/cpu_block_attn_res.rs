@@ -749,7 +749,8 @@ impl CpuBlockAttnResModel {
             // Q projection
             let q_dim = layer.q_proj.out_features();
             let kv_dim_out = layer.v_proj.out_features();
-            let mut q = gpu_mm(&normed, layer.q_proj.weight(), seq, hd, q_dim);
+            let q_w = layer.q_proj.weight();
+            let mut q = gpu_mm(&normed, &q_w, seq, hd, q_dim);
             if let Some(ref lora_m) = lora_m {
                 if let Some(lora_out) = lora_m.forward(layer_idx, "q_proj", &normed, seq) {
                     for (i, v) in lora_out.iter().enumerate() { q[i] += v; }
@@ -762,8 +763,10 @@ impl CpuBlockAttnResModel {
             let (k, v) = match kv {
                 Some((sk, sv)) => (sk.to_vec(), sv.to_vec()),
                 None => {
-                    let mut k = gpu_mm(&normed, layer.k_proj.weight(), seq, hd, layer.k_proj.out_features());
-                    let mut v_raw = gpu_mm(&normed, layer.v_proj.weight(), seq, hd, layer.v_proj.out_features());
+                    let k_w = layer.k_proj.weight();
+                    let v_w = layer.v_proj.weight();
+                    let mut k = gpu_mm(&normed, &k_w, seq, hd, layer.k_proj.out_features());
+                    let mut v_raw = gpu_mm(&normed, &v_w, seq, hd, layer.v_proj.out_features());
                     if let Some(ref lora_m) = lora_m {
                         if let Some(lora_out) = lora_m.forward(layer_idx, "v_proj", &normed, seq) {
                             for (i, l) in lora_out.iter().enumerate() { v_raw[i] += l; }
@@ -815,11 +818,14 @@ impl CpuBlockAttnResModel {
                     for &ei in &indices[..moe.top_k] {
                         let w = router_out[r_off + ei] / top_k_sum;
                         let input_t = &normed2[t * hd..(t + 1) * hd];
-                        let gated = gpu_mm(input_t, &moe.expert_gate[ei], 1, hd, moe.intermediate_dim);
-                        let upped = gpu_mm(input_t, &moe.expert_up[ei], 1, hd, moe.intermediate_dim);
+                        let gate_w = moe.expert_gate[ei].to_fp32();
+                        let up_w = moe.expert_up[ei].to_fp32();
+                        let down_w = moe.expert_down[ei].to_fp32();
+                        let gated = gpu_mm(input_t, &gate_w, 1, hd, moe.intermediate_dim);
+                        let upped = gpu_mm(input_t, &up_w, 1, hd, moe.intermediate_dim);
                         let gated: Vec<f32> = if moe.use_gelu { gated.iter().map(|&x| gelu_tanh(x)).collect() } else { gated.iter().map(|&x| x * (1.0 / (1.0 + (-x).exp()))).collect() };
                         let combined: Vec<f32> = gated.iter().zip(upped.iter()).map(|(&g, &u)| g * u).collect();
-                        let down = gpu_mm(&combined, &moe.expert_down[ei], 1, moe.intermediate_dim, hd);
+                        let down = gpu_mm(&combined, &down_w, 1, moe.intermediate_dim, hd);
                         for d in 0..hd { expert_outputs[t * hd + d] += w * down[d]; }
                     }
                 }
@@ -832,11 +838,11 @@ impl CpuBlockAttnResModel {
                     (Some(g), Some(u), Some(d)) => (g.weight(), u.weight(), d.weight()),
                     _ => { continue; }
                 };
-                let gated = gpu_mm(&normed2, gate_w, seq, hd, id);
-                let upped = gpu_mm(&normed2, up_w, seq, hd, id);
+                let gated = gpu_mm(&normed2, &gate_w, seq, hd, id);
+                let upped = gpu_mm(&normed2, &up_w, seq, hd, id);
                 let gated: Vec<f32> = if layer.use_gelu { gated.iter().map(|&x| gelu_tanh(x)).collect() } else { gated.iter().map(|&x| x * (1.0 / (1.0 + (-x).exp()))).collect() };
                 let combined: Vec<f32> = gated.iter().zip(upped.iter()).map(|(&g, &u)| g * u).collect();
-                let ffn_out = gpu_mm(&combined, down_w, seq, id, hd);
+                let ffn_out = gpu_mm(&combined, &down_w, seq, id, hd);
                 let normed_ffn = layer.post_ffn_norm.forward(&ffn_out);
                 for i in 0..hidden.len() { hidden[i] = ffn_residual[i] + normed_ffn[i] * layer.layer_scalar; }
             }
@@ -852,7 +858,8 @@ impl CpuBlockAttnResModel {
                     let gate_gelu: Vec<f32> = gate_out.iter().map(|&x| gelu_tanh(x)).collect();
                     let mut gated = vec![0.0f32; seq * ple_dim];
                     for i in 0..seq * ple_dim { gated[i] = gate_gelu[i] * ple_s[i]; }
-                    let proj_out = gpu_mm(&gated, proj.weight(), seq, ple_dim, hd);
+                    let proj_w = proj.weight();
+                    let proj_out = gpu_mm(&gated, &proj_w, seq, ple_dim, hd);
                     let ple_final = norm.forward(&proj_out);
                     for i in 0..hidden.len() { hidden[i] += ple_final[i]; }
                 }
@@ -1739,7 +1746,7 @@ pub fn dense_ffn_to_moe(
         let (gate, up, down, use_gelu, inter_dim) = match (&layer.ffn_gate, &layer.ffn_up, &layer.ffn_down) {
             (Some(g), Some(u), Some(d)) => {
                 let idim = g.out_features();
-                (g.weight().to_vec(), u.weight().to_vec(), d.weight().to_vec(), layer.use_gelu, idim)
+                (g.weight(), u.weight(), d.weight(), layer.use_gelu, idim)
             }
             _ => continue, // Already MoE or no FFN
         };
@@ -1753,16 +1760,19 @@ pub fn dense_ffn_to_moe(
             .map(|_| rng.gen::<f32>() * noise_stddev * 2.0 - noise_stddev)
             .collect();
 
-        // Expert 0: exact copy of dense FFN
-        moe.expert_gate[0] = gate.clone();
-        moe.expert_up[0] = up.clone();
-        moe.expert_down[0] = down.clone();
+        // Expert 0: exact copy of dense FFN → ternary
+        moe.expert_gate[0] = crate::model::cpu_moe::TernaryExpert::from_fp32(&gate, inter_dim, hd);
+        moe.expert_up[0] = crate::model::cpu_moe::TernaryExpert::from_fp32(&up, inter_dim, hd);
+        moe.expert_down[0] = crate::model::cpu_moe::TernaryExpert::from_fp32(&down, hd, inter_dim);
 
-        // Experts 1..N: dense FFN + perturbation noise
+        // Experts 1..N: dense FFN + perturbation noise → ternary
         for e in 1..num_experts {
-            moe.expert_gate[e] = gate.iter().map(|&w| w + rng.gen::<f32>() * noise_stddev * 2.0 - noise_stddev).collect();
-            moe.expert_up[e] = up.iter().map(|&w| w + rng.gen::<f32>() * noise_stddev * 2.0 - noise_stddev).collect();
-            moe.expert_down[e] = down.iter().map(|&w| w + rng.gen::<f32>() * noise_stddev * 2.0 - noise_stddev).collect();
+            let g_noised: Vec<f32> = gate.iter().map(|&w| w + rng.gen::<f32>() * noise_stddev * 2.0 - noise_stddev).collect();
+            let u_noised: Vec<f32> = up.iter().map(|&w| w + rng.gen::<f32>() * noise_stddev * 2.0 - noise_stddev).collect();
+            let d_noised: Vec<f32> = down.iter().map(|&w| w + rng.gen::<f32>() * noise_stddev * 2.0 - noise_stddev).collect();
+            moe.expert_gate[e] = crate::model::cpu_moe::TernaryExpert::from_fp32(&g_noised, inter_dim, hd);
+            moe.expert_up[e] = crate::model::cpu_moe::TernaryExpert::from_fp32(&u_noised, inter_dim, hd);
+            moe.expert_down[e] = crate::model::cpu_moe::TernaryExpert::from_fp32(&d_noised, hd, inter_dim);
         }
 
         // Replace dense FFN with MoE
@@ -1861,9 +1871,9 @@ pub fn gemma4_to_block_attnres(teacher: &MappedGemma4Model) -> CpuBlockAttnResMo
             Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs } => {
                 let mut moe_layer = CpuMoELayer::new(hd, layer_inter_dim, config.num_experts, config.top_k);
                 moe_layer.gate_weights = router.clone();
-                moe_layer.expert_gate = expert_gates.clone();
-                moe_layer.expert_up = expert_ups.clone();
-                moe_layer.expert_down = expert_downs.clone();
+                moe_layer.expert_gate = expert_gates.iter().map(|g| crate::model::cpu_moe::TernaryExpert::from_fp32(g, layer_inter_dim, hd)).collect();
+                moe_layer.expert_up = expert_ups.iter().map(|u| crate::model::cpu_moe::TernaryExpert::from_fp32(u, layer_inter_dim, hd)).collect();
+                moe_layer.expert_down = expert_downs.iter().map(|d| crate::model::cpu_moe::TernaryExpert::from_fp32(d, hd, layer_inter_dim)).collect();
                 moe_layer.use_gelu = true; // Gemma 4
                 (
                     None, None, None,

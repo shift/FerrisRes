@@ -12,7 +12,8 @@ use crate::model::block_attn_res::BlockAttnResLayer;
 
 /// Upload a CPU-trained model's linear layer weights to a GPU linear layer.
 fn upload_linear(gpu_linear: &crate::model::linear::Linear, cpu_linear: &CpuLinear, queue: &Queue) {
-    gpu_linear.set_weight(queue, cpu_linear.weight());
+    let w = cpu_linear.weight();
+    gpu_linear.set_weight(queue, &w);
 }
 
 /// Upload a single CPU layer's weights to a GPU layer.
