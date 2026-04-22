@@ -25,6 +25,9 @@
           vulkan-tools
           vulkan-validation-layers
 
+          # GPU debugging: inspect MoE kernel execution, reduction shaders
+          renderdoc
+
           # GPU drivers (Mesa for Intel/AMD)
           mesa
           libdrm
