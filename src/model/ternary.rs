@@ -309,19 +309,18 @@ pub fn ternary_matmul(
 
         for r in 0..out_rows {
             let weight_row = &ternary[r * in_cols..(r + 1) * in_cols];
-            // Branchless ternary matmul: convert sign to f32 and multiply
-            // w > 0 → 1.0, w < 0 → -1.0, w == 0 → 0.0
-            // Using sign extraction: (w >> 7) gives -1 for negative, 0 otherwise
-            // Combined: sign = (w > 0) - (w < 0) → branchless with comparison
-            let mut sum = 0.0f32;
+            // Split positive/negative accumulators — only 1 multiply at the end.
+            // The `if` branches are predictable (33% each of {-1, 0, +1})
+            // and the multiply-by-0 in the else branch is free.
+            let mut pos_sum = 0.0f32;
+            let mut neg_sum = 0.0f32;
             for j in 0..in_cols {
                 let w = weight_row[j];
-                // Branchless: (w > 0) as i8 - (w < 0) as i8 gives {-1, 0, 1}
-                // Cast to f32 and multiply — compiler can auto-vectorize
-                let sign = (w > 0) as i8 as f32 - (w < 0) as i8 as f32;
-                sum += sign * input_row[j];
+                let v = input_row[j];
+                pos_sum += if w > 0 { v } else { 0.0 };
+                neg_sum += if w < 0 { v } else { 0.0 };
             }
-            out_slice[r] = scale * sum;
+            out_slice[r] = scale * (pos_sum - neg_sum);
         }
     }
 
