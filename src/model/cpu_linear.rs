@@ -111,6 +111,21 @@ impl CpuLinear {
         output
     }
 
+    /// Packed parallel forward — 4× less memory bandwidth than unpacked.
+    /// Fastest path for decode (seq=1) on memory-bound systems.
+    pub fn forward_packed_parallel(&self, input: &[f32], seq: usize) -> Vec<f32> {
+        let mut output = crate::model::ternary::ternary_matmul_packed_parallel(
+            &self.packed, self.scale, input,
+            self.out_features, self.in_features, seq,
+        );
+        if let Some(ref bias) = self.bias {
+            for j in 0..self.out_features {
+                output[j] += bias[j];
+            }
+        }
+        output
+    }
+
     /// Dequantize all weights to FP32 (for export, checkpoint saving, etc).
     pub fn weight(&self) -> Vec<f32> {
         self.ternary.iter().map(|&v| v as f32 * self.scale).collect()
