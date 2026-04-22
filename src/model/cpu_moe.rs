@@ -47,6 +47,14 @@ impl TernaryExpert {
         crate::model::ternary::ternary_matmul_parallel(&self.values, self.scale, input, self.rows, self.cols, seq)
     }
 
+    /// Packed parallel forward — uses 2-bit packed weights for 4× less memory bandwidth.
+    /// This is the fastest path for decode (seq=1).
+    pub fn forward_packed_parallel(&self, input: &[f32], seq: usize) -> Vec<f32> {
+        crate::model::ternary::ternary_matmul_packed_parallel(
+            &self.packed, self.scale, input, self.rows, self.cols, seq,
+        )
+    }
+
     /// Single-token forward.
     pub fn forward_single(&self, input: &[f32]) -> Vec<f32> {
         ternary_matmul(&self.values, self.scale, input, self.rows, self.cols, 1)
@@ -118,6 +126,12 @@ impl CpuMoELayer {
     /// Parallel forward using rayon — use for decode (seq=1) with large expert matrices.
     pub fn forward_parallel(&self, input: &[f32], seq: usize) -> Vec<f32> {
         self.forward_parallel_impl(input, seq, None, 0, None)
+    }
+
+    /// Packed parallel forward — 4× less memory bandwidth than unpacked.
+    /// Fastest path for decode (seq=1).
+    pub fn forward_packed_parallel(&self, input: &[f32], seq: usize) -> Vec<f32> {
+        self.forward_packed_parallel_impl(input, seq, None, 0, None)
     }
 
     /// Forward pass that also collects routing data for loss/gradient computation.
@@ -214,7 +228,43 @@ impl CpuMoELayer {
         output
     }
 
-    /// Expert forward with parallel matmul for each projection.
+    /// Packed parallel MoE forward — 4× less memory bandwidth.
+    fn forward_packed_parallel_impl(
+        &self,
+        input: &[f32],
+        seq: usize,
+        _routing_collector: Option<&mut Vec<MoERoutingData>>,
+        layer_idx: usize,
+        lora_manager: Option<&crate::training::lora::LoraManager>,
+    ) -> Vec<f32> {
+        let h = self.hidden_dim;
+        let ne = self.num_experts;
+        let tk = self.top_k;
+
+        let gate_logits = matmul(input, &self.gate_weights, seq, h, ne);
+        let (selected_experts, expert_weights, _gate_probs) = self.top_k_select_with_probs(&gate_logits, seq);
+
+        let mut output = vec![0.0f32; seq * h];
+
+        for t in 0..seq {
+            for k_idx in 0..tk {
+                let expert_idx = selected_experts[t * tk + k_idx];
+                let weight = expert_weights[t * tk + k_idx];
+                if weight.abs() < 1e-8 { continue; }
+
+                let token = &input[t * h..(t + 1) * h];
+                let expert_out = self.expert_forward_packed_parallel_with_lora(expert_idx, token, lora_manager, layer_idx);
+
+                for (i, &v) in expert_out.iter().enumerate() {
+                    output[t * h + i] += weight * v;
+                }
+            }
+        }
+
+        output
+    }
+
+    /// Expert forward with unpacked parallel matmul for each projection.
     fn expert_forward_parallel_with_lora(
         &self,
         expert_idx: usize,
@@ -224,7 +274,6 @@ impl CpuMoELayer {
     ) -> Vec<f32> {
         let id = self.intermediate_dim;
 
-        // gate: parallel ternary matmul + LoRA
         let mut gated = self.expert_gate[expert_idx].forward_parallel(token, 1);
         if let Some(lm) = lora_manager {
             let name = format!("moe.expert.{}.gate", expert_idx);
@@ -238,7 +287,6 @@ impl CpuMoELayer {
             gated.iter().map(|&x| x / (1.0 + (-x).exp())).collect()
         };
 
-        // up: parallel ternary matmul + LoRA
         let mut upped = self.expert_up[expert_idx].forward_parallel(token, 1);
         if let Some(lm) = lora_manager {
             let name = format!("moe.expert.{}.up", expert_idx);
@@ -250,8 +298,52 @@ impl CpuMoELayer {
         let mut combined = vec![0.0; id];
         for i in 0..id { combined[i] = gated[i] * upped[i]; }
 
-        // down: parallel ternary matmul + LoRA
         let mut down_out = self.expert_down[expert_idx].forward_parallel(&combined, 1);
+        if let Some(lm) = lora_manager {
+            let name = format!("moe.expert.{}.down", expert_idx);
+            if let Some(lo) = lm.forward(layer_idx, &name, &combined, 1) {
+                for (i, v) in lo.iter().enumerate() { down_out[i] += v; }
+            }
+        }
+
+        down_out
+    }
+
+    /// Expert forward with packed parallel matmul — 4× less memory bandwidth.
+    fn expert_forward_packed_parallel_with_lora(
+        &self,
+        expert_idx: usize,
+        token: &[f32],
+        lora_manager: Option<&crate::training::lora::LoraManager>,
+        layer_idx: usize,
+    ) -> Vec<f32> {
+        let id = self.intermediate_dim;
+
+        let mut gated = self.expert_gate[expert_idx].forward_packed_parallel(token, 1);
+        if let Some(lm) = lora_manager {
+            let name = format!("moe.expert.{}.gate", expert_idx);
+            if let Some(lo) = lm.forward(layer_idx, &name, token, 1) {
+                for (i, v) in lo.iter().enumerate() { gated[i] += v; }
+            }
+        }
+        let gated: Vec<f32> = if self.use_gelu {
+            gated.iter().map(|&x| crate::model::gemma_mapper::gelu_tanh(x)).collect()
+        } else {
+            gated.iter().map(|&x| x / (1.0 + (-x).exp())).collect()
+        };
+
+        let mut upped = self.expert_up[expert_idx].forward_packed_parallel(token, 1);
+        if let Some(lm) = lora_manager {
+            let name = format!("moe.expert.{}.up", expert_idx);
+            if let Some(lo) = lm.forward(layer_idx, &name, token, 1) {
+                for (i, v) in lo.iter().enumerate() { upped[i] += v; }
+            }
+        }
+
+        let mut combined = vec![0.0; id];
+        for i in 0..id { combined[i] = gated[i] * upped[i]; }
+
+        let mut down_out = self.expert_down[expert_idx].forward_packed_parallel(&combined, 1);
         if let Some(lm) = lora_manager {
             let name = format!("moe.expert.{}.down", expert_idx);
             if let Some(lo) = lm.forward(layer_idx, &name, &combined, 1) {

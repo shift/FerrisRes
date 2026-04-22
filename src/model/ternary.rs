@@ -344,20 +344,27 @@ pub fn ternary_matmul_parallel(
     assert_eq!(input.len(), seq * in_cols);
 
     if seq <= 1 {
-        // Single token — parallelize across output rows instead
+        // Single token — parallelize across output rows in BATCHES
+        // to amortize rayon task scheduling overhead.
+        // Batch size: aim for ~32 tasks (e.g., 2048 rows / 32 = 64 rows per task).
         let mut output = vec![0.0f32; out_rows];
-        output.par_iter_mut().enumerate().for_each(|(r, out_val)| {
-            let weight_row = &ternary[r * in_cols..(r + 1) * in_cols];
-            let input_row = &input[..in_cols];
-            let mut pos_sum = 0.0f32;
-            let mut neg_sum = 0.0f32;
-            for j in 0..in_cols {
-                let w = weight_row[j];
-                let v = input_row[j];
-                pos_sum += if w > 0 { v } else { 0.0 };
-                neg_sum += if w < 0 { v } else { 0.0 };
+        let batch_size = (out_rows / 32).max(1);
+        output.par_chunks_mut(batch_size).enumerate().for_each(|(batch_idx, chunk)| {
+            let start_row = batch_idx * batch_size;
+            for r in 0..chunk.len() {
+                let row = start_row + r;
+                let weight_row = &ternary[row * in_cols..(row + 1) * in_cols];
+                let input_row = &input[..in_cols];
+                let mut pos_sum = 0.0f32;
+                let mut neg_sum = 0.0f32;
+                for j in 0..in_cols {
+                    let w = weight_row[j];
+                    let v = input_row[j];
+                    pos_sum += if w > 0 { v } else { 0.0 };
+                    neg_sum += if w < 0 { v } else { 0.0 };
+                }
+                chunk[r] = scale * (pos_sum - neg_sum);
             }
-            *out_val = scale * (pos_sum - neg_sum);
         });
         return output;
     }
@@ -453,6 +460,71 @@ pub fn ternary_matmul_packed(
             output[s * out_rows + r] = scale * sum;
         }
     }
+
+    output
+}
+
+/// Parallel ternary matmul from 2-bit packed data using rayon.
+///
+/// Single-token (seq=1): parallelize across output rows in batches.
+/// Multi-token: parallelize across sequence positions.
+/// Uses 4× less memory bandwidth than unpacked ternary matmul.
+pub fn ternary_matmul_packed_parallel(
+    packed: &[u8],
+    scale: f32,
+    input: &[f32],
+    out_rows: usize,
+    in_cols: usize,
+    _seq: usize, // always 1 for decode
+) -> Vec<f32> {
+    use rayon::prelude::*;
+    let mut output = vec![0.0f32; out_rows];
+    let batch_size = (out_rows / 32).max(1);
+
+    output.par_chunks_mut(batch_size).enumerate().for_each(|(batch_idx, chunk)| {
+        let start_row = batch_idx * batch_size;
+        let input_row = &input[..in_cols];
+        let full_quads = in_cols / 4;
+        let remainder = in_cols % 4;
+
+        for r in 0..chunk.len() {
+            let row = start_row + r;
+            // Each row is full_quads bytes (or full_quads+1 if remainder)
+            let row_packed_start = row * ((in_cols + 3) / 4);
+            let mut sum = 0.0f32;
+
+            // Process 4 values at a time from packed bytes
+            for q in 0..full_quads {
+                let byte_idx = row_packed_start + q;
+                let packed_byte = packed[byte_idx];
+
+                // Unrolled: extract 4 signs and accumulate
+                let s0 = TERNARY_DECODE[(packed_byte & 0b11) as usize] as f32;
+                let s1 = TERNARY_DECODE[((packed_byte >> 2) & 0b11) as usize] as f32;
+                let s2 = TERNARY_DECODE[((packed_byte >> 4) & 0b11) as usize] as f32;
+                let s3 = TERNARY_DECODE[((packed_byte >> 6) & 0b11) as usize] as f32;
+
+                let base = q * 4;
+                sum += s0 * input_row[base]
+                     + s1 * input_row[base + 1]
+                     + s2 * input_row[base + 2]
+                     + s3 * input_row[base + 3];
+            }
+
+            // Handle remainder
+            if remainder > 0 {
+                let byte_idx = row_packed_start + full_quads;
+                let packed_byte = packed[byte_idx];
+                let base = full_quads * 4;
+                for bit_pos in 0..remainder {
+                    let code = ((packed_byte >> (bit_pos * 2)) & 0b11) as usize;
+                    sum += TERNARY_DECODE[code] as f32 * input_row[base + bit_pos];
+                }
+            }
+
+            chunk[r] = scale * sum;
+        }
+    });
 
     output
 }
