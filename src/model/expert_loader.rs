@@ -376,16 +376,19 @@ impl ExpertLoader {
             if let Some(ref moe) = layer.moe {
                 for expert_idx in 0..moe.num_experts {
                     // Convert each expert's weight matrices to sparse ternary
+                    let gate_fp32 = moe.expert_gate[expert_idx].to_fp32();
                     let gate = crate::model::sparse_ternary::prune_fp32_to_sparse_ternary(
-                        &moe.expert_gate[expert_idx],
+                        &gate_fp32,
                         moe.intermediate_dim, moe.hidden_dim,
                     );
+                    let up_fp32 = moe.expert_up[expert_idx].to_fp32();
                     let up = crate::model::sparse_ternary::prune_fp32_to_sparse_ternary(
-                        &moe.expert_up[expert_idx],
+                        &up_fp32,
                         moe.intermediate_dim, moe.hidden_dim,
                     );
+                    let down_fp32 = moe.expert_down[expert_idx].to_fp32();
                     let down = crate::model::sparse_ternary::prune_fp32_to_sparse_ternary(
-                        &moe.expert_down[expert_idx],
+                        &down_fp32,
                         moe.hidden_dim, moe.intermediate_dim,
                     );
 

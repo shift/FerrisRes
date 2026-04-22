@@ -9,7 +9,7 @@
 
 use crate::model::cpu_linear::CpuLinear;
 use crate::model::ternary::{
-    pack_ternary, quantize_ternary, ternary_matmul, ternary_matmul_decode, ternary_matmul_packed,
+    pack_ternary, ternary_matmul, ternary_matmul_decode, ternary_matmul_packed,
     ternary_stats, TernaryStats,
 };
 
@@ -54,9 +54,9 @@ impl TernaryLinear {
     pub fn from_cpu_linear(linear: &CpuLinear) -> Self {
         let out_features = linear.out_features();
         let in_features = linear.in_features();
-        let weights = linear.weight();
-
-        let (ternary, scale) = quantize_ternary(weights);
+        // Use raw ternary values directly — no FP32 round-trip
+        let ternary = linear.ternary_values().to_vec();
+        let scale = linear.scale();
         let packed = pack_ternary(&ternary);
 
         Self {

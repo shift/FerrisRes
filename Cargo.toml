@@ -27,6 +27,7 @@ image = "0.25"
 rand = "0.8"
 pollster = "0.3"
 memmap2 = "0.9"
+half = { version = "2", features = ["num-traits", "serde", "bytemuck"] }
 ureq = { version = "2", features = ["json"] }
 matrixmultiply = "0.3"
 regex = "1"

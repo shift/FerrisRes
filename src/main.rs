@@ -1953,12 +1953,12 @@ async fn cmd_distill(
                             // === Down projection backward ===
                             // combined [id] → down [id, hd] → expert_out [hd]
                             // d_combined = d_expert_out @ down^T  [hd] → [id]
-                            let down = &moe.expert_down[ei]; // [id * hd]
+                            let down_fp32 = moe.expert_down[ei].to_fp32();
                             let mut d_combined = vec![0.0f32; id];
                             for i in 0..id {
                                 let mut s = 0.0f32;
                                 for o in 0..hd.min(d_expert_out.len()) {
-                                    s += d_expert_out[o] * down[i * hd + o];
+                                    s += d_expert_out[o] * down_fp32[i * hd + o];
                                 }
                                 d_combined[i] = s;
                             }

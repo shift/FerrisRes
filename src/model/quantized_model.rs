@@ -123,7 +123,9 @@ pub fn quantize_pipeline(
         let attn = layer.q_proj.weight().len() + layer.k_proj.weight().len()
             + layer.v_proj.weight().len() + layer.out_proj.weight().len();
         let ffn = if let Some(ref moe) = layer.moe {
-            moe.expert_gate.len() * moe.expert_gate[0].len() * 3
+            moe.expert_gate.iter().map(|e| e.values.len()).sum::<usize>()
+            + moe.expert_up.iter().map(|e| e.values.len()).sum::<usize>()
+            + moe.expert_down.iter().map(|e| e.values.len()).sum::<usize>()
         } else {
             let g = layer.ffn_gate.as_ref().map(|g| g.weight().len()).unwrap_or(0);
             let u = layer.ffn_up.as_ref().map(|u| u.weight().len()).unwrap_or(0);
@@ -157,9 +159,9 @@ pub fn quantize_pipeline(
             + layer.v_proj.weight().len() + layer.out_proj.weight().len();
         if let Some(ref moe) = layer.moe {
             for e in 0..moe.num_experts {
-                report.ternary_weights += moe.expert_gate[e].len()
-                    + moe.expert_up[e].len()
-                    + moe.expert_down[e].len();
+                report.ternary_weights += moe.expert_gate[e].values.len()
+                    + moe.expert_up[e].values.len()
+                    + moe.expert_down[e].values.len();
             }
         }
         report.fp32_weights += layer.attn_norm.weight().len() + layer.post_attn_norm.weight().len()
