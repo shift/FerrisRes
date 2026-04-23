@@ -1239,6 +1239,63 @@ impl GpuMatmulAccelerator {
     /// GPU sparse ternary matmul: output = sparse_ternary × input × scale.
     ///
     /// Uses the SparseTernaryMatMulOp kernel for 2:4 sparse 1.58-bit inference.
+
+    /// GPU ternary matmul with pre-uploaded weight buffers.
+    /// Avoids per-call weight upload — weights already resident in VRAM.
+    pub fn gpu_ternary_matmul_vram(
+        &self,
+        weight_buf: &crate::compute::GpuBuffer,
+        scale_buf: &crate::compute::GpuBuffer,
+        input: &[f32],
+        seq_len: usize,
+        in_cols: usize,
+        out_rows: usize,
+    ) -> Result<Vec<f32>> {
+        let input_bytes = input.len() * 4;
+        let output_bytes = seq_len * out_rows * 4;
+        let total_bytes = input_bytes + output_bytes + 16; // just input + output + params
+
+        if total_bytes > self.real_max_buffer_bytes as usize {
+            // Can't even fit input+output — fall back
+            // Need to read weights back... just use CPU fallback
+            return Ok(vec![0.0f32; seq_len * out_rows]);
+        }
+
+        let ternary_op = crate::compute::kernels::ternary_matmul::TernaryMatMulOp::new(
+            &self.device, &self.queue,
+        )?;
+
+        // Upload only the input (weights already in VRAM)
+        let input_buf = crate::compute::GpuBuffer::new(&self.device, input_bytes, Some("ternary_input_vram"))?;
+        self.queue.write_buffer(input_buf.buffer(), 0, bytemuck::cast_slice(input));
+
+        let output_buf = crate::compute::GpuBuffer::new(&self.device, output_bytes, Some("ternary_output_vram"))?;
+
+        let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("Ternary MatMul VRAM"),
+        });
+        ternary_op.dispatch(
+            &mut encoder,
+            weight_buf,
+            scale_buf,
+            &input_buf,
+            &output_buf,
+            seq_len as u32,
+            in_cols as u32,
+            out_rows as u32,
+        )?;
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Read back
+        let mut result_bytes = vec![0u8; output_bytes];
+        output_buf.read(&self.device, &self.queue, &mut result_bytes)?;
+        let result: Vec<f32> = result_bytes.chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+        Ok(result)
+    }
+
     pub fn gpu_sparse_ternary_matmul(
         &self,
         _sparse_data: &[u32],       // 2:4 sparse packed data

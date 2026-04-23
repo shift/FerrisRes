@@ -2772,11 +2772,26 @@ fn generate_student(
     let first_token = sample_token(last_logits, temperature);
     all_tokens.push(first_token);
 
-    // Pre-build GPU weight cache to avoid per-step repacking
+    // Pre-build GPU weight cache and upload to VRAM
     let weight_cache = gpu.map(|_| {
         ferrisres::model::cpu_block_attn_res::GpuWeightCache::build(model)
     });
-    if weight_cache.is_some() {
+    let vram_cache = match (&weight_cache, gpu) {
+        (Some(wc), Some(gpu_ref)) => {
+            match ferrisres::model::cpu_block_attn_res::GpuVramCache::upload(wc, gpu_ref) {
+                Ok(vram) => {
+                    info!(event = "gpu_vram_uploaded", layers = vram.layers.len(), vram_mb = vram.total_vram_bytes / (1024*1024), "GPU VRAM weight cache uploaded");
+                    Some(vram)
+                }
+                Err(e) => {
+                    info!(event = "gpu_vram_failed", error = %e, "VRAM upload failed, using per-step upload");
+                    None
+                }
+            }
+        }
+        _ => None
+    };
+    if gpu.is_some() {
         let cache_mb = weight_cache.as_ref().map(|c| {
             c.layers.iter().map(|l| {
                 l.q_packed.len() * 4 + l.q_scales.len() * 4 +
@@ -2785,14 +2800,16 @@ fn generate_student(
                 l.o_packed.len() * 4 + l.o_scales.len() * 4
             }).sum::<usize>()
         }).unwrap_or(0) / (1024 * 1024);
-        info!(event = "gpu_weight_cache", layers = model.layers.len(), cache_mb, "GPU weight cache built");
+        info!(event = "gpu_weight_cache", layers = model.layers.len(), cache_mb, vram = vram_cache.is_some(), "GPU weight cache built");
     }
 
     // === Decode phase: one token at a time using KV cache ===
     for step in 1..max_new_tokens {
         let t0 = std::time::Instant::now();
 
-        let logits = if let (Some(gpu_ref), Some(wc)) = (gpu, weight_cache.as_ref()) {
+        let logits = if let (Some(gpu_ref), Some(vram)) = (gpu, vram_cache.as_ref()) {
+            model.forward_decode_gpu_vram(all_tokens[all_tokens.len() - 1], &mut cache, gpu_ref, vram)
+        } else if let (Some(gpu_ref), Some(wc)) = (gpu, weight_cache.as_ref()) {
             model.forward_decode_gpu_cached(all_tokens[all_tokens.len() - 1], &mut cache, gpu_ref, wc)
         } else if gpu.is_some() {
             model.forward_decode_gpu(all_tokens[all_tokens.len() - 1], &mut cache, gpu.unwrap())
