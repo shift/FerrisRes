@@ -2772,11 +2772,29 @@ fn generate_student(
     let first_token = sample_token(last_logits, temperature);
     all_tokens.push(first_token);
 
+    // Pre-build GPU weight cache to avoid per-step repacking
+    let weight_cache = gpu.map(|_| {
+        ferrisres::model::cpu_block_attn_res::GpuWeightCache::build(model)
+    });
+    if weight_cache.is_some() {
+        let cache_mb = weight_cache.as_ref().map(|c| {
+            c.layers.iter().map(|l| {
+                l.q_packed.len() * 4 + l.q_scales.len() * 4 +
+                l.k_packed.len() * 4 + l.k_scales.len() * 4 +
+                l.v_packed.len() * 4 + l.v_scales.len() * 4 +
+                l.o_packed.len() * 4 + l.o_scales.len() * 4
+            }).sum::<usize>()
+        }).unwrap_or(0) / (1024 * 1024);
+        info!(event = "gpu_weight_cache", layers = model.layers.len(), cache_mb, "GPU weight cache built");
+    }
+
     // === Decode phase: one token at a time using KV cache ===
     for step in 1..max_new_tokens {
         let t0 = std::time::Instant::now();
 
-        let logits = if gpu.is_some() {
+        let logits = if let (Some(gpu_ref), Some(wc)) = (gpu, weight_cache.as_ref()) {
+            model.forward_decode_gpu_cached(all_tokens[all_tokens.len() - 1], &mut cache, gpu_ref, wc)
+        } else if gpu.is_some() {
             model.forward_decode_gpu(all_tokens[all_tokens.len() - 1], &mut cache, gpu.unwrap())
         } else {
             model.forward_decode(all_tokens[all_tokens.len() - 1], &mut cache)
