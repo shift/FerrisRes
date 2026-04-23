@@ -1829,14 +1829,13 @@ async fn cmd_distill(
         );
 
         // Hidden state matching loss: MSE between teacher and student per-layer states
-        let (hidden_mse_loss, _student_states) = if chunk_idx < frozen_states_per_chunk.len() {
+        // Uses per_layer_hidden collected during forward_train (no extra forward pass)
+        let hidden_mse_loss = if chunk_idx < frozen_states_per_chunk.len() && !train_output.per_layer_hidden.is_empty() {
             let teacher_states = &frozen_states_per_chunk[chunk_idx];
-            let student_states = student.forward_with_hidden_states(batch_tokens);
-            let mse = if teacher_states.len() == student_states.len() && !teacher_states.is_empty() {
-                let _hd = config.hidden_dim;
+            let student_states = &train_output.per_layer_hidden;
+            if teacher_states.len() == student_states.len() && !teacher_states.is_empty() {
                 let mut total_mse = 0.0f32;
                 let mut num_layers_compared = 0usize;
-                // Compare at every 5th layer to save compute
                 for layer_idx in (0..teacher_states.len()).step_by(5) {
                     let t_state = &teacher_states[layer_idx];
                     let s_state = &student_states[layer_idx];
@@ -1851,10 +1850,9 @@ async fn cmd_distill(
                 if num_layers_compared > 0 { total_mse / num_layers_compared as f32 } else { 0.0 }
             } else {
                 0.0
-            };
-            (mse, Some(student_states))
+            }
         } else {
-            (0.0, None)
+            0.0
         };
 
         // MoE Load balance loss: num_experts × Σ(f_i × P_i)

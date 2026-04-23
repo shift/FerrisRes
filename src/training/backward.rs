@@ -16,6 +16,8 @@ pub struct TrainForwardOutput {
     pub activations: Vec<LayerActivations>,
     /// Post-final-norm hidden states [seq, hidden_dim] — input to lm_head
     pub final_hidden: Vec<f32>,
+    /// Per-layer post-residual hidden states (for hidden state MSE loss)
+    pub per_layer_hidden: Vec<Vec<f32>>,
 }
 
 impl CpuBlockAttnResModel {
@@ -61,6 +63,8 @@ impl CpuBlockAttnResModel {
         let mut routing_data = Vec::new();
         let mut activations = Vec::with_capacity(self.num_layers);
         let lora_m = self.lora_manager.as_ref();
+
+        let mut per_layer_hidden: Vec<Vec<f32>> = Vec::with_capacity(self.num_layers);
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let ple_slice = ple_precomputed.as_ref().map(|pre| {
@@ -218,6 +222,9 @@ impl CpuBlockAttnResModel {
                 expert_activations: layer_expert_act.unwrap_or_default(),
             });
 
+            // Store per-layer hidden state for MSE loss
+            per_layer_hidden.push(hidden.clone());
+
             for t in 0..seq { for d in 0..hd { partial_sum[d] += hidden[t * hd + d]; } }
             if self.is_block_boundary(layer_idx) {
                 for d in 0..hd { partial_sum[d] /= ((seq) * (self.block_config.layers_per_block)) as f32; }
@@ -236,7 +243,7 @@ impl CpuBlockAttnResModel {
             for l in logits.iter_mut() { *l = (*l / cap).tanh() * cap; }
         }
 
-        TrainForwardOutput { logits, routing_data, activations, final_hidden }
+        TrainForwardOutput { logits, routing_data, activations, final_hidden, per_layer_hidden }
     }
 }
 
