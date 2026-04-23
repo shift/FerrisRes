@@ -1812,17 +1812,11 @@ async fn cmd_distill(
 
         // Student forward using CpuBlockAttnResModel.
         // Stores activations inline for proper layer-by-layer backward.
-        // GPU path: TODO — wire forward_gpu to also store activations.
-        let train_output = if gpu_accel.is_some() {
-            // GPU forward for logits, then CPU forward_train for activations
-            // (temporary until forward_gpu stores activations)
-            let gpu_logits = student.forward_gpu(batch_tokens, gpu_accel.as_ref().unwrap(), &dispatch);
-            let mut cpu_out = student.forward_train(batch_tokens);
-            cpu_out.logits = gpu_logits; // use GPU logits (more accurate)
-            cpu_out
-        } else {
-            student.forward_train(batch_tokens)
-        };
+        // Note: we only use forward_train (not forward_gpu) because:
+        // 1. forward_train stores activations needed for backward pass
+        // 2. GPU ternary matmul gives same results as CPU (same packed weights)
+        // 3. Avoids double-forward (GPU logits + CPU activations = 2× cost)
+        let train_output = student.forward_train(batch_tokens);
         let student_logits = train_output.logits;
         let routing_data = train_output.routing_data;
         let _activations = train_output.activations;
