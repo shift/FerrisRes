@@ -2204,11 +2204,203 @@ impl CpuBlockAttnResModel {
         }
         logits
     }
-}
+
+    /// GPU decode with VRAM-resident weights — zero per-step weight upload.
+    /// Uses GpuVramCache for weight buffers, only uploads input each step.
+    pub fn forward_decode_gpu_vram(
+        &self,
+        new_token_id: u32,
+        cache: &mut crate::inference::student_kv_cache::ModelKVCache,
+        gpu: &crate::model::gpu_forward::GpuMatmulAccelerator,
+        vram: &GpuVramCache,
+    ) -> Vec<f32> {
+        let hd = self.hidden_dim;
+        let vs = self.vocab_size;
+        let pos = cache.seq_len();
+
+        cache.cached_token_ids.push(new_token_id);
+
+        // 1. Embedding
+        let mut hidden = vec![0.0f32; hd];
+        let id = new_token_id as usize;
+        if id * hd + hd <= self.embed_tokens.len() {
+            for d in 0..hd { hidden[d] = self.embed_tokens[id * hd + d]; }
+        }
+        let scale = (hd as f32).sqrt();
+        for h in hidden.iter_mut() { *h *= scale; }
+
+        let ple_dim = self.hidden_size_per_layer_input;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let ple_input = cache.ple_prefix.as_ref().and_then(|pre| {
+                let all_tokens = &cache.cached_token_ids;
+                let t = all_tokens.len() - 1;
+                let idx = t * self.num_layers * ple_dim + layer_idx * ple_dim;
+                if idx + ple_dim <= pre.len() {
+                    Some(pre[idx..idx + ple_dim].to_vec())
+                } else {
+                    None
+                }
+            });
+
+            let kv_dim = layer.num_kv_heads * layer.head_dim;
+            let q_dim = layer.num_heads * layer.head_dim;
+            let vl = &vram.layers[layer_idx];
+
+            let residual = hidden.clone();
+            let normed = layer.attn_norm.forward_single(&hidden);
+
+            // Q — VRAM-resident weights
+            let mut q = gpu.gpu_ternary_matmul_vram(&vl.q_weights, &vl.q_scales, &normed, 1, hd, layer.q_proj.out_features())
+                .unwrap_or_else(|_| Self::gpu_ternary_mm_cpu(layer.q_proj.gpu_packed(), &normed, 1, hd, layer.q_proj.out_features()));
+            q = crate::model::gemma_mapper::per_head_rms_norm(&q, layer.q_norm.weight(), 1, layer.num_heads, layer.head_dim);
+            apply_rope(&mut q, 1, layer.num_heads, layer.head_dim, pos, layer.rope_theta, layer.partial_rotary_factor);
+
+            // K/V
+            let mut k = gpu.gpu_ternary_matmul_vram(&vl.k_weights, &vl.k_scales, &normed, 1, hd, layer.k_proj.out_features())
+                .unwrap_or_else(|_| Self::gpu_ternary_mm_cpu(layer.k_proj.gpu_packed(), &normed, 1, hd, layer.k_proj.out_features()));
+            let v_raw = gpu.gpu_ternary_matmul_vram(&vl.v_weights, &vl.v_scales, &normed, 1, hd, layer.v_proj.out_features())
+                .unwrap_or_else(|_| Self::gpu_ternary_mm_cpu(layer.v_proj.gpu_packed(), &normed, 1, hd, layer.v_proj.out_features()));
+            k = crate::model::gemma_mapper::per_head_rms_norm(&k, layer.k_norm.weight(), 1, layer.num_kv_heads, layer.head_dim);
+            let v = crate::model::gemma_mapper::per_head_rms_norm_no_scale(&v_raw, 1, layer.num_kv_heads, layer.head_dim);
+            apply_rope_gqa(&mut k, 1, layer.num_kv_heads, layer.head_dim, pos, layer.rope_theta, layer.partial_rotary_factor);
+
+            cache.layers[layer_idx].append(&k, &v);
+            let (full_k, full_v) = cache.layers[layer_idx].get();
+
+            // Attention (CPU)
+            let attn_out = layer.cpu_attention_packed_parallel(&q, full_k, full_v, 1, layer.num_heads, layer.num_kv_heads, layer.head_dim, q_dim, kv_dim);
+
+            // O
+            let attn_out = gpu.gpu_ternary_matmul_vram(&vl.o_weights, &vl.o_scales, &attn_out, 1, layer.out_proj.in_features(), layer.out_proj.out_features())
+                .unwrap_or_else(|_| Self::gpu_ternary_mm_cpu(layer.out_proj.gpu_packed(), &attn_out, 1, layer.out_proj.in_features(), layer.out_proj.out_features()));
+            let attn_out = layer.post_attn_norm.forward_single(&attn_out);
+            for i in 0..hd { hidden[i] = residual[i] + attn_out[i]; }
+
+            // FFN
+            let ffn_residual = hidden.clone();
+            let normed2 = layer.pre_ffn_norm.forward_single(&hidden);
+
+            if let Some(ref experts) = vl.moe_experts {
+                let moe = layer.moe.as_ref().unwrap();
+                // Router
+                let mut router_out = vec![0.0f32; moe.num_experts];
+                for e in 0..moe.num_experts {
+                    let mut dot = 0.0f32;
+                    for d in 0..hd { dot += normed2[d] * moe.gate_weights[e * hd + d]; }
+                    router_out[e] = dot;
+                }
+                let max_r = router_out.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum_e = 0.0f32;
+                for e in 0..moe.num_experts { router_out[e] = (router_out[e] - max_r).exp(); sum_e += router_out[e]; }
+                for e in 0..moe.num_experts { router_out[e] /= sum_e; }
+                let mut indices: Vec<usize> = (0..moe.num_experts).collect();
+                indices.sort_by(|&a, &b| router_out[b].partial_cmp(&router_out[a]).unwrap());
+                let top_k_sum: f32 = indices[..moe.top_k].iter().map(|&e| router_out[e]).sum();
+
+                let mut expert_out = vec![0.0f32; hd];
+                for &ei in &indices[..moe.top_k] {
+                    let w = router_out[ei] / top_k_sum;
+                    let ew = &experts[ei];
+                    let gated = gpu.gpu_ternary_matmul_vram(&ew.gate_weights, &ew.gate_scales, &normed2, 1, hd, moe.intermediate_dim)
+                        .unwrap_or_else(|_| vec![0.0f32; moe.intermediate_dim]);
+                    let upped = gpu.gpu_ternary_matmul_vram(&ew.up_weights, &ew.up_scales, &normed2, 1, hd, moe.intermediate_dim)
+                        .unwrap_or_else(|_| vec![0.0f32; moe.intermediate_dim]);
+                    let gated: Vec<f32> = if moe.use_gelu { gated.iter().map(|&x| crate::model::gemma_mapper::gelu_tanh(x)).collect() } else { gated.iter().map(|&x| x / (1.0 + (-x).exp())).collect() };
+                    let combined: Vec<f32> = gated.iter().zip(upped.iter()).map(|(&g, &u)| g * u).collect();
+                    let down = gpu.gpu_ternary_matmul_vram(&ew.down_weights, &ew.down_scales, &combined, 1, moe.intermediate_dim, hd)
+                        .unwrap_or_else(|_| vec![0.0f32; hd]);
+                    for d in 0..hd { expert_out[d] += w * down[d]; }
+                }
+                let normed_ffn = layer.post_ffn_norm.forward_single(&expert_out);
+                for i in 0..hd { hidden[i] = ffn_residual[i] + normed_ffn[i] * layer.layer_scalar; }
+            } else if let (Some(ref g), Some(ref u), Some(ref d)) = (&vl.ffn_gate, &vl.ffn_up, &vl.ffn_down) {
+                let id = layer.intermediate_dim;
+                let gated = gpu.gpu_ternary_matmul_vram(&g.0, &g.1, &normed2, 1, hd, id)
+                    .unwrap_or_else(|_| vec![0.0f32; id]);
+                let upped = gpu.gpu_ternary_matmul_vram(&u.0, &u.1, &normed2, 1, hd, id)
+                    .unwrap_or_else(|_| vec![0.0f32; id]);
+                let gated: Vec<f32> = if layer.use_gelu { gated.iter().map(|&x| crate::model::gemma_mapper::gelu_tanh(x)).collect() } else { gated.iter().map(|&x| x / (1.0 + (-x).exp())).collect() };
+                let combined: Vec<f32> = gated.iter().zip(upped.iter()).map(|(&g, &u)| g * u).collect();
+                let ffn_out = gpu.gpu_ternary_matmul_vram(&d.0, &d.1, &combined, 1, id, hd)
+                    .unwrap_or_else(|_| vec![0.0f32; hd]);
+                let normed_ffn = layer.post_ffn_norm.forward_single(&ffn_out);
+                for i in 0..hd { hidden[i] = ffn_residual[i] + normed_ffn[i] * layer.layer_scalar; }
+            }
+
+            // PLE (CPU)
+            if let Some(ref ple_s) = ple_input {
+                if let (Some(ref gate), Some(ref proj), Some(ref norm)) =
+                    (&layer.ple_input_gate, &layer.ple_projection, &layer.ple_post_norm)
+                {
+                    let ple_d = ple_s.len();
+                    let gate_w = gate.weight();
+                    let proj_w = proj.weight();
+                    let gate_out = matmul(&hidden, &gate_w, 1, hd, ple_d);
+                    let gate_gelu: Vec<f32> = gate_out.iter().map(|&x| crate::model::gemma_mapper::gelu_tanh(x)).collect();
+                    let mut gated = vec![0.0f32; ple_d];
+                    for i in 0..ple_d { gated[i] = gate_gelu[i] * ple_s[i]; }
+                    let proj_out = matmul(&gated, &proj_w, 1, ple_d, hd);
+                    let ple_final = norm.forward_single(&proj_out);
+                    for i in 0..hd { hidden[i] += ple_final[i]; }
+                }
+            }
+
+            // Block tracking
+            for d in 0..hd { cache.partial_sum[d] += hidden[d]; }
+            if self.is_block_boundary(layer_idx) {
+                cache.block_token_count += 1;
+                let mut block_rep = cache.partial_sum.clone();
+                for d in 0..hd { block_rep[d] /= (cache.block_token_count * self.block_config.layers_per_block) as f32; }
+                cache.block_reps.push(block_rep);
+                cache.partial_sum = vec![0.0f32; hd];
+                cache.block_token_count = 0;
+                let inter_out = self.inter_block_attention_single(&hidden, &cache.block_reps);
+                for d in 0..hd { hidden[d] += inter_out[d]; }
+            }
+        }
+
+        // Final norm + LM head (CPU)
+        hidden = crate::model::gemma_mapper::rms_norm(&hidden, &self.final_norm, hd, 1e-6);
+        let mut logits = matmul(&hidden, &self.lm_head, 1, hd, vs);
+        if let Some(cap) = self.final_logit_softcapping {
+            for l in logits.iter_mut() { *l = (*l / cap).tanh() * cap; }
+        }
+        logits
+    }
+
+    /// CPU fallback for ternary matmul
+    fn gpu_ternary_mm_cpu(packed_scales: (Vec<u32>, Vec<f32>), input: &[f32], seq: usize, in_cols: usize, out_rows: usize) -> Vec<f32> {
+        let (packed, scales) = packed_scales;
+        let cols_packed = (in_cols + 15) / 16;
+        let mut result = vec![0.0f32; seq * out_rows];
+        for t in 0..seq {
+            for row in 0..out_rows {
+                let mut sum = 0.0f32;
+                for c in 0..cols_packed {
+                    let p = packed[row * cols_packed + c];
+                    for bit in 0..16u32 {
+                        let col = c * 16 + bit as usize;
+                        if col >= in_cols { break; }
+                        let code = (p >> (bit * 2)) & 3;
+                        let val = input[t * in_cols + col];
+                        match code {
+                            0 => sum -= val,
+                            2 => sum += val,
+                            _ => {}
+                        }
+                    }
+                }
+                result[t * out_rows + row] = sum * scales[row];
+            }
+        }
+        result
+    }
 
 // ---------------------------------------------------------------------------
 // Ternary Inference Model
 // ---------------------------------------------------------------------------
+}
 
 /// A fully ternary-quantized BlockAttnResModel for inference.
 ///
@@ -2871,5 +3063,109 @@ impl GpuWeightCache {
             });
         }
         GpuWeightCache { layers }
+    }
+}
+
+/// GPU VRAM-resident weight cache.
+/// Uploads all packed weights to GPU buffers once, avoids per-step upload.
+/// Holds wgpu buffer references — must stay alive during inference.
+pub struct GpuVramCache {
+    pub layers: Vec<GpuVramLayer>,
+    pub total_vram_bytes: usize,
+}
+
+pub struct GpuVramLayer {
+    pub q_weights: crate::compute::GpuBuffer,
+    pub q_scales: crate::compute::GpuBuffer,
+    pub k_weights: crate::compute::GpuBuffer,
+    pub k_scales: crate::compute::GpuBuffer,
+    pub v_weights: crate::compute::GpuBuffer,
+    pub v_scales: crate::compute::GpuBuffer,
+    pub o_weights: crate::compute::GpuBuffer,
+    pub o_scales: crate::compute::GpuBuffer,
+    /// MoE experts: [expert_idx][gate_weights, gate_scales, up_weights, up_scales, down_weights, down_scales]
+    pub moe_experts: Option<Vec<GpuVramExpert>>,
+    /// Dense FFN
+    pub ffn_gate: Option<(crate::compute::GpuBuffer, crate::compute::GpuBuffer)>,
+    pub ffn_up: Option<(crate::compute::GpuBuffer, crate::compute::GpuBuffer)>,
+    pub ffn_down: Option<(crate::compute::GpuBuffer, crate::compute::GpuBuffer)>,
+}
+
+pub struct GpuVramExpert {
+    pub gate_weights: crate::compute::GpuBuffer,
+    pub gate_scales: crate::compute::GpuBuffer,
+    pub up_weights: crate::compute::GpuBuffer,
+    pub up_scales: crate::compute::GpuBuffer,
+    pub down_weights: crate::compute::GpuBuffer,
+    pub down_scales: crate::compute::GpuBuffer,
+}
+
+impl GpuVramCache {
+    /// Upload all weights from a pre-computed GpuWeightCache to GPU VRAM.
+    /// Returns the VRAM cache with resident buffers.
+    pub fn upload(
+        weight_cache: &GpuWeightCache,
+        gpu: &crate::model::gpu_forward::GpuMatmulAccelerator,
+    ) -> anyhow::Result<Self> {
+        let device = gpu.device();
+        let queue = gpu.queue();
+        let mut total_bytes = 0usize;
+
+        let mut upload_buf = |data: &[u8], label: &str| -> anyhow::Result<crate::compute::GpuBuffer> {
+            let buf = crate::compute::GpuBuffer::new(device, data.len(), Some(label))?;
+            queue.write_buffer(buf.buffer(), 0, data);
+            total_bytes += data.len();
+            Ok(buf)
+        };
+
+        let mut layers = Vec::with_capacity(weight_cache.layers.len());
+
+        for (li, lw) in weight_cache.layers.iter().enumerate() {
+            let q_weights = upload_buf(bytemuck::cast_slice(&lw.q_packed), &format!("l{}_q_w", li))?;
+            let q_scales = upload_buf(bytemuck::cast_slice(&lw.q_scales), &format!("l{}_q_s", li))?;
+            let k_weights = upload_buf(bytemuck::cast_slice(&lw.k_packed), &format!("l{}_k_w", li))?;
+            let k_scales = upload_buf(bytemuck::cast_slice(&lw.k_scales), &format!("l{}_k_s", li))?;
+            let v_weights = upload_buf(bytemuck::cast_slice(&lw.v_packed), &format!("l{}_v_w", li))?;
+            let v_scales = upload_buf(bytemuck::cast_slice(&lw.v_scales), &format!("l{}_v_s", li))?;
+            let o_weights = upload_buf(bytemuck::cast_slice(&lw.o_packed), &format!("l{}_o_w", li))?;
+            let o_scales = upload_buf(bytemuck::cast_slice(&lw.o_scales), &format!("l{}_o_s", li))?;
+
+            let moe_experts = lw.moe_experts.as_ref().map(|experts| {
+                experts.iter().enumerate().map(|(ei, ew)| {
+                    Ok(GpuVramExpert {
+                        gate_weights: upload_buf(bytemuck::cast_slice(&ew[0].0), &format!("l{}_e{}_gw", li, ei))?,
+                        gate_scales: upload_buf(bytemuck::cast_slice(&ew[0].1), &format!("l{}_e{}_gs", li, ei))?,
+                        up_weights: upload_buf(bytemuck::cast_slice(&ew[1].0), &format!("l{}_e{}_uw", li, ei))?,
+                        up_scales: upload_buf(bytemuck::cast_slice(&ew[1].1), &format!("l{}_e{}_us", li, ei))?,
+                        down_weights: upload_buf(bytemuck::cast_slice(&ew[2].0), &format!("l{}_e{}_dw", li, ei))?,
+                        down_scales: upload_buf(bytemuck::cast_slice(&ew[2].1), &format!("l{}_e{}_ds", li, ei))?,
+                    })
+                }).collect::<anyhow::Result<Vec<_>>>()
+            }).transpose()?;
+
+            let ffn_gate = lw.ffn_gate.as_ref().map(|(w, s)| -> anyhow::Result<_> {
+                Ok((upload_buf(bytemuck::cast_slice(w), &format!("l{}_fg_w", li))?,
+                    upload_buf(bytemuck::cast_slice(s), &format!("l{}_fg_s", li))?))
+            }).transpose()?;
+            let ffn_up = lw.ffn_up.as_ref().map(|(w, s)| -> anyhow::Result<_> {
+                Ok((upload_buf(bytemuck::cast_slice(w), &format!("l{}_fu_w", li))?,
+                    upload_buf(bytemuck::cast_slice(s), &format!("l{}_fu_s", li))?))
+            }).transpose()?;
+            let ffn_down = lw.ffn_down.as_ref().map(|(w, s)| -> anyhow::Result<_> {
+                Ok((upload_buf(bytemuck::cast_slice(w), &format!("l{}_fd_w", li))?,
+                    upload_buf(bytemuck::cast_slice(s), &format!("l{}_fd_s", li))?))
+            }).transpose()?;
+
+            layers.push(GpuVramLayer {
+                q_weights, q_scales,
+                k_weights, k_scales,
+                v_weights, v_scales,
+                o_weights, o_scales,
+                moe_experts,
+                ffn_gate, ffn_up, ffn_down,
+            });
+        }
+
+        Ok(GpuVramCache { layers, total_vram_bytes: total_bytes })
     }
 }
