@@ -684,8 +684,41 @@ async fn cmd_infer(
                 info!(event = "lora_merged", "LoRA merged into ternary base weights, adapters removed");
             }
 
+            // Try GPU acceleration
+            let gpu_accel: Option<ferrisres::model::gpu_forward::GpuMatmulAccelerator> =
+                match ferrisres::model::gpu_forward::GpuMatmulAccelerator::new() {
+                    Ok(accel) => {
+                        info!(event = "gpu_available", "GPU available for student inference");
+                        Some(accel)
+                    }
+                    Err(e) => {
+                        info!(event = "gpu_unavailable", error = ?e, "No GPU, using CPU-only student inference");
+                        None
+                    }
+                };
+
+            let gpu_dispatch = gpu_accel.as_ref().map(|gpu| {
+                let profile = gpu.profile();
+                let vram = gpu.estimated_vram_bytes();
+                let max_buf = gpu.max_buffer_bytes();
+                ferrisres::device::DispatchPlan::new(
+                    profile, 0, vram, max_buf,
+                    student_model.hidden_dim as u64,
+                    student_model.layers.first().map_or(8, |l| l.num_heads as u64),
+                    student_model.layers.first().map_or(256, |l| l.head_dim as u64),
+                    student_model.layers.first().map_or(6144, |l| l.intermediate_dim as u64),
+                    student_model.vocab_size as u64,
+                    1, // decode: seq=1
+                    student_model.layers.first().map_or(1, |l| l.num_kv_heads as u64),
+                )
+            });
+
+            if let Some(ref plan) = gpu_dispatch {
+                info!(event = "student_dispatch", "\n{}", plan.summary());
+            }
+
             // Autoregressive generation on student model
-            let gen_tokens = generate_student(&student_model, &tokens, max_tokens, temperature as f32, None);
+            let gen_tokens = generate_student(&student_model, &tokens, max_tokens, temperature as f32, None, gpu_accel.as_ref(), gpu_dispatch.as_ref());
 
             let output_text = decoder(&gen_tokens);
             let display_output = if let Some(ref mut layer) = armor_layer {
@@ -2707,6 +2740,8 @@ fn generate_student(
     max_new_tokens: usize,
     temperature: f32,
     eos_token_id: Option<u32>,
+    gpu: Option<&ferrisres::model::gpu_forward::GpuMatmulAccelerator>,
+    _dispatch: Option<&ferrisres::device::DispatchPlan>,
 ) -> Vec<u32> {
     let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
     let vs = model.vocab_size;
@@ -2724,11 +2759,11 @@ fn generate_student(
 
     info!(event = "student_gen_start", prompt_len = prompt_tokens.len(), max_new_tokens, "Starting student model generation (KV-cached)");
 
-    // === Prefill phase: process all prompt tokens at once ===
+    // === Prefill phase: process all prompt tokens at once (CPU, populates KV cache) ===
     let t0 = std::time::Instant::now();
     let logits = model.forward_prefill(prompt_tokens, &mut cache);
     let prefill_ms = t0.elapsed().as_millis();
-    info!(event = "student_prefill", prompt_len = prompt_tokens.len(), prefill_ms, cache_mb = cache.total_memory_bytes() / (1024*1024), "Prefill complete");
+    info!(event = "student_prefill", prompt_len = prompt_tokens.len(), prefill_ms, cache_mb = cache.total_memory_bytes() / (1024*1024), gpu = gpu.is_some(), "Prefill complete");
 
     // Take logits for last position
     let last_logits = &logits[(prompt_tokens.len() - 1) * vs..prompt_tokens.len() * vs];
@@ -2741,7 +2776,11 @@ fn generate_student(
     for step in 1..max_new_tokens {
         let t0 = std::time::Instant::now();
 
-        let logits = model.forward_decode(all_tokens[all_tokens.len() - 1], &mut cache);
+        let logits = if gpu.is_some() {
+            model.forward_decode_gpu(all_tokens[all_tokens.len() - 1], &mut cache, gpu.unwrap())
+        } else {
+            model.forward_decode(all_tokens[all_tokens.len() - 1], &mut cache)
+        };
         let forward_ms = t0.elapsed().as_millis();
 
         let last_logits = &logits; // decode returns only last token's logits
