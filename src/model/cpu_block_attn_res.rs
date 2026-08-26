@@ -2926,7 +2926,7 @@ pub fn gemma4_to_block_attnres(teacher: &MappedGemma4Model) -> CpuBlockAttnResMo
 
 /// Merge LoRA delta into a CpuLinear's ternary weights.
 /// Dequantize → merge → re-quantize in-place.
-
+///
 /// Apply LoRA delta (A @ B * scaling) to FP32 weights in-place.
 fn apply_lora_delta(
     fp32_weights: &mut [f32],

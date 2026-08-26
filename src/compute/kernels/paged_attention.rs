@@ -15,7 +15,6 @@
 pub const BLOCK_SIZE: u32 = 16;
 
 #[allow(dead_code)]
-
 /// WGSL kernel for paged attention decode (single query token).
 ///
 /// Computes attention for a single query against paged KV cache:

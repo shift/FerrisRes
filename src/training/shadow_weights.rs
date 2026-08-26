@@ -180,7 +180,7 @@ impl<P: ShadowPrecision> BitLinear<P> {
         self.shadow.is_some()
     }
 
-    /// === Forward pass methods ===
+    // === Forward pass methods ===
 
     /// Unified forward: routes to STE or inference path based on shadow presence.
     pub fn forward(&self, input: &[f32], seq_len: usize) -> Vec<f32> {

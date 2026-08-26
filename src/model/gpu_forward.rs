@@ -83,11 +83,10 @@ pub struct GpuWeightCache {
 // GPU weight storage
 // ---------------------------------------------------------------------------
 
-/// No GPU weight cache — upload just-in-time per matmul to avoid OOM.
-/// On datacenter GPUs with enough VRAM, this could be replaced with a
-/// persistent cache, but the per-call upload overhead is ~12ms/layer on
-/// PCIe 3.0 which is negligible compared to the matmul itself.
-
+// No GPU weight cache — upload just-in-time per matmul to avoid OOM.
+// On datacenter GPUs with enough VRAM, this could be replaced with a
+// persistent cache, but the per-call upload overhead is ~12ms/layer on
+// PCIe 3.0 which is negligible compared to the matmul itself.
 // ---------------------------------------------------------------------------
 // GPU matmul accelerator
 // ---------------------------------------------------------------------------
@@ -1239,7 +1238,7 @@ impl GpuMatmulAccelerator {
     /// GPU sparse ternary matmul: output = sparse_ternary × input × scale.
     ///
     /// Uses the SparseTernaryMatMulOp kernel for 2:4 sparse 1.58-bit inference.
-
+    ///
     /// GPU ternary matmul with pre-uploaded weight buffers.
     /// Avoids per-call weight upload — weights already resident in VRAM.
     pub fn gpu_ternary_matmul_vram(

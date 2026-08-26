@@ -1049,7 +1049,7 @@ impl MmapedSafetensors {
             tensors.insert(name.to_string(), LoadedTensor {
                 name: name.to_string(),
                 shape,
-                dtype: dtype,
+                dtype,
                 data,
             });
         }

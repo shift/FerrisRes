@@ -99,7 +99,7 @@ impl GpuCapabilities {
         let norm16 = features.contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
 
         let max_workgroup_invocations = limits.max_compute_invocations_per_workgroup;
-        let max_storage_buffer_size = limits.max_storage_buffer_binding_size as u64;
+        let max_storage_buffer_size = limits.max_storage_buffer_binding_size;
         let max_workgroup_size_x = limits.max_compute_workgroup_size_x;
         let max_workgroup_size_y = limits.max_compute_workgroup_size_y;
         let max_workgroup_size_z = limits.max_compute_workgroup_size_z;
@@ -427,8 +427,10 @@ impl Default for VendorTuning {
 fn detect_vram_ash() -> Option<(u64, String, GpuKind)> {
     let entry = unsafe { ash::Entry::load().ok()? };
 
-    let mut app_info = ash::vk::ApplicationInfo::default();
-    app_info.api_version = ash::vk::API_VERSION_1_0;
+    let app_info = ash::vk::ApplicationInfo {
+        api_version: ash::vk::API_VERSION_1_0,
+        ..Default::default()
+    };
 
     let extension_names: Vec<*const std::os::raw::c_char> = vec![ash::ext::debug_utils::NAME.as_ptr()];
 

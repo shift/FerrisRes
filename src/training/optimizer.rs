@@ -6,7 +6,6 @@ use wgpu::{Device, Queue};
 use crate::compute::buffer::GpuBuffer;
 use crate::compute::kernels::elementwise::ElementWiseOp;
 use crate::error::{FerrisResError, Result};
-#[allow(unused_imports)]
 
 const ADAM_WGSL: &str = r#"
 struct Params {

@@ -4,7 +4,7 @@
 //! "Patch-to-Cluster Attention: Visual Token Clustering for Efficient Vision Transformers"
 //!
 //! Instead of flat token sequences, tokens are grouped into spatial clusters.
-/// Within-cluster attention is cheap (few tokens); cross-cluster is compressed.
+//! Within-cluster attention is cheap (few tokens); cross-cluster is compressed.
 
 /// Configuration for Patch-to-Cluster attention.
 #[derive(Debug, Clone)]

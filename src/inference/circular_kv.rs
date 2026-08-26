@@ -224,7 +224,7 @@ impl ValidSegmentMask {
             // Recent window wraps around from write_head
             for i in 0..recent_count {
                 // Walk backward from write_head
-                let pos = if write_head >= i + 1 {
+                let pos = if write_head > i {
                     write_head - i - 1
                 } else {
                     self.capacity - (i + 1 - write_head)
