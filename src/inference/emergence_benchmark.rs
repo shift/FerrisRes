@@ -317,7 +317,7 @@ impl EmergenceBenchmark {
     pub fn measure_self_correction(&mut self, error_recurrence_rate: f32, mirror_pass_rate: f32) -> &EmergenceScore {
         // Baseline: no correction (recurrence = 1.0, pass rate depends)
         // Augmented: with correction loop
-        let baseline_correction = 1.0 - 1.0; // No correction → rate = 0
+        let baseline_correction = 0.0; // No correction → rate = 0
         let augmented_correction = 1.0 - error_recurrence_rate;
 
         let m = Measurement::new(

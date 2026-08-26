@@ -168,7 +168,8 @@ impl AsyncGradientOffload {
             return None;
         }
 
-        // Map every buffer in the pool and return the first non-empty result.
+        // Map every buffer in the pool and return the newest staged result.
+        let mut last_result = None;
         for _ in 0..self.buffering_depth {
             let buf = self.staging_pool.pop_front()?;
             let (tx, rx) = tokio::sync::oneshot::channel::<
@@ -180,13 +181,12 @@ impl AsyncGradientOffload {
             let _ = device.poll(wgpu::PollType::wait_indefinitely());
             let _ = rx.await;
             let mapped = buf.slice(..).get_mapped_range();
-            let result: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&mapped).to_vec();
+            last_result = Some(bytemuck::cast_slice::<u8, f32>(&mapped).to_vec());
             drop(mapped);
             buf.unmap();
             self.staging_pool.push_back(buf);
-            return Some(result);
         }
-        None
+        last_result
     }
 
     /// Return the recommended buffering depth for a given device profile and

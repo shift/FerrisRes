@@ -655,7 +655,7 @@ async fn cmd_infer(
                 + l.ffn_up.as_ref().map_or(0, |u| u.memory_bytes())
                 + l.ffn_down.as_ref().map_or(0, |d| d.memory_bytes())
             }).sum();
-            let embed_kb = student_model.embed_tokens.len() * 1 + student_model.lm_head.len() * 1; // ternary = 1 byte/value
+            let embed_kb = student_model.embed_tokens.len() + student_model.lm_head.len(); // ternary = 1 byte/value
             info!(event = "student_memory", ternary_kb = total_ternary_kb / 1024, embed_kb = embed_kb / 1024, "Ternary student memory estimate");
 
             // Load and merge LoRA adapters if specified
@@ -1379,7 +1379,7 @@ async fn cmd_distill(
     info!(event = "teacher_precompute_start", "pre-computing teacher logits");
     let mut teacher_logits_chunks: Vec<Vec<f32>> = Vec::new();
     let mut frozen_states_per_chunk: Vec<Vec<Vec<f32>>> = Vec::new();
-    let num_chunks = (token_ids.len() + seq_len - 1) / seq_len;
+    let num_chunks = token_ids.len().div_ceil(seq_len);
 
     if gpu_accel.is_some() && dispatch.attn_qkv_dispatch != ferrisres::device::OpTarget::Cpu {
         // GPU-accelerated teacher forward
@@ -1585,7 +1585,7 @@ async fn cmd_distill(
     };
     // Each expert adds ffn_params worth of memory (f32 × 4 bytes)
     let est_4exp_gb = (student_params_pre_moe + 3 * ffn_params) as f64 * 4.0 / 1e9;
-    let est_2exp_gb = (student_params_pre_moe + 1 * ffn_params) as f64 * 4.0 / 1e9;
+    let est_2exp_gb = (student_params_pre_moe + ffn_params) as f64 * 4.0 / 1e9;
     let num_experts = if est_4exp_gb > available_gb as f64 * 0.7 {
         info!(event = "moe_ram_adapt", available_gb, est_4exp_gb = format!("{:.1}", est_4exp_gb), est_2exp_gb = format!("{:.1}", est_2exp_gb), "Using 2 experts (4 experts would exceed 70% RAM)");
         2
@@ -1748,7 +1748,7 @@ async fn cmd_distill(
                     }
                     // Tiled: process tile_n columns at a time
                     let mut result = vec![0.0f32; m * n];
-                    let num_tiles = (n + tile_n - 1) / tile_n;
+                    let num_tiles = n.div_ceil(tile_n);
                     for tile_idx in 0..num_tiles {
                         let col_start = tile_idx * tile_n;
                         let col_end = (col_start + tile_n).min(n);
@@ -2104,8 +2104,7 @@ async fn cmd_distill(
                                     let g = ea.gated[i];
                                     // gelu'(x) ≈ 0.5 * (1 + erf(x/√2))
                                     // Approximate from output: crude but functional
-                                    let sigmoid_approx = 1.0 / (1.0 + (-g * 1.702).exp());
-                                    sigmoid_approx
+                                    1.0 / (1.0 + (-g * 1.702).exp())
                                 } else {
                                     // silu'(x) = σ(x)(1 + x(1 - σ(x)))
                                     // Approximate: σ(x) ≈ silu(x)/x but x unknown
@@ -2227,7 +2226,7 @@ async fn cmd_distill(
 
         results.push(gemma_mapper::DistillationStepResult {
             step: global_step,
-            kl_loss: kl_loss,
+            kl_loss,
             bridge_weight: hidden_mse_loss,
             learning_rate: lr,
             layer_cosine_sim: vec![],
