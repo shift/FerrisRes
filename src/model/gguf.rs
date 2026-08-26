@@ -618,13 +618,13 @@ fn dequantize_q6_k(raw: &[u8], n_elements: usize) -> Vec<f32> {
             for l in 0..32 {
                 let is_idx = l / 16;
 
-                let q1 = (((raw[ql_start + ql_off + l] & 0x0F) as i32) | (((raw[qh_start + qh_off + l] >> 0) & 3) as i32) << 4) - 32;
+                let q1 = (((raw[ql_start + ql_off + l] & 0x0F) as i32) | (((raw[qh_start + qh_off + l] & 3) as i32) << 4)) - 32;
                 let q2 = (((raw[ql_start + ql_off + l + 32] & 0x0F) as i32) | (((raw[qh_start + qh_off + l] >> 2) & 3) as i32) << 4) - 32;
                 let q3 = (((raw[ql_start + ql_off + l] >> 4) as i32) | (((raw[qh_start + qh_off + l] >> 4) & 3) as i32) << 4) - 32;
                 let q4 = (((raw[ql_start + ql_off + l + 32] >> 4) as i32) | (((raw[qh_start + qh_off + l] >> 6) & 3) as i32) << 4) - 32;
 
                 let sc = &raw[sc_start..sc_start + 16];
-                out.push(d * sc[sc_off + is_idx + 0] as f32 * q1 as f32);
+                out.push(d * sc[sc_off + is_idx] as f32 * q1 as f32);
                 out.push(d * sc[sc_off + is_idx + 2] as f32 * q2 as f32);
                 out.push(d * sc[sc_off + is_idx + 4] as f32 * q3 as f32);
                 out.push(d * sc[sc_off + is_idx + 6] as f32 * q4 as f32);

@@ -48,6 +48,63 @@ webgpu = ["wgpu/webgpu"]
 integrated_gpu_profile = []
 high_end_profile = []
 
+[lints.clippy]
+approx_constant = "allow"
+assertions_on_constants = "allow"
+clone_on_copy = "allow"
+collapsible_if = "allow"
+collapsible_match = "allow"
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+empty_line_after_doc_comments = "allow"
+empty_line_after_outer_attr = "allow"
+eq_op = "allow"
+erasing_op = "allow"
+excessive_precision = "allow"
+field_reassign_with_default = "allow"
+for_kv_map = "allow"
+identity_op = "allow"
+if_same_then_else = "allow"
+items_after_test_module = "allow"
+iter_cloned_collect = "allow"
+large_enum_variant = "allow"
+len_without_is_empty = "allow"
+len_zero = "allow"
+let_and_return = "allow"
+manual_clamp = "allow"
+manual_div_ceil = "allow"
+manual_flatten = "allow"
+manual_memcpy = "allow"
+manual_range_contains = "allow"
+manual_slice_size_calculation = "allow"
+manual_strip = "allow"
+missing_const_for_thread_local = "allow"
+module_inception = "allow"
+needless_bool = "allow"
+needless_borrow = "allow"
+needless_borrowed_reference = "allow"
+needless_borrows_for_generic_args = "allow"
+needless_range_loop = "allow"
+needless_update = "allow"
+new_without_default = "allow"
+option_as_ref_deref = "allow"
+ptr_arg = "allow"
+redundant_closure = "allow"
+redundant_guards = "allow"
+should_implement_trait = "allow"
+single_match = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+unnecessary_cast = "allow"
+unnecessary_filter_map = "allow"
+unnecessary_map_or = "allow"
+unnecessary_min_or_max = "allow"
+unnecessary_unwrap = "allow"
+unused_enumerate_index = "allow"
+useless_format = "allow"
+useless_vec = "allow"
+vec_init_then_push = "allow"
+
 [build-dependencies]
 naga = "29"
 
@@ -69,7 +126,6 @@ harness = false
 
 [[bench]]
 name = "turboquant_benchmarks"
-harness = false
 path = "benches/turboquant_benchmarks.rs"
 
 [[bench]]

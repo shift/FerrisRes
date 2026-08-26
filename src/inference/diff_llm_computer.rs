@@ -372,7 +372,7 @@ impl DiffLlmComputer {
             },
             5 => CalmInstruction::BranchIf {
                 condition_reg: reg_a,
-                target: (value as u32).max(0),
+                target: value as u32,
             },
             _ => CalmInstruction::Halt,
         };

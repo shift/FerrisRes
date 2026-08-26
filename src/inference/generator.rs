@@ -98,9 +98,9 @@ impl GenerateConfig {
 }
 
 pub struct TokenGenerator {
-    model: Arc<BlockAttnResModel>,
-    lm_head: Arc<LMHead>,
-    embedding: Arc<TokenEmbedding>,
+    model: BlockAttnResModel,
+    lm_head: LMHead,
+    embedding: TokenEmbedding,
     kv_cache: ModelKVCache,
     device: Arc<Device>,
     queue: Arc<Queue>,
@@ -157,7 +157,7 @@ fn sample_token(processor: &mut LogitProcessor, logits: &[f32]) -> usize {
 
 impl TokenGenerator {
     pub fn new(
-        model: Arc<BlockAttnResModel>,
+        model: BlockAttnResModel,
         lm_head: LMHead,
         embedding: TokenEmbedding,
         device: Arc<Device>,
@@ -180,8 +180,8 @@ impl TokenGenerator {
 
         Ok(Self {
             model,
-            lm_head: Arc::new(lm_head),
-            embedding: Arc::new(embedding),
+            lm_head,
+            embedding,
             kv_cache,
             device,
             queue,

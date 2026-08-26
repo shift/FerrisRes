@@ -400,8 +400,6 @@ impl OutlierChannelSplitter {
     pub fn new(hidden_dim: u32, average_bits: f32) -> Self {
         let (outlier_bits, regular_bits) = if average_bits <= 2.5 {
             (3u32, 2u32)
-        } else if average_bits <= 3.5 {
-            (4u32, 3u32)
         } else {
             (4u32, 3u32)
         };

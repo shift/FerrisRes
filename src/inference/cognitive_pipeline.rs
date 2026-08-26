@@ -1147,9 +1147,7 @@ impl CognitivePipeline {
     /// q <= 0.1 → 1.5 (important failure)
     /// q == 0.5 → 0.5 (ordinary, not worth remembering)
     pub fn quality_extremity(q: f32) -> f32 {
-        if q >= 0.9 {
-            1.5
-        } else if q <= 0.1 {
+        if q >= 0.9 || q <= 0.1 {
             1.5
         } else {
             0.5 + (q - 0.5).abs()

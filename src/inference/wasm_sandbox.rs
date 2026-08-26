@@ -298,11 +298,7 @@ pub fn execute_wasm_parse_with_runtime(call: &ToolCall, runtime: &WasmRuntime) -
                     result.fuel_consumed,
                     format_diagnostics_brief(&result.diagnostics),
                 );
-                if result.error_count == 0 {
-                    ToolResult::success(&call.call_id, "wasm_parse", &output)
-                } else {
-                    ToolResult::success(&call.call_id, "wasm_parse", &output)
-                }
+                ToolResult::success(&call.call_id, "wasm_parse", &output)
             }
             Err(e) => {
                 // WASM module failed — fall back to built-in check

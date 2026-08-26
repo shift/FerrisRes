@@ -2248,7 +2248,7 @@ impl Gemma4Teacher {
         let nh = config.num_heads;
         let seq = token_ids.len();
         let vs = config.vocab_size;
-        let mut layer_states: Vec<Vec<f32>> = if collect_states { Vec::new() } else { Vec::new() };
+        let mut layer_states: Vec<Vec<f32>> = Vec::new();
 
         // 1. Embedding lookup (Gemma scales by sqrt(hidden_dim))
         let mut hidden = vec![0.0f32; seq * hd];

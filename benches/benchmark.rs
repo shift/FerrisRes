@@ -11,7 +11,7 @@ fn bench_matmul(c: &mut Criterion) {
         let device = Arc::new(compute.device().clone());
         let queue = Arc::new(compute.queue().clone());
 
-        let matmul_op = MatMulOp::new(&device);
+        let matmul_op = MatMulOp::new(&device, &queue);
 
         let mut group = c.benchmark_group("matmul");
         for size in [128u32, 256, 512] {
@@ -55,7 +55,7 @@ fn bench_rmsnorm(c: &mut Criterion) {
                     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("bench_rmsnorm"),
                     });
-                    rmsnorm_op.dispatch(&device, &mut encoder, &input, &output, rows, hd).unwrap();
+                    rmsnorm_op.dispatch(&device, &queue, &mut encoder, &input, &output, rows, hd).unwrap();
                     queue.submit(std::iter::once(encoder.finish()));
                     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
                 });
@@ -72,7 +72,7 @@ fn bench_softmax(c: &mut Criterion) {
         let device = Arc::new(compute.device().clone());
         let queue = Arc::new(compute.queue().clone());
 
-        let softmax_op = SoftmaxOp::new(&device).unwrap();
+        let softmax_op = SoftmaxOp::new(&device, &queue).unwrap();
 
         let mut group = c.benchmark_group("softmax");
         for (rows, cols) in [(1u32, 512u32), (8u32, 512u32)] {
@@ -103,7 +103,7 @@ fn bench_elementwise(c: &mut Criterion) {
         let device = Arc::new(compute.device().clone());
         let queue = Arc::new(compute.queue().clone());
 
-        let ew_op = ElementWiseOp::new(&device);
+        let ew_op = ElementWiseOp::new(&device, &queue);
         let numel = 4096u32;
         let bytes = numel as usize * std::mem::size_of::<f32>();
         let a_buf = GpuBuffer::new(&device, bytes, Some("bench_ew_a")).unwrap();

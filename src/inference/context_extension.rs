@@ -67,7 +67,6 @@ impl ContextExtensionConfig {
             method: ExtensionMethod::StreamingLLM,
             sink_window: window,
             num_sink_tokens: sink_tokens,
-            ..Default::default()
         }
     }
 

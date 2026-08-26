@@ -1318,7 +1318,7 @@ pub fn pack_ternary_u32(packed_u8: &[u8], total_values: usize) -> Vec<u32> {
     let cols_packed_u32 = (total_values + 15) / 16;
     let mut packed = vec![0u32; cols_packed_u32];
     for i in 0..cols_packed_u32 {
-        let b0 = packed_u8.get(i * 4 + 0).copied().unwrap_or(0) as u32;
+        let b0 = packed_u8.get(i * 4).copied().unwrap_or(0) as u32;
         let b1 = packed_u8.get(i * 4 + 1).copied().unwrap_or(0) as u32;
         let b2 = packed_u8.get(i * 4 + 2).copied().unwrap_or(0) as u32;
         let b3 = packed_u8.get(i * 4 + 3).copied().unwrap_or(0) as u32;

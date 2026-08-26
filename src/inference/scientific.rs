@@ -194,13 +194,8 @@ impl ChemicalValidator {
             // Triple bond — need capacity >= 3
             state.atom_capacities.last().map_or(false, |&c| c >= 3)
         } else if idx >= 12 && idx <= 20 {
-            // Ring digit 1-9
-            let digit = idx - 11;
-            if state.open_rings.contains(&digit) {
-                true // Closing a ring
-            } else {
-                true // Opening a new ring
-            }
+            // Ring digit 1-9: both opening and closing rings are valid.
+            true
         } else if idx == 21 {
             // Branch open
             true

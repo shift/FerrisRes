@@ -616,9 +616,7 @@ fn infer_type(s: &str) -> ParamType {
         ParamType::Url
     } else if s.starts_with("$.") {
         ParamType::JsonPath
-    } else if s.starts_with('/') {
-        ParamType::Path
-    } else if s.contains('.') {
+    } else if s.starts_with('/') || s.contains('.') {
         ParamType::Path
     } else if s.parse::<f64>().is_ok() {
         ParamType::Number

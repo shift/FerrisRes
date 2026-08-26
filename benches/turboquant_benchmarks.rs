@@ -5,12 +5,11 @@
 //! - Compression/decompression latency
 //! - Attention accuracy comparison
 
-use std::time::Instant;
-
 #[cfg(test)]
 mod benchmarks {
-    use super::*;
-    use crate::compute::turboquant::{TurboQuantConfig, TurboQuantEngine, OutlierChannelSplitter};
+    use std::time::Instant;
+
+    use ferrisres::compute::turboquant::{TurboQuantConfig, TurboQuantEngine, OutlierChannelSplitter};
     
     /// Memory savings benchmark
     #[test]
@@ -67,20 +66,20 @@ mod benchmarks {
     #[test]
     fn test_compression_config() {
         // Test builder pattern
-        let config = crate::inference::TwoPhaseConfig::default()
+        let config = ferrisres::inference::TwoPhaseConfig::default()
             .with_2bit_compression();
         
         assert!(config.use_turboquant);
         assert_eq!(config.compression_bit_width, Some(2));
         assert!((config.compression_ratio() - 16.0).abs() < 0.1);
         
-        let config_2_5 = crate::inference::TwoPhaseConfig::default()
+        let config_2_5 = ferrisres::inference::TwoPhaseConfig::default()
             .with_2_5bit_compression();
         
         assert!(config_2_5.use_outlier_splitting);
         assert!((config_2_5.compression_ratio() - 12.8).abs() < 0.2);
         
-        let config_3 = crate::inference::TwoPhaseConfig::default()
+        let config_3 = ferrisres::inference::TwoPhaseConfig::default()
             .with_3bit_compression();
         
         assert!((config_3.compression_ratio() - 10.7).abs() < 0.2);
@@ -142,14 +141,14 @@ mod benchmarks {
         println!("  Sequence length: {}", seq_len);
         println!("  Layers: {}", num_layers);
         println!("  Hidden dim: {}", hidden_dim);
-        println!("");
+        println!();
         println!("  f32 baseline: {} MB", total_bytes / (1024 * 1024));
         
         // 2-bit
         let tq_2bit = TurboQuantConfig::two_bit(hidden_dim);
         let ratio_2bit = TurboQuantEngine::new(tq_2bit).unwrap().compression_ratio();
         println!("  2-bit: {} MB ({:.1}x)", 
-            total_bytes as f32 / ratio_22 / (1024.0 * 1024.0),
+            total_bytes as f32 / ratio_2bit / (1024.0 * 1024.0),
             ratio_2bit);
         
         // 2.5-bit
@@ -173,6 +172,6 @@ mod benchmarks {
             total_bytes as f32 / ratio_4bit / (1024.0 * 1024.0),
             ratio_4bit);
         
-        assert!(true);
+        assert!(ratio_2bit > ratio_3bit && ratio_3bit > ratio_4bit);
     }
 }

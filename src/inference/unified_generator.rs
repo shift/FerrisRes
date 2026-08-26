@@ -95,9 +95,9 @@ impl UnifiedGenerateConfig {
 /// through the [`AnyModel`] abstraction. All optimizations (TurboQuant,
 /// YaRN, StreamingLLM, logit processors, RAG, tool search) work identically.
 pub struct UnifiedTokenGenerator {
-    model: Arc<AnyModel>,
-    lm_head: Arc<LMHead>,
-    embedding: Arc<TokenEmbedding>,
+    model: AnyModel,
+    lm_head: LMHead,
+    embedding: TokenEmbedding,
     kv_cache: ModelKVCache,
     device: Arc<Device>,
     queue: Arc<Queue>,
@@ -164,9 +164,9 @@ impl UnifiedTokenGenerator {
         )?;
 
         Ok(Self {
-            model: Arc::new(model),
-            lm_head: Arc::new(lm_head),
-            embedding: Arc::new(embedding),
+            model,
+            lm_head,
+            embedding,
             kv_cache,
             device,
             queue,
