@@ -194,6 +194,14 @@ pub struct BlockAttnResLayer {
 }
 
 impl BlockAttnResLayer {
+    pub fn num_kv_heads(&self) -> usize {
+        self.num_kv_heads
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
     pub fn new(
         device: Arc<Device>,
         queue: Arc<Queue>,

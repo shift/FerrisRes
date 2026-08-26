@@ -63,11 +63,11 @@ enum Commands {
         /// Path to tokenizer.json (HuggingFace format). Recommended when using --model-path.
         #[arg(long)]
         tokenizer: Option<String>,
-        #[arg(long, default_value_t = 512)]
+        #[arg(long, default_value_t = 128)]
         hidden_dim: usize,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 1)]
         num_blocks: usize,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 1)]
         block_size: usize,
         #[arg(long)]
         prompt: String,
@@ -861,8 +861,8 @@ async fn cmd_infer(
     let embedding = TokenEmbedding::new(
         Arc::clone(&device),
         Arc::clone(&queue),
-        model_config.hidden_dim,
         vocab_size,
+        model_config.hidden_dim,
     )?;
     let lm_head = LMHead::new(
         Arc::clone(&device),

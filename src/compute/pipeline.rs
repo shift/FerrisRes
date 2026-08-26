@@ -172,19 +172,11 @@ impl WgpuCompute {
         shader: &ShaderModule,
         entry_point: &str,
     ) -> Result<ComputePipeline> {
-        let layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Compute Pipeline Layout"),
-                bind_group_layouts: &[],
-                immediate_size: 0,
-            });
-
         let pipeline = self
             .device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Compute Pipeline"),
-                layout: Some(&layout),
+                layout: None,
                 module: shader,
                 entry_point: Some(entry_point),
                 cache: None,

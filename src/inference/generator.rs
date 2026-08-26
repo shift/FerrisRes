@@ -165,8 +165,16 @@ impl TokenGenerator {
         max_seq_len: u32,
     ) -> Result<Self> {
         let config = model.config();
-        let num_heads = config.attention_heads as u32;
-        let head_dim = (config.hidden_dim / config.attention_heads) as u32;
+        let (num_kv_heads, head_dim) = model
+            .layers()
+            .first()
+            .map(|layer| (layer.num_kv_heads() as u32, layer.head_dim() as u32))
+            .unwrap_or_else(|| {
+                (
+                    config.attention_heads as u32,
+                    (config.hidden_dim / config.attention_heads) as u32,
+                )
+            });
         let total_layers = config.total_layers() as u32;
 
         let kv_cache = ModelKVCache::new(
@@ -174,7 +182,7 @@ impl TokenGenerator {
             Arc::clone(&queue),
             total_layers,
             max_seq_len,
-            num_heads,
+            num_kv_heads,
             head_dim,
         )?;
 
@@ -192,15 +200,24 @@ impl TokenGenerator {
     #[allow(dead_code)]
     fn make_kv_cache(&self) -> Result<ModelKVCache> {
         let config = self.model.config();
-        let num_heads = config.attention_heads as u32;
-        let head_dim = (config.hidden_dim / config.attention_heads) as u32;
+        let (num_kv_heads, head_dim) = self
+            .model
+            .layers()
+            .first()
+            .map(|layer| (layer.num_kv_heads() as u32, layer.head_dim() as u32))
+            .unwrap_or_else(|| {
+                (
+                    config.attention_heads as u32,
+                    (config.hidden_dim / config.attention_heads) as u32,
+                )
+            });
         let total_layers = config.total_layers() as u32;
         ModelKVCache::new(
             Arc::clone(&self.device),
             Arc::clone(&self.queue),
             total_layers,
             self.max_seq_len,
-            num_heads,
+            num_kv_heads,
             head_dim,
         )
     }

@@ -3,7 +3,7 @@ use wgpu::{
     PipelineLayoutDescriptor, ShaderModuleDescriptor, ShaderSource,
 };
 use crate::compute::GpuBuffer;
-use crate::error::{FerrisResError, Result};
+use crate::error::Result;
 
 const RMSNORM_WGSL: &str = r#"
 struct Params {
@@ -304,13 +304,6 @@ impl RmsNormOp {
             hidden_dim
         );
 
-        if hidden_dim > 256 {
-            return Err(FerrisResError::Unsupported(format!(
-                "RmsNorm hidden_dim {} exceeds max workgroup size 256",
-                hidden_dim
-            )));
-        }
-
         let params_data: [u32; 2] = [hidden_dim, rows];
 
         let params_buffer = device.create_buffer(&BufferDescriptor {
@@ -373,13 +366,6 @@ impl RmsNormOp {
         rows: u32,
         hidden_dim: u32,
     ) -> Result<()> {
-        if hidden_dim > 256 {
-            return Err(FerrisResError::Unsupported(format!(
-                "RmsNorm backward hidden_dim {} exceeds max workgroup size 256",
-                hidden_dim
-            )));
-        }
-
         let params_data: [u32; 2] = [hidden_dim, rows];
         let params_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("RmsNorm Backward Params"),
