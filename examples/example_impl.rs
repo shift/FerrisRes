@@ -158,3 +158,23 @@ impl BlockAttnResLayer {
         partial_block
     }
 }
+
+fn main() {
+    // Minimal demonstration of a BlockAttnRes layer forward pass using mock tensors.
+    let layer = BlockAttnResLayer {
+        attn_res_proj: Linear { weight: VulkanTensor {} },
+        attn_res_norm: RMSNorm {},
+        mlp_res_proj: Linear { weight: VulkanTensor {} },
+        mlp_res_norm: RMSNorm {},
+        block_size: 4,
+        layer_number: 1,
+    };
+
+    let hidden_states = VulkanTensor {};
+    let mut blocks: Vec<Arc<VulkanTensor>> = vec![Arc::new(VulkanTensor {})];
+
+    let identity: &dyn Fn(&VulkanTensor) -> VulkanTensor = &|x| x.clone();
+
+    let _out = layer.forward(&mut blocks, hidden_states, identity, identity);
+    println!("BlockAttnRes forward pass completed with {} block(s)", blocks.len());
+}

@@ -137,7 +137,7 @@ fn matmul_double_buf(
             let b_col = col + dc;
             tile_a[0u * TS * TS + lr * TS + lc] =
                 select(0.0, a[a_row * params.K + a_col], a_row < params.M && a_col < params.K);
-            tile_b[0u * TS * TS + lr * TS + lc] =
+            tile_b[0u * TS * TS + lc * TS + lr] =
                 select(0.0, b[b_row * params.N + b_col], b_row < params.K && b_col < params.N);
         }
     }
@@ -159,14 +159,15 @@ fn matmul_double_buf(
                     let b_col = col + dc;
                     tile_a[next * TS * TS + lr * TS + lc] =
                         select(0.0, a[a_row * params.K + a_col], a_row < params.M && a_col < params.K);
-                    tile_b[next * TS * TS + lr * TS + lc] =
+                    tile_b[next * TS * TS + lc * TS + lr] =
                         select(0.0, b[b_row * params.N + b_col], b_row < params.K && b_col < params.N);
                 }
             }
         }
 
         // Accumulate 2x2 block from current tile
-        // Each thread reads its 2 rows from tile_a and 2 cols from tile_b
+        // tile_b is stored TRANSPOSED as [n][k], so consecutive k values are
+        // contiguous in shared memory: element (k, col) lives at col * TS + k.
         let a_base0 = cur * TS * TS + (local_row * 2u + 0u) * TS;
         let a_base1 = cur * TS * TS + (local_row * 2u + 1u) * TS;
         let b_base0 = cur * TS * TS + (local_col * 2u + 0u) * TS;
@@ -493,7 +494,7 @@ impl MatMulOp {
         k: u32,
         n: u32,
     ) -> Result<()> {
-        let tile_size = 32u32;  // 32x32 output tile (16x16 WG × 2x2 register blocking)
+        let tile_size = 16u32;  // Shader computes one output per 16x16 workgroup thread.
         let workgroup_count_x = (m + tile_size - 1) / tile_size;
         let workgroup_count_y = (n + tile_size - 1) / tile_size;
 
@@ -842,8 +843,9 @@ impl MatMulDoubleBufferOp {
         self.queue
             .write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params_data));
 
-        let wg_x = (m + 15) / 16;
-        let wg_y = (n + 15) / 16;
+        let tile_size = 32u32;  // 16x16 workgroup × 2x2 register blocking.
+        let wg_x = (m + tile_size - 1) / tile_size;
+        let wg_y = (n + tile_size - 1) / tile_size;
 
         tracing::debug!(
             "MatMulDoubleBufferOp dispatch: M={} K={} N={} workgroups=({},{},1)",

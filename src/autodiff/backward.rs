@@ -914,7 +914,6 @@ impl BackwardPass {
 
                 let tokens_id = inputs[0];
                 let queries_id = inputs[1];
-                let output_id = output_id;
 
                 // Allocate gradient buffers if needed
                 let tokens_grad_size = bs * hd * std::mem::size_of::<f32>();

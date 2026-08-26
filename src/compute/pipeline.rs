@@ -58,12 +58,21 @@ impl WgpuCompute {
             wgpu::Features::empty()
         };
 
+        // Requesting Features::IMMEDIATES alone is not enough: max_immediate_size
+        // defaults to 0 bytes, which makes any pipeline layout with immediate data
+        // fail validation. Opt in to the adapter's supported size (all current
+        // kernels use well under 256 bytes).
+        let mut required_limits = wgpu::Limits::default().using_resolution(adapter.limits());
+        if required_features.contains(wgpu::Features::IMMEDIATES) {
+            required_limits.max_immediate_size = adapter.limits().max_immediate_size.min(256);
+        }
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("FerrisRes Device"),
                     required_features,
-                    required_limits: wgpu::Limits::default(),
+                    required_limits,
                     memory_hints: wgpu::MemoryHints::default(),
                     trace: wgpu::Trace::Off,
                     experimental_features: wgpu::ExperimentalFeatures::disabled(),

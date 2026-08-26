@@ -116,12 +116,21 @@ async fn try_adapter(backends: wgpu::Backends, force_software: bool) -> Result<O
         }
     }
 
+    let mut required_limits = Limits::downlevel_webgl2_defaults()
+        .using_resolution(adapter.limits());
+    // Requesting Features::IMMEDIATES alone is not enough: max_immediate_size
+    // defaults to 0 bytes, which makes any pipeline layout with immediate data
+    // fail validation. Opt in to the adapter's supported size (all current
+    // kernels use well under 256 bytes).
+    if required_features.contains(Features::IMMEDIATES) {
+        required_limits.max_immediate_size = adapter.limits().max_immediate_size.min(256);
+    }
+
     let (device, queue) = match adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("FerrisRes Device"),
             required_features,
-            required_limits: Limits::downlevel_webgl2_defaults()
-                .using_resolution(adapter.limits()),
+            required_limits,
             experimental_features: wgpu::ExperimentalFeatures::default(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,

@@ -287,7 +287,7 @@ impl ApiServer {
                 let body = format!(r#"{{"object":"list","data":[{}]}}"#, data.join(","));
                 http_ok(body, "application/json")
             }
-            ("POST", path) if path == "/v1/chat/completions" => {
+            ("POST", "/v1/chat/completions") => {
                 let chat_req = self.parse_chat_request(&req.body);
                 match chat_req {
                     Some(chat_req) => {
@@ -302,7 +302,7 @@ impl ApiServer {
                     None => http_bad("Invalid request body"),
                 }
             }
-            ("POST", path) if path == "/v1/completions" => {
+            ("POST", "/v1/completions") => {
                 let comp_req = self.parse_completion_request(&req.body);
                 match comp_req {
                     Some(comp_req) => {

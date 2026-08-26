@@ -603,6 +603,46 @@ impl ElementWiseOp {
         numel: u32,
     ) -> Result<()> {
         let workgroup_count = (numel + 255) / 256;
+
+        // wgpu forbids binding the same buffer as both read-only and read-write
+        // in the same dispatch scope. When in-place (a == c), use a temporary.
+        let same_buf = std::ptr::eq(a.buffer() as *const _, c.buffer() as *const _);
+        if same_buf {
+            let tmp = GpuBuffer::new(
+                &self.device,
+                c.size(),
+                Some("ew_gelu_tmp"),
+            )?;
+            self.dispatch_gelu_impl(encoder, a, &tmp, numel)?;
+            let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ElementWise GELU Copy Pass"),
+                timestamp_writes: None,
+            });
+            cp.set_pipeline(&self.copy_pipeline);
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ElementWise GELU Copy BG"),
+                layout: &self.copy_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: tmp.buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: c.buffer().as_entire_binding() },
+                ],
+            });
+            cp.set_bind_group(0, &bg, &[]);
+            cp.dispatch_workgroups(workgroup_count, 1, 1);
+            drop(cp);
+            return Ok(());
+        }
+        self.dispatch_gelu_impl(encoder, a, c, numel)
+    }
+
+    fn dispatch_gelu_impl(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        a: &GpuBuffer,
+        c: &GpuBuffer,
+        numel: u32,
+    ) -> Result<()> {
+        let workgroup_count = (numel + 255) / 256;
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ElementWise GELU Bind Group"),
             layout: &self.gelu_bind_group_layout,
@@ -634,6 +674,49 @@ impl ElementWiseOp {
 
     /// Element-wise multiply: c = a * b
     pub fn dispatch_mul(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        a: &GpuBuffer,
+        b: &GpuBuffer,
+        c: &GpuBuffer,
+        numel: u32,
+    ) -> Result<()> {
+        let workgroup_count = (numel + 255) / 256;
+
+        // wgpu forbids binding the same buffer as both read-only and read-write
+        // in the same dispatch scope. When in-place (a == c or b == c), use a
+        // temporary and copy the result back.
+        let a_same = std::ptr::eq(a.buffer() as *const _, c.buffer() as *const _);
+        let b_same = std::ptr::eq(b.buffer() as *const _, c.buffer() as *const _);
+        if a_same || b_same {
+            let tmp = GpuBuffer::new(
+                &self.device,
+                c.size(),
+                Some("ew_mul_tmp"),
+            )?;
+            self.dispatch_mul_impl(encoder, a, b, &tmp, numel)?;
+            let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ElementWise Mul Copy Pass"),
+                timestamp_writes: None,
+            });
+            cp.set_pipeline(&self.copy_pipeline);
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ElementWise Mul Copy BG"),
+                layout: &self.copy_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: tmp.buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: c.buffer().as_entire_binding() },
+                ],
+            });
+            cp.set_bind_group(0, &bg, &[]);
+            cp.dispatch_workgroups(workgroup_count, 1, 1);
+            drop(cp);
+            return Ok(());
+        }
+        self.dispatch_mul_impl(encoder, a, b, c, numel)
+    }
+
+    fn dispatch_mul_impl(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         a: &GpuBuffer,
