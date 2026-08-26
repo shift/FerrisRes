@@ -871,7 +871,7 @@ async fn cmd_infer(
         vocab_size,
     )?;
     let generator = TokenGenerator::new(
-        Arc::new(model),
+        model,
         lm_head,
         embedding,
         Arc::clone(&device),
