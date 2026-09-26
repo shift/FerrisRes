@@ -1,4 +1,5 @@
 use crate::model::cpu_linear::{CpuLinear, CpuRmsNorm};
+use crate::model::block_residual::BlockResidualState;
 use crate::model::cpu_moe::CpuMoELayer;
 use crate::model::gemma_mapper::{matmul, rms_norm, apply_rope, apply_rope_gqa, gelu_tanh};
 use crate::model::gemma_mapper::{MappedGemma4Model, Gemma4FfnWeights};
@@ -466,14 +467,21 @@ impl CpuBlockAttnResLayer {
     ) -> Vec<f32> {
         let heads_per_kv = num_heads / num_kv_heads;
         let scale = 1.0f32; // Per-head RMSNorm replaces 1/sqrt(d)
+        let kv_seq = k.len() / kv_dim;
+        assert_eq!(k.len(), kv_seq * kv_dim);
+        assert_eq!(v.len(), k.len());
+        assert_eq!(q.len(), seq * q_dim);
+        assert!(seq <= kv_seq, "queries must be a suffix of the cached keys");
+        let query_offset = kv_seq - seq;
         let mut attn_out = vec![0.0f32; seq * q_dim];
 
         for h in 0..num_heads {
             let kv_h = h / heads_per_kv;
             for t in 0..seq {
                 let mut max_score = f32::NEG_INFINITY;
-                let mut scores = vec![0.0f32; seq];
-                for s in 0..=t {
+                let last_key = query_offset + t;
+                let mut scores = vec![0.0f32; last_key + 1];
+                for s in 0..=last_key {
                     let mut dot = 0.0f32;
                     for d in 0..head_dim {
                         dot += q[t * q_dim + h * head_dim + d]
@@ -483,14 +491,14 @@ impl CpuBlockAttnResLayer {
                     if scores[s] > max_score { max_score = scores[s]; }
                 }
                 let mut sum_exp = 0.0f32;
-                for s in 0..=t {
-                    scores[s] = (scores[s] - max_score).exp();
-                    sum_exp += scores[s];
+                for score in &mut scores {
+                    *score = (*score - max_score).exp();
+                    sum_exp += *score;
                 }
-                for s in 0..=t { scores[s] /= sum_exp; }
+                for score in &mut scores { *score /= sum_exp; }
                 for d in 0..head_dim {
                     let mut sum = 0.0f32;
-                    for s in 0..=t {
+                    for s in 0..=last_key {
                         sum += scores[s] * v[s * kv_dim + kv_h * head_dim + d];
                     }
                     attn_out[t * q_dim + h * head_dim + d] = sum;
@@ -637,17 +645,7 @@ impl CpuBlockAttnResModel {
         let first_shared_layer = self.num_layers.saturating_sub(self.num_kv_shared_layers);
         let mut shared_kv: std::collections::HashMap<usize, (Vec<f32>, Vec<f32>)> = std::collections::HashMap::new();
 
-        // Block representations: block_reps[0] = mean of initial embedding
-        let mut block_reps: Vec<Vec<f32>> = Vec::new();
-        let mut partial_sum = vec![0.0f32; hd];
-        // Initialize: mean pool the initial embedding across seq dimension
-        for t in 0..seq {
-            for d in 0..hd {
-                partial_sum[d] += hidden[t * hd + d];
-            }
-        }
-        for d in 0..hd { partial_sum[d] /= seq as f32; }
-        block_reps.push(partial_sum.clone());
+        let mut blocks = BlockResidualState::new(&hidden);
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // Get PLE slice for this layer
@@ -688,32 +686,7 @@ impl CpuBlockAttnResModel {
                 shared_kv.insert(layer_idx, (k_states, v_states));
             }
 
-            // Accumulate into partial_sum for block representation
-            for t in 0..seq {
-                for d in 0..hd {
-                    partial_sum[d] += hidden[t * hd + d];
-                }
-            }
-
-            // Block boundary: inter-block attention
-            if self.is_block_boundary(layer_idx) {
-                // Finalize this block's representation
-                for d in 0..hd { partial_sum[d] /= ((seq) * (self.block_config.layers_per_block)) as f32; }
-                block_reps.push(partial_sum.clone());
-
-                // Inter-block attention: query=current hidden, keys=block_reps
-                let inter_out = self.inter_block_attention(&hidden, &block_reps, seq);
-
-                // Add as residual
-                for t in 0..seq {
-                    for d in 0..hd {
-                        hidden[t * hd + d] += inter_out[d];
-                    }
-                }
-
-                // Reset partial_sum for next block
-                partial_sum = vec![0.0f32; hd];
-            }
+            blocks.apply_layer(self, &mut hidden, layer_idx);
         }
 
         // 4. Final norm + LM head
@@ -734,8 +707,8 @@ impl CpuBlockAttnResModel {
     ///
     /// This is the first phase of cached inference. It runs the full forward
     /// pass on all prompt tokens and stores K/V projections in the cache.
-    /// Returns logits for the last position.
-    ///
+    /// Starts a new request (clears the supplied cache) and returns logits for
+    /// all prompt positions, shaped `[token_ids.len(), vocab_size]`.
     /// After this call, use `forward_decode()` for each subsequent token.
     pub fn forward_prefill(
         &self,
@@ -745,6 +718,8 @@ impl CpuBlockAttnResModel {
         let seq = token_ids.len();
         let hd = self.hidden_dim;
         let vs = self.vocab_size;
+
+        cache.clear();
 
         // Store token IDs for PLE recomputation during decode
         cache.cached_token_ids = token_ids.to_vec();
@@ -771,19 +746,7 @@ impl CpuBlockAttnResModel {
         let first_shared_layer = self.num_layers.saturating_sub(self.num_kv_shared_layers);
         let mut shared_kv: std::collections::HashMap<usize, (Vec<f32>, Vec<f32>)> = std::collections::HashMap::new();
 
-        // Block tracking
-        cache.block_reps.clear();
-        cache.partial_sum = vec![0.0f32; hd];
-        cache.block_token_count = seq;
-        // Initialize block_rep[0] = mean of embeddings
-        for t in 0..seq {
-            for d in 0..hd {
-                cache.partial_sum[d] += hidden[t * hd + d];
-            }
-        }
-        let mut init_rep = cache.partial_sum.clone();
-        for d in 0..hd { init_rep[d] /= seq as f32; }
-        cache.block_reps.push(init_rep);
+        let mut blocks = BlockResidualState::new(&hidden);
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let ple_slice = ple_precomputed.as_ref().map(|pre| {
@@ -818,23 +781,7 @@ impl CpuBlockAttnResModel {
                 cache.layers[layer_idx].append_batch(&k_states, &v_states, seq);
             }
 
-            // Block tracking
-            for t in 0..seq {
-                for d in 0..hd {
-                    cache.partial_sum[d] += hidden[t * hd + d];
-                }
-            }
-            if self.is_block_boundary(layer_idx) {
-                let mut block_rep = cache.partial_sum.clone();
-                for d in 0..hd { block_rep[d] /= (seq * self.block_config.layers_per_block) as f32; }
-                cache.block_reps.push(block_rep);
-                cache.partial_sum = vec![0.0f32; hd];
-
-                let inter_out = self.inter_block_attention(&hidden, &cache.block_reps, seq);
-                for t in 0..seq {
-                    for d in 0..hd { hidden[t * hd + d] += inter_out[d]; }
-                }
-            }
+            blocks.apply_layer(self, &mut hidden, layer_idx);
         }
 
         // 4. Final norm + LM head
@@ -848,8 +795,9 @@ impl CpuBlockAttnResModel {
 
     /// Decode forward: processes a single new token using cached K/V.
     ///
-    /// This is the fast path — O(1) per token instead of O(n).
-    /// Only computes Q/K/V for the new token, attends against cached K/V.
+    /// Only computes Q/K/V for the new token and attends against cached K/V.
+    /// Attention still scales with the cached prefix; depth residual state is
+    /// rebuilt for this token only, never pooled across sequence positions.
     ///
     /// Must call `forward_prefill()` first to populate the cache.
     pub fn forward_decode(
@@ -873,6 +821,7 @@ impl CpuBlockAttnResModel {
         }
         let scale = (hd as f32).sqrt();
         for h in hidden.iter_mut() { *h *= scale; }
+        let mut blocks = BlockResidualState::new(&hidden);
 
         // 2. PLE: compute PLE input for just this token at this position
         let ple_dim = self.hidden_size_per_layer_input;
@@ -965,19 +914,7 @@ impl CpuBlockAttnResModel {
             // === FFN for single token (parallel) ===
             layer.forward_ffn_parallel(&mut hidden, ple_input.as_ref().map(|p| p.as_slice()));
 
-            // Block tracking
-            for d in 0..hd { cache.partial_sum[d] += hidden[d]; }
-            if self.is_block_boundary(layer_idx) {
-                cache.block_token_count += 1;
-                let mut block_rep = cache.partial_sum.clone();
-                for d in 0..hd { block_rep[d] /= (cache.block_token_count * self.block_config.layers_per_block) as f32; }
-                cache.block_reps.push(block_rep);
-                cache.partial_sum = vec![0.0f32; hd];
-                cache.block_token_count = 0;
-
-                let inter_out = self.inter_block_attention_single(&hidden, &cache.block_reps);
-                for d in 0..hd { hidden[d] += inter_out[d]; }
-            }
+            blocks.apply_layer(self, &mut hidden, layer_idx);
         }
 
         // 4. Final norm + LM head
@@ -1064,11 +1001,7 @@ impl CpuBlockAttnResModel {
         // 3. Per-layer transformer
         let first_shared_layer = self.num_layers.saturating_sub(self.num_kv_shared_layers);
         let mut shared_kv: std::collections::HashMap<usize, (Vec<f32>, Vec<f32>)> = std::collections::HashMap::new();
-        let mut block_reps: Vec<Vec<f32>> = Vec::new();
-        let mut partial_sum = vec![0.0f32; hd];
-        for t in 0..seq { for d in 0..hd { partial_sum[d] += hidden[t * hd + d]; } }
-        for d in 0..hd { partial_sum[d] /= seq as f32; }
-        block_reps.push(partial_sum.clone());
+        let mut blocks = BlockResidualState::new(&hidden);
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let ple_slice = ple_precomputed.as_ref().map(|pre| {
@@ -1214,14 +1147,7 @@ impl CpuBlockAttnResModel {
                 }
             }
 
-            for t in 0..seq { for d in 0..hd { partial_sum[d] += hidden[t * hd + d]; } }
-            if self.is_block_boundary(layer_idx) {
-                for d in 0..hd { partial_sum[d] /= ((seq) * (self.block_config.layers_per_block)) as f32; }
-                block_reps.push(partial_sum.clone());
-                let inter_out = self.inter_block_attention(&hidden, &block_reps, seq);
-                for t in 0..seq { for d in 0..hd { hidden[t * hd + d] += inter_out[d]; } }
-                partial_sum = vec![0.0f32; hd];
-            }
+            blocks.apply_layer(self, &mut hidden, layer_idx);
         }
 
         // 4. Final norm + LM head (CPU — too large for GPU buffer)
@@ -1265,15 +1191,10 @@ impl CpuBlockAttnResModel {
         let ple_precomputed = self.precompute_ple(&hidden, token_ids, seq, hd, ple_dim);
 
         // 3. Per-layer transformer — attention + FFN separated for routing collection
+        let mut routing_data = Vec::new();
         let first_shared_layer = self.num_layers.saturating_sub(self.num_kv_shared_layers);
         let mut shared_kv: std::collections::HashMap<usize, (Vec<f32>, Vec<f32>)> = std::collections::HashMap::new();
-        let mut block_reps: Vec<Vec<f32>> = Vec::new();
-        let mut partial_sum = vec![0.0f32; hd];
-        for t in 0..seq { for d in 0..hd { partial_sum[d] += hidden[t * hd + d]; } }
-        for d in 0..hd { partial_sum[d] /= seq as f32; }
-        block_reps.push(partial_sum.clone());
-
-        let mut routing_data = Vec::new();
+        let mut blocks = BlockResidualState::new(&hidden);
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let ple_slice = ple_precomputed.as_ref().map(|pre| {
@@ -1365,14 +1286,7 @@ impl CpuBlockAttnResModel {
             );
 
             // Block boundary
-            for t in 0..seq { for d in 0..hd { partial_sum[d] += hidden[t * hd + d]; } }
-            if self.is_block_boundary(layer_idx) {
-                for d in 0..hd { partial_sum[d] /= ((seq) * (self.block_config.layers_per_block)) as f32; }
-                block_reps.push(partial_sum.clone());
-                let inter_out = self.inter_block_attention(&hidden, &block_reps, seq);
-                for t in 0..seq { for d in 0..hd { hidden[t * hd + d] += inter_out[d]; } }
-                partial_sum = vec![0.0f32; hd];
-            }
+            blocks.apply_layer(self, &mut hidden, layer_idx);
         }
 
         // 4. Final norm + LM head
@@ -1544,116 +1458,46 @@ impl CpuBlockAttnResModel {
 // ---------------------------------------------------------------------------
 
 impl CpuBlockAttnResModel {
-    /// Inter-block attention: cross-attention between current hidden state
-    /// and accumulated block representations. Mirrors GPU forward_inter_block().
-    ///
-    /// query = current hidden (partial_sum or mean-pooled token states)
-    /// keys = normed block representations [num_blocks_so_far, hidden_dim]
-    /// values = normed block representations (same as keys)
-    ///
-    /// Returns: attention output [hidden_dim] to add as residual.
+    /// Attention across depth blocks, independently at every token position.
+    /// `hidden`, each block snapshot, and the result are `[seq, hidden_dim]`.
+    /// There is no sequence pooling: a token never reads another token's row.
     pub fn inter_block_attention(
         &self,
-        hidden: &[f32],      // [seq, hidden_dim] current token states
-        block_reps: &[Vec<f32>], // block representations so far (each [hidden_dim])
+        hidden: &[f32],
+        block_reps: &[Vec<f32>],
         seq: usize,
     ) -> Vec<f32> {
         let hd = self.hidden_dim;
-        let num_entries = block_reps.len(); // completed blocks + initial
-        if num_entries == 0 { return vec![0.0; hd]; }
-
-        // Mean-pool current hidden across seq dimension as query
-        let mut query = vec![0.0f32; hd];
+        assert_eq!(hidden.len(), seq * hd);
+        let mut output = vec![0.0; hidden.len()];
+        if block_reps.is_empty() || seq == 0 { return output; }
+        let normed_reps: Vec<Vec<f32>> = block_reps.iter().map(|rep| {
+            assert_eq!(rep.len(), hidden.len(), "depth snapshots must preserve token positions");
+            rms_norm(rep, &self.block_config.attn_res_norm, hd, 1e-6)
+        }).collect();
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut scores = vec![0.0; block_reps.len()];
         for t in 0..seq {
-            for d in 0..hd {
-                query[d] += hidden[t * hd + d];
+            let start = t * hd;
+            let query = &hidden[start..start + hd];
+            for (score, rep) in scores.iter_mut().zip(&normed_reps) {
+                *score = query.iter().zip(&rep[start..start + hd])
+                    .map(|(q, k)| q * k).sum::<f32>() * scale;
+            }
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0;
+            for score in &mut scores { *score = (*score - max).exp(); sum += *score; }
+            for (score, rep) in scores.iter().zip(&normed_reps) {
+                let weight = score / sum;
+                for d in 0..hd { output[start + d] += weight * rep[start + d]; }
             }
         }
-        for d in 0..hd { query[d] /= seq as f32; }
-
-        // Normalize block representations with attn_res_norm
-        let norm_weights = &self.block_config.attn_res_norm;
-        let mut normed_reps = Vec::with_capacity(num_entries);
-        for rep in block_reps {
-            let normed = crate::model::gemma_mapper::rms_norm(rep, norm_weights, hd, 1e-6);
-            normed_reps.push(normed);
-        }
-
-        // Flatten normed reps into [num_entries, hd] matrix
-        let mut flat_keys = vec![0.0f32; num_entries * hd];
-        for (i, nr) in normed_reps.iter().enumerate() {
-            flat_keys[i * hd..(i + 1) * hd].copy_from_slice(nr);
-        }
-
-        // Compute scores: query [1, hd] @ keys^T [hd, num_entries] = [1, num_entries]
-        let scale = 1.0f32 / (hd as f32).sqrt();
-        let scores = crate::model::gemma_mapper::matmul(&query, &flat_keys, 1, hd, num_entries);
-
-        // Softmax
-        let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut weights = vec![0.0f32; num_entries];
-        let mut sum_exp = 0.0f32;
-        for (i, &s) in scores.iter().enumerate() {
-            weights[i] = ((s - max_score) * scale).exp();
-            sum_exp += weights[i];
-        }
-        for w in &mut weights { *w /= sum_exp; }
-
-        // Weighted sum of block representations
-        let mut output = vec![0.0f32; hd];
-        for (i, &w) in weights.iter().enumerate() {
-            for d in 0..hd {
-                output[d] += w * normed_reps[i][d];
-            }
-        }
-
         output
     }
 
-    /// Inter-block attention for a single token (decode mode).
-    /// Same as inter_block_attention but hidden is [hd] not [seq × hd].
-    pub fn inter_block_attention_single(
-        &self,
-        hidden: &[f32],       // [hidden_dim] single token
-        block_reps: &[Vec<f32>],
-    ) -> Vec<f32> {
-        let hd = self.hidden_dim;
-        let num_entries = block_reps.len();
-        if num_entries == 0 { return vec![0.0; hd]; }
-
-        // Query is the hidden state directly (single token, no mean pooling needed)
-        let query = hidden;
-
-        // Normalize block representations
-        let norm_weights = &self.block_config.attn_res_norm;
-        let mut normed_reps = Vec::with_capacity(num_entries);
-        for rep in block_reps {
-            let normed = crate::model::gemma_mapper::rms_norm(rep, norm_weights, hd, 1e-6);
-            normed_reps.push(normed);
-        }
-
-        let mut flat_keys = vec![0.0f32; num_entries * hd];
-        for (i, nr) in normed_reps.iter().enumerate() {
-            flat_keys[i * hd..(i + 1) * hd].copy_from_slice(nr);
-        }
-
-        let scale = 1.0f32 / (hd as f32).sqrt();
-        let scores = crate::model::gemma_mapper::matmul(query, &flat_keys, 1, hd, num_entries);
-
-        let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut weights = vec![0.0f32; num_entries];
-        let mut sum_exp = 0.0f32;
-        for (i, &s) in scores.iter().enumerate() {
-            weights[i] = ((s - max_score) * scale).exp();
-            sum_exp += weights[i];
-        }
-        for w in &mut weights { *w /= sum_exp; }
-
-        let mut output = vec![0.0f32; hd];
-        for (i, &w) in weights.iter().enumerate() {
-            for d in 0..hd { output[d] += w * normed_reps[i][d]; }
-        }
-        output
+    /// Decode uses exactly the same depth attention with a single token row.
+    pub fn inter_block_attention_single(&self, hidden: &[f32], block_reps: &[Vec<f32>]) -> Vec<f32> {
+        self.inter_block_attention(hidden, block_reps, 1)
     }
 
     /// Attach LoRA adapters to targeted projections.
@@ -1907,6 +1751,7 @@ impl CpuBlockAttnResModel {
         }
         let scale = (hd as f32).sqrt();
         for h in hidden.iter_mut() { *h *= scale; }
+        let mut blocks = BlockResidualState::new(&hidden);
 
         let ple_dim = self.hidden_size_per_layer_input;
 
@@ -2028,18 +1873,7 @@ impl CpuBlockAttnResModel {
                 }
             }
 
-            // Block tracking
-            for d in 0..hd { cache.partial_sum[d] += hidden[d]; }
-            if self.is_block_boundary(layer_idx) {
-                cache.block_token_count += 1;
-                let mut block_rep = cache.partial_sum.clone();
-                for d in 0..hd { block_rep[d] /= (cache.block_token_count * self.block_config.layers_per_block) as f32; }
-                cache.block_reps.push(block_rep);
-                cache.partial_sum = vec![0.0f32; hd];
-                cache.block_token_count = 0;
-                let inter_out = self.inter_block_attention_single(&hidden, &cache.block_reps);
-                for d in 0..hd { hidden[d] += inter_out[d]; }
-            }
+            blocks.apply_layer(self, &mut hidden, layer_idx);
         }
 
         // Final norm + LM head (CPU — too large for GPU buffer on iGPU)
@@ -2074,6 +1908,7 @@ impl CpuBlockAttnResModel {
         }
         let scale = (hd as f32).sqrt();
         for h in hidden.iter_mut() { *h *= scale; }
+        let mut blocks = BlockResidualState::new(&hidden);
 
         let ple_dim = self.hidden_size_per_layer_input;
 
@@ -2182,18 +2017,7 @@ impl CpuBlockAttnResModel {
                 }
             }
 
-            // Block tracking
-            for d in 0..hd { cache.partial_sum[d] += hidden[d]; }
-            if self.is_block_boundary(layer_idx) {
-                cache.block_token_count += 1;
-                let mut block_rep = cache.partial_sum.clone();
-                for d in 0..hd { block_rep[d] /= (cache.block_token_count * self.block_config.layers_per_block) as f32; }
-                cache.block_reps.push(block_rep);
-                cache.partial_sum = vec![0.0f32; hd];
-                cache.block_token_count = 0;
-                let inter_out = self.inter_block_attention_single(&hidden, &cache.block_reps);
-                for d in 0..hd { hidden[d] += inter_out[d]; }
-            }
+            blocks.apply_layer(self, &mut hidden, layer_idx);
         }
 
         // Final norm + LM head (CPU)
@@ -2228,6 +2052,7 @@ impl CpuBlockAttnResModel {
         }
         let scale = (hd as f32).sqrt();
         for h in hidden.iter_mut() { *h *= scale; }
+        let mut blocks = BlockResidualState::new(&hidden);
 
         let ple_dim = self.hidden_size_per_layer_input;
 
@@ -2346,18 +2171,7 @@ impl CpuBlockAttnResModel {
                 }
             }
 
-            // Block tracking
-            for d in 0..hd { cache.partial_sum[d] += hidden[d]; }
-            if self.is_block_boundary(layer_idx) {
-                cache.block_token_count += 1;
-                let mut block_rep = cache.partial_sum.clone();
-                for d in 0..hd { block_rep[d] /= (cache.block_token_count * self.block_config.layers_per_block) as f32; }
-                cache.block_reps.push(block_rep);
-                cache.partial_sum = vec![0.0f32; hd];
-                cache.block_token_count = 0;
-                let inter_out = self.inter_block_attention_single(&hidden, &cache.block_reps);
-                for d in 0..hd { hidden[d] += inter_out[d]; }
-            }
+            blocks.apply_layer(self, &mut hidden, layer_idx);
         }
 
         // Final norm + LM head (CPU)

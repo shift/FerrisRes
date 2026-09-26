@@ -1,7 +1,8 @@
 //! KV cache for CpuBlockAttnResModel inference.
 //!
-//! Enables O(1) per-token generation instead of O(n) by caching K/V projections
-//! from previous positions. On the test machine (Skylake, 32GB):
+//! Avoids recomputing prior-token K/V projections. Attention still scans the
+//! cached prefix; total decode work is not constant in context length.
+//! Historical timings on the test machine (Skylake, 32GB):
 //!   - Without cache: 217s for seq=42 tokens
 //!   - With cache:    ~42s for seq=42 tokens (only new token computed)
 //!
@@ -9,7 +10,7 @@
 //!   - Per-layer K/V caching
 //!   - KV-shared layers (later layers reuse earlier layers' K/V)
 //!   - PLE per-layer inputs
-//!   - Inter-block attention block representations
+//! Depth-block residuals are local to each model call, not temporal cache state.
 //!   - RoPE position tracking
 
 /// KV cache for a single transformer layer.
@@ -104,11 +105,12 @@ impl LayerKVCache {
 pub struct ModelKVCache {
     /// Per-layer caches.
     pub layers: Vec<LayerKVCache>,
-    /// Cached block representations for inter-block attention.
+    /// Legacy summary storage retained for API compatibility; model paths no
+    /// longer use it. Depth residuals are computed per token, within each call.
     pub block_reps: Vec<Vec<f32>>,
-    /// Partial sum accumulator for current block.
+    /// Legacy accumulator, reset by clear(); not used by current model paths.
     pub partial_sum: Vec<f32>,
-    /// Current block token count (for averaging).
+    /// Legacy summary counter; not used by current model paths.
     pub block_token_count: usize,
     /// Shared KV mapping: layer_idx → source_layer_idx.
     /// For KV-shared layers, we point to the source layer's cache.

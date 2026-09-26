@@ -1,12 +1,12 @@
 //! Model architecture dispatcher — auto-detect BlockAttnRes vs Standard from weights.
 //!
-//! When loading model weights (safetensors or GGUF), this module auto-detects
-//! the architecture and instantiates the correct model type. A unified
-//! [`AnyModel`] enum wraps both [`BlockAttnResModel`] and
-//! [`StandardTransformerModel`] so the TokenGenerator pipeline works with
-//! either transparently.
+//! Architecture detection and explicit model construction are available.
+//! Generic pretrained checkpoint import is **not implemented**: the AnyModel
+//! file-loading methods fail explicitly rather than discard learned tensors.
+//! Model-specific CPU Gemma loaders are separate and unaffected.
 //!
-//! CLI usage: `--arch auto|block-attn-res|standard` to override detection.
+//! [`AnyModel`] wraps [`BlockAttnResModel`] and [`StandardTransformerModel`]
+//! for shared inference dispatch.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -15,9 +15,9 @@ use wgpu::{Device, Queue};
 use crate::error::{FerrisResError, Result};
 use crate::inference::kv_cache::ModelKVCache;
 use crate::model::config::BlockAttnResConfig;
-use crate::model::gguf::{load_gguf, GgufFile};
+use crate::model::gguf::GgufFile;
 use crate::model::model::BlockAttnResModel;
-use crate::model::safetensors::{load_safetensors, LoadedWeights, ModelArchitecture};
+use crate::model::safetensors::{LoadedWeights, ModelArchitecture};
 use crate::model::standard_transformer::{StandardTransformerConfig, StandardTransformerModel};
 
 // ---------------------------------------------------------------------------
@@ -180,76 +180,44 @@ impl AnyModel {
         Ok(Self::Standard(model))
     }
 
-    /// Auto-detect and create from a safetensors file.
+    /// Pretrained safetensors import is not implemented for AnyModel.
+    /// Always returns Unsupported without allocating an untrained substitute.
+    /// Explicit constructors and model-specific CPU Gemma loaders remain usable.
     pub fn from_safetensors(
-        path: &Path,
-        device: Arc<Device>,
-        queue: Arc<Queue>,
-        hint: &ArchitectureHint,
+        _path: &Path,
+        _device: Arc<Device>,
+        _queue: Arc<Queue>,
+        _hint: &ArchitectureHint,
     ) -> Result<Self> {
-        let weights = load_safetensors(path)?;
-        let detected = ArchitectureDetector::detect_from_safetensors(&weights, hint);
-
-        match detected {
-            DetectedArchitecture::BlockAttnRes => {
-                let hidden_dim = weights.infer_hidden_dim().unwrap_or(512);
-                let vocab_size = weights.infer_vocab_size().unwrap_or(32000);
-                let config = BlockAttnResConfig::new(hidden_dim);
-                Self::new_block_attn_res(device, queue, config, vocab_size)
-            }
-            DetectedArchitecture::Standard => {
-                let config = infer_standard_config(&weights);
-                Self::new_standard(device, queue, config)
-            }
-        }
+        Err(Self::checkpoint_import_unavailable())
     }
 
-    /// Auto-detect and create from a GGUF file.
+    /// Pretrained GGUF import is not implemented for AnyModel.
+    /// Always returns Unsupported; no file data is silently discarded.
     pub fn from_gguf(
-        path: &Path,
-        device: Arc<Device>,
-        queue: Arc<Queue>,
-        hint: &ArchitectureHint,
+        _path: &Path,
+        _device: Arc<Device>,
+        _queue: Arc<Queue>,
+        _hint: &ArchitectureHint,
     ) -> Result<Self> {
-        let gguf = load_gguf(path)?;
-        let detected = ArchitectureDetector::detect_from_gguf(&gguf, hint);
-
-        match detected {
-            DetectedArchitecture::BlockAttnRes => {
-                let hidden_dim = gguf.infer_hidden_dim().unwrap_or(512);
-                let vocab_size = gguf.infer_vocab_size().unwrap_or(32000);
-                let config = BlockAttnResConfig::new(hidden_dim);
-                Self::new_block_attn_res(device, queue, config, vocab_size)
-            }
-            DetectedArchitecture::Standard => {
-                let config = infer_standard_config_gguf(&gguf);
-                Self::new_standard(device, queue, config)
-            }
-        }
+        Err(Self::checkpoint_import_unavailable())
     }
 
-    /// Auto-detect from file extension and load.
+    /// Generic pretrained checkpoint import is unavailable, regardless of
+    /// extension or architecture hint. Does not read or validate the path.
     pub fn from_path(
-        path: &Path,
-        device: Arc<Device>,
-        queue: Arc<Queue>,
-        hint: &ArchitectureHint,
+        _path: &Path,
+        _device: Arc<Device>,
+        _queue: Arc<Queue>,
+        _hint: &ArchitectureHint,
     ) -> Result<Self> {
-        let ext = path.extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        Err(Self::checkpoint_import_unavailable())
+    }
 
-        match ext {
-            "safetensors" => Self::from_safetensors(path, device, queue, hint),
-            "gguf" => Self::from_gguf(path, device, queue, hint),
-            _ => {
-                // Try safetensors first, then GGUF
-                if let Ok(m) = Self::from_safetensors(path, device.clone(), queue.clone(), hint) {
-                    return Ok(m);
-                }
-                Self::from_gguf(path, device, queue, hint)
-            }
-        }
+    fn checkpoint_import_unavailable() -> FerrisResError {
+        FerrisResError::Unsupported(
+            "AnyModel pretrained checkpoint import is not implemented; refusing to substitute an untrained model. Use a supported model-specific loader (such as the CPU Gemma loader), or explicit constructors for a newly initialized model.".into()
+        )
     }
 
     /// Number of layers.
@@ -378,6 +346,19 @@ impl AnyModel {
         }
     }
 
+    /// Finalize hidden states once before the output projection.
+    pub fn finalize_hidden_states(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        hidden: crate::compute::GpuBuffer,
+        rows: u32,
+    ) -> Result<crate::compute::GpuBuffer> {
+        match self {
+            Self::Standard(model) => model.normalize_output(encoder, &hidden, rows),
+            Self::BlockAttnRes(_) => Ok(hidden),
+        }
+    }
+
     /// Access the underlying BlockAttnResModel if applicable.
     pub fn as_block_attn_res(&self) -> Option<&BlockAttnResModel> {
         match self {
@@ -393,48 +374,6 @@ impl AnyModel {
             _ => None,
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Helper inference functions
-// ---------------------------------------------------------------------------
-
-fn infer_num_heads(weights: &LoadedWeights, hidden_dim: usize) -> usize {
-    // Try to find num_heads from weight shape
-    for name in &["q_proj.weight", "layers.0.q_proj.weight", "model.layers.0.self_attn.q_proj.weight"] {
-        if let Some(t) = weights.get(name) {
-            if t.shape.len() == 2 {
-                let out_dim = t.shape[0];
-                if out_dim > 0 && hidden_dim > 0 {
-                    return hidden_dim / (hidden_dim / out_dim.max(1)).max(1);
-                }
-            }
-        }
-    }
-    // Default: assume head_dim = 128 (LLaMA/Mistral common)
-    (hidden_dim / 128).max(1)
-}
-
-fn infer_num_heads_gguf(gguf: &GgufFile, hidden_dim: usize) -> usize {
-    gguf.metadata_u32("llama.attention.head_count")
-        .map(|n| n as usize)
-        .unwrap_or_else(|| (hidden_dim / 128).max(1))
-}
-
-fn infer_standard_config(weights: &LoadedWeights) -> StandardTransformerConfig {
-    let hidden_dim = weights.infer_hidden_dim().unwrap_or(512);
-    let num_layers = weights.infer_num_layers();
-    let vocab_size = weights.infer_vocab_size().unwrap_or(32000);
-    let num_heads = infer_num_heads(weights, hidden_dim);
-    StandardTransformerConfig::from_inferred(hidden_dim, num_heads, num_layers, vocab_size)
-}
-
-fn infer_standard_config_gguf(gguf: &GgufFile) -> StandardTransformerConfig {
-    let hidden_dim = gguf.infer_hidden_dim().unwrap_or(512);
-    let num_layers = gguf.infer_num_layers();
-    let vocab_size = gguf.infer_vocab_size().unwrap_or(32000);
-    let num_heads = infer_num_heads_gguf(gguf, hidden_dim);
-    StandardTransformerConfig::from_inferred(hidden_dim, num_heads, num_layers, vocab_size)
 }
 
 // ---------------------------------------------------------------------------

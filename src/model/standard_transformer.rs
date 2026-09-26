@@ -1,8 +1,8 @@
 //! Standard transformer layer — O(n²) full self-attention compatibility mode.
 //!
-//! This module implements a standard pre-norm transformer layer that can load
-//! and run models like LLaMA, Mistral, Gemma, etc. within FerrisRes's GPU
-//! runtime. It reuses all existing WGSL kernels and gains access to FerrisRes
+//! This module implements a standard pre-norm transformer layer with explicit
+//! gated FFN activation (SiLU or GELU-tanh) within FerrisRes's GPU runtime.
+//! This does not imply complete pretrained architecture compatibility. It reuses all existing WGSL kernels and gains access to FerrisRes
 //! optimizations (TurboQuant, YaRN, ToMe, iGPU support).
 //!
 //! Architecture: Pre-norm → Q/K/V → RoPE → Full self-attention → residual → FFN
@@ -15,12 +15,23 @@ use wgpu::{Device, Queue};
 use crate::compute::buffer::GpuBuffer;
 use crate::compute::kernels::rope::RopeOp;
 use crate::compute::kernels::flash_decode::FlashDecodeOp;
-use crate::compute::kernels::rmsnorm::RmsNormOp;
 use crate::compute::kernels::elementwise::ElementWiseOp;
 use crate::compute::kernels::prefill_attn::PrefillAttnOp;
 use crate::error::Result;
 use crate::inference::kv_cache::LayerKVCache;
 use crate::model::linear::Linear;
+use crate::compute::kernels::gpu_transformer::GpuTransformerPipeline;
+
+/// Activation applied to the gate before multiplication with the up projection.
+/// Select from checkpoint architecture metadata, never from tensor shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GatedActivation {
+    /// SwiGLU used by LLaMA and Mistral.
+    #[default]
+    Silu,
+    /// GELU's tanh approximation, not exact-erf GELU.
+    GeluTanh,
+}
 
 /// Configuration for a standard transformer model.
 #[derive(Debug, Clone)]
@@ -32,6 +43,9 @@ pub struct StandardTransformerConfig {
     pub head_dim: usize,
     pub vocab_size: usize,
     pub use_bias: bool,
+    pub ffn_activation: GatedActivation,
+    /// Positive normal finite RMSNorm epsilon; import must set its metadata value.
+    pub norm_eps: f32,
 }
 
 impl StandardTransformerConfig {
@@ -44,8 +58,10 @@ impl StandardTransformerConfig {
             num_layers,
             intermediate_dim,
             head_dim,
+            norm_eps: 1e-5,
             vocab_size: 32000,
             use_bias: false,
+            ffn_activation: GatedActivation::Silu,
         }
     }
 
@@ -56,9 +72,11 @@ impl StandardTransformerConfig {
             num_heads: 32,
             num_layers: 32,
             intermediate_dim: 11008,
+            norm_eps: 1e-5,
             head_dim: 128,
             vocab_size: 32000,
             use_bias: false,
+            ffn_activation: GatedActivation::Silu,
         }
     }
 
@@ -69,9 +87,11 @@ impl StandardTransformerConfig {
             num_heads: 32,
             num_layers: 32,
             intermediate_dim: 14336,
+            norm_eps: 1e-5,
             head_dim: 128,
             vocab_size: 32000,
             use_bias: false,
+            ffn_activation: GatedActivation::Silu,
         }
     }
 
@@ -84,8 +104,10 @@ impl StandardTransformerConfig {
             num_layers,
             intermediate_dim: hidden_dim * 4,
             head_dim,
+            norm_eps: 1e-5,
             vocab_size,
             use_bias: false,
+            ffn_activation: GatedActivation::Silu,
         }
     }
 }
@@ -99,7 +121,7 @@ impl StandardTransformerConfig {
 ///
 /// Structure:
 ///   input → RMSNorm → Q/K/V projection → RoPE → full attention →
-///   out_proj → residual_add → RMSNorm → FFN (gate+up → silu → down) → residual_add → output
+///   out_proj → residual_add → RMSNorm → down(activation(gate) * up) → residual_add → output
 pub struct StandardTransformerLayer {
     // Dimensions
     hidden_dim: usize,
@@ -112,7 +134,7 @@ pub struct StandardTransformerLayer {
     k_proj: Linear,
     v_proj: Linear,
     out_proj: Linear,
-    attn_norm: RmsNormOp,
+    attn_norm_weight: GpuBuffer,
     rope: RopeOp,
 
     // Decode
@@ -125,7 +147,10 @@ pub struct StandardTransformerLayer {
     ff_gate: Linear,
     ff_up: Linear,
     ff_down: Linear,
-    ff_norm: RmsNormOp,
+    ff_norm_weight: GpuBuffer,
+    norm_eps: f32,
+    ffn_activation: GatedActivation,
+    ffn_ops: GpuTransformerPipeline,
 
     // Elementwise
     elementwise: ElementWiseOp,
@@ -141,6 +166,9 @@ impl StandardTransformerLayer {
         queue: Arc<Queue>,
         config: &StandardTransformerConfig,
     ) -> Result<Self> {
+        if !config.norm_eps.is_finite() || config.norm_eps < f32::MIN_POSITIVE {
+            return Err(crate::error::FerrisResError::Shape("norm_eps must be positive, normal and finite".into()));
+        }
         let hidden_dim = config.hidden_dim;
         let num_heads = config.num_heads;
         let head_dim = config.head_dim;
@@ -176,8 +204,11 @@ impl StandardTransformerLayer {
             intermediate_dim, hidden_dim, config.use_bias,
         )?;
 
-        let attn_norm = RmsNormOp::new(&device)?;
-        let ff_norm = RmsNormOp::new(&device)?;
+        let attn_norm_weight = GpuBuffer::new(&device, hidden_dim * 4, Some("std_attn_norm_weight"))?;
+        let ff_norm_weight = GpuBuffer::new(&device, hidden_dim * 4, Some("std_ff_norm_weight"))?;
+        let unit_scale = vec![1.0f32; hidden_dim];
+        queue.write_buffer(attn_norm_weight.buffer(), 0, bytemuck::cast_slice(&unit_scale));
+        queue.write_buffer(ff_norm_weight.buffer(), 0, bytemuck::cast_slice(&unit_scale));
         let elementwise = ElementWiseOp::new(&device, &queue);
         let rope = RopeOp::new(&device)?;
         let flash_decode = FlashDecodeOp::new(&device, &queue)?;
@@ -192,14 +223,17 @@ impl StandardTransformerLayer {
             k_proj,
             v_proj,
             out_proj,
-            attn_norm,
+            attn_norm_weight,
             rope,
             flash_decode,
             prefill_attn,
             ff_gate,
             ff_up,
             ff_down,
-            ff_norm,
+            ff_norm_weight,
+            norm_eps: config.norm_eps,
+            ffn_activation: config.ffn_activation,
+            ffn_ops: GpuTransformerPipeline::new(&device)?,
             elementwise,
             device,
             queue,
@@ -229,14 +263,9 @@ impl StandardTransformerLayer {
             seq_len as usize * hidden_dim * f32_size,
             Some("std_prefill_normed"),
         )?;
-        self.attn_norm.dispatch(
-            &self.device,
-            &self.queue,
-            encoder,
-            hidden_states,
-            &normed,
-            seq_len,
-            hidden_dim as u32,
+        self.ffn_ops.dispatch_rmsnorm_with_epsilon(
+            &self.device, &self.queue, encoder, hidden_states, &normed,
+            &self.attn_norm_weight, seq_len, hidden_dim as u32, self.norm_eps,
         )?;
 
         // Q/K/V projections
@@ -298,14 +327,9 @@ impl StandardTransformerLayer {
             seq_len as usize * hidden_dim * f32_size,
             Some("std_prefill_ff_norm"),
         )?;
-        self.ff_norm.dispatch(
-            &self.device,
-            &self.queue,
-            encoder,
-            &residual1,
-            &ff_normed,
-            seq_len,
-            hidden_dim as u32,
+        self.ffn_ops.dispatch_rmsnorm_with_epsilon(
+            &self.device, &self.queue, encoder, &residual1, &ff_normed,
+            &self.ff_norm_weight, seq_len, hidden_dim as u32, self.norm_eps,
         )?;
 
         let ff_gate = GpuBuffer::new(
@@ -321,16 +345,14 @@ impl StandardTransformerLayer {
         self.ff_gate.forward(encoder, &ff_normed, &ff_gate, seq_len)?;
         self.ff_up.forward(encoder, &ff_normed, &ff_up, seq_len)?;
 
-        // FFN activation: ReLU(gate) then elementwise multiply with up
-        self.elementwise.dispatch_relu(encoder, &ff_gate, &ff_gate, seq_len * self.intermediate_dim as u32)?;
-        self.elementwise.dispatch_add(encoder, &ff_gate, &ff_up, &ff_gate, seq_len * self.intermediate_dim as u32)?;
+        let ff_gated = self.activate_gate(encoder, &ff_gate, &ff_up, seq_len * self.intermediate_dim as u32)?;
 
         let ff_down = GpuBuffer::new(
             &self.device,
             seq_len as usize * hidden_dim * f32_size,
             Some("std_prefill_down"),
         )?;
-        self.ff_down.forward(encoder, &ff_gate, &ff_down, seq_len)?;
+        self.ff_down.forward(encoder, &ff_gated, &ff_down, seq_len)?;
 
         // Final residual
         let output = GpuBuffer::new(
@@ -384,14 +406,9 @@ impl StandardTransformerLayer {
             hidden_dim * f32_size,
             Some("std_decode_normed"),
         )?;
-        self.attn_norm.dispatch(
-            &self.device,
-            &self.queue,
-            encoder,
-            hidden_states,
-            &normed,
-            1u32,
-            hidden_dim as u32,
+        self.ffn_ops.dispatch_rmsnorm_with_epsilon(
+            &self.device, &self.queue, encoder, hidden_states, &normed,
+            &self.attn_norm_weight, 1, hidden_dim as u32, self.norm_eps,
         )?;
 
         // Q projection → temp buffer
@@ -438,14 +455,9 @@ impl StandardTransformerLayer {
 
         // FFN
         let ff_normed = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("std_decode_ff_norm"))?;
-        self.ff_norm.dispatch(
-            &self.device,
-            &self.queue,
-            encoder,
-            &residual1,
-            &ff_normed,
-            1u32,
-            hidden_dim as u32,
+        self.ffn_ops.dispatch_rmsnorm_with_epsilon(
+            &self.device, &self.queue, encoder, &residual1, &ff_normed,
+            &self.ff_norm_weight, 1, hidden_dim as u32, self.norm_eps,
         )?;
 
         let ff_gate = GpuBuffer::new(
@@ -461,15 +473,36 @@ impl StandardTransformerLayer {
         self.ff_gate.forward(encoder, &ff_normed, &ff_gate, 1u32)?;
         self.ff_up.forward(encoder, &ff_normed, &ff_up, 1u32)?;
 
-        self.elementwise.dispatch_relu(encoder, &ff_gate, &ff_gate, intermediate_dim)?;
-        self.elementwise.dispatch_add(encoder, &ff_gate, &ff_up, &ff_gate, intermediate_dim)?;
+        let ff_gated = self.activate_gate(encoder, &ff_gate, &ff_up, intermediate_dim)?;
 
         let ff_down = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("std_decode_down"))?;
-        self.ff_down.forward(encoder, &ff_gate, &ff_down, 1u32)?;
+        self.ff_down.forward(encoder, &ff_gated, &ff_down, 1u32)?;
 
         let output = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("std_decode_output"))?;
         self.elementwise.dispatch_add(encoder, &residual1, &ff_down, &output, hidden_dim as u32)?;
 
+        Ok(output)
+    }
+
+    /// Both forward paths share the same non-aliasing gated activation.
+    fn activate_gate(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        gate: &GpuBuffer,
+        up: &GpuBuffer,
+        numel: u32,
+    ) -> Result<GpuBuffer> {
+        let output = GpuBuffer::new(&self.device, numel as usize * 4, Some("std_ff_gated"))?;
+        match self.ffn_activation {
+            GatedActivation::Silu => self.ffn_ops.dispatch_silu_multiply(
+                &self.device, &self.queue, encoder, gate, up, &output, numel,
+            )?,
+            GatedActivation::GeluTanh => {
+                let activated = GpuBuffer::new(&self.device, numel as usize * 4, Some("std_ff_gelu"))?;
+                self.elementwise.dispatch_gelu(encoder, gate, &activated, numel)?;
+                self.elementwise.dispatch_mul(encoder, &activated, up, &output, numel)?;
+            }
+        }
         Ok(output)
     }
 
@@ -486,6 +519,21 @@ impl StandardTransformerLayer {
     /// Get the head dimension.
     pub fn head_dim(&self) -> usize {
         self.head_dim
+    }
+
+    /// Validate both scales before writing either. Signed and zero scales are valid.
+    pub fn set_norm_weights(&self, attention: &[f32], ffn: &[f32]) -> Result<()> {
+        if [attention, ffn].iter().any(|w| w.len() != self.hidden_dim || w.iter().any(|v| !v.is_finite())) {
+            return Err(crate::error::FerrisResError::Shape("norm scales must match hidden_dim and contain only finite values".into()));
+        }
+        self.queue.write_buffer(self.attn_norm_weight.buffer(), 0, bytemuck::cast_slice(attention));
+        self.queue.write_buffer(self.ff_norm_weight.buffer(), 0, bytemuck::cast_slice(ffn));
+        Ok(())
+    }
+
+    /// Attention and FFN scale buffers, respectively (for checkpoint export).
+    pub fn norm_weights(&self) -> (&GpuBuffer, &GpuBuffer) {
+        (&self.attn_norm_weight, &self.ff_norm_weight)
     }
 
     /// Access the Q projection layer (for weight loading).
@@ -530,8 +578,10 @@ impl StandardTransformerLayer {
 pub struct StandardTransformerModel {
     layers: Vec<StandardTransformerLayer>,
     config: StandardTransformerConfig,
-    _device: Arc<Device>,
-    _queue: Arc<Queue>,
+    final_norm_weight: GpuBuffer,
+    final_norm_ops: GpuTransformerPipeline,
+    device: Arc<Device>,
+    queue: Arc<Queue>,
 }
 
 impl StandardTransformerModel {
@@ -540,6 +590,16 @@ impl StandardTransformerModel {
         queue: Arc<Queue>,
         config: StandardTransformerConfig,
     ) -> Result<Self> {
+        if !config.norm_eps.is_finite() || config.norm_eps < f32::MIN_POSITIVE {
+            return Err(crate::error::FerrisResError::Shape("norm_eps must be positive, normal and finite".into()));
+        }
+        let norm_bytes = config.hidden_dim.checked_mul(4).filter(|&n| n > 0
+            && n as u64 <= device.limits().max_storage_buffer_binding_size
+            && n as u64 <= device.limits().max_buffer_size)
+            .ok_or_else(|| crate::error::FerrisResError::Shape("invalid final norm dimension".into()))?;
+        let final_norm_weight = GpuBuffer::new(&device, norm_bytes, Some("std_final_norm_weight"))?;
+        queue.write_buffer(final_norm_weight.buffer(), 0, bytemuck::cast_slice(&vec![1.0f32; config.hidden_dim]));
+        let final_norm_ops = GpuTransformerPipeline::new(&device)?;
         let num_layers = config.num_layers;
         let mut layers = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
@@ -553,9 +613,39 @@ impl StandardTransformerModel {
         Ok(Self {
             layers,
             config,
-            _device: device,
-            _queue: queue,
+            final_norm_weight,
+            final_norm_ops,
+            device,
+            queue,
         })
+    }
+
+    /// Upload effective final RMSNorm multipliers after validating all values.
+    pub fn set_final_norm_weight(&self, scale: &[f32]) -> Result<()> {
+        if scale.len() != self.config.hidden_dim || scale.iter().any(|v| !v.is_finite()) {
+            return Err(crate::error::FerrisResError::Shape("final norm scale must match hidden_dim and be finite".into()));
+        }
+        self.queue.write_buffer(self.final_norm_weight.buffer(), 0, bytemuck::cast_slice(scale));
+        Ok(())
+    }
+
+    pub fn final_norm_weight(&self) -> &GpuBuffer {
+        &self.final_norm_weight
+    }
+
+    /// Normalize output hidden states once, after all layers and before LM head.
+    pub fn normalize_output(&self, encoder: &mut wgpu::CommandEncoder, hidden: &GpuBuffer, rows: u32) -> Result<GpuBuffer> {
+        let bytes = self.config.hidden_dim.checked_mul(rows as usize).and_then(|n| n.checked_mul(4))
+            .filter(|&n| rows > 0 && n <= hidden.size()
+                && n as u64 <= self.device.limits().max_storage_buffer_binding_size
+                && n as u64 <= self.device.limits().max_buffer_size)
+            .ok_or_else(|| crate::error::FerrisResError::Shape("invalid final norm rows or input size".into()))?;
+        let output = GpuBuffer::new(&self.device, bytes, Some("std_final_norm_output"))?;
+        self.final_norm_ops.dispatch_rmsnorm_with_epsilon(
+            &self.device, &self.queue, encoder, hidden, &output, &self.final_norm_weight,
+            rows, self.config.hidden_dim as u32, self.config.norm_eps,
+        )?;
+        Ok(output)
     }
 
     pub fn layers(&self) -> &[StandardTransformerLayer] {

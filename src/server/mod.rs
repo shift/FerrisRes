@@ -14,6 +14,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
+use crate::security::armor::{ArmorLayer, SecurityVerdict};
+
 // ---------------------------------------------------------------------------
 // Request/Response types
 // ---------------------------------------------------------------------------
@@ -226,6 +228,7 @@ impl Default for ApiServerConfig {
 pub struct ApiServer {
     config: ApiServerConfig,
     handler: Arc<Mutex<Box<dyn ApiHandler + Send>>>,
+    armor: Option<Mutex<ArmorLayer>>,
 }
 
 /// Trait for handling API requests.
@@ -243,6 +246,45 @@ impl ApiServer {
         Self {
             config,
             handler: Arc::new(Mutex::new(handler)),
+            armor: None,
+        }
+    }
+
+    /// Enable Armor request (L0/L1) and response (L3) filtering.
+    /// Hidden-state L2 probing requires model-level hooks and is not provided here.
+    pub fn with_armor(mut self, armor: ArmorLayer) -> Self {
+        self.armor = Some(Mutex::new(armor));
+        self
+    }
+
+    fn input_allowed(&self, prompt: &str) -> bool {
+        match &self.armor {
+            None => true,
+            Some(armor) => match armor.lock() {
+                Ok(mut armor) => matches!(armor.verify_input(prompt), SecurityVerdict::Allow),
+                Err(_) => false, // A failed security layer must never fail open.
+            },
+        }
+    }
+
+    fn completion_response(&self, mut response: ChatCompletionResponse, stream: bool) -> String {
+        if let Some(armor) = &self.armor {
+            let armor = match armor.lock() {
+                Ok(armor) => armor,
+                Err(_) => return http_forbidden(),
+            };
+            for choice in &mut response.choices {
+                match armor.sanitize_output(&choice.message.content) {
+                    SecurityVerdict::Allow => {},
+                    SecurityVerdict::Redact(text) => choice.message.content = text,
+                    SecurityVerdict::Block(_) => return http_forbidden(),
+                }
+            }
+        }
+        if stream {
+            sse_response(response)
+        } else {
+            http_ok(response.to_json(), "application/json")
         }
     }
 
@@ -291,13 +333,17 @@ impl ApiServer {
                 let chat_req = self.parse_chat_request(&req.body);
                 match chat_req {
                     Some(chat_req) => {
+                        let prompt = chat_req.messages.iter()
+                            .map(|message| format!("{}: {}", message.role, message.content))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !self.input_allowed(&prompt) {
+                            return http_forbidden();
+                        }
                         let mut handler = self.handler.lock().unwrap();
                         let resp = handler.chat_completion(&chat_req);
-                        if chat_req.stream {
-                            sse_response(resp)
-                        } else {
-                            http_ok(resp.to_json(), "application/json")
-                        }
+                        drop(handler);
+                        self.completion_response(resp, chat_req.stream)
                     }
                     None => http_bad("Invalid request body"),
                 }
@@ -306,13 +352,13 @@ impl ApiServer {
                 let comp_req = self.parse_completion_request(&req.body);
                 match comp_req {
                     Some(comp_req) => {
+                        if !self.input_allowed(&comp_req.prompt) {
+                            return http_forbidden();
+                        }
                         let mut handler = self.handler.lock().unwrap();
                         let resp = handler.completion(&comp_req);
-                        if comp_req.stream {
-                            sse_response(resp)
-                        } else {
-                            http_ok(resp.to_json(), "application/json")
-                        }
+                        drop(handler);
+                        self.completion_response(resp, comp_req.stream)
                     }
                     None => http_bad("Invalid request body"),
                 }
@@ -373,6 +419,15 @@ fn http_ok(body: String, content_type: &str) -> String {
 fn http_bad(body: &str) -> String {
     format!(
         "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(), body
+    )
+}
+
+fn http_forbidden() -> String {
+    // Never reflect the blocked prompt, generated content or scanner reason.
+    let body = r#"{"error":{"message":"Content blocked by Armor","type":"content_filter","code":"content_filter"}}"#;
+    format!(
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
         body.len(), body
     )
 }
@@ -457,6 +512,85 @@ fn parse_messages(json: &str) -> Option<Vec<ChatMessage>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    struct SensitiveHandler(Arc<AtomicUsize>);
+
+    impl ApiHandler for SensitiveHandler {
+        fn chat_completion(&mut self, _req: &ChatCompletionRequest) -> ChatCompletionResponse {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ChatCompletionResponse {
+                id: "test".into(), object: "chat.completion".into(), created: 0,
+                model: "test".into(),
+                choices: ["Contact alice@example.com", "Contact bob@example.com"].iter()
+                    .enumerate().map(|(index, text)| Choice {
+                        index, message: ChatMessage::assistant(text), finish_reason: "stop".into(),
+                    }).collect(),
+                usage: Usage { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            }
+        }
+        fn completion(&mut self, _req: &CompletionRequest) -> ChatCompletionResponse {
+            self.chat_completion(&ChatCompletionRequest {
+                model: "test".into(), messages: vec![], max_tokens: 1,
+                temperature: 1.0, top_p: 1.0, stream: false,
+            })
+        }
+        fn list_models(&self) -> Vec<ModelInfo> { vec![] }
+    }
+
+    fn armor_server() -> (ApiServer, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server = ApiServer::new(ApiServerConfig::default(), Box::new(SensitiveHandler(calls.clone())))
+            .with_armor(ArmorLayer::new());
+        (server, calls)
+    }
+
+    fn http_request(server: &ApiServer, path: &str, body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let (mut connection, _) = listener.accept().unwrap();
+                connection.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                server.handle_connection(&mut connection);
+            });
+            write!(client, "POST {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            response
+        })
+    }
+
+    #[test]
+    fn armor_redacts_every_choice_before_json_or_sse_delivery() {
+        for path in ["/v1/chat/completions", "/v1/completions"] {
+            for stream in [false, true] {
+                let (server, calls) = armor_server();
+                let body = format!(r#"{{"messages":[{{"role":"user","content":"Hello"}}],"prompt":"Hello","stream":{stream}}}"#);
+                let response = http_request(&server, path, &body);
+                assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert!(response.contains("Contact"));
+                assert!(!response.contains("alice@example.com"), "{response}");
+                assert!(!response.contains("bob@example.com"), "{response}");
+                if stream { assert!(response.contains("data: [DONE]")); }
+            }
+        }
+    }
+
+    #[test]
+    fn armor_rejects_input_before_handler_execution() {
+        let (server, calls) = armor_server();
+        for path in ["/v1/chat/completions", "/v1/completions"] {
+            let response = http_request(&server, path,
+                r#"{"messages":[{"role":"system","content":"alice@example.com"},{"role":"user","content":"Hello"}],"prompt":"alice@example.com"}"#);
+            assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+            assert!(!response.contains("alice@example.com"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn test_chat_message_constructors() {

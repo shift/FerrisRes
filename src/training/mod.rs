@@ -1,3 +1,4 @@
+pub(crate) mod params;
 pub mod optimizer;
 pub mod optimizer_scale;
 pub mod optimizer_adamem;

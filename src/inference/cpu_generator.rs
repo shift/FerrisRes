@@ -1,12 +1,13 @@
 //! CPU-side token generation for CpuBlockAttnResModel.
 //!
 //! Provides prefill (batch), incremental decode, and streaming generation
-//! using a CPU KV cache with optional TurboQuant + recurrent block summaries.
+//! using a CPU KV cache and causal token-local depth-block residuals.
 
 use std::collections::HashMap;
 use crate::error::Result;
 use crate::inference::logit_processors::{LogitProcessor, LogitProcessorConfig};
 use crate::model::cpu_block_attn_res::CpuBlockAttnResModel;
+use crate::model::block_residual::BlockResidualState;
 use crate::model::gemma_mapper::{apply_rope, apply_rope_gqa, gelu_tanh, rms_norm, matmul, per_head_rms_norm, per_head_rms_norm_no_scale};
 
 /// Per-layer CPU KV cache: stores K and V as contiguous f32 buffers.
@@ -166,16 +167,10 @@ impl CpuGenerateConfig {
 /// - Per-layer KV caching
 /// - KV sharing (layers 15-34 share K/V from layers computed earlier)
 /// - Inter-block attention at block boundaries
-/// - Optional recurrent block summaries for unlimited context
+/// - Token-local block summaries, reset for each forward/decode step
 pub struct CpuTokenGenerator {
     model: CpuBlockAttnResModel,
     kv_cache: CpuModelKVCache,
-    /// Block representations accumulated during generation.
-    block_reps: Vec<Vec<f32>>,
-    /// Partial sum accumulator for current block.
-    partial_sum: Vec<f32>,
-    /// Tokens in current block (for mean-pooling).
-    partial_count: usize,
     /// Shared KV: maps source_layer_idx → (K, V) computed during prefill/decode.
     shared_kv: HashMap<usize, (Vec<f32>, Vec<f32>)>,
 }
@@ -194,9 +189,6 @@ impl CpuTokenGenerator {
         Self {
             model,
             kv_cache,
-            block_reps: Vec::new(),
-            partial_sum: Vec::new(),
-            partial_count: 0,
             shared_kv: HashMap::new(),
         }
     }
@@ -219,10 +211,7 @@ impl CpuTokenGenerator {
 
         // Reset state
         self.kv_cache.reset_all();
-        self.block_reps.clear();
         self.shared_kv.clear();
-        self.partial_sum = vec![0.0f32; self.model.hidden_dim];
-        self.partial_count = 0;
 
         let mut logit_processor = LogitProcessor::new(config.to_logit_config());
         logit_processor.record_prompt(prompt_tokens);
@@ -265,13 +254,8 @@ impl CpuTokenGenerator {
         // 1. Embedding with Gemma scaling
         let mut hidden = self.embed_tokens(token_ids);
 
-        // 2. Initialize block reps with mean-pooled embedding
-        for t in 0..seq {
-            for d in 0..hd {
-                self.partial_sum[d] += hidden[t * hd + d];
-            }
-        }
-        self.partial_count = seq;
+        // 2. Keep separate depth summaries for every prompt position.
+        let mut blocks = BlockResidualState::new(&hidden);
 
         // 3. Pre-compute PLE inputs
         let ple_dim = self.model.hidden_size_per_layer_input;
@@ -333,25 +317,14 @@ impl CpuTokenGenerator {
                 }
             }
 
-            // Accumulate into partial_sum for block representation
-            for t in 0..seq {
-                for d in 0..hd {
-                    self.partial_sum[d] += hidden[t * hd + d];
-                }
-            }
-            self.partial_count += seq;
-
-            // Block boundary: inter-block attention
-            if self.model.is_block_boundary(layer_idx) {
-                self.finalize_block_and_inter_attn(&mut hidden, seq);
-            }
+            blocks.apply_layer(&self.model, &mut hidden, layer_idx);
         }
 
         // 5. Final norm + LM head
         let logits = self.compute_logits(&hidden, seq);
 
-        // Sample first token
-        let mut logits_vec = logits;
+        // Only the last prompt position predicts the next token.
+        let mut logits_vec = logits[logits.len() - self.model.vocab_size..].to_vec();
         let idx = logit_processor.process_and_sample(&mut logits_vec);
         Ok(idx as u32)
     }
@@ -367,6 +340,7 @@ impl CpuTokenGenerator {
 
         // 1. Embed single token
         let mut hidden = self.embed_tokens(&[token_id]);
+        let mut blocks = BlockResidualState::new(&hidden);
 
         // 2. PLE for single token
         let ple_dim = self.model.hidden_size_per_layer_input;
@@ -400,10 +374,7 @@ impl CpuTokenGenerator {
                 layer_idx, &hidden, ple_slice.as_deref(), pos, kv_shared,
             );
 
-            // Block boundary inter-block attention during decode
-            if layer_info[layer_idx].1 {
-                self.finalize_block_and_inter_attn(&mut hidden, 1);
-            }
+            blocks.apply_layer(&self.model, &mut hidden, layer_idx);
         }
 
         // 4. Final norm + LM head
@@ -550,29 +521,6 @@ impl CpuTokenGenerator {
         }
 
         hidden
-    }
-
-    /// Finalize a block and apply inter-block attention.
-    fn finalize_block_and_inter_attn(&mut self, hidden: &mut Vec<f32>, seq: usize) {
-        let hd = self.model.hidden_dim;
-
-        // Finalize block rep: mean pool the accumulated partial sum
-        if self.partial_count > 0 {
-            for d in 0..hd {
-                self.partial_sum[d] /= self.partial_count as f32;
-            }
-        }
-        self.block_reps.push(self.partial_sum.clone());
-        self.partial_sum = vec![0.0f32; hd];
-        self.partial_count = 0;
-
-        // Inter-block attention
-        let inter_out = self.model.inter_block_attention(hidden, &self.block_reps, seq);
-        for t in 0..seq {
-            for d in 0..hd {
-                hidden[t * hd + d] += inter_out[d];
-            }
-        }
     }
 
     /// Embed tokens with Gemma scaling.

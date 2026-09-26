@@ -4,6 +4,7 @@ use crate::compute::buffer::GpuBuffer;
 use crate::compute::kernels::elementwise::ElementWiseOp;
 use crate::autodiff::graph::{ComputationGraph, NodeId, NodeKind};
 use crate::error::{FerrisResError, Result};
+use crate::training::params::KernelParams;
 
 const MATMUL_GRAD_A_WGSL: &str = r#"
 struct Params {
@@ -16,7 +17,7 @@ struct Params {
 @group(0) @binding(1) var<storage, read> b_transposed: array<f32>;
 @group(0) @binding(2) var<storage, read_write> grad_a: array<f32>;
 
-var<private> params: Params;
+@group(1) @binding(0) var<uniform> params: Params;
 
 @compute @workgroup_size(64)
 fn matmul_grad_a(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -44,7 +45,7 @@ struct Params {
 @group(0) @binding(1) var<storage, read> grad_output: array<f32>;
 @group(0) @binding(2) var<storage, read_write> grad_b: array<f32>;
 
-var<private> params: Params;
+@group(1) @binding(0) var<uniform> params: Params;
 
 @compute @workgroup_size(64)
 fn matmul_grad_b(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -71,7 +72,7 @@ struct Params {
 @group(0) @binding(1) var<storage, read> grad_output: array<f32>;
 @group(0) @binding(2) var<storage, read_write> grad_input: array<f32>;
 
-var<private> params: Params;
+@group(1) @binding(0) var<uniform> params: Params;
 
 @compute @workgroup_size(256)
 fn softmax_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -117,7 +118,7 @@ struct Params {
 @group(0) @binding(2) var<storage, read> grad_output: array<f32>;
 @group(0) @binding(3) var<storage, read_write> grad_input: array<f32>;
 
-var<private> params: Params;
+@group(1) @binding(0) var<uniform> params: Params;
 
 @compute @workgroup_size(256)
 fn rmsnorm_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -157,7 +158,7 @@ struct Params {
 @group(0) @binding(1) var<storage, read> targets: array<u32>;
 @group(0) @binding(2) var<storage, read_write> grad_input: array<f32>;
 
-var<private> params: Params;
+@group(1) @binding(0) var<uniform> params: Params;
 
 @compute @workgroup_size(256)
 fn loss_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -206,6 +207,7 @@ pub struct BackwardPass {
     rmsnorm_grad_layout: wgpu::BindGroupLayout,
     loss_grad_pipeline: wgpu::ComputePipeline,
     loss_grad_layout: wgpu::BindGroupLayout,
+    params: KernelParams,
 }
 
 impl BackwardPass {
@@ -213,6 +215,7 @@ impl BackwardPass {
         tracing::info!(event = "creating_backwardpass_gradient_pipelines", "Creating BackwardPass gradient pipelines");
 
         let elementwise = ElementWiseOp::new(&device, &queue);
+        let params = KernelParams::new(&device);
 
         let matmul_grad_a_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("MatMul Grad A Shader"),
@@ -295,8 +298,8 @@ impl BackwardPass {
 
         let matmul_grad_a_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("MatMul Grad A Pipeline Layout"),
-            bind_group_layouts: &[Some(&matmul_grad_a_layout)],
-            immediate_size: 12,
+            bind_group_layouts: &[Some(&matmul_grad_a_layout), Some(&params.layout)],
+            immediate_size: 0,
         });
 
         let matmul_grad_a_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -315,8 +318,8 @@ impl BackwardPass {
 
         let matmul_grad_b_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("MatMul Grad B Pipeline Layout"),
-            bind_group_layouts: &[Some(&matmul_grad_b_layout)],
-            immediate_size: 12,
+            bind_group_layouts: &[Some(&matmul_grad_b_layout), Some(&params.layout)],
+            immediate_size: 0,
         });
 
         let matmul_grad_b_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -335,8 +338,8 @@ impl BackwardPass {
 
         let softmax_grad_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Softmax Grad Pipeline Layout"),
-            bind_group_layouts: &[Some(&softmax_grad_layout)],
-            immediate_size: 8,
+            bind_group_layouts: &[Some(&softmax_grad_layout), Some(&params.layout)],
+            immediate_size: 0,
         });
 
         let softmax_grad_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -373,15 +376,15 @@ impl BackwardPass {
             entries: &[
                 read_entry.clone(),
                 read_entry_b.clone(),
-                rw_entry.clone(),
+                wgpu::BindGroupLayoutEntry { binding: 2, ..read_entry.clone() },
                 rmsnorm_read_c,
             ],
         });
 
         let rmsnorm_grad_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("RmsNorm Grad Pipeline Layout"),
-            bind_group_layouts: &[Some(&rmsnorm_grad_layout)],
-            immediate_size: 16,
+            bind_group_layouts: &[Some(&rmsnorm_grad_layout), Some(&params.layout)],
+            immediate_size: 0,
         });
 
         let rmsnorm_grad_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -400,8 +403,8 @@ impl BackwardPass {
 
         let loss_grad_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Loss Grad Pipeline Layout"),
-            bind_group_layouts: &[Some(&loss_grad_layout)],
-            immediate_size: 16,
+            bind_group_layouts: &[Some(&loss_grad_layout), Some(&params.layout)],
+            immediate_size: 0,
         });
 
         let loss_grad_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -431,6 +434,7 @@ impl BackwardPass {
             rmsnorm_grad_layout,
             loss_grad_pipeline,
             loss_grad_layout,
+            params,
         }
     }
 
@@ -523,7 +527,7 @@ impl BackwardPass {
                 });
                 pass.set_pipeline(&self.matmul_grad_a_pipeline);
                 pass.set_bind_group(0, &bg_a, &[]);
-                pass.set_immediates(0, &[m.to_le_bytes(), k.to_le_bytes(), n.to_le_bytes()].concat());
+                self.params.bind(&self.device, &mut pass, &[m.to_le_bytes(), k.to_le_bytes(), n.to_le_bytes()].concat());
                 pass.dispatch_workgroups(wg_x, wg_y, 1);
                 drop(pass);
 
@@ -546,7 +550,7 @@ impl BackwardPass {
                 });
                 pass.set_pipeline(&self.matmul_grad_b_pipeline);
                 pass.set_bind_group(0, &bg_b, &[]);
-                pass.set_immediates(0, &[m.to_le_bytes(), k.to_le_bytes(), n.to_le_bytes()].concat());
+                self.params.bind(&self.device, &mut pass, &[m.to_le_bytes(), k.to_le_bytes(), n.to_le_bytes()].concat());
                 pass.dispatch_workgroups(wg_x_b, wg_y_b, 1);
                 drop(pass);
 
@@ -652,7 +656,7 @@ impl BackwardPass {
                 });
                 pass.set_pipeline(&self.softmax_grad_pipeline);
                 pass.set_bind_group(0, &bg, &[]);
-                pass.set_immediates(0, &[rows.to_le_bytes(), cols.to_le_bytes()].concat());
+                self.params.bind(&self.device, &mut pass, &[rows.to_le_bytes(), cols.to_le_bytes()].concat());
                 pass.dispatch_workgroups(wg, 1, 1);
                 drop(pass);
 
@@ -692,7 +696,7 @@ impl BackwardPass {
                 pass.set_pipeline(&self.rmsnorm_grad_pipeline);
                 pass.set_bind_group(0, &bg, &[]);
                 let eps_bytes = 1e-5_f32.to_le_bytes();
-                pass.set_immediates(0, &[
+                self.params.bind(&self.device, &mut pass, &[
                     hidden_dim.to_le_bytes(),
                     eps_bytes,
                     0u32.to_le_bytes(),
@@ -766,7 +770,7 @@ impl BackwardPass {
                 });
                 pass.set_pipeline(&self.loss_grad_pipeline);
                 pass.set_bind_group(0, &bg, &[]);
-                pass.set_immediates(0, &[
+                self.params.bind(&self.device, &mut pass, &[
                     batch_size.to_le_bytes(),
                     vocab_size.to_le_bytes(),
                     0u32.to_le_bytes(),
@@ -799,7 +803,7 @@ impl BackwardPass {
                     @group(0) @binding(0) var<storage, read> token_ids: array<u32>;
                     @group(0) @binding(1) var<storage, read> grad_out: array<f32>;
                     @group(0) @binding(2) var<storage, read_write> grad_emb: array<f32>;
-                    var<private> p: EP;
+                    @group(1) @binding(0) var<uniform> p: EP;
 
                     @compute @workgroup_size(256)
                     fn scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -859,8 +863,8 @@ impl BackwardPass {
 
                 let emb_grad_pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("Embedding Grad Pipeline Layout"),
-                    bind_group_layouts: &[Some(&emb_grad_layout)],
-                    immediate_size: 16,
+                    bind_group_layouts: &[Some(&emb_grad_layout), Some(&self.params.layout)],
+                    immediate_size: 0,
                 });
 
                 let emb_grad_pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -893,7 +897,7 @@ impl BackwardPass {
                 });
                 pass.set_pipeline(&emb_grad_pipeline);
                 pass.set_bind_group(0, &bg, &[]);
-                pass.set_immediates(0, &[
+                self.params.bind(&self.device, &mut pass, &[
                     vocab_size.to_le_bytes(),
                     hidden_dim.to_le_bytes(),
                     seq_len.to_le_bytes(),
@@ -1038,7 +1042,7 @@ impl BackwardPass {
         });
         pass.set_pipeline(&self.matmul_grad_a_pipeline);
         pass.set_bind_group(0, &bg, &[]);
-        pass.set_immediates(0, &[m.to_le_bytes(), n.to_le_bytes(), k.to_le_bytes()].concat());
+        self.params.bind(&self.device, &mut pass, &[m.to_le_bytes(), n.to_le_bytes(), k.to_le_bytes()].concat());
         pass.dispatch_workgroups(wg_x, wg_y, 1);
         drop(pass);
 
@@ -1074,7 +1078,7 @@ impl BackwardPass {
         });
         pass.set_pipeline(&self.matmul_grad_b_pipeline);
         pass.set_bind_group(0, &bg, &[]);
-        pass.set_immediates(0, &[m.to_le_bytes(), k.to_le_bytes(), n.to_le_bytes()].concat());
+        self.params.bind(&self.device, &mut pass, &[m.to_le_bytes(), k.to_le_bytes(), n.to_le_bytes()].concat());
         pass.dispatch_workgroups(wg_x, wg_y, 1);
         drop(pass);
 
@@ -1098,7 +1102,7 @@ impl BackwardPass {
             }
             @group(0) @binding(0) var<storage, read> grad_out: array<f32>;
             @group(0) @binding(1) var<storage, read_write> grad_bias: array<f32>;
-            var<private> p: BP;
+            @group(1) @binding(0) var<uniform> p: BP;
 
             @compute @workgroup_size(256)
             fn sum_rows(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -1146,8 +1150,8 @@ impl BackwardPass {
 
         let bias_grad_pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Bias Grad Sum Pipeline Layout"),
-            bind_group_layouts: &[Some(&bias_grad_layout)],
-            immediate_size: 8,
+            bind_group_layouts: &[Some(&bias_grad_layout), Some(&self.params.layout)],
+            immediate_size: 0,
         });
 
         let bias_grad_pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1174,7 +1178,7 @@ impl BackwardPass {
         });
         pass.set_pipeline(&bias_grad_pipeline);
         pass.set_bind_group(0, &bg, &[]);
-        pass.set_immediates(0, &[batch.to_le_bytes(), out_features.to_le_bytes()].concat());
+        self.params.bind(&self.device, &mut pass, &[batch.to_le_bytes(), out_features.to_le_bytes()].concat());
         pass.dispatch_workgroups(wg, 1, 1);
         drop(pass);
 

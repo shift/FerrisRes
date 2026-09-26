@@ -251,6 +251,7 @@ impl UnifiedTokenGenerator {
         let vocab_size = self.lm_head.vocab_size();
         let logits_bytes = vocab_size * f32_size;
         let logits_buf = GpuBuffer::new(&self.device, logits_bytes, Some("unified_prefill_logits"))?;
+        let last_hidden = self.model.finalize_hidden_states(&mut encoder, last_hidden, 1)?;
         self.lm_head.forward(&mut encoder, &last_hidden, &logits_buf, 1)?;
         self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -307,6 +308,7 @@ impl UnifiedTokenGenerator {
             }
 
             let logits_buf = GpuBuffer::new(&self.device, logits_bytes, Some("unified_decode_logits"))?;
+            let current = self.model.finalize_hidden_states(&mut encoder, current, 1)?;
             self.lm_head.forward(&mut encoder, &current, &logits_buf, 1)?;
             self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -413,6 +415,10 @@ impl UnifiedTokenGenerator {
                 Ok(b) => b,
                 Err(_) => return,
             };
+            let last_hidden = match self.model.finalize_hidden_states(&mut encoder, last_hidden, 1) {
+                Ok(hidden) => hidden,
+                Err(_) => return,
+            };
             if self.lm_head.forward(&mut encoder, &last_hidden, &logits_buf, 1).is_err() {
                 return;
             }
@@ -463,6 +469,10 @@ impl UnifiedTokenGenerator {
 
                 let logits_buf = match GpuBuffer::new(&self.device, logits_bytes, Some("ustream_decode_logits")) {
                     Ok(b) => b,
+                    Err(_) => return,
+                };
+                let current = match self.model.finalize_hidden_states(&mut encoder, current, 1) {
+                    Ok(hidden) => hidden,
                     Err(_) => return,
                 };
                 if self.lm_head.forward(&mut encoder, &current, &logits_buf, 1).is_err() {

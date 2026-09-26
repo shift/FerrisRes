@@ -6,6 +6,7 @@ use wgpu::{Device, Queue};
 use crate::compute::buffer::GpuBuffer;
 use crate::compute::kernels::elementwise::ElementWiseOp;
 use crate::error::{FerrisResError, Result};
+use crate::training::params::KernelParams;
 
 const ADAM_WGSL: &str = r#"
 struct Params {
@@ -24,7 +25,7 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> v: array<f32>;
 @group(0) @binding(3) var<storage, read_write> param: array<f32>;
 
-var<private> p: Params;
+@group(1) @binding(0) var<uniform> p: Params;
 
 @compute @workgroup_size(256)
 fn adam_update(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -59,7 +60,7 @@ struct LossParams {
 @group(0) @binding(1) var<storage, read> targets: array<u32>;
 @group(0) @binding(2) var<storage, read_write> loss_output: array<f32>;
 
-var<private> params: LossParams;
+@group(1) @binding(0) var<uniform> params: LossParams;
 
 @compute @workgroup_size(64)
 fn cross_entropy(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -157,6 +158,7 @@ pub struct AdamOptimizer {
     elementwise: ElementWiseOp,
     adam_pipeline: wgpu::ComputePipeline,
     adam_bind_group_layout: wgpu::BindGroupLayout,
+    params: KernelParams,
 }
 
 impl AdamOptimizer {
@@ -229,9 +231,10 @@ impl AdamOptimizer {
             entries: &[read_entry, rw_entry, rw_entry_v, rw_entry_param],
         });
 
+        let params = KernelParams::new(&device);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Adam Pipeline Layout"),
-            bind_group_layouts: &[Some(&adam_bind_group_layout)],
+            bind_group_layouts: &[Some(&adam_bind_group_layout), Some(&params.layout)],
             immediate_size: 0,
         });
 
@@ -257,6 +260,7 @@ impl AdamOptimizer {
             elementwise,
             adam_pipeline,
             adam_bind_group_layout,
+            params,
         }
     }
 
@@ -337,10 +341,7 @@ impl AdamOptimizer {
 
         pass.set_pipeline(&self.adam_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.set_immediates(
-            0,
-            unsafe { std::slice::from_raw_parts(&params as *const AdamParams as *const u8, std::mem::size_of::<AdamParams>()) },
-        );
+        self.params.bind(&self.device, &mut pass, bytemuck::bytes_of(&params));
         pass.dispatch_workgroups(workgroup_count, 1, 1);
 
         drop(pass);
@@ -353,7 +354,8 @@ impl AdamOptimizer {
     }
 }
 
-#[repr(C, packed)]
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct AdamParams {
     beta1: f32,
     one_minus_beta1: f32,
@@ -369,6 +371,7 @@ pub struct CrossEntropyLoss {
     device: Arc<Device>,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    params: KernelParams,
 }
 
 impl CrossEntropyLoss {
@@ -418,9 +421,10 @@ impl CrossEntropyLoss {
             entries: &[read_entry, targets_read_entry, rw_entry],
         });
 
+        let params = KernelParams::new(&device);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Cross Entropy Loss Pipeline Layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
+            bind_group_layouts: &[Some(&bind_group_layout), Some(&params.layout)],
             immediate_size: 0,
         });
 
@@ -437,6 +441,7 @@ impl CrossEntropyLoss {
             device,
             pipeline,
             bind_group_layout,
+            params,
         }
     }
 
@@ -490,10 +495,7 @@ impl CrossEntropyLoss {
 
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.set_immediates(
-            0,
-            unsafe { std::slice::from_raw_parts(&params as *const LossParams as *const u8, std::mem::size_of::<LossParams>()) },
-        );
+        self.params.bind(&self.device, &mut pass, bytemuck::bytes_of(&params));
         pass.dispatch_workgroups(workgroup_count, 1, 1);
 
         drop(pass);
@@ -502,7 +504,8 @@ impl CrossEntropyLoss {
     }
 }
 
-#[repr(C, packed)]
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct LossParams {
     batch_size: u32,
     vocab_size: u32,

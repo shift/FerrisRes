@@ -2469,7 +2469,6 @@ async fn cmd_serve(
         model_name: model_name.clone(),
         tokenizer,
         loaded_model,
-        _armor: armor,
     });
 
     let server_config = ferrisres::server::ApiServerConfig {
@@ -2478,7 +2477,11 @@ async fn cmd_serve(
         model_name,
     };
 
-    let server = ferrisres::server::ApiServer::new(server_config, handler);
+    let mut server = ferrisres::server::ApiServer::new(server_config, handler);
+    if armor {
+        server = server.with_armor(ferrisres::ArmorLayer::new());
+        info!(event = "armor_enabled", "API Armor request/response filtering enabled (L0/L1/L3; no hidden-state L2 hook)");
+    }
     info!(event = "server_starting", "FerrisRes API server starting on {}:{}", host, port);
     println!("FerrisRes API server starting on {}:{}", host, port);
     println!("Endpoints:");
@@ -2496,7 +2499,6 @@ struct FerrisResApiHandler {
     model_name: String,
     tokenizer: Arc<dyn Send + Sync + Fn(&str) -> Vec<u32>>,
     loaded_model: Option<Gemma4Teacher>,
-    _armor: bool,
 }
 
 impl ferrisres::server::ApiHandler for FerrisResApiHandler {

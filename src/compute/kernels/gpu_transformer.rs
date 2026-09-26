@@ -25,6 +25,8 @@ const RMSNORM_WEIGHTED_WGSL: &str = r#"
 struct Params {
     hidden_dim: u32,
     rows: u32,
+    epsilon: f32,
+    _padding: u32,
 }
 
 @group(0) @binding(0) var<storage, read> input: array<f32>;
@@ -62,7 +64,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
     // Phase 3: broadcast inv_rms, apply norm + weight
     var inv_rms = 1.0;
     if (col == 0u) {
-        inv_rms = inverseSqrt(wg_data[0u] / f32(hidden_dim) + 1e-6);
+        inv_rms = inverseSqrt(wg_data[0u] / f32(hidden_dim) + params.epsilon);
         wg_data[0u] = inv_rms;
     }
     workgroupBarrier();
@@ -538,10 +540,35 @@ impl GpuTransformerPipeline {
         rows: u32,
         hidden_dim: u32,
     ) -> Result<()> {
-        let params_data: [u32; 2] = [hidden_dim, rows];
+        self.dispatch_rmsnorm_with_epsilon(device, queue, encoder, input, output, weight, rows, hidden_dim, 1e-6)
+    }
+
+    /// Weighted RMSNorm with a distinct epsilon uniform for every dispatch.
+    pub fn dispatch_rmsnorm_with_epsilon(
+        &self,
+        device: &Device,
+        queue: &Queue,
+        encoder: &mut CommandEncoder,
+        input: &GpuBuffer,
+        output: &GpuBuffer,
+        weight: &GpuBuffer,
+        rows: u32,
+        hidden_dim: u32,
+        epsilon: f32,
+    ) -> Result<()> {
+        if !epsilon.is_finite() || epsilon < f32::MIN_POSITIVE || rows == 0 || hidden_dim == 0 {
+            return Err(crate::error::FerrisResError::Shape("RMSNorm requires positive dimensions and positive normal finite epsilon".into()));
+        }
+        let bytes = u64::from(rows).checked_mul(u64::from(hidden_dim))
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| crate::error::FerrisResError::Shape("RMSNorm byte size overflow".into()))?;
+        if (input.size() as u64) < bytes || (output.size() as u64) < bytes || (weight.size() as u64) < u64::from(hidden_dim) * 4 {
+            return Err(crate::error::FerrisResError::Shape("RMSNorm buffer is smaller than its declared dimensions".into()));
+        }
+        let params_data: [u32; 4] = [hidden_dim, rows, epsilon.to_bits(), 0];
         let params_buf = device.create_buffer(&BufferDescriptor {
             label: Some("rmsnorm_params"),
-            size: 8,
+            size: 16,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });

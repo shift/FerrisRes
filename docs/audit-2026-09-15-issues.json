@@ -1,0 +1,227 @@
+[
+  {
+    "key": "A01",
+    "priority": "critical",
+    "title": "Preserve causality in CPU BlockAttnRes summaries",
+    "location": "src/model/cpu_block_attn_res.rs:640-710,1555-1610; src/training/backward.rs:57-61,230-237",
+    "evidence": "Reproduced: changing only second token flips first-token logit from +0.54119587 to -0.54119587 in forward and forward_train. Full-sequence mean summaries are broadcast to every token.",
+    "fix": "Use per-token causal depth summaries; add prefix-invariance and prefill/decode equivalence tests. See cpu_forward_prefix_logits_are_causal and cpu_training_prefix_logits_are_causal.",
+    "task_id": "1f821f56-be94-4e67-9176-8bb665be0236"
+  },
+  {
+    "key": "A02",
+    "priority": "critical",
+    "title": "Repair GPU optimizer and autodiff parameter bindings",
+    "location": "src/training/optimizer.rs:27,62,423-425,492; src/autodiff/backward.rs:19,47,74,120,160",
+    "evidence": "Reproduced cross entropy validation: set_immediates size16 exceeds pipeline immediate_size0. WGSL parameters are private zero-initialized variables, not uniform/immediate bindings. Same pattern exists in Adam and autodiff shaders; those variants source-verified only.",
+    "fix": "Wire parameters consistently through supported bindings, configure pipeline ranges, then verify cross entropy, Adam, and backward numerically. See gpu_cross_entropy_dispatch_is_valid.",
+    "task_id": "65ad0745-5902-4b43-bb29-b6a12096cd27"
+  },
+  {
+    "key": "A03",
+    "priority": "critical",
+    "title": "Upload trained weights in AnyModel file loaders",
+    "location": "src/model/dispatcher.rs:184-228",
+    "evidence": "Source-verified: from_safetensors/from_gguf only infer configuration then invoke constructors; parsed tensor values never enter created model. Does not implicate separate CPU Gemma loaders.",
+    "fix": "Validate/map/upload all tensors and compare outputs against a reference checkpoint; missing required weights must error.",
+    "task_id": "95b2091a-4955-466a-bca0-be613d300647"
+  },
+  {
+    "key": "A04",
+    "priority": "critical",
+    "title": "Enforce Armor when enabled on API server",
+    "location": "src/main.rs:2468-2472,2495-2610",
+    "evidence": "Source-verified: serve stores armor in unused _armor field; neither completion handler performs input checks or output sanitization. --armor gives false assurance.",
+    "fix": "Wire Armor checks into server generation or reject unsupported flag; test blocked input and redacted output through HTTP.",
+    "task_id": "e10937fe-2879-4075-89a7-3f9615561585"
+  },
+  {
+    "key": "A05",
+    "priority": "high",
+    "title": "Bound HTTP input and enforce connection deadlines",
+    "location": "src/server/mod.rs:166-194,249-258",
+    "evidence": "Source-verified: serial accept loop, unbounded read_line and Content-Length allocation, no read timeout. One idle client blocks all service; huge declared body can exhaust memory. No destructive/OOM probe performed.",
+    "fix": "Limit headers/body, validate framing and reject over-limit lengths before allocation, enforce deadlines and bounded concurrency. Test slow/incomplete requests safely.",
+    "task_id": "a80d4d37-2b6d-4960-906f-2b5329ca16a7"
+  },
+  {
+    "key": "A06",
+    "priority": "high",
+    "title": "Replace substring API request parsing with validated JSON",
+    "location": "src/server/mod.rs:324-359,400-455",
+    "evidence": "Source-verified: parsers always return Some, messages require literal {\"role\", strings stop at escaped quotes, stream detection requires exact \"stream\":true. Valid whitespace/key reordering changes meaning and malformed input is accepted.",
+    "fix": "Use serde request types and range/schema validation; test pretty JSON, reordered keys, escaped content, malformed bodies and streaming booleans.",
+    "task_id": "e4cf60c3-46da-4ca1-baf4-a8d1f1710bea"
+  },
+  {
+    "key": "A07",
+    "priority": "medium",
+    "title": "Reject incomplete HTTP bodies instead of zero padding",
+    "location": "src/server/mod.rs:192-197",
+    "evidence": "Reproduced: declares Content-Length5, sends abc and closes write side; parser returns Some with zero-padded body because read_exact error is ignored.",
+    "fix": "Propagate read failures and return 400; see truncated_http_body_is_rejected.",
+    "task_id": "f2bad3db-5284-4dd3-b931-8d7e15f09a6b"
+  },
+  {
+    "key": "A08",
+    "priority": "medium",
+    "title": "Serialize all API response fields with JSON escaping",
+    "location": "src/server/mod.rs:106-137",
+    "evidence": "Reproduced: assistant content containing U+0001 produces invalid JSON. Other string fields such as model/id/role are interpolated without escaping.",
+    "fix": "Serialize structured responses with serde_json; test control characters and quoted model names. See response_with_control_character_is_valid_json.",
+    "task_id": "116fd67e-7e61-4c5a-b699-007c6b71e481"
+  },
+  {
+    "key": "A09",
+    "priority": "medium",
+    "title": "Implement OpenAI-compatible completion and SSE response schemas",
+    "location": "src/server/mod.rs:296-314,383-391; src/main.rs:2566-2600",
+    "evidence": "Source-verified: stream=true computes complete response before returning one full-response SSE event, not chat.completion.chunk delta events. Text completion choices use message instead of text.",
+    "fix": "Separate text/chat response types, emit real incremental SSE chunks and correct finish reasons; test with an OpenAI client.",
+    "task_id": "b55ec85c-df4a-4289-966a-f3f571506717"
+  },
+  {
+    "key": "A10",
+    "priority": "high",
+    "title": "Enforce host shell timeouts and bounded output capture",
+    "location": "src/inference/host_tools.rs:196-231",
+    "evidence": "Reproduced: sleep2 with timeout_secs1 completes successfully. Timeout variable unused; Command::output buffers all output before truncation. Post-hoc truncation can also split UTF-8.",
+    "fix": "Use supervised child/process-group deadlines and bounded concurrent stdout/stderr reads; see shell_timeout_is_enforced.",
+    "task_id": "23d77210-e8cb-44e8-97ec-25babebf281d"
+  },
+  {
+    "key": "A11",
+    "priority": "high",
+    "title": "Enforce web_fetch max_bytes during response reads",
+    "location": "src/inference/host_tools.rs:115-119",
+    "evidence": "Reproduced with local HTTP fixture: 6-byte response returned despite max_bytes1; _max_bytes unused and entire body read into memory.",
+    "fix": "Read through a bounded reader with explicit truncation/error semantics, including decompressed data; see web_fetch_obeys_byte_limit.",
+    "task_id": "1ae1d9a8-1d8d-4dfd-90df-aed3135fc5d4"
+  },
+  {
+    "key": "A12",
+    "priority": "high",
+    "title": "Make file_read bounded and UTF-8-safe",
+    "location": "src/inference/host_tools.rs:150-156",
+    "evidence": "Reproduced: reading \u00e9 with max_bytes1 panics at byte index1. Entire file is read before applying limit, so max_bytes does not bound memory.",
+    "fix": "Bound reads before allocation growth and truncate only at valid character boundaries; see file_read_unicode_limit_does_not_panic.",
+    "task_id": "928be780-2290-40fe-a05c-4f66bea0b6c7"
+  },
+  {
+    "key": "A13",
+    "priority": "high",
+    "title": "Correct autoregressive decode RoPE position off-by-one",
+    "location": "src/inference/generator.rs:307,481; src/inference/unified_generator.rs:268,433; src/model/standard_transformer.rs:410-414",
+    "evidence": "Source-verified: first sampled token follows prompt positions0..N-1 and must use positionN, but both generators pass N+1. Layer uses supplied effective_pos directly.",
+    "fix": "Use zero-based N+step and test cached logits against full-forward prefix logits, including context-extension modes.",
+    "task_id": "a324c6d7-347b-4819-91d2-a8669871dd80"
+  },
+  {
+    "key": "A14",
+    "priority": "medium",
+    "title": "Honor zero output-token limits in GPU generators",
+    "location": "src/inference/generator.rs:294-306; src/inference/unified_generator.rs:257-267,342-432",
+    "evidence": "Source-verified: first token sampled/appended before max_tokens check, so nonempty prompt with max_tokens0 still produces one token. Audit streaming max_new_tokens0 too.",
+    "fix": "Return empty output before prefill for zero budget; test buffered and streaming APIs.",
+    "task_id": "6ff235b1-7f5e-42e2-bcbe-6e5e47a0a773"
+  },
+  {
+    "key": "A15",
+    "priority": "high",
+    "title": "Use cache-local indices for repeated context compaction",
+    "location": "src/inference/unified_generator.rs:272-292,432-434; src/inference/kv_cache.rs:157-200",
+    "evidence": "Source-verified: compaction selects indices from growing global_pos even after physical cache shrinks, and triggers every later step; eventually copies beyond physical capacity. Streaming decode lacks equivalent compaction.",
+    "fix": "Separate absolute RoPE positions from current physical cache indices, validate every index, and test multiple capacity crossings and streaming parity.",
+    "task_id": "7fc711da-647c-4c3b-95ab-fa15caa87e28"
+  },
+  {
+    "key": "A16",
+    "priority": "high",
+    "title": "Infer attention heads from metadata rather than square projection width",
+    "location": "src/model/dispatcher.rs:405-417",
+    "evidence": "Source-verified: for square 4096x4096 q_proj, infer_num_heads returns4096, implying head_dim1. Projection shape alone cannot determine head count.",
+    "fix": "Load architecture config/head metadata and reject ambiguity; test LLaMA-style square Q projection and GQA.",
+    "task_id": "a8800f37-3493-4c7d-bc38-1ce8fa936ef9"
+  },
+  {
+    "key": "A17",
+    "priority": "high",
+    "title": "Implement architecture-correct standard-transformer gated FFN",
+    "location": "src/model/standard_transformer.rs:325-326,464-465",
+    "evidence": "Source-verified: prefill/decode use ReLU(gate)+up, not SiLU(gate)*up required for supported LLaMA/Mistral SwiGLU. Other advertised families require their own activation.",
+    "fix": "Represent architecture-specific activation/gating and compare per-layer outputs to reference models.",
+    "task_id": "e67822f4-dba7-4de7-ad01-9794dd3cf968"
+  },
+  {
+    "key": "A18",
+    "priority": "high",
+    "title": "Correct autodiff matmul gradient layouts and dispatch coverage",
+    "location": "src/autodiff/backward.rs:8-60,506-552",
+    "evidence": "Source-verified: kernels index B/A as transposed but dispatcher binds original buffers. workgroup_size64 is 1D while Y dispatch is divided by64, so columns are under-covered even after parameter binding repair.",
+    "fix": "Correct row-major transpose indexing and 2D coverage; use non-square finite-difference gradient checks after A02.",
+    "task_id": "cc500f88-5288-461c-aa96-b73c94a6e508"
+  },
+  {
+    "key": "A19",
+    "priority": "high",
+    "title": "Accumulate gradients for every reverse-mode graph edge",
+    "location": "src/autodiff/backward.rs:99-104,638-656; src/autodiff/graph.rs",
+    "evidence": "Source-verified: ReLU/softmax/matmul write directly to input gradients while Add/Scale accumulate; multiple consumers overwrite earlier contributions.",
+    "fix": "Accumulate all contributions using safe temporary buffers or ordered addition; test x feeding two ReLUs and a diamond graph, after A02.",
+    "task_id": "e5f98e40-47e0-40ad-8fa1-985b3b4d63ea"
+  },
+  {
+    "key": "A20",
+    "priority": "high",
+    "title": "Correct RMSNorm autodiff Jacobian and preserve epsilon",
+    "location": "src/autodiff/backward.rs:133-144,660-702",
+    "evidence": "Source-verified: unit-scale formula is inv_rms/d*(g-y*dot(g,y)) rather than inv_rms*(g-y*dot(g,y)/d); dispatcher discards NodeKind epsilon and sends1e-5.",
+    "fix": "Implement correct normalization/weight derivatives and use node epsilon; verify numerical gradients for multiple rows and non-default epsilon after A02.",
+    "task_id": "c9a3b3e1-6ea9-4e67-affb-0c66b4bda549"
+  },
+  {
+    "key": "A21",
+    "priority": "high",
+    "title": "Replace CLI distillation surrogate gradients with valid chain-rule backprop",
+    "location": "src/main.rs:1933-2035",
+    "evidence": "Source-verified: immutable d_hidden= d_logits@lm_head^T is reused unchanged across all layers and substituted/truncated for Q/K/V gradients, omitting attention and normalization Jacobians. Freezing base weights does not justify omission.",
+    "fix": "Backpropagate through frozen operations to trainable adapters, validate end-to-end finite differences, or explicitly expose approximation as a separate experimental mode.",
+    "task_id": "f37aa4d4-dc19-463d-b9fd-b90d10756d9e"
+  },
+  {
+    "key": "A22",
+    "priority": "high",
+    "title": "Honor API generation settings and model stop tokens",
+    "location": "src/main.rs:2515-2518,2570-2574",
+    "evidence": "Source-verified: chat uses hardcoded256 tokens and temperature0.7; text ignores requested temperature; both pass EOS=None, chat ignores top_p and always reports stop.",
+    "fix": "Pass validated request configuration and model EOS through generation; test max_tokens0/1, greedy temperature, top_p and finish_reason.",
+    "task_id": "22fa4eda-9e41-40b7-b9aa-045c2fd5fa82"
+  },
+  {
+    "key": "A23",
+    "priority": "high",
+    "title": "Decode API outputs with the loaded tokenizer",
+    "location": "src/main.rs:2423-2440,2517-2519,2573-2575",
+    "evidence": "Source-verified: HF tokenizer is retained only as encoding closure, while output IDs are decoded using SimpleTokenizer. Real model vocab IDs yield corrupt output.",
+    "fix": "Retain encode/decode tokenizer pair and stop silently falling back to incompatible tokenization for loaded models; test HF roundtrip and generated vocabulary IDs.",
+    "task_id": "d99b9a99-6fd8-4bf5-96e9-4c54cd7a3b9b"
+  },
+  {
+    "key": "A24",
+    "priority": "high",
+    "title": "Reject zero or invalid GGUF alignment without panicking",
+    "location": "src/model/gguf.rs:752-760,784-785",
+    "evidence": "Reproduced: tiny GGUFv3 file with general.alignment UInt32=0 panics at gguf.rs:785: attempt to divide by zero. See gguf_zero_alignment_returns_error_without_panic.",
+    "fix": "Validate nonzero supported alignment and checked offset arithmetic; add tiny malformed metadata fixture and fuzz loader.",
+    "task_id": "a81fd196-dacf-4300-bfcd-409c93262645"
+  },
+  {
+    "key": "A25",
+    "priority": "high",
+    "title": "Reject or handle empty prompts in CPU server generation",
+    "location": "src/main.rs:2635-2653; src/server/mod.rs:345-359",
+    "evidence": "Source-verified: empty prompt yields empty token vector with SimpleTokenizer; generate_cpu computes (all_tokens.len()-1)*vocab_size, underflow/index panic. Server JSON parser permits missing/empty prompt and handles requests serially without panic isolation.",
+    "fix": "Validate nonempty token input or add BOS token, reject invalid requests, and test empty completions with loaded model.",
+    "task_id": "b6e0143e-a804-4d34-936c-73eade53746d"
+  }
+]

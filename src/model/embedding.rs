@@ -8,19 +8,28 @@ const EMBED_WGSL: &str = r#"
 @group(0) @binding(1) var<storage, read> input_ids: array<u32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
-var<private> vocab_size: u32;
-var<private> hidden_dim: u32;
+struct Params {
+    vocab_size: u32,
+    hidden_dim: u32,
+    batch_size: u32,
+    _padding: u32,
+}
+@group(0) @binding(3) var<uniform> params: Params;
 
 @compute @workgroup_size(256)
 fn embed_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tid = gid.x;
+    if (tid >= params.batch_size) { return; }
     let token_id = input_ids[tid];
-    if (token_id >= vocab_size) {
+    let out_offset = tid * params.hidden_dim;
+    if (token_id >= params.vocab_size) {
+        for (var j = 0u; j < params.hidden_dim; j = j + 1u) {
+            output[out_offset + j] = 0.0;
+        }
         return;
     }
-    let row_offset = token_id * hidden_dim;
-    let out_offset = tid * hidden_dim;
-    for (var j: u32 = 0u; j < hidden_dim; j = j + 1u) {
+    let row_offset = token_id * params.hidden_dim;
+    for (var j = 0u; j < params.hidden_dim; j = j + 1u) {
         output[out_offset + j] = weights[row_offset + j];
     }
 }
@@ -33,14 +42,13 @@ pub struct TokenEmbedding {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     device: Arc<Device>,
-    #[allow(dead_code)]
     queue: Arc<Queue>,
 }
 
 impl TokenEmbedding {
     pub fn new(
         device: Arc<Device>,
-    queue: Arc<Queue>,
+        queue: Arc<Queue>,
         vocab_size: usize,
         hidden_dim: usize,
     ) -> Result<Self> {
@@ -49,7 +57,12 @@ impl TokenEmbedding {
             vocab_size, hidden_dim
         );
 
-        let weight_bytes = vocab_size * hidden_dim * std::mem::size_of::<f32>();
+        let elements = vocab_size.checked_mul(hidden_dim).filter(|&n| n > 0 && n <= u32::MAX as usize)
+            .ok_or_else(|| crate::error::FerrisResError::Shape("invalid embedding dimensions".into()))?;
+        let weight_bytes = elements.checked_mul(4).filter(|&n|
+            n as u64 <= device.limits().max_storage_buffer_binding_size
+                && n as u64 <= device.limits().max_buffer_size)
+            .ok_or_else(|| crate::error::FerrisResError::Shape("embedding table exceeds device limits".into()))?;
         let weight = GpuBuffer::zeros(&device, &queue, weight_bytes, Some("TokenEmbedding Weight"))?;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -90,15 +103,25 @@ impl TokenEmbedding {
             count: None,
         };
 
+        let params_entry = wgpu::BindGroupLayoutEntry {
+            binding: 3,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("TokenEmbedding Bind Group Layout"),
-            entries: &[weights_entry, input_ids_entry, output_entry],
+            entries: &[weights_entry, input_ids_entry, output_entry, params_entry],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("TokenEmbedding Pipeline Layout"),
             bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 8,
+            immediate_size: 0,
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -123,6 +146,7 @@ impl TokenEmbedding {
         })
     }
 
+    /// Gather rows; out-of-vocabulary IDs produce zero rows. Zero batch is a no-op.
     pub fn forward(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -130,7 +154,27 @@ impl TokenEmbedding {
         output: &GpuBuffer,
         batch_size: u32,
     ) -> Result<()> {
-        let workgroup_count = (batch_size + 255) / 256;
+        if batch_size == 0 { return Ok(()); }
+        let elements = (batch_size as usize).checked_mul(self.hidden_dim)
+            .filter(|&n| n <= u32::MAX as usize)
+            .ok_or_else(|| crate::error::FerrisResError::Shape("embedding output index overflow".into()))?;
+        let bytes = elements.checked_mul(4)
+            .ok_or_else(|| crate::error::FerrisResError::Shape("embedding output size overflow".into()))?;
+        if (input_ids.size() as u64) < u64::from(batch_size) * 4 || output.size() < bytes {
+            return Err(crate::error::FerrisResError::Shape("embedding input/output buffer too small".into()));
+        }
+        let workgroup_count = batch_size.div_ceil(256);
+        if workgroup_count > self.device.limits().max_compute_workgroups_per_dimension {
+            return Err(crate::error::FerrisResError::Shape("embedding dispatch exceeds device limits".into()));
+        }
+        let params = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("TokenEmbedding Params"), size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&params, 0, bytemuck::cast_slice(&[
+            self.vocab_size as u32, self.hidden_dim as u32, batch_size, 0,
+        ]));
 
         tracing::debug!(
             "TokenEmbedding::forward batch_size={} workgroups={}",
@@ -153,12 +197,9 @@ impl TokenEmbedding {
                     binding: 2,
                     resource: output.buffer().as_entire_binding(),
                 },
+                wgpu::BindGroupEntry { binding: 3, resource: params.as_entire_binding() },
             ],
         });
-
-        let mut immediates = [0u8; 8];
-        immediates[0..4].copy_from_slice(&(self.vocab_size as u32).to_le_bytes());
-        immediates[4..8].copy_from_slice(&(self.hidden_dim as u32).to_le_bytes());
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("TokenEmbedding Compute Pass"),
@@ -167,7 +208,6 @@ impl TokenEmbedding {
 
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.set_immediates(0, &immediates);
         pass.dispatch_workgroups(workgroup_count, 1, 1);
 
         drop(pass);

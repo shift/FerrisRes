@@ -1,0 +1,14 @@
+Baseline: cargo test --lib --tests -- --test-threads=1
+test result: ok. 1596 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 69.53s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.90s
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.35s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.75s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+Clippy: cargo clippy --all-targets -- -D warnings
+FerrisRes development environment activated.
+Vulkan SDK tools available (try running vulkaninfo).
+Rust version: rustc 1.94.1 (e408947bf 2026-03-25)
+    Checking ferrisres v0.2.3 (/home/shift/code/FerrisRes)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 17s
