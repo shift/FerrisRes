@@ -1,0 +1,19 @@
+{
+  "_source": {
+    "url": "https://huggingface.co/Qwen/Qwen3-8B/raw/main/config.json",
+    "retrieved": "2026-11-21",
+    "sha256": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30",
+    "note": "Trimmed to the fields the descriptor reads. Original file hash above."
+  },
+  "architectures": ["Qwen3ForCausalLM"],
+  "head_dim": 128,
+  "hidden_size": 4096,
+  "num_hidden_layers": 36,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 8,
+  "intermediate_size": 12288,
+  "max_position_embeddings": 40960,
+  "rope_theta": 1000000,
+  "tie_word_embeddings": false,
+  "vocab_size": 151936
+}

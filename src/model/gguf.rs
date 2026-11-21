@@ -818,6 +818,15 @@ impl GgufFile {
         })
     }
 
+    /// Get `<architecture>.<suffix>` (for example
+    /// `qwen2.attention.head_count`), falling back to the `llama.` prefix used
+    /// by llama.cpp conversions that share the same key names.
+    pub fn metadata_u32_for_arch(&self, suffix: &str) -> Option<u32> {
+        let arch_key = format!("{}.{}", self.architecture(), suffix);
+        self.metadata_u32(&arch_key)
+            .or_else(|| self.metadata_u32(&format!("llama.{}", suffix)))
+    }
+
     /// Get the model architecture name (e.g., "llama", "mistral").
     pub fn architecture(&self) -> &str {
         self.metadata_string("general.architecture").unwrap_or("unknown")
@@ -957,6 +966,13 @@ impl GgufFile {
             map.insert(format!("{}attn_k.weight", prefix), format!("layers.{}.k_proj.weight", i));
             map.insert(format!("{}attn_v.weight", prefix), format!("layers.{}.v_proj.weight", i));
             map.insert(format!("{}attn_output.weight", prefix), format!("layers.{}.out_proj.weight", i));
+            // Qwen 2.5 stores Q/K/V biases (qkv_bias quirk). The current CPU
+            // forward pass consumes the weights only; these names are mapped so
+            // the tensors are visible to the loader and can be refused or used
+            // by a forward pass that implements the quirk.
+            map.insert(format!("{}attn_q.bias", prefix), format!("layers.{}.q_proj.bias", i));
+            map.insert(format!("{}attn_k.bias", prefix), format!("layers.{}.k_proj.bias", i));
+            map.insert(format!("{}attn_v.bias", prefix), format!("layers.{}.v_proj.bias", i));
             map.insert(format!("{}ffn_norm.weight", prefix), format!("layers.{}.ff_norm.weight", i));
 
             // FFN: gate is used by most modern architectures (GeGLU, SwiGLU)

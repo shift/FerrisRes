@@ -1,0 +1,55 @@
+{
+  "_source": "Hand-written descriptor. Fields verified against Qwen/Qwen3-8B config.json (see tests/fixtures/qwen3-8b.config.json).",
+  "name": "qwen3",
+  "match_architectures": ["Qwen3ForCausalLM"],
+  "match_gguf_architectures": ["qwen3"],
+  "required": [
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "intermediate_size",
+    "max_position_embeddings",
+    "rope_theta",
+    "tie_word_embeddings",
+    "vocab_size"
+  ],
+  "fields": {
+    "hidden": "hidden_size",
+    "layers": "num_hidden_layers",
+    "heads": "num_attention_heads",
+    "kv_heads": "num_key_value_heads",
+    "ffn": "intermediate_size",
+    "head_dim": "head_dim",
+    "rope_theta": "rope_theta",
+    "vocab": "vocab_size",
+    "tie_embeddings": "tie_word_embeddings",
+    "max_positions": "max_position_embeddings",
+    "sliding_window": "sliding_window"
+  },
+  "moe": {
+    "trigger_field": "num_experts",
+    "experts": "num_experts",
+    "top_k": "num_experts_per_tok",
+    "ffn": "moe_intermediate_size"
+  },
+  "quirks": {
+    "qk_norm": true
+  },
+  "weights": {
+    "model.embed_tokens.weight": "embed",
+    "model.layers.{i}.input_layernorm.weight": "layers.{i}.attn_norm",
+    "model.layers.{i}.self_attn.q_proj.weight": "layers.{i}.attn.q",
+    "model.layers.{i}.self_attn.k_proj.weight": "layers.{i}.attn.k",
+    "model.layers.{i}.self_attn.v_proj.weight": "layers.{i}.attn.v",
+    "model.layers.{i}.self_attn.o_proj.weight": "layers.{i}.attn.o",
+    "model.layers.{i}.self_attn.q_norm.weight": "layers.{i}.attn.q_norm",
+    "model.layers.{i}.self_attn.k_norm.weight": "layers.{i}.attn.k_norm",
+    "model.layers.{i}.post_attention_layernorm.weight": "layers.{i}.ffn_norm",
+    "model.layers.{i}.mlp.gate_proj.weight": "layers.{i}.mlp.gate",
+    "model.layers.{i}.mlp.up_proj.weight": "layers.{i}.mlp.up",
+    "model.layers.{i}.mlp.down_proj.weight": "layers.{i}.mlp.down",
+    "model.norm.weight": "final_norm",
+    "lm_head.weight": "lm_head"
+  }
+}

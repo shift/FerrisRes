@@ -1,0 +1,50 @@
+{
+  "_source": "Hand-written descriptor. Fields verified against Qwen/Qwen2.5-1.5B-Instruct config.json (see tests/fixtures/qwen2.5-1.5b.config.json).",
+  "name": "qwen2",
+  "match_architectures": ["Qwen2ForCausalLM"],
+  "match_gguf_architectures": ["qwen2"],
+  "required": [
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "intermediate_size",
+    "max_position_embeddings",
+    "rope_theta",
+    "tie_word_embeddings",
+    "vocab_size"
+  ],
+  "fields": {
+    "hidden": "hidden_size",
+    "layers": "num_hidden_layers",
+    "heads": "num_attention_heads",
+    "kv_heads": "num_key_value_heads",
+    "ffn": "intermediate_size",
+    "head_dim": "head_dim",
+    "rope_theta": "rope_theta",
+    "vocab": "vocab_size",
+    "tie_embeddings": "tie_word_embeddings",
+    "max_positions": "max_position_embeddings",
+    "sliding_window": "sliding_window"
+  },
+  "quirks": {
+    "qkv_bias": true
+  },
+  "weights": {
+    "model.embed_tokens.weight": "embed",
+    "model.layers.{i}.input_layernorm.weight": "layers.{i}.attn_norm",
+    "model.layers.{i}.self_attn.q_proj.weight": "layers.{i}.attn.q",
+    "model.layers.{i}.self_attn.k_proj.weight": "layers.{i}.attn.k",
+    "model.layers.{i}.self_attn.v_proj.weight": "layers.{i}.attn.v",
+    "model.layers.{i}.self_attn.o_proj.weight": "layers.{i}.attn.o",
+    "model.layers.{i}.self_attn.q_proj.bias": "layers.{i}.attn.q_bias",
+    "model.layers.{i}.self_attn.k_proj.bias": "layers.{i}.attn.k_bias",
+    "model.layers.{i}.self_attn.v_proj.bias": "layers.{i}.attn.v_bias",
+    "model.layers.{i}.post_attention_layernorm.weight": "layers.{i}.ffn_norm",
+    "model.layers.{i}.mlp.gate_proj.weight": "layers.{i}.mlp.gate",
+    "model.layers.{i}.mlp.up_proj.weight": "layers.{i}.mlp.up",
+    "model.layers.{i}.mlp.down_proj.weight": "layers.{i}.mlp.down",
+    "model.norm.weight": "final_norm",
+    "lm_head.weight": "lm_head"
+  }
+}

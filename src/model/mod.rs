@@ -1,3 +1,4 @@
+pub mod architectures;
 pub mod config;
 pub mod linear;
 pub mod cpu_linear;

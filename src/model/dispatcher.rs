@@ -95,7 +95,8 @@ impl ArchitectureDetector {
         let arch = gguf.architecture();
         match arch {
             "block-attn-res" | "block_attn_res" => DetectedArchitecture::BlockAttnRes,
-            "llama" | "mistral" | "gpt-neox" | "gpt_neox" | "falcon" | "mpt" | "gemma" => {
+            "llama" | "mistral" | "gpt-neox" | "gpt_neox" | "falcon" | "mpt" | "gemma"
+            | "qwen2" | "qwen3" => {
                 DetectedArchitecture::Standard
             }
             _ => {
@@ -416,7 +417,7 @@ fn infer_num_heads(weights: &LoadedWeights, hidden_dim: usize) -> usize {
 }
 
 fn infer_num_heads_gguf(gguf: &GgufFile, hidden_dim: usize) -> usize {
-    gguf.metadata_u32("llama.attention.head_count")
+    gguf.metadata_u32_for_arch("attention.head_count")
         .map(|n| n as usize)
         .unwrap_or_else(|| (hidden_dim / 128).max(1))
 }

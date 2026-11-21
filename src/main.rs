@@ -191,6 +191,12 @@ enum Commands {
         text: String,
     },
 
+    /// Inspect model architectures without loading weights.
+    Models {
+        #[command(subcommand)]
+        command: ModelsCommands,
+    },
+
     /// Start the OpenAI-compatible API server.
     Serve {
         /// Path to model file (safetensors or GGUF).
@@ -227,6 +233,18 @@ enum Commands {
 }
 
 #[tokio::main]
+#[derive(Subcommand)]
+enum ModelsCommands {
+    /// Validate a HuggingFace config.json against the architecture registry.
+    Check {
+        /// Path to config.json.
+        config: String,
+        /// Emit the machine-readable report.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
@@ -265,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Evaluate {
             model_path, config, text,
         } => cmd_evaluate(model_path, config, text).await,
+        Commands::Models { command } => cmd_models(command).await,
         Commands::Serve {
             model_path, config, model_format, tokenizer,
             host, port, model_name, armor, cognitive, concepts_path,
@@ -294,6 +313,48 @@ fn readback_f32(device: &Arc<wgpu::Device>, queue: &Arc<wgpu::Queue>, buffer: &G
     drop(data);
     staging.unmap();
     val
+}
+
+async fn cmd_models(command: ModelsCommands) -> anyhow::Result<()> {
+    match command {
+        ModelsCommands::Check { config, json } => {
+            let report =
+                ferrisres::model::architectures::check_config_file(std::path::Path::new(&config))
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("architecture: {}", report.architecture);
+                println!("supported:    {}", report.supported);
+                println!(
+                    "quirks:       {}",
+                    if report.quirks.is_empty() {
+                        "-".to_string()
+                    } else {
+                        report.quirks.join(", ")
+                    }
+                );
+                println!(
+                    "missing:      {}",
+                    if report.missing.is_empty() {
+                        "-".to_string()
+                    } else {
+                        report.missing.join(", ")
+                    }
+                );
+                println!("weights:      {} mapped slots", report.weights_mapped.len());
+                if let Some(error) = &report.error {
+                    println!("error:        {}", error);
+                }
+                println!(
+                    "note:         {}",
+                    ferrisres::model::architectures::ARCHITECTURE_SEMANTICS_NOTE
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 async fn cmd_info() -> anyhow::Result<()> {
