@@ -2061,6 +2061,7 @@ mod tests {
             embed_tokens_per_layer: None,
             hidden_size_per_layer_input: 0,
             num_kv_shared_layers: 0,
+            context_max: None,
             block_config: BlockConfig {
                 num_blocks: block.num_blocks,
                 layers_per_block: block.layers_per_block,

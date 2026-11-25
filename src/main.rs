@@ -40,6 +40,9 @@ enum Commands {
         /// Tier preset used when --model-path is omitted: nano, small, base, large.
         #[arg(long, default_value = "base")]
         tier: String,
+        /// Declare that a draft model is loaded and available to this runtime.
+        #[arg(long)]
+        draft: bool,
     },
 
     Train {
@@ -272,7 +275,11 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Info => cmd_info().await,
-        Commands::Capabilities { model_path, tier } => cmd_capabilities(model_path, tier),
+        Commands::Capabilities {
+            model_path,
+            tier,
+            draft,
+        } => cmd_capabilities(model_path, tier, draft).await,
         Commands::Train {
             hidden_dim,
             num_blocks,
@@ -363,7 +370,11 @@ async fn cmd_info() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_capabilities(model_path: Option<String>, tier: String) -> anyhow::Result<()> {
+async fn cmd_capabilities(
+    model_path: Option<String>,
+    tier: String,
+    draft: bool,
+) -> anyhow::Result<()> {
     let model = match model_path {
         Some(path) => {
             let config = ferrisres::model::checkpoint::load_config(&path)?;
@@ -380,8 +391,14 @@ fn cmd_capabilities(model_path: Option<String>, tier: String) -> anyhow::Result<
         }
     };
 
-    let capability = Capability::detect();
-    let device = DeviceFeatures::from_capability(&capability);
+    // Query the real adapter when one exists; otherwise fall back to the
+    // memory-only detection and keep the shader features conservative.
+    let (capability, queried_adapter) = match WgpuCompute::new().await {
+        Ok(compute) => (compute.detect_capability(), true),
+        Err(_) => (Capability::detect(), false),
+    };
+    let mut device = DeviceFeatures::from_capability(&capability);
+    device.draft_available = draft;
 
     println!("declared:");
     println!("  arch: {}", model.arch);
@@ -405,11 +422,9 @@ fn cmd_capabilities(model_path: Option<String>, tier: String) -> anyhow::Result<
         "  block_sparse: {}",
         if model.block_sparse { "yes" } else { "no" }
     );
-    println!("  draft: {}", if model.draft { "yes" } else { "no" });
     println!("  mtp: {}", if model.mtp { "yes" } else { "no" });
     println!("  vision: {}", if model.vision { "yes" } else { "no" });
     println!("  audio: {}", if model.audio { "yes" } else { "no" });
-    println!("  lora: {}", if model.lora { "yes" } else { "no" });
 
     println!("device:");
     if device.has_adapter() {
@@ -418,11 +433,18 @@ fn cmd_capabilities(model_path: Option<String>, tier: String) -> anyhow::Result<
         println!("  adapter: no adapter");
         println!("  gpu_kind: {} (conservative)", device.gpu_kind);
     }
+    if queried_adapter {
+        println!("  feature source: wgpu::Features");
+    } else {
+        println!("  feature source: conservative (no wgpu adapter)");
+    }
     println!("  shared_ram_mb: {}", device.shared_ram_mb);
     println!("  coop_matrix: {}", device.coop_matrix);
     println!("  f16: {}", device.f16);
     println!("  immediates: {}", device.immediates);
     println!("  max_storage_buffer: {}", device.max_storage_buffer);
+    println!("  draft_available: {}", device.draft_available);
+    println!("  lora: runtime (any model with linear layers)");
 
     let context = 8192.min(model.context_max);
     let resolution = resolve(&model, &device, &Workload::Chat { context });

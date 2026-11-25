@@ -647,6 +647,10 @@ pub struct CpuBlockAttnResModel {
     pub hidden_size_per_layer_input: usize,       // ple_dim
     pub num_kv_shared_layers: usize,              // number of shared KV layers
 
+    /// Context limit declared by the checkpoint header, if any. Preserved so a
+    /// load → save cycle does not silently reset it to the default.
+    pub context_max: Option<usize>,
+
     // Block-MoE-Res structure
     pub block_config: BlockConfig,
 
@@ -3130,6 +3134,7 @@ pub fn gemma4_to_block_attnres(teacher: &MappedGemma4Model) -> CpuBlockAttnResMo
         embed_tokens_per_layer: teacher.embed_tokens_per_layer.clone(),
         hidden_size_per_layer_input: config.hidden_size_per_layer_input.unwrap_or(0),
         num_kv_shared_layers: config.num_kv_shared_layers,
+        context_max: None,
 
         // Block-MoE-Res structure: 7 blocks × 5 layers for E2B
         block_config: BlockConfig {

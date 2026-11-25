@@ -3,7 +3,8 @@
 //! Three axes decide what the engine can do for one request:
 //!
 //! - **Model**: what the checkpoint declares (this module reads the header).
-//! - **Device**: what the adapter can do.
+//! - **Device/runtime**: what the adapter can do, and which external models
+//!   (a draft model) the runtime has loaded.
 //! - **Workload**: what the request needs (context, tools, draft, modality).
 //!
 //! The engine runs the intersection. Anything outside it is a typed refusal or
@@ -44,11 +45,9 @@ pub struct ModelFeatures {
     pub context_max: usize,
     pub looped: bool,
     pub block_sparse: bool,
-    pub draft: bool,
     pub mtp: bool,
     pub vision: bool,
     pub audio: bool,
-    pub lora: bool,
     pub tier: Option<Tier>,
 }
 
@@ -81,7 +80,15 @@ impl ModelFeatures {
             .map(|l| l.num_experts)
             .max()
             .unwrap_or(0);
-        let top_k = config.layer_configs.iter().map(|l| l.top_k).max().unwrap_or(0);
+        // Tiers are top-1 by design. A header that explicitly declares more
+        // keeps it, so the device budget rule still has something to refuse.
+        let declared_top_k = config
+            .layer_configs
+            .iter()
+            .map(|l| l.top_k)
+            .max()
+            .unwrap_or(0);
+        let top_k = declared_top_k.max(1);
 
         // The loop is described by the block structure: every block boundary
         // adds one pass over the core layers. `num_blocks` and the boundary
@@ -117,11 +124,9 @@ impl ModelFeatures {
             context_max: config.context_max.unwrap_or(DEFAULT_CONTEXT_MAX),
             looped,
             block_sparse,
-            draft: has("draft"),
             mtp: has("mtp"),
             vision: has("vision"),
             audio: has("audio"),
-            lora: has("lora"),
             tier,
         }
     }
@@ -135,17 +140,15 @@ impl ModelFeatures {
             num_layers: spec.layers,
             visits: spec.prelude + spec.core * spec.passes + spec.coda,
             experts: spec.experts,
-            top_k: 2.min(spec.experts).max(1),
+            top_k: 1,
             vocab_size: spec.vocab,
             kv_bits: DEFAULT_KV_BITS,
             context_max: spec.context_max,
             looped: spec.passes > 1,
             block_sparse: true,
-            draft: false,
             mtp: false,
             vision: false,
             audio: false,
-            lora: false,
             tier: Some(tier),
         }
     }
@@ -162,9 +165,6 @@ impl ModelFeatures {
         if self.block_sparse {
             out.push("block_sparse".to_string());
         }
-        if self.draft {
-            out.push("draft".to_string());
-        }
         if self.mtp {
             out.push("mtp".to_string());
         }
@@ -174,9 +174,6 @@ impl ModelFeatures {
         if self.audio {
             out.push("audio".to_string());
         }
-        if self.lora {
-            out.push("lora".to_string());
-        }
         if let Some(tier) = self.tier {
             out.push(format!("tier:{}", tier.name()));
         }
@@ -184,7 +181,8 @@ impl ModelFeatures {
     }
 }
 
-/// What the active adapter can do.
+/// What the runtime offers: the active adapter plus any external model a
+/// request may use (currently a draft model).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceFeatures {
     pub adapter: String,
@@ -194,15 +192,19 @@ pub struct DeviceFeatures {
     pub f16: bool,
     pub immediates: bool,
     pub max_storage_buffer: u64,
+    /// A draft checkpoint is loaded and can be used by `Workload::Draft`.
+    /// Drafting is a runtime arrangement (for example Nano drafting for
+    /// Small/Base), not a property of the target checkpoint.
+    pub draft_available: bool,
 }
 
 impl DeviceFeatures {
-    /// Build a descriptor from the adapter information `Capability::detect`
-    /// reports.
+    /// Build a descriptor from the adapter information `Capability` reports.
     ///
-    /// `Capability` does not expose cooperative-matrix, f16 or immediate
-    /// support, so those default to `false` (conservative). A request that
-    /// needs them then gets a named fallback instead of a guess.
+    /// `Capability::detect()` alone does not query the adapter, so the three
+    /// shader features stay `false`. A `Capability` produced by
+    /// `WgpuCompute::detect_capability()` carries the real `wgpu::Features`
+    /// flags.
     pub fn from_capability(cap: &Capability) -> Self {
         let has_adapter = !cap.adapter_name.trim().is_empty() || !cap.backend.trim().is_empty();
         Self {
@@ -213,10 +215,11 @@ impl DeviceFeatures {
             },
             gpu_kind: format!("{:?}", cap.gpu_kind).to_ascii_lowercase(),
             shared_ram_mb: cap.shared_ram_mb,
-            coop_matrix: false,
-            f16: false,
-            immediates: false,
+            coop_matrix: cap.coop_matrix,
+            f16: cap.f16,
+            immediates: cap.immediates,
             max_storage_buffer: cap.max_storage_buffer_range,
+            draft_available: false,
         }
     }
 
@@ -303,14 +306,14 @@ pub fn resolve(model: &ModelFeatures, device: &DeviceFeatures, workload: &Worklo
     if model.audio {
         r.enabled.push("audio".to_string());
     }
-    if model.lora {
-        r.enabled.push("lora".to_string());
-    }
     if let Some(tier) = model.tier {
         r.enabled.push(format!("tier:{}", tier.name()));
     }
 
-    // --- Device axis ------------------------------------------------------
+    // --- Device / runtime axis -------------------------------------------
+    // LoRA adapters attach to any model with linear layers, like tools; they
+    // are not a checkpoint restriction.
+    r.enabled.push("lora".to_string());
     if device.coop_matrix {
         r.enabled.push("coop_matrix".to_string());
     } else {
@@ -362,12 +365,12 @@ pub fn resolve(model: &ModelFeatures, device: &DeviceFeatures, workload: &Worklo
             }
         }
         Workload::Draft => {
-            if model.draft {
+            if device.draft_available {
                 r.enabled.push("draft".to_string());
             } else {
                 r.refusals.push((
                     "draft".to_string(),
-                    "checkpoint does not declare draft support".to_string(),
+                    "no draft model is available".to_string(),
                 ));
             }
         }
@@ -424,11 +427,9 @@ mod tests {
             context_max: 32768,
             looped: true,
             block_sparse: true,
-            draft: false,
             mtp: false,
             vision: false,
             audio: false,
-            lora: false,
             tier: Some(Tier::Base),
         }
     }
@@ -442,6 +443,7 @@ mod tests {
             f16: true,
             immediates: true,
             max_storage_buffer: 1 << 30,
+            draft_available: false,
         }
     }
 
@@ -465,12 +467,80 @@ mod tests {
     }
 
     #[test]
-    fn draft_is_refused_when_not_declared() {
+    fn draft_is_refused_when_no_draft_model_is_available() {
         let r = resolve(&text_model(), &device(16384, true), &Workload::Draft);
         assert!(r
             .refusals
             .iter()
-            .any(|(f, why)| f == "draft" && why.contains("draft")));
+            .any(|(f, why)| f == "draft" && why.contains("no draft model")));
+        assert!(!r.enabled.iter().any(|f| f == "draft"));
+    }
+
+    #[test]
+    fn draft_is_enabled_when_the_runtime_has_one() {
+        let mut d = device(16384, true);
+        d.draft_available = true;
+        let r = resolve(&text_model(), &d, &Workload::Draft);
+        assert!(r.enabled.iter().any(|f| f == "draft"));
+        assert!(r.refusals.is_empty());
+    }
+
+    #[test]
+    fn lora_is_a_runtime_capability_on_every_workload() {
+        for workload in [
+            Workload::Chat { context: 8192 },
+            Workload::Rag { context: 8192 },
+            Workload::Tools,
+            Workload::Vision,
+            Workload::Draft,
+            Workload::Training,
+        ] {
+            let r = resolve(&text_model(), &device(16384, true), &workload);
+            assert!(
+                r.enabled.iter().any(|f| f == "lora"),
+                "lora missing for {:?}",
+                workload
+            );
+        }
+    }
+
+    #[test]
+    fn rag_and_tools_add_their_tokens() {
+        let rag = resolve(
+            &text_model(),
+            &device(16384, true),
+            &Workload::Rag { context: 8192 },
+        );
+        assert!(rag.enabled.iter().any(|f| f == "rag"));
+        assert!(rag.enabled.iter().any(|f| f == "context:8192"));
+
+        let tools = resolve(&text_model(), &device(16384, true), &Workload::Tools);
+        assert!(tools.enabled.iter().any(|f| f == "tools"));
+    }
+
+    #[test]
+    fn f16_and_immediates_fall_back_when_absent() {
+        let mut d = device(16384, true);
+        d.f16 = false;
+        d.immediates = false;
+        let r = resolve(&text_model(), &d, &Workload::Chat { context: 8192 });
+        assert!(r
+            .fallbacks
+            .iter()
+            .any(|(f, why)| f == "f16" && why.contains("f32")));
+        assert!(r
+            .fallbacks
+            .iter()
+            .any(|(f, why)| f == "immediates" && why.contains("uniform buffers")));
+        assert!(!r.enabled.iter().any(|f| f == "f16"));
+        assert!(!r.enabled.iter().any(|f| f == "immediates"));
+    }
+
+    #[test]
+    fn tier_presets_are_top_one() {
+        for tier in [Tier::Nano, Tier::Small, Tier::Base, Tier::Large] {
+            assert_eq!(ModelFeatures::from_tier(tier).top_k, 1, "{:?}", tier);
+        }
     }
 
     #[test]
@@ -588,17 +658,15 @@ mod tests {
     fn declared_features_are_the_capability_vocabulary() {
         let mut m = text_model();
         m.vision = true;
-        m.draft = true;
-        m.lora = true;
+        m.mtp = true;
         assert_eq!(
             m.declared_features(),
             vec![
                 "arch:block_attnres",
                 "looped",
                 "block_sparse",
-                "draft",
+                "mtp",
                 "vision",
-                "lora",
                 "tier:base",
             ]
         );
@@ -618,6 +686,9 @@ mod tests {
             max_bind_groups: 0,
             backend: String::new(),
             adapter_name: String::new(),
+            coop_matrix: false,
+            f16: false,
+            immediates: false,
         };
         let d = DeviceFeatures::from_capability(&cap);
         assert!(!d.has_adapter());
@@ -625,5 +696,32 @@ mod tests {
         assert!(!d.coop_matrix);
         assert!(!d.f16);
         assert!(!d.immediates);
+        assert!(!d.draft_available);
+    }
+
+    #[test]
+    fn device_from_capability_uses_adapter_features() {
+        let cap = Capability {
+            vram_mb: 8192,
+            shared_ram_mb: 16384,
+            gpu_kind: crate::device::capability::GpuKind::Discrete,
+            vendor: crate::device::capability::GpuVendor::Nvidia,
+            max_compute_workgroup_size: 1024,
+            max_compute_invocations_per_workgroup: 1024,
+            max_storage_buffer_range: 1 << 30,
+            max_storage_buffers_per_shader_stage: 8,
+            max_bind_groups: 4,
+            backend: "Vulkan".to_string(),
+            adapter_name: "NVIDIA T4".to_string(),
+            coop_matrix: true,
+            f16: true,
+            immediates: true,
+        };
+        let d = DeviceFeatures::from_capability(&cap);
+        assert!(d.has_adapter());
+        assert!(d.coop_matrix);
+        assert!(d.f16);
+        assert!(d.immediates);
+        assert!(!d.draft_available);
     }
 }

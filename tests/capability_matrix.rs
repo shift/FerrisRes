@@ -68,9 +68,12 @@ fn tiny_boundaries(tier: Tier) -> Vec<usize> {
 }
 
 fn tiny_model(tier: Tier) -> CpuBlockAttnResModel {
+    tiny_model_with_top_k(tier, 1)
+}
+
+fn tiny_model_with_top_k(tier: Tier, top_k: usize) -> CpuBlockAttnResModel {
     let spec = tier.spec();
     let layers = tiny_layer_count(tier);
-    let top_k = 2.min(spec.experts).max(1);
 
     let layers: Vec<CpuBlockAttnResLayer> = (0..layers)
         .map(|idx| {
@@ -81,6 +84,8 @@ fn tiny_model(tier: Tier) -> CpuBlockAttnResModel {
             // the stored data the same length.
             layer.q_norm = CpuRmsNorm::from_weight(vec![1.0; HEADS * HEAD_DIM], 1e-6);
             layer.k_norm = CpuRmsNorm::from_weight(vec![1.0; KV_HEADS * HEAD_DIM], 1e-6);
+            // Tiers route top-1 at every size; this helper lets a test declare
+            // more so the device budget rule can be exercised.
             layer.moe = Some(CpuMoELayer::new(
                 HIDDEN,
                 INTERMEDIATE,
@@ -108,6 +113,7 @@ fn tiny_model(tier: Tier) -> CpuBlockAttnResModel {
         embed_tokens_per_layer: None,
         hidden_size_per_layer_input: 0,
         num_kv_shared_layers: 0,
+        context_max: None,
         block_config: BlockConfig {
             num_blocks: spec.passes,
             layers_per_block: spec.core,
@@ -138,11 +144,13 @@ fn hd530() -> DeviceFeatures {
         f16: true,
         immediates: true,
         max_storage_buffer: 128 * 1024 * 1024,
+        draft_available: false,
     }
 }
 
 /// NVIDIA T4: cooperative matrices. The shared-RAM figure is synthetic and
-/// deliberately below the top-k budget so the RAM rule is exercised.
+/// deliberately below the top-k budget so the RAM rule can be exercised by a
+/// checkpoint that declares more than top-1.
 fn t4() -> DeviceFeatures {
     DeviceFeatures {
         adapter: "NVIDIA T4".to_string(),
@@ -152,6 +160,7 @@ fn t4() -> DeviceFeatures {
         f16: true,
         immediates: true,
         max_storage_buffer: 1024 * 1024 * 1024,
+        draft_available: false,
     }
 }
 
@@ -176,6 +185,7 @@ fn features_roundtrip_for_every_tier() {
         assert_eq!(features.hidden_dim, HIDDEN, "{:?}", tier);
         assert_eq!(features.num_layers, tiny_layer_count(tier), "{:?}", tier);
         assert_eq!(features.experts, tier.spec().experts, "{:?}", tier);
+        assert_eq!(features.top_k, 1, "{:?} must be top-1", tier);
         assert_eq!(features.vocab_size, VOCAB, "{:?}", tier);
         assert_eq!(
             features.visits,
@@ -186,6 +196,7 @@ fn features_roundtrip_for_every_tier() {
         assert!(features.looped, "{:?}", tier);
         assert!(features.block_sparse, "{:?}", tier);
         assert_eq!(features.context_max, tier.spec().context_max, "{:?}", tier);
+        assert_eq!(features.mtp, false, "{:?}", tier);
     }
 }
 
@@ -193,13 +204,9 @@ fn features_roundtrip_for_every_tier() {
 fn adapter_capabilities_select_fallbacks_per_tier() {
     for tier in TIERS {
         let (_dir, _path, features) = saved_features(tier);
-        assert!(features.top_k > 1, "{:?} must exercise the top-k rule", tier);
+        assert_eq!(features.top_k, 1, "{:?} is top-1", tier);
 
-        let integrated = resolve(
-            &features,
-            &hd530(),
-            &Workload::Chat { context: 8_192 },
-        );
+        let integrated = resolve(&features, &hd530(), &Workload::Chat { context: 8_192 });
         assert!(
             integrated
                 .fallbacks
@@ -211,7 +218,7 @@ fn adapter_capabilities_select_fallbacks_per_tier() {
         );
         assert!(
             !integrated.fallbacks.iter().any(|(f, _)| f == "top_k"),
-            "{:?} HD-530 has enough shared RAM for top-k: {:?}",
+            "{:?} HD-530 has enough shared RAM for top-1: {:?}",
             tier,
             integrated
         );
@@ -223,18 +230,40 @@ fn adapter_capabilities_select_fallbacks_per_tier() {
             tier,
             discrete
         );
-        let (_, why) = discrete
-            .fallbacks
-            .iter()
-            .find(|(feature, _)| feature == "top_k")
-            .unwrap_or_else(|| panic!("{:?} T4 must fall back to top-1: {:?}", tier, discrete));
-        assert!(why.contains("4096"), "{:?}: {}", tier, why);
-        assert!(discrete.enabled.iter().any(|f| f == "top_k:1"));
         assert!(
-            !discrete.refusals.iter().any(|(f, _)| f == "top_k"),
-            "top-k is a fallback, never a refusal"
+            !discrete.fallbacks.iter().any(|(f, _)| f == "top_k"),
+            "{:?} top-1 needs no top-k fallback: {:?}",
+            tier,
+            discrete
         );
+        assert!(discrete.enabled.iter().any(|f| f == "top_k:1"));
     }
+}
+
+#[test]
+fn a_checkpoint_that_declares_top_two_falls_back_on_low_ram() {
+    let (_dir, path) = CheckpointDir::new("top-two");
+    save_model(&tiny_model_with_top_k(Tier::Base, 2), &path).expect("save checkpoint");
+    let features = ModelFeatures::from_config(&load_config(&path).expect("load header"));
+    assert_eq!(features.top_k, 2, "the header declares top-2");
+
+    let discrete = resolve(&features, &t4(), &Workload::Chat { context: 8_192 });
+    let (_, why) = discrete
+        .fallbacks
+        .iter()
+        .find(|(feature, _)| feature == "top_k")
+        .unwrap_or_else(|| panic!("T4 must fall back to top-1: {:?}", discrete));
+    assert!(why.contains("4096"), "{}", why);
+    assert!(discrete.enabled.iter().any(|f| f == "top_k:1"));
+    assert!(
+        !discrete.refusals.iter().any(|(f, _)| f == "top_k"),
+        "top-k is a fallback, never a refusal"
+    );
+
+    // The same declaration keeps top-2 on a device with enough shared RAM.
+    let integrated = resolve(&features, &hd530(), &Workload::Chat { context: 8_192 });
+    assert!(!integrated.fallbacks.iter().any(|(f, _)| f == "top_k"));
+    assert!(integrated.enabled.iter().any(|f| f == "top_k:2"));
 }
 
 #[test]
@@ -255,16 +284,34 @@ fn vision_is_refused_on_every_text_tier() {
 }
 
 #[test]
+fn draft_is_a_runtime_choice() {
+    let (_dir, _path, features) = saved_features(Tier::Base);
+
+    let without = resolve(&features, &hd530(), &Workload::Draft);
+    assert!(
+        without
+            .refusals
+            .iter()
+            .any(|(f, why)| f == "draft" && why.contains("no draft model")),
+        "{:?}",
+        without
+    );
+    assert!(!without.enabled.iter().any(|f| f == "draft"));
+
+    let mut with_draft = hd530();
+    with_draft.draft_available = true;
+    let with = resolve(&features, &with_draft, &Workload::Draft);
+    assert!(with.enabled.iter().any(|f| f == "draft"), "{:?}", with);
+    assert!(with.refusals.is_empty(), "{:?}", with);
+}
+
+#[test]
 fn short_context_falls_back_to_dense_on_every_tier() {
     for tier in TIERS {
         let (_dir, _path, features) = saved_features(tier);
         assert!(features.block_sparse, "{:?}", tier);
 
-        let resolution = resolve(
-            &features,
-            &t4(),
-            &Workload::Chat { context: 1_024 },
-        );
+        let resolution = resolve(&features, &t4(), &Workload::Chat { context: 1_024 });
         let (_, why) = resolution
             .fallbacks
             .iter()
@@ -319,10 +366,35 @@ fn old_header_derives_the_same_features() {
 }
 
 #[test]
+fn declared_context_max_survives_a_resave() {
+    let (dir, path) = CheckpointDir::new("context-resave");
+    let mut model = tiny_model(Tier::Base);
+    model.context_max = Some(131_072);
+
+    save_model(&model, &path).expect("first save");
+    let first = load_config(&path).expect("first header");
+    assert_eq!(first.context_max, Some(131_072));
+
+    let loaded = load_model(&path).expect("load weights");
+    assert_eq!(loaded.context_max, Some(131_072));
+
+    let again = dir.0.join("again").to_string_lossy().into_owned();
+    save_model(&loaded, &again).expect("second save");
+    let second = load_config(&again).expect("second header");
+    assert_eq!(second.context_max, Some(131_072));
+    assert_eq!(
+        ModelFeatures::from_config(&second).context_max,
+        131_072,
+        "re-saving must not reset the declared context"
+    );
+}
+
+#[test]
 #[ignore = "requires a GPU adapter"]
 fn detected_adapter_resolves_for_base() {
-    let capability = ferrisres::Capability::detect();
-    let device = DeviceFeatures::from_capability(&capability);
+    let compute = pollster::block_on(ferrisres::WgpuCompute::new())
+        .expect("a real adapter is required for this test");
+    let device = DeviceFeatures::from_capability(&compute.detect_capability());
     let features = ModelFeatures::from_tier(Tier::Base);
     let context = 8_192.min(features.context_max);
     let resolution = resolve(&features, &device, &Workload::Chat { context });

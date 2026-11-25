@@ -123,6 +123,7 @@ impl WgpuCompute {
         let info = self.adapter_info();
         Capability::detect()
             .with_adapter_limits(&limits, &info)
+            .with_adapter_features(self.adapter.features())
     }
     
     /// Get optimized compute parameters based on detected hardware

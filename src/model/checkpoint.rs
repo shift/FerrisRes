@@ -498,6 +498,7 @@ pub fn load_model(path: &str) -> Result<CpuBlockAttnResModel> {
         final_logit_softcapping: config.final_logit_softcapping,
         hidden_size_per_layer_input: config.hidden_size_per_layer_input,
         num_kv_shared_layers: config.num_kv_shared_layers,
+        context_max: config.context_max,
         block_config: BlockConfig {
             num_blocks: config.num_blocks,
             layers_per_block: config.layers_per_block,
@@ -566,12 +567,13 @@ fn serialize_config(model: &CpuBlockAttnResModel, tier: Option<Tier>) -> BlockMo
     let mut features = ModelFeatures::from_config(&config);
     if let Some(tier) = tier {
         features.tier = Some(tier);
-        features.context_max = tier.spec().context_max;
     }
     config.features = Some(features.declared_features());
-    // Only a tier declaration carries a known context limit. Without one the
-    // header stays silent and readers fall back to DEFAULT_CONTEXT_MAX.
-    config.context_max = tier.map(|t| t.spec().context_max);
+    // A loaded checkpoint keeps its declared context limit across a re-save.
+    // A tier declaration supplies one when the model does not carry it.
+    config.context_max = model
+        .context_max
+        .or_else(|| tier.map(|t| t.spec().context_max));
 
     config
 }

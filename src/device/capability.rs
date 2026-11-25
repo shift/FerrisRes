@@ -283,6 +283,15 @@ pub struct Capability {
     pub max_bind_groups: u32,
     pub backend: String,
     pub adapter_name: String,
+    /// Adapter exposes `wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX`.
+    #[serde(default)]
+    pub coop_matrix: bool,
+    /// Adapter exposes `wgpu::Features::SHADER_F16`.
+    #[serde(default)]
+    pub f16: bool,
+    /// Adapter exposes `wgpu::Features::IMMEDIATES`.
+    #[serde(default)]
+    pub immediates: bool,
 }
 
 impl Capability {
@@ -299,6 +308,9 @@ impl Capability {
             max_bind_groups: 0,
             backend: String::new(),
             adapter_name: String::new(),
+            coop_matrix: false,
+            f16: false,
+            immediates: false,
         };
 
         match detect_vram_ash() {
@@ -344,6 +356,18 @@ impl Capability {
         if self.adapter_name.is_empty() {
             self.adapter_name = adapter_info.name.clone();
         }
+        self
+    }
+
+    /// Record the shader features the selected adapter actually exposes.
+    ///
+    /// `detect()` only reads memory and PCI information; this is the point
+    /// where a real `wgpu::Features` set is available, so capability negotiation
+    /// sees the truth instead of conservative `false` values.
+    pub fn with_adapter_features(mut self, features: wgpu::Features) -> Self {
+        self.coop_matrix = features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
+        self.f16 = features.contains(wgpu::Features::SHADER_F16);
+        self.immediates = features.contains(wgpu::Features::IMMEDIATES);
         self
     }
 
@@ -650,6 +674,9 @@ mod tests {
             max_bind_groups: 4,
             backend: "Vulkan".to_string(),
             adapter_name: "RTX 4060".to_string(),
+            coop_matrix: true,
+            f16: true,
+            immediates: true,
         };
         assert_eq!(cap.effective_vram_mb(), 8192);
     }
@@ -668,6 +695,9 @@ mod tests {
             max_bind_groups: 4,
             backend: "Vulkan".to_string(),
             adapter_name: "Intel HD 530".to_string(),
+            coop_matrix: false,
+            f16: true,
+            immediates: true,
         };
         assert_eq!(cap.effective_vram_mb(), 8192); // Falls back to shared RAM
     }
