@@ -62,6 +62,11 @@ this, which is the point.
 prefill tok/s, decode tok/s, layer-visits, KV bytes, peak RAM. Record the
 machine and the adapter.
 
+The CLI benchmark is **GPU-only** and its shape flags are accepted but unused; it
+says so on every run. CPU throughput is measured with
+`cargo bench --bench ternary_kernels` (criterion: unpacked, packed, FFN,
+attention, decode and prefill groups).
+
 ## 6. Decision head (when it exists)
 
 Accuracy and ECE on held-out decisions, selective accuracy at 80% coverage, and
