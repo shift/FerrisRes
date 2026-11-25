@@ -31,8 +31,10 @@
 use std::path::Path;
 
 use crate::error::{FerrisResError, Result};
+use crate::model::capabilities::ModelFeatures;
 use crate::model::cpu_block_attn_res::CpuBlockAttnResModel;
 use crate::model::safetensors::{TensorToWrite, SafeDtype, write_safetensors};
+use crate::model::tiers::Tier;
 
 /// Model configuration stored as JSON alongside the safetensors weights.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -52,6 +54,17 @@ pub struct BlockMoeResConfig {
     pub boundary_layers: Vec<usize>,
     // Per-layer config (compressed — only stores deviations from defaults)
     pub layer_configs: Vec<LayerConfig>,
+    /// Header format written by the saver. `0` means a pre-capability
+    /// checkpoint (serde default), `1` means this version.
+    #[serde(default)]
+    pub format_version: u16,
+    /// Capability strings declared by the checkpoint. `None` on old
+    /// checkpoints; the loader derives the same set from the config.
+    #[serde(default)]
+    pub features: Option<Vec<String>>,
+    /// Declared context limit. `None` on old checkpoints.
+    #[serde(default)]
+    pub context_max: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -73,8 +86,24 @@ pub struct LayerConfig {
 ///
 /// Creates two files:
 /// - `{path}.safetensors` — model weights
-/// - `{path}.json` — model configuration
+/// - `{path}.json` — model configuration and declared capabilities
+///
+/// The declared capability set is derived from the model. Use
+/// [`save_model_with_tier`] to declare a tier as well.
 pub fn save_model(model: &CpuBlockAttnResModel, path: &str) -> Result<()> {
+    save_model_with_tier(model, path, None)
+}
+
+/// Save a model and declare which tier preset it was built from.
+///
+/// A tier cannot be recovered from weights (a scaled-down checkpoint has the
+/// same shape as several tiers), so it is an explicit declaration in the
+/// header. Everything else is derived from the model.
+pub fn save_model_with_tier(
+    model: &CpuBlockAttnResModel,
+    path: &str,
+    tier: Option<Tier>,
+) -> Result<()> {
     let st_path = format!("{}.safetensors", path);
     let json_path = format!("{}.json", path);
 
@@ -299,7 +328,7 @@ pub fn save_model(model: &CpuBlockAttnResModel, path: &str) -> Result<()> {
     write_safetensors(Path::new(&st_path), &tensors)?;
 
     // Write config
-    let config = serialize_config(model);
+    let config = serialize_config(model, tier);
     let config_json = serde_json::to_string_pretty(&config)
         .map_err(|e| FerrisResError::Shape(format!("Failed to serialize config: {}", e)))?;
     std::fs::write(&json_path, config_json)
@@ -315,6 +344,26 @@ pub fn save_model(model: &CpuBlockAttnResModel, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read a checkpoint header without loading weights.
+///
+/// Old headers (no `features`) are normalised here: the declared feature set is
+/// derived from the architecture and written into the returned config, while
+/// `format_version` stays `0` so callers can tell the formats apart.
+pub fn load_config(path: &str) -> Result<BlockMoeResConfig> {
+    let json_path = format!("{}.json", path);
+    let config_json = std::fs::read_to_string(&json_path)
+        .map_err(|e| FerrisResError::Shape(format!("Failed to read config {}: {}", json_path, e)))?;
+    let mut config: BlockMoeResConfig = serde_json::from_str(&config_json)
+        .map_err(|e| FerrisResError::Shape(format!("Failed to parse config: {}", e)))?;
+
+    if config.features.is_none() {
+        let derived = ModelFeatures::from_config(&config);
+        config.features = Some(derived.declared_features());
+    }
+
+    Ok(config)
+}
+
 /// Load a complete Block-MoE-Res model from disk.
 ///
 /// Reads:
@@ -327,13 +376,9 @@ pub fn load_model(path: &str) -> Result<CpuBlockAttnResModel> {
     use crate::model::cpu_block_attn_res::{CpuBlockAttnResLayer, BlockConfig};
 
     let st_path = format!("{}.safetensors", path);
-    let json_path = format!("{}.json", path);
 
-    // Read config
-    let config_json = std::fs::read_to_string(&json_path)
-        .map_err(|e| FerrisResError::Shape(format!("Failed to read config {}: {}", json_path, e)))?;
-    let config: BlockMoeResConfig = serde_json::from_str(&config_json)
-        .map_err(|e| FerrisResError::Shape(format!("Failed to parse config: {}", e)))?;
+    // Read config (normalises old headers)
+    let config = load_config(path)?;
 
     // Mmap safetensors
     let mmap = MmapedSafetensors::open(Path::new(&st_path))
@@ -478,7 +523,7 @@ pub fn load_model(path: &str) -> Result<CpuBlockAttnResModel> {
 }
 
 /// Extract serializable config from model.
-fn serialize_config(model: &CpuBlockAttnResModel) -> BlockMoeResConfig {
+fn serialize_config(model: &CpuBlockAttnResModel, tier: Option<Tier>) -> BlockMoeResConfig {
     let layer_configs: Vec<LayerConfig> = model.layers.iter().map(|layer| {
         LayerConfig {
             use_gelu: layer.use_gelu,
@@ -497,7 +542,7 @@ fn serialize_config(model: &CpuBlockAttnResModel) -> BlockMoeResConfig {
         }
     }).collect();
 
-    BlockMoeResConfig {
+    let mut config = BlockMoeResConfig {
         hidden_dim: model.hidden_dim,
         vocab_size: model.vocab_size,
         num_layers: model.num_layers,
@@ -511,7 +556,24 @@ fn serialize_config(model: &CpuBlockAttnResModel) -> BlockMoeResConfig {
         layers_per_block: model.block_config.layers_per_block,
         boundary_layers: model.block_config.boundary_layers.clone(),
         layer_configs,
+        format_version: 1,
+        features: None,
+        context_max: None,
+    };
+
+    // Derive the declaration from the freshly built header, then add the one
+    // fact weights cannot carry: which tier preset this checkpoint came from.
+    let mut features = ModelFeatures::from_config(&config);
+    if let Some(tier) = tier {
+        features.tier = Some(tier);
+        features.context_max = tier.spec().context_max;
     }
+    config.features = Some(features.declared_features());
+    // Only a tier declaration carries a known context limit. Without one the
+    // header stays silent and readers fall back to DEFAULT_CONTEXT_MAX.
+    config.context_max = tier.map(|t| t.spec().context_max);
+
+    config
 }
 
 #[cfg(test)]
@@ -533,10 +595,40 @@ mod tests {
             layers_per_block: 5,
             boundary_layers: vec![4, 9, 14, 19, 24, 29, 34],
             layer_configs: vec![],
+            format_version: 1,
+            features: Some(vec!["arch:block_attnres".to_string(), "looped".to_string()]),
+            context_max: Some(32768),
         };
         let json = serde_json::to_string(&config).unwrap();
         let recovered: BlockMoeResConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(recovered.hidden_dim, 1536);
         assert_eq!(recovered.boundary_layers.len(), 7);
+        assert_eq!(recovered.format_version, 1);
+        assert_eq!(recovered.features.as_deref().unwrap().len(), 2);
+        assert_eq!(recovered.context_max, Some(32768));
+    }
+
+    #[test]
+    fn old_header_without_new_fields_loads_with_defaults() {
+        use super::*;
+        let json = r#"{
+            "hidden_dim": 8,
+            "vocab_size": 16,
+            "num_layers": 2,
+            "num_heads": 2,
+            "num_kv_heads": 1,
+            "head_dim": 4,
+            "final_logit_softcapping": null,
+            "hidden_size_per_layer_input": 0,
+            "num_kv_shared_layers": 0,
+            "num_blocks": 1,
+            "layers_per_block": 2,
+            "boundary_layers": [1],
+            "layer_configs": []
+        }"#;
+        let config: BlockMoeResConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.format_version, 0);
+        assert!(config.features.is_none());
+        assert!(config.context_max.is_none());
     }
 }

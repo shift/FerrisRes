@@ -2,9 +2,11 @@ use std::sync::Arc;
 use std::time::Instant;
 use clap::{Parser, Subcommand};
 use tracing::{info, warn, trace};
-use ferrisres::{WgpuCompute, DeviceProfile, BlockAttnResConfig, BlockAttnResModel, SimpleTokenizer};
+use ferrisres::{WgpuCompute, DeviceProfile, BlockAttnResConfig, BlockAttnResModel, SimpleTokenizer, Capability};
 use ferrisres::compute::{GpuBuffer, MatMulOp, RmsNormOp, SoftmaxOp, ElementWiseOp};
 use ferrisres::training::AdamOptimizer;
+use ferrisres::model::capabilities::{resolve, DeviceFeatures, ModelFeatures, Workload};
+use ferrisres::model::tiers::Tier;
 use ferrisres::model::gemma_mapper::{
     self, Gemma4Config, Gemma4Teacher,
     load_gemma4_model_mmap,
@@ -25,6 +27,20 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Info,
+
+    /// Print declared model features, detected device features, and the
+    /// resolved capability set for a chat request.
+    ///
+    /// Refusals are information: the command exits 0 even when a request
+    /// cannot be honoured.
+    Capabilities {
+        /// Read `{path}.json` only. No weights are loaded.
+        #[arg(long)]
+        model_path: Option<String>,
+        /// Tier preset used when --model-path is omitted: nano, small, base, large.
+        #[arg(long, default_value = "base")]
+        tier: String,
+    },
 
     Train {
         #[arg(long, default_value_t = 512)]
@@ -256,6 +272,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Info => cmd_info().await,
+        Commands::Capabilities { model_path, tier } => cmd_capabilities(model_path, tier),
         Commands::Train {
             hidden_dim,
             num_blocks,
@@ -342,6 +359,94 @@ async fn cmd_info() -> anyhow::Result<()> {
     info!(event = "max_storage_buffer_mb", "Max storage buffer: {} MB", capability.max_storage_buffer_range / (1024 * 1024));
     info!(event = "max_storage_buffers_stage", "Max storage buffers/stage: {}", capability.max_storage_buffers_per_shader_stage);
     info!(event = "max_bind_groups", "Max bind groups: {}", capability.max_bind_groups);
+
+    Ok(())
+}
+
+fn cmd_capabilities(model_path: Option<String>, tier: String) -> anyhow::Result<()> {
+    let model = match model_path {
+        Some(path) => {
+            let config = ferrisres::model::checkpoint::load_config(&path)?;
+            ModelFeatures::from_config(&config)
+        }
+        None => {
+            let tier = Tier::parse(&tier).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown tier '{}'; expected nano, small, base or large",
+                    tier
+                )
+            })?;
+            ModelFeatures::from_tier(tier)
+        }
+    };
+
+    let capability = Capability::detect();
+    let device = DeviceFeatures::from_capability(&capability);
+
+    println!("declared:");
+    println!("  arch: {}", model.arch);
+    println!(
+        "  tier: {}",
+        model.tier.map(|t| t.name()).unwrap_or("none")
+    );
+    println!("  hidden_dim: {}", model.hidden_dim);
+    println!("  num_layers: {}", model.num_layers);
+    println!("  visits: {}", model.visits);
+    println!("  experts: {}", model.experts);
+    println!("  top_k: {}", model.top_k);
+    println!("  vocab_size: {}", model.vocab_size);
+    println!("  kv_bits: {}", model.kv_bits);
+    println!("  context_max: {}", model.context_max);
+    println!(
+        "  looped: {}",
+        if model.looped { "yes" } else { "no" }
+    );
+    println!(
+        "  block_sparse: {}",
+        if model.block_sparse { "yes" } else { "no" }
+    );
+    println!("  draft: {}", if model.draft { "yes" } else { "no" });
+    println!("  mtp: {}", if model.mtp { "yes" } else { "no" });
+    println!("  vision: {}", if model.vision { "yes" } else { "no" });
+    println!("  audio: {}", if model.audio { "yes" } else { "no" });
+    println!("  lora: {}", if model.lora { "yes" } else { "no" });
+
+    println!("device:");
+    if device.has_adapter() {
+        println!("  adapter: {} ({})", device.adapter, device.gpu_kind);
+    } else {
+        println!("  adapter: no adapter");
+        println!("  gpu_kind: {} (conservative)", device.gpu_kind);
+    }
+    println!("  shared_ram_mb: {}", device.shared_ram_mb);
+    println!("  coop_matrix: {}", device.coop_matrix);
+    println!("  f16: {}", device.f16);
+    println!("  immediates: {}", device.immediates);
+    println!("  max_storage_buffer: {}", device.max_storage_buffer);
+
+    let context = 8192.min(model.context_max);
+    let resolution = resolve(&model, &device, &Workload::Chat { context });
+
+    println!("resolved (chat, context {}):", context);
+    if resolution.enabled.is_empty() {
+        println!("  enabled: (none)");
+    } else {
+        println!("  enabled: {}", resolution.enabled.join(", "));
+    }
+    if resolution.fallbacks.is_empty() {
+        println!("  fallbacks: (none)");
+    } else {
+        for (feature, reason) in &resolution.fallbacks {
+            println!("  fallback {}: {}", feature, reason);
+        }
+    }
+    if resolution.refusals.is_empty() {
+        println!("  refusals: (none)");
+    } else {
+        for (feature, reason) in &resolution.refusals {
+            println!("  refusal {}: {}", feature, reason);
+        }
+    }
 
     Ok(())
 }

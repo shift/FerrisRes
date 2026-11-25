@@ -1,4 +1,6 @@
 pub mod config;
+pub mod capabilities;
+pub mod tiers;
 pub mod linear;
 pub mod cpu_linear;
 pub mod cpu_moe;
