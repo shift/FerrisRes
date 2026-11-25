@@ -120,8 +120,21 @@ async fn try_adapter(backends: wgpu::Backends, force_software: bool) -> Result<O
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("FerrisRes Device"),
             required_features,
-            required_limits: Limits::downlevel_webgl2_defaults()
-                .using_resolution(adapter.limits()),
+            // `using_resolution` copies only the texture-dimension limits; every
+            // other field keeps the downlevel default. `max_immediate_size`
+            // defaults to 0, so a device that advertises `IMMEDIATES` was still
+            // created with zero immediate space and the first pipeline layout
+            // with `immediate_size: 4` failed validation ("exceeds device
+            // immediate data size limit 0..0"). Take the adapter's value
+            // whenever the feature is enabled.
+            required_limits: {
+                let mut limits = Limits::downlevel_webgl2_defaults()
+                    .using_resolution(adapter.limits());
+                if required_features.contains(Features::IMMEDIATES) {
+                    limits.max_immediate_size = adapter.limits().max_immediate_size;
+                }
+                limits
+            },
             experimental_features: wgpu::ExperimentalFeatures::default(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,

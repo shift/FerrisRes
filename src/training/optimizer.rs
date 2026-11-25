@@ -25,7 +25,7 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> v: array<f32>;
 @group(0) @binding(3) var<storage, read_write> param: array<f32>;
 
-var<private> p: Params;
+var<immediate> p: Params;
 
 @compute @workgroup_size(256)
 fn adam_update(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -60,7 +60,7 @@ struct LossParams {
 @group(0) @binding(1) var<storage, read> targets: array<u32>;
 @group(0) @binding(2) var<storage, read_write> loss_output: array<f32>;
 
-var<private> params: LossParams;
+var<immediate> params: LossParams;
 
 @compute @workgroup_size(64)
 fn cross_entropy(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -233,7 +233,10 @@ impl AdamOptimizer {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Adam Pipeline Layout"),
             bind_group_layouts: &[Some(&adam_bind_group_layout)],
-            immediate_size: 0,
+            // Must equal the WGSL `Params` struct (8 x f32 = 32 bytes) that the
+            // host writes with `set_immediates`. It was 0, so every update read
+            // zeros and the kernel was a no-op.
+            immediate_size: std::mem::size_of::<AdamParams>() as u32,
         });
 
         let adam_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -422,7 +425,8 @@ impl CrossEntropyLoss {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Cross Entropy Loss Pipeline Layout"),
             bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
+            // Must equal the WGSL `LossParams` struct (4 x u32 = 16 bytes).
+            immediate_size: std::mem::size_of::<LossParams>() as u32,
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -631,3 +635,9 @@ mod tests {
         assert!(matches!(DeviceProfile::HighEnd.optimizer_hint(), OptimizerHint::AdaMeM { .. }));
     }
 }
+
+// The WGSL structs above are passed through `set_immediates`, so their byte
+// size is a contract with the host. If a field is added to either struct the
+// WGSL declaration must change too, and these assertions fail the build.
+const _: () = assert!(std::mem::size_of::<AdamParams>() == 32);
+const _: () = assert!(std::mem::size_of::<LossParams>() == 16);
