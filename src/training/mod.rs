@@ -13,6 +13,7 @@ pub mod tool_triggered_lora;
 pub mod backward;
 pub mod shadow_weights;
 pub mod bit_moe;
+pub mod f32_trainer;
 
 pub use optimizer::{SgdOptimizer, AdamOptimizer, CrossEntropyLoss, WeightOptimizer, OptimizerHint, optimizer_for_profile};
 pub use dataset::{
