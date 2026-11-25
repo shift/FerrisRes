@@ -49,6 +49,23 @@ Hybrid attention: sliding window 1024 with 1–4 global visits. KV with MQA and
 2k–4k and extending with YaRN is the plan; claiming 32k without the extension
 phase would be a number the model cannot use.
 
+## Target hardware (calculated)
+
+Decode is memory-bound on both; the context penalty that dominates the i5
+disappears at 256 GB/s.
+
+| tier | MB/token | Strix Halo 256 GB/s | DGX Spark 273 GB/s |
+|---|---:|---:|---:|
+| Nano | 13.3 | ~9,600–13,500 tok/s | ~10,300–14,400 tok/s |
+| Small | 27.1 | ~4,700–6,600 | ~5,000–7,100 |
+| Base | 117.2 | ~1,100–1,500 | ~1,200–1,600 |
+| Large | 117.3 | ~1,100–1,500 | ~1,200–1,600 |
+
+Training 2B tokens at 50% of FP16 peak: Small ~12 h / 7 h, Base ~66 h / 40 h,
+Large ~113 h / 68 h (Strix / Spark). With 128 GB unified, Base with Adam fits
+without offload. These are roofline estimates; the engine's Vulkan path on
+RDNA 3.5 and Blackwell is unverified and does not use tensor cores.
+
 ## What not to build
 
 - 3B and above: ~2 tok/s at 6.3 GB/s, and 2B tokens of from-scratch training is
