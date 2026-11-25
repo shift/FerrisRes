@@ -18,35 +18,73 @@
 //!
 //! # Architecture
 //!
-//! Gemma-2-style pre-norm decoder, `num_layers` identical layers:
+//! Gemma-4-style pre-norm decoder, `num_layers` identical layers, plus the
+//! Block AttnRes mechanism of the CPU inference model
+//! ([`crate::model::cpu_block_attn_res::CpuBlockAttnResModel`]):
 //!
 //! ```text
 //! x = embed[token] * sqrt(hidden)
+//! if blocks are configured:
+//!     block_reps[0] = mean(x over the sequence)
+//!     partial_sum   = block_reps[0]          (not reset — see below)
 //! for each layer:
 //!     h  = rmsnorm(x, attn_norm)
 //!     q  = h @ Wq ; k = h @ Wk ; v = h @ Wv
 //!     q  = rmsnorm_per_head(q, q_norm) ; k = rmsnorm_per_head(k, k_norm)
+//!     v  = rmsnorm_per_head(v)               (no learned scale)
 //!     q  = rope(q) ; k = rope(k)
-//!     a  = causal_attention(q, k, v)          (GQA: kv heads repeat)
+//!     a  = causal_attention(q, k, v)         (GQA, scale 1.0)
 //!     y  = rmsnorm(a @ Wo, post_attn_norm)
 //!     x  = x + y * layer_scalar
 //!     h2 = rmsnorm(x, pre_ffn_norm)
 //!     f  = silu(h2 @ Wg) * (h2 @ Wu)
 //!     y2 = rmsnorm(f @ Wd, post_ffn_norm)
 //!     x  = x + y2 * layer_scalar
+//!     if blocks are configured:
+//!         partial_sum += sum_t x[t]
+//!         if layer is a block boundary:
+//!             rep = partial_sum / (seq * layers_per_block)
+//!             block_reps.push(rep)
+//!             x += inter_block_attention(x, block_reps)   (same vector for every t)
+//!             partial_sum = 0
 //! x = rmsnorm(x, final_norm)
 //! logits = x @ lm_head
 //! ```
 //!
+//! `inter_block_attention` mean-pools `x` over the sequence into a query,
+//! RMS-norms every block summary with the trainable `attn_res_norm`, takes the
+//! softmax of the scores, and returns the weighted sum of the normed summaries.
+//!
+//! # Inference-model key-layout quirk
+//!
+//! [`crate::model::cpu_block_attn_res::CpuBlockAttnResModel::inter_block_attention`]
+//! builds `flat_keys` as `[num_entries, hidden]` and then calls
+//! `matmul(query, flat_keys, 1, hidden, num_entries)`, which expects
+//! `[hidden, num_entries]`. The scores it actually computes are therefore
+//! `sum_l query[l] * flat_keys[l * num_entries + j]`, not `query · key_j`.
+//! The equivalence gate forces us to reproduce that indexing exactly; the
+//! intended `query · key_j` differs by 2.5e-1 on the gate's config. This is
+//! recorded as an inference-model defect, not a design choice.
+//!
 //! Weight layout is `[in, out]`, row-major, so `y[o] = sum_i x[i] * W[i*out+o]`.
 //!
-//! # Deviations from the milestone brief
+//! # Conventions taken from the inference model
 //!
-//! The brief lists `post_attn_norm.w` and `post_ffn_norm.w` as parameters but
-//! its numbered forward step omits them. Leaving them unused would give them a
-//! gradient of exactly zero and make their finite-difference check vacuous, so
-//! they are applied the way Gemma-2 applies them: to the *output* of each
-//! sub-layer, before the residual add. Everything else follows the brief.
+//! The equivalence test at the bottom of this file forces these to match
+//! [`crate::model::cpu_block_attn_res::CpuBlockAttnResModel::forward`]:
+//!
+//! * `post_attn_norm` / `post_ffn_norm` are applied to each sub-layer output
+//!   *before* the residual add (as the inference model does).
+//! * Attention scores are not scaled by `1/sqrt(head_dim)`: the per-head Q/K
+//!   RMSNorm already fixes the scale, and the inference model uses `scale = 1`.
+//! * V is RMS-normalised per head without a learned scale.
+//! * `partial_sum` is *not* reset after `block_reps[0]` is pushed, so the first
+//!   block summary also contains the initial embedding mean. This mirrors the
+//!   inference model exactly.
+//!
+//! The per-sub-layer `layer_scalar` placement differs from the inference model,
+//! which multiplies the whole layer output. Both are identical when
+//! `layer_scalar == 1.0`, which is the value used by the equivalence test.
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -96,6 +134,76 @@ impl F32Config {
 }
 
 // ---------------------------------------------------------------------------
+// Block AttnRes configuration
+// ---------------------------------------------------------------------------
+
+/// Block partitioning for the Block AttnRes mechanism.
+///
+/// Mirrors [`crate::model::cpu_block_attn_res::BlockConfig`] minus
+/// `attn_res_proj`, which the inference model carries but never uses. The
+/// trainable norm lives in [`F32Model::attn_res_norm`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct F32BlockConfig {
+    /// Number of blocks (2 in the reference test config).
+    pub num_blocks: usize,
+    /// Layers per block; the block summary is divided by `seq * layers_per_block`.
+    pub layers_per_block: usize,
+    /// Layer indices that end a block. Empty means "plain transformer".
+    pub boundary_layers: Vec<usize>,
+}
+
+impl F32BlockConfig {
+    /// No block boundaries: the model behaves exactly like the plain
+    /// pre-norm transformer.
+    pub fn plain() -> Self {
+        Self {
+            num_blocks: 0,
+            layers_per_block: 0,
+            boundary_layers: Vec::new(),
+        }
+    }
+
+    /// True when `layer` ends a block.
+    pub fn is_boundary(&self, layer: usize) -> bool {
+        self.boundary_layers.contains(&layer)
+    }
+
+    /// Boundaries must end each block, because the forward divides the
+    /// accumulated sum by exactly `layers_per_block`.
+    fn validate(&self, num_layers: usize) {
+        if self.boundary_layers.is_empty() {
+            return;
+        }
+        assert!(
+            self.layers_per_block > 0,
+            "layers_per_block must be > 0 when boundary_layers is non-empty"
+        );
+        assert!(
+            self.num_blocks >= self.boundary_layers.len(),
+            "num_blocks ({}) must cover every boundary ({})",
+            self.num_blocks,
+            self.boundary_layers.len()
+        );
+        for (j, &b) in self.boundary_layers.iter().enumerate() {
+            assert!(
+                b < num_layers,
+                "boundary layer {} outside num_layers {}",
+                b,
+                num_layers
+            );
+            assert_eq!(
+                b,
+                (j + 1) * self.layers_per_block - 1,
+                "boundary {} must be the last layer of block {} (index {})",
+                b,
+                j,
+                (j + 1) * self.layers_per_block - 1
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Parameters
 // ---------------------------------------------------------------------------
 
@@ -123,10 +231,14 @@ pub struct LayerParams {
 #[derive(Debug, Clone)]
 pub struct F32Model {
     pub config: F32Config,
-    pub embed: Vec<f32>,        // [vocab, hidden]
+    pub block_config: F32BlockConfig,
+    pub embed: Vec<f32>,         // [vocab, hidden]
     pub layers: Vec<LayerParams>,
-    pub final_norm_w: Vec<f32>, // [hidden]
-    pub lm_head: Vec<f32>,      // [hidden, vocab]
+    pub final_norm_w: Vec<f32>,  // [hidden]
+    pub lm_head: Vec<f32>,       // [hidden, vocab]
+    /// Inter-block attention norm, trainable even in the plain config (where
+    /// it is unused and receives zero gradient).
+    pub attn_res_norm: Vec<f32>, // [hidden]
 }
 
 /// Deterministic PRNG (splitmix64). Used only for initialisation and for
@@ -173,8 +285,20 @@ fn init_scale(fan_in: usize) -> f32 {
 impl F32Model {
     /// Deterministic `1/sqrt(fan_in)` initialisation. Norm weights start at 1,
     /// `layer_scalar` at 1. The same seed always produces the same model.
+    ///
+    /// This is the plain pre-norm transformer: no block boundaries.
     pub fn new_random(config: F32Config, seed: u64) -> Self {
+        Self::new_random_with_blocks(config, F32BlockConfig::plain(), seed)
+    }
+
+    /// Same as [`Self::new_random`], with an explicit Block AttnRes layout.
+    pub fn new_random_with_blocks(
+        config: F32Config,
+        block_config: F32BlockConfig,
+        seed: u64,
+    ) -> Self {
         config.validate();
+        block_config.validate(config.num_layers);
         let mut rng = SplitMix64::new(seed);
         let h = config.hidden;
         let q_dim = config.q_dim();
@@ -224,10 +348,12 @@ impl F32Model {
 
         Self {
             config,
+            block_config,
             embed,
             layers,
             final_norm_w: vec![1.0; h],
             lm_head,
+            attn_res_norm: vec![1.0; h],
         }
     }
 
@@ -263,6 +389,7 @@ impl F32Model {
         }
         out.push(("final_norm".to_string(), self.final_norm_w.as_slice()));
         out.push(("lm_head".to_string(), self.lm_head.as_slice()));
+        out.push(("attn_res_norm".to_string(), self.attn_res_norm.as_slice()));
         out
     }
 
@@ -293,6 +420,7 @@ impl F32Model {
         }
         out.push(("final_norm".to_string(), self.final_norm_w.as_mut_slice()));
         out.push(("lm_head".to_string(), self.lm_head.as_mut_slice()));
+        out.push(("attn_res_norm".to_string(), self.attn_res_norm.as_mut_slice()));
         out
     }
 
@@ -361,10 +489,31 @@ impl F32Model {
         }
         let x_embed = x.clone();
 
+        // Block AttnRes state. `block_reps[0]` is the mean of the initial
+        // embedding over the sequence; it is pushed only when blocks are
+        // configured so the plain path stays bit-identical to before.
+        let has_blocks = !self.block_config.boundary_layers.is_empty();
+        let mut block_reps: Vec<Vec<f32>> = Vec::new();
+        let mut boundaries: Vec<BoundaryCache> = Vec::new();
+        let mut partial_sum = vec![0.0f32; h];
+        if has_blocks {
+            for t in 0..seq {
+                for d in 0..h {
+                    partial_sum[d] += x[t * h + d];
+                }
+            }
+            for d in 0..h {
+                partial_sum[d] /= seq as f32;
+            }
+            block_reps.push(partial_sum.clone());
+            // Deliberately no reset here: the inference model keeps the mean in
+            // the accumulator, so the first block summary includes it.
+        }
+
         let (cos, sin) = self.rope_tables(seq);
         let mut layer_caches = Vec::with_capacity(cfg.num_layers);
 
-        for lp in &self.layers {
+        for (layer_index, lp) in self.layers.iter().enumerate() {
             let x_in = x.clone();
 
             // --- attention block -------------------------------------------------
@@ -375,8 +524,13 @@ impl F32Model {
             matmul(&h_attn, &lp.q, seq, h, q_dim, &mut q_proj);
             let mut k_proj = vec![0.0; seq * kv_dim];
             matmul(&h_attn, &lp.k, seq, h, kv_dim, &mut k_proj);
+            let mut v_raw = vec![0.0; seq * kv_dim];
+            matmul(&h_attn, &lp.v, seq, h, kv_dim, &mut v_raw);
+
+            // Per-head V RMSNorm without a learned scale (inference model
+            // convention: `per_head_rms_norm_no_scale`).
             let mut v = vec![0.0; seq * kv_dim];
-            matmul(&h_attn, &lp.v, seq, h, kv_dim, &mut v);
+            rmsnorm_no_scale_fwd(&v_raw, eps, seq * kv_heads, head_dim, &mut v);
 
             let mut q = vec![0.0; seq * q_dim];
             rmsnorm_fwd(&q_proj, &lp.q_norm_w, eps, seq * heads, head_dim, &mut q);
@@ -433,6 +587,7 @@ impl F32Model {
                 k_proj,
                 q,
                 k,
+                v_raw,
                 v,
                 attn_probs,
                 attn_concat,
@@ -449,6 +604,38 @@ impl F32Model {
             });
 
             x = x_out;
+
+            // --- block summary + inter-block attention ---------------------------
+            if has_blocks {
+                for t in 0..seq {
+                    for d in 0..h {
+                        partial_sum[d] += x[t * h + d];
+                    }
+                }
+                if self.block_config.is_boundary(layer_index) {
+                    let denom = (seq * self.block_config.layers_per_block) as f32;
+                    for d in 0..h {
+                        partial_sum[d] /= denom;
+                    }
+                    block_reps.push(partial_sum.clone());
+
+                    let inter =
+                        inter_block_attention_fwd(&x, &block_reps, &self.attn_res_norm, seq, h, eps);
+                    boundaries.push(BoundaryCache {
+                        layer_idx: layer_index,
+                        rep_index: block_reps.len() - 1,
+                        num_entries: block_reps.len(),
+                        query: inter.query,
+                        normed_reps: inter.normed_reps,
+                        weights: inter.weights,
+                    });
+                    // The same attention vector is added to every token.
+                    for i in 0..seq * h {
+                        x[i] += inter.output[i % h];
+                    }
+                    partial_sum = vec![0.0f32; h];
+                }
+            }
         }
 
         let x_final_in = x.clone();
@@ -462,6 +649,8 @@ impl F32Model {
             seq,
             x_embed,
             layers: layer_caches,
+            block_reps,
+            boundaries,
             x_final_in,
             h_final,
             cos,
@@ -560,8 +749,80 @@ impl F32Model {
             eps,
         );
 
+        // --- block summaries and inter-block attention ------------------------
+        //
+        // Every block summary is a mean over the sequence and over the block's
+        // layers, so its gradient flows back into the hidden state of every
+        // layer in that block. `d_layer_extra[l]` accumulates those terms and
+        // is added to `dx` when layer `l` is reached in the reverse loop.
+        let mut d_block_reps: Vec<Vec<f32>> =
+            vec![vec![0.0f32; h]; cache.block_reps.len()];
+        let mut d_layer_extra: Vec<Vec<f32>> =
+            vec![vec![0.0f32; seq * h]; cfg.num_layers];
+        let mut d_initial_mean = vec![0.0f32; h];
+
         // --- layers, last to first -------------------------------------------
         for l in (0..cfg.num_layers).rev() {
+            // The boundary attention is processed *before* this block's layers,
+            // because it consumes the gradient of the boundary layer's output.
+            if let Some(bj) = cache.boundaries.iter().position(|b| b.layer_idx == l) {
+                let bc = &cache.boundaries[bj];
+
+                // `inter_out` is added to every token: d_inter = sum_t dx[t].
+                let mut d_inter = vec![0.0f32; h];
+                for t in 0..seq {
+                    for d in 0..h {
+                        d_inter[d] += dx[t * h + d];
+                    }
+                }
+
+                let mut d_query = vec![0.0f32; h];
+                inter_block_attention_bwd(
+                    &bc.query,
+                    &cache.block_reps[..bc.num_entries],
+                    &bc.normed_reps,
+                    &bc.weights,
+                    &d_inter,
+                    &self.attn_res_norm,
+                    &mut grads.attn_res_norm,
+                    &mut d_query,
+                    &mut d_block_reps[..bc.num_entries],
+                    h,
+                    eps,
+                );
+
+                // query = mean of this layer's output over the sequence.
+                for t in 0..seq {
+                    for d in 0..h {
+                        dx[t * h + d] += d_query[d] / seq as f32;
+                    }
+                }
+
+                // The new summary's gradient flows into every layer of the
+                // block, including this boundary layer.
+                let lpb = self.block_config.layers_per_block;
+                let k = bc.rep_index;
+                let scale = 1.0 / ((seq * lpb) as f32);
+                let first = l + 1 - lpb;
+                for bl in first..=l {
+                    for i in 0..seq * h {
+                        d_layer_extra[bl][i] += d_block_reps[k][i % h] * scale;
+                    }
+                }
+                // The first block summary also contains `block_reps[0]`, the
+                // mean of the initial embedding.
+                if first == 0 {
+                    for d in 0..h {
+                        d_initial_mean[d] += d_block_reps[k][d] * scale;
+                    }
+                }
+            }
+
+            // Gradient of this layer's output through its block summary.
+            for i in 0..seq * h {
+                dx[i] += d_layer_extra[l][i];
+            }
+
             let lc = &cache.layers[l];
             let lp = &self.layers[l];
             let lg = &mut grads.layers[l];
@@ -696,6 +957,10 @@ impl F32Model {
                 eps,
             );
 
+            // undo per-head V norm (no learned scale)
+            let mut dv_raw = vec![0.0f32; seq * kv_dim];
+            rmsnorm_no_scale_bwd(&lc.v_raw, &dv, &mut dv_raw, seq * kv_heads, head_dim, eps);
+
             // projections back to the normed input
             let mut d_h_attn = vec![0.0; seq * h];
             let mut d_h_attn_k = vec![0.0; seq * h];
@@ -704,8 +969,8 @@ impl F32Model {
             matmul_bwd_x(&dq_proj, &lp.q, &mut d_h_attn, seq, h, q_dim);
             matmul_bwd_w(&lc.h_attn, &dk_proj, &mut lg.k, seq, h, kv_dim);
             matmul_bwd_x(&dk_proj, &lp.k, &mut d_h_attn_k, seq, h, kv_dim);
-            matmul_bwd_w(&lc.h_attn, &dv, &mut lg.v, seq, h, kv_dim);
-            matmul_bwd_x(&dv, &lp.v, &mut d_h_attn_v, seq, h, kv_dim);
+            matmul_bwd_w(&lc.h_attn, &dv_raw, &mut lg.v, seq, h, kv_dim);
+            matmul_bwd_x(&dv_raw, &lp.v, &mut d_h_attn_v, seq, h, kv_dim);
             for i in 0..seq * h {
                 d_h_attn[i] += d_h_attn_k[i] + d_h_attn_v[i];
             }
@@ -728,6 +993,17 @@ impl F32Model {
         }
 
         // --- embedding scatter-add -------------------------------------------
+        // `block_reps[0]` is the mean of the initial embedding, and the first
+        // block summary also contains that mean. Both gradients land on x_0 and
+        // are spread evenly over every position.
+        if !cache.block_reps.is_empty() {
+            for t in 0..seq {
+                for d in 0..h {
+                    dx[t * h + d] += (d_block_reps[0][d] + d_initial_mean[d]) / seq as f32;
+                }
+            }
+        }
+
         let sqrt_h = (h as f32).sqrt();
         for t in 0..seq {
             let tok = cache.tokens[t] as usize;
@@ -753,7 +1029,8 @@ pub struct LayerCache {
     pub k_proj: Vec<f32>,            // [seq, kv_dim] before per-head norm
     pub q: Vec<f32>,                 // [seq, q_dim] after norm + rope
     pub k: Vec<f32>,                 // [seq, kv_dim] after norm + rope
-    pub v: Vec<f32>,                 // [seq, kv_dim]
+    pub v_raw: Vec<f32>,             // [seq, kv_dim] before per-head V norm
+    pub v: Vec<f32>,                 // [seq, kv_dim] after per-head V norm
     pub attn_probs: Vec<f32>,        // [heads, seq, seq], causal, rows sum to 1
     pub attn_concat: Vec<f32>,       // [seq, q_dim] attention output
     pub attn_out: Vec<f32>,          // [seq, hidden] attn_concat @ Wo
@@ -768,12 +1045,33 @@ pub struct LayerCache {
     pub x_out: Vec<f32>,             // [seq, hidden] layer output
 }
 
+/// One inter-block attention site, cached for the backward pass.
+#[derive(Debug, Clone)]
+pub struct BoundaryCache {
+    /// Layer index that ended this block.
+    pub layer_idx: usize,
+    /// Index of this block's summary in [`ForwardCache::block_reps`].
+    pub rep_index: usize,
+    /// Number of summaries used as keys (`rep_index + 1`).
+    pub num_entries: usize,
+    /// Mean-pooled hidden state used as the query: `[hidden]`.
+    pub query: Vec<f32>,
+    /// RMS-normed summaries used as keys and values: `[num_entries][hidden]`.
+    pub normed_reps: Vec<Vec<f32>>,
+    /// Softmax weights over the summaries: `[num_entries]`.
+    pub weights: Vec<f32>,
+}
+
 /// Full forward cache.
 #[derive(Debug, Clone)]
 pub struct ForwardCache {
     pub seq: usize,
     pub x_embed: Vec<f32>,     // [seq, hidden] embed[token] * sqrt(hidden)
     pub layers: Vec<LayerCache>,
+    /// Raw block summaries, index 0 = mean initial embedding.
+    pub block_reps: Vec<Vec<f32>>,
+    /// One entry per block boundary, in forward order.
+    pub boundaries: Vec<BoundaryCache>,
     pub x_final_in: Vec<f32>,  // [seq, hidden] input to final norm
     pub h_final: Vec<f32>,     // [seq, hidden] after final norm
     pub cos: Vec<f32>,         // [seq, head_dim/2]
@@ -812,6 +1110,7 @@ pub struct Gradients {
     pub layers: Vec<LayerGradients>,
     pub final_norm_w: Vec<f32>,
     pub lm_head: Vec<f32>,
+    pub attn_res_norm: Vec<f32>,
 }
 
 impl Gradients {
@@ -842,6 +1141,7 @@ impl Gradients {
             layers: (0..cfg.num_layers).map(|_| layer()).collect(),
             final_norm_w: vec![0.0; h],
             lm_head: vec![0.0; h * cfg.vocab],
+            attn_res_norm: vec![0.0; h],
         }
     }
 
@@ -868,6 +1168,7 @@ impl Gradients {
         }
         out.push(("final_norm".to_string(), self.final_norm_w.as_slice()));
         out.push(("lm_head".to_string(), self.lm_head.as_slice()));
+        out.push(("attn_res_norm".to_string(), self.attn_res_norm.as_slice()));
         out
     }
 }
@@ -1089,6 +1390,236 @@ fn rmsnorm_bwd(
     }
 }
 
+/// Per-head RMSNorm forward without a learned scale (V normalisation).
+fn rmsnorm_no_scale_fwd(x: &[f32], eps: f32, rows: usize, dim: usize, out: &mut [f32]) {
+    debug_assert_eq!(x.len(), rows * dim);
+    debug_assert_eq!(out.len(), rows * dim);
+    for r in 0..rows {
+        let xr = &x[r * dim..(r + 1) * dim];
+        let or = &mut out[r * dim..(r + 1) * dim];
+        let mut ss = 0.0f32;
+        for &v in xr {
+            ss += v * v;
+        }
+        let inv = 1.0 / (ss / dim as f32 + eps).sqrt();
+        for i in 0..dim {
+            or[i] = xr[i] * inv;
+        }
+    }
+}
+
+/// Backward of [`rmsnorm_no_scale_fwd`]. `dx` is overwritten.
+fn rmsnorm_no_scale_bwd(
+    x: &[f32],
+    dy: &[f32],
+    dx: &mut [f32],
+    rows: usize,
+    dim: usize,
+    eps: f32,
+) {
+    debug_assert_eq!(x.len(), rows * dim);
+    debug_assert_eq!(dy.len(), rows * dim);
+    debug_assert_eq!(dx.len(), rows * dim);
+    let inv_dim = 1.0 / dim as f32;
+    for r in 0..rows {
+        let xr = &x[r * dim..(r + 1) * dim];
+        let dyr = &dy[r * dim..(r + 1) * dim];
+        let dxr = &mut dx[r * dim..(r + 1) * dim];
+
+        let mut ss = 0.0f32;
+        for &v in xr {
+            ss += v * v;
+        }
+        let inv = 1.0 / (ss * inv_dim + eps).sqrt();
+
+        let mut dy_dot_x = 0.0f32;
+        for i in 0..dim {
+            dy_dot_x += dyr[i] * xr[i];
+        }
+        let c = inv * inv * inv * dy_dot_x * inv_dim;
+        for i in 0..dim {
+            dxr[i] = inv * dyr[i] - c * xr[i];
+        }
+    }
+}
+
+/// Forward result of one inter-block attention site.
+struct InterBlockForward {
+    query: Vec<f32>,           // [hidden]
+    normed_reps: Vec<Vec<f32>>, // [n][hidden]
+    weights: Vec<f32>,         // [n]
+    output: Vec<f32>,          // [hidden]
+}
+
+/// Inter-block attention, matching
+/// [`crate::model::cpu_block_attn_res::CpuBlockAttnResModel::inter_block_attention`]:
+///
+/// ```text
+/// query  = mean(hidden over the sequence)
+/// key_i  = rmsnorm(block_reps[i], attn_res_norm)
+/// w      = softmax(score * 1/sqrt(hidden))
+/// output = sum_i w_i * key_i
+/// ```
+///
+/// `score` follows the inference model's flattened-key indexing, which is not
+/// `query · key_i`; see [`inter_block_attention_bwd`] and the module docs.
+fn inter_block_attention_fwd(
+    hidden: &[f32],
+    block_reps: &[Vec<f32>],
+    attn_res_norm: &[f32],
+    seq: usize,
+    hd: usize,
+    eps: f32,
+) -> InterBlockForward {
+    let n = block_reps.len();
+    assert!(n > 0, "inter-block attention needs at least one summary");
+
+    let mut query = vec![0.0f32; hd];
+    for t in 0..seq {
+        for d in 0..hd {
+            query[d] += hidden[t * hd + d];
+        }
+    }
+    for d in 0..hd {
+        query[d] /= seq as f32;
+    }
+
+    let mut normed_reps = Vec::with_capacity(n);
+    for rep in block_reps {
+        let mut normed = vec![0.0f32; hd];
+        rmsnorm_fwd(rep, attn_res_norm, eps, 1, hd, &mut normed);
+        normed_reps.push(normed);
+    }
+
+    // Raw dot products, then the same `exp((s - max) * scale)` softmax the
+    // inference model uses.
+    //
+    // IMPORTANT: the inference model builds `flat_keys` as
+    // `[num_entries, hidden]` and then calls
+    // `matmul(query, flat_keys, 1, hidden, num_entries)`, which reads it as
+    // `[hidden, num_entries]`. The effective score is therefore
+    // `sum_l query[l] * flat_keys[l * num_entries + j]`, not
+    // `query . normed_reps[j]`. We reproduce that indexing exactly so the
+    // equivalence gate holds; see the note in the module documentation.
+    let mut flat_keys = vec![0.0f32; n * hd];
+    for i in 0..n {
+        flat_keys[i * hd..(i + 1) * hd].copy_from_slice(&normed_reps[i]);
+    }
+    let mut scores = vec![0.0f32; n];
+    for j in 0..n {
+        let mut acc = 0.0f32;
+        for l in 0..hd {
+            acc += query[l] * flat_keys[l * n + j];
+        }
+        scores[j] = acc;
+    }
+    let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut weights = vec![0.0f32; n];
+    let mut sum_exp = 0.0f32;
+    for i in 0..n {
+        weights[i] = ((scores[i] - max_score) * scale).exp();
+        sum_exp += weights[i];
+    }
+    for w in weights.iter_mut() {
+        *w /= sum_exp;
+    }
+
+    let mut output = vec![0.0f32; hd];
+    for i in 0..n {
+        for d in 0..hd {
+            output[d] += weights[i] * normed_reps[i][d];
+        }
+    }
+
+    InterBlockForward {
+        query,
+        normed_reps,
+        weights,
+        output,
+    }
+}
+
+/// Backward of [`inter_block_attention_fwd`].
+///
+/// `d_block_reps` is accumulated (not overwritten): a summary is a key for this
+/// boundary and for every later boundary, and the reverse loop has already
+/// added the later contributions.
+#[allow(clippy::too_many_arguments)]
+fn inter_block_attention_bwd(
+    query: &[f32],
+    block_reps: &[Vec<f32>],
+    normed_reps: &[Vec<f32>],
+    weights: &[f32],
+    d_out: &[f32],
+    attn_res_norm: &[f32],
+    d_attn_res_norm: &mut [f32],
+    d_query: &mut [f32],
+    d_block_reps: &mut [Vec<f32>],
+    hd: usize,
+    eps: f32,
+) {
+    let n = weights.len();
+    let scale = 1.0 / (hd as f32).sqrt();
+
+    // dw_i = d_out . normed_i
+    let mut dw = vec![0.0f32; n];
+    for i in 0..n {
+        dw[i] = dot(d_out, &normed_reps[i]);
+    }
+    let mut weighted = 0.0f32;
+    for i in 0..n {
+        weighted += weights[i] * dw[i];
+    }
+
+    // Same `[num_entries, hidden]` -> `[hidden, num_entries]` indexing as the
+    // forward pass.
+    let mut flat_keys = vec![0.0f32; n * hd];
+    for i in 0..n {
+        flat_keys[i * hd..(i + 1) * hd].copy_from_slice(&normed_reps[i]);
+    }
+
+    for d in d_query.iter_mut() {
+        *d = 0.0;
+    }
+    let mut d_flat = vec![0.0f32; n * hd];
+    for j in 0..n {
+        // d(score_j) where the softmax is over `score * scale`.
+        let ds = weights[j] * (dw[j] - weighted);
+        for l in 0..hd {
+            d_query[l] += ds * scale * flat_keys[l * n + j];
+            d_flat[l * n + j] += ds * scale * query[l];
+        }
+    }
+
+    let mut d_normed = vec![vec![0.0f32; hd]; n];
+    for i in 0..n {
+        for d in 0..hd {
+            // output = sum_j w_j * normed_j, plus the score path through the
+            // flattened key buffer.
+            d_normed[i][d] = weights[i] * d_out[d] + d_flat[i * hd + d];
+        }
+    }
+
+    for i in 0..n {
+        let mut d_rep = vec![0.0f32; hd];
+        rmsnorm_bwd(
+            &block_reps[i],
+            attn_res_norm,
+            &d_normed[i],
+            d_attn_res_norm,
+            &mut d_rep,
+            1,
+            hd,
+            eps,
+        );
+        for d in 0..hd {
+            d_block_reps[i][d] += d_rep[d];
+        }
+    }
+}
+
+
 /// RoPE forward, half-split layout: pair `(d, d + half)` rotates by
 /// `pos * theta^(-2d/head_dim)`.
 fn apply_rope(x: &mut [f32], seq: usize, heads: usize, head_dim: usize, cos: &[f32], sin: &[f32]) {
@@ -1150,7 +1681,9 @@ fn attention_fwd(
     out: &mut [f32],
 ) {
     let group = heads / kv_heads;
-    let scale = 1.0 / (head_dim as f32).sqrt();
+    // The inference model uses scale 1.0: the per-head Q/K RMSNorm already
+    // normalises the dot products.
+    let scale = 1.0f32;
     for hh in 0..heads {
         let kvh = hh / group;
         for t in 0..seq {
@@ -1218,7 +1751,7 @@ fn attention_bwd(
         *x = 0.0;
     }
     let group = heads / kv_heads;
-    let scale = 1.0 / (head_dim as f32).sqrt();
+    let scale = 1.0f32;
     let mut dp = vec![0.0f32; seq];
 
     for hh in 0..heads {
@@ -1284,6 +1817,19 @@ mod tests {
         }
     }
 
+    /// 4 layers, 2 blocks of 2 layers, boundaries at layers 1 and 3.
+    fn two_block_config() -> F32Config {
+        tiny_config(4, 1)
+    }
+
+    fn two_blocks() -> F32BlockConfig {
+        F32BlockConfig {
+            num_blocks: 2,
+            layers_per_block: 2,
+            boundary_layers: vec![1, 3],
+        }
+    }
+
     /// Loss evaluated with f64 accumulation over the f32 forward pass. Used
     /// only by the numeric side of the gradient check.
     fn loss_f64(model: &F32Model, tokens: &[u32]) -> f64 {
@@ -1328,8 +1874,8 @@ mod tests {
 
     /// Central-difference check of every parameter tensor. Panics with the
     /// offending tensor and index if any entry exceeds the tolerance.
-    fn run_gradient_check(cfg: F32Config, seed: u64) {
-        let mut model = F32Model::new_random(cfg, seed);
+    fn run_gradient_check(cfg: F32Config, block_config: F32BlockConfig, seed: u64) {
+        let mut model = F32Model::new_random_with_blocks(cfg, block_config.clone(), seed);
         let tokens: Vec<u32> = (0..cfg.max_seq)
             .map(|t| ((t * 3 + 1) % cfg.vocab) as u32)
             .collect();
@@ -1360,11 +1906,12 @@ mod tests {
         let mut worst_err = 0.0f64;
 
         println!(
-            "gradient check: layers={} heads={} kv_heads={} seq={}",
+            "gradient check: layers={} heads={} kv_heads={} seq={} blocks={:?}",
             cfg.num_layers,
             cfg.num_heads,
             cfg.num_kv_heads,
-            tokens.len()
+            tokens.len(),
+            block_config.boundary_layers
         );
         println!("{:<26} {:>5} {:>12} {:>12}", "tensor", "n", "max_abs_err", "max_rel_err");
 
@@ -1428,14 +1975,235 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Equivalence with the CPU inference model
+    // -----------------------------------------------------------------------
+
+    use crate::model::cpu_block_attn_res::{
+        BlockConfig, CpuBlockAttnResLayer, CpuBlockAttnResModel,
+    };
+    use crate::model::cpu_linear::{CpuLinear, CpuRmsNorm};
+
+    /// Norm weights around 1.0, so the model is not degenerate.
+    fn rand_norm(rng: &mut SplitMix64, n: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; n];
+        fill_uniform(&mut v, 0.1, rng);
+        for x in v.iter_mut() {
+            *x += 1.0;
+        }
+        v
+    }
+
+    /// `CpuLinear` stores `[out, in]` row-major and quantises to ternary.
+    fn cpu_linear(rng: &mut SplitMix64, in_f: usize, out_f: usize) -> CpuLinear {
+        let mut w = vec![0.0f32; out_f * in_f];
+        fill_uniform(&mut w, init_scale(in_f), rng);
+        CpuLinear::from_weight(w, in_f, out_f)
+    }
+
+    /// CPU weight `[out, in]` -> f32-trainer weight `[in, out]`.
+    fn cpu_to_f32(w: &[f32], in_f: usize, out_f: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; in_f * out_f];
+        for o in 0..out_f {
+            for i in 0..in_f {
+                out[i * out_f + o] = w[o * in_f + i];
+            }
+        }
+        out
+    }
+
+    /// Dense `CpuBlockAttnResModel` with no PLE, no MoE, no KV sharing, no
+    /// softcapping, SwiGLU, and `layer_scalar = 1`.
+    fn cpu_dense_block_model(
+        cfg: &F32Config,
+        block: &F32BlockConfig,
+        seed: u64,
+    ) -> CpuBlockAttnResModel {
+        let mut rng = SplitMix64::new(seed);
+        let h = cfg.hidden;
+        let q_dim = cfg.q_dim();
+        let kv_dim = cfg.kv_dim();
+        let hd = cfg.head_dim;
+        let inter = cfg.intermediate;
+
+        let layers = (0..cfg.num_layers)
+            .map(|idx| CpuBlockAttnResLayer {
+                layer_number: idx,
+                hidden_dim: h,
+                num_heads: cfg.num_heads,
+                num_kv_heads: cfg.num_kv_heads,
+                head_dim: hd,
+                intermediate_dim: inter,
+                attn_norm: CpuRmsNorm::from_weight(rand_norm(&mut rng, h), cfg.eps),
+                q_proj: cpu_linear(&mut rng, h, q_dim),
+                k_proj: cpu_linear(&mut rng, h, kv_dim),
+                v_proj: cpu_linear(&mut rng, h, kv_dim),
+                out_proj: cpu_linear(&mut rng, q_dim, h),
+                q_norm: CpuRmsNorm::from_weight(rand_norm(&mut rng, hd), cfg.eps),
+                k_norm: CpuRmsNorm::from_weight(rand_norm(&mut rng, hd), cfg.eps),
+                // The inference forward ignores `v_norm` and uses
+                // `per_head_rms_norm_no_scale`, which has no parameters.
+                v_norm: CpuRmsNorm::from_weight(vec![1.0; hd], cfg.eps),
+                post_attn_norm: CpuRmsNorm::from_weight(rand_norm(&mut rng, h), cfg.eps),
+                pre_ffn_norm: CpuRmsNorm::from_weight(rand_norm(&mut rng, h), cfg.eps),
+                ffn_gate: Some(cpu_linear(&mut rng, h, inter)),
+                ffn_up: Some(cpu_linear(&mut rng, h, inter)),
+                ffn_down: Some(cpu_linear(&mut rng, inter, h)),
+                moe: None,
+                post_ffn_norm: CpuRmsNorm::from_weight(rand_norm(&mut rng, h), cfg.eps),
+                layer_scalar: 1.0,
+                ple_input_gate: None,
+                ple_projection: None,
+                ple_post_norm: None,
+                rope_theta: cfg.rope_theta as f64,
+                partial_rotary_factor: 1.0,
+                use_gelu: false,
+                kv_shared: false,
+            })
+            .collect();
+
+        let mut embed = vec![0.0f32; cfg.vocab * h];
+        fill_uniform(&mut embed, init_scale(h), &mut rng);
+        let mut lm_head = vec![0.0f32; h * cfg.vocab];
+        fill_uniform(&mut lm_head, init_scale(h), &mut rng);
+
+        CpuBlockAttnResModel {
+            layers,
+            embed_tokens: embed,
+            lm_head,
+            final_norm: rand_norm(&mut rng, h),
+            hidden_dim: h,
+            vocab_size: cfg.vocab,
+            num_layers: cfg.num_layers,
+            final_logit_softcapping: None,
+            ple_model_projection: None,
+            ple_projection_norm: None,
+            embed_tokens_per_layer: None,
+            hidden_size_per_layer_input: 0,
+            num_kv_shared_layers: 0,
+            block_config: BlockConfig {
+                num_blocks: block.num_blocks,
+                layers_per_block: block.layers_per_block,
+                boundary_layers: block.boundary_layers.clone(),
+                // Present in the inference struct, unused by its forward.
+                attn_res_proj: vec![0.0; h * h],
+                attn_res_norm: rand_norm(&mut rng, h),
+            },
+            lora_manager: None,
+        }
+    }
+
+    /// Copy the (ternary-quantised, dequantised) CPU weights into an
+    /// `F32Model`, transposing every `[out, in]` projection to `[in, out]`.
+    fn f32_from_cpu_model(
+        cfg: F32Config,
+        block: F32BlockConfig,
+        cpu: &CpuBlockAttnResModel,
+    ) -> F32Model {
+        let mut model = F32Model::new_random_with_blocks(cfg, block, 0);
+        let h = cfg.hidden;
+        let q_dim = cfg.q_dim();
+        let kv_dim = cfg.kv_dim();
+        let inter = cfg.intermediate;
+
+        model.embed.copy_from_slice(&cpu.embed_tokens);
+        model.lm_head.copy_from_slice(&cpu.lm_head);
+        model.final_norm_w.copy_from_slice(&cpu.final_norm);
+        model.attn_res_norm.copy_from_slice(&cpu.block_config.attn_res_norm);
+
+        assert_eq!(model.layers.len(), cpu.layers.len());
+        for (ml, cl) in model.layers.iter_mut().zip(cpu.layers.iter()) {
+            ml.attn_norm_w.copy_from_slice(cl.attn_norm.weight());
+            ml.q.copy_from_slice(&cpu_to_f32(&cl.q_proj.weight(), h, q_dim));
+            ml.k.copy_from_slice(&cpu_to_f32(&cl.k_proj.weight(), h, kv_dim));
+            ml.v.copy_from_slice(&cpu_to_f32(&cl.v_proj.weight(), h, kv_dim));
+            ml.q_norm_w.copy_from_slice(cl.q_norm.weight());
+            ml.k_norm_w.copy_from_slice(cl.k_norm.weight());
+            ml.o.copy_from_slice(&cpu_to_f32(&cl.out_proj.weight(), q_dim, h));
+            ml.post_attn_norm_w.copy_from_slice(cl.post_attn_norm.weight());
+            ml.pre_ffn_norm_w.copy_from_slice(cl.pre_ffn_norm.weight());
+            ml.gate.copy_from_slice(&cpu_to_f32(
+                &cl.ffn_gate.as_ref().unwrap().weight(),
+                h,
+                inter,
+            ));
+            ml.up.copy_from_slice(&cpu_to_f32(
+                &cl.ffn_up.as_ref().unwrap().weight(),
+                h,
+                inter,
+            ));
+            ml.down.copy_from_slice(&cpu_to_f32(
+                &cl.ffn_down.as_ref().unwrap().weight(),
+                inter,
+                h,
+            ));
+            ml.post_ffn_norm_w.copy_from_slice(cl.post_ffn_norm.weight());
+            ml.layer_scalar = cl.layer_scalar;
+        }
+
+        model
+    }
+
+    /// Equivalence gate: the f32 forward must reproduce the CPU inference
+    /// forward on the same weights, including both block boundaries.
+    #[test]
+    fn f32_forward_matches_cpu_block_attn_res() {
+        let cfg = two_block_config();
+        let block = two_blocks();
+        let cpu = cpu_dense_block_model(&cfg, &block, 0xC0FF_EE01);
+        let model = f32_from_cpu_model(cfg, block, &cpu);
+
+        let tokens: Vec<u32> = vec![1, 4, 2, 7];
+        let cpu_logits = cpu.forward(&tokens);
+        let (f32_logits, cache) = model.forward(&tokens);
+        assert_eq!(cpu_logits.len(), f32_logits.len());
+        assert_eq!(cache.block_reps.len(), 3, "initial mean + one per boundary");
+        assert_eq!(cache.boundaries.len(), 2);
+
+        let mut max_abs = 0.0f32;
+        let mut max_at = (0usize, 0usize);
+        for t in 0..tokens.len() {
+            for j in 0..cfg.vocab {
+                let i = t * cfg.vocab + j;
+                let d = (cpu_logits[i] - f32_logits[i]).abs();
+                if d > max_abs {
+                    max_abs = d;
+                    max_at = (t, j);
+                }
+            }
+        }
+
+        println!(
+            "equivalence: max |cpu - f32| logit diff = {:.3e} at (t={}, j={})",
+            max_abs, max_at.0, max_at.1
+        );
+        println!("cpu logits[0..4] = {:?}", &cpu_logits[..4]);
+        println!("f32 logits[0..4] = {:?}", &f32_logits[..4]);
+        assert!(
+            max_abs <= 1e-4,
+            "f32 forward differs from the CPU inference forward by {} at (t={}, j={})",
+            max_abs,
+            max_at.0,
+            max_at.1
+        );
+    }
+
     #[test]
     fn gradient_check_gqa_one_layer() {
-        run_gradient_check(tiny_config(1, 1), 0x5EED_0001);
+        run_gradient_check(tiny_config(1, 1), F32BlockConfig::plain(), 0x5EED_0001);
     }
 
     #[test]
     fn gradient_check_two_layers_full_kv() {
-        run_gradient_check(tiny_config(2, 2), 0x5EED_0002);
+        run_gradient_check(tiny_config(2, 2), F32BlockConfig::plain(), 0x5EED_0002);
+    }
+
+    /// Two blocks of two layers each: boundaries at layers 1 and 3. Exercises
+    /// the block-summary gradient into every layer of both blocks and the
+    /// `attn_res_norm` gradient through the RMSNorm of the summaries.
+    #[test]
+    fn gradient_check_two_blocks() {
+        run_gradient_check(two_block_config(), two_blocks(), 0x5EED_0003);
     }
 
     #[test]
@@ -1480,27 +2248,81 @@ mod tests {
         );
     }
 
+    /// Same synthetic task as [`loss_decreases_on_synthetic_batch`], with two
+    /// blocks of two layers (boundaries at layers 1 and 3).
     #[test]
-    fn deterministic_init_and_loss() {
-        let cfg = tiny_config(1, 1);
-        let a = F32Model::new_random(cfg, 1234);
-        let b = F32Model::new_random(cfg, 1234);
+    fn loss_decreases_with_two_blocks() {
+        let cfg = F32Config {
+            hidden: 16,
+            num_layers: 4,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 8,
+            intermediate: 32,
+            vocab: 32,
+            max_seq: 16,
+            rope_theta: 10_000.0,
+            eps: 1e-6,
+        };
+        let block = F32BlockConfig {
+            num_blocks: 2,
+            layers_per_block: 2,
+            boundary_layers: vec![1, 3],
+        };
+        let mut model = F32Model::new_random_with_blocks(cfg, block, 42);
+        let tokens: Vec<u32> = (0..16).map(|t| ((t % 4) + 1) as u32).collect();
 
-        let ta = a.tensors();
-        let tb = b.tensors();
-        assert_eq!(ta.len(), tb.len());
-        for ((na, pa), (nb, pb)) in ta.iter().zip(tb.iter()) {
-            assert_eq!(na, nb);
-            assert_eq!(pa, pb, "parameters differ for tensor {}", na);
+        let mut adam = Adam::new(&model);
+        let mut losses = Vec::with_capacity(300);
+        for _ in 0..300 {
+            let (logits, cache) = model.forward(&tokens);
+            let (loss, d_logits) = F32Model::cross_entropy(&logits, &tokens, cfg.vocab);
+            assert!(loss.is_finite(), "loss became non-finite");
+            losses.push(loss);
+            let grads = model.backward(&cache, &d_logits);
+            adam.step(&mut model, &grads, 1e-2, 0.9, 0.999, 1e-8);
         }
 
-        let tokens: Vec<u32> = vec![1, 4, 2, 7];
-        let (la, _) = a.forward(&tokens);
-        let (lb, _) = b.forward(&tokens);
-        assert_eq!(la, lb, "logits differ for identical seeds");
-        let (loss_a, _) = F32Model::cross_entropy(&la, &tokens, cfg.vocab);
-        let (loss_b, _) = F32Model::cross_entropy(&lb, &tokens, cfg.vocab);
-        assert_eq!(loss_a, loss_b);
+        let first: f32 = losses[..10].iter().sum::<f32>() / 10.0;
+        let last: f32 = losses[290..].iter().sum::<f32>() / 10.0;
+        println!(
+            "blocked loss first-10 mean = {:.6}, last-10 mean = {:.6}",
+            first, last
+        );
+        assert!(last.is_finite());
+        assert!(
+            last < 0.5 * first,
+            "blocked loss did not halve: first={} last={}",
+            first,
+            last
+        );
+    }
+
+    #[test]
+    fn deterministic_init_and_loss() {
+        for (cfg, block) in [
+            (tiny_config(1, 1), F32BlockConfig::plain()),
+            (two_block_config(), two_blocks()),
+        ] {
+            let a = F32Model::new_random_with_blocks(cfg, block.clone(), 1234);
+            let b = F32Model::new_random_with_blocks(cfg, block, 1234);
+
+            let ta = a.tensors();
+            let tb = b.tensors();
+            assert_eq!(ta.len(), tb.len());
+            for ((na, pa), (nb, pb)) in ta.iter().zip(tb.iter()) {
+                assert_eq!(na, nb);
+                assert_eq!(pa, pb, "parameters differ for tensor {}", na);
+            }
+
+            let tokens: Vec<u32> = vec![1, 4, 2, 7];
+            let (la, _) = a.forward(&tokens);
+            let (lb, _) = b.forward(&tokens);
+            assert_eq!(la, lb, "logits differ for identical seeds");
+            let (loss_a, _) = F32Model::cross_entropy(&la, &tokens, cfg.vocab);
+            let (loss_b, _) = F32Model::cross_entropy(&lb, &tokens, cfg.vocab);
+            assert_eq!(loss_a, loss_b);
+        }
     }
 
     #[test]
@@ -1532,33 +2354,88 @@ mod tests {
         }
     }
 
+    /// The causal mask inside every attention layer still holds with blocks:
+    /// no probability above the diagonal, and the layers of the first block
+    /// (which run before any boundary) are unaffected by a future token.
+    ///
+    /// The final logits are deliberately *not* causal in the blocked config:
+    /// inter-block attention mean-pools the hidden state over the whole
+    /// sequence, exactly as the inference model does.
+    #[test]
+    fn causal_mask_within_blocks() {
+        let cfg = two_block_config();
+        let model = F32Model::new_random_with_blocks(cfg, two_blocks(), 99);
+        let tokens: Vec<u32> = vec![1, 2, 3, 4];
+        let changed_pos = 2;
+
+        let mut perturbed = tokens.clone();
+        perturbed[changed_pos] = 9;
+
+        let (_, base) = model.forward(&tokens);
+        let (_, pert) = model.forward(&perturbed);
+
+        for lc in &base.layers {
+            for hh in 0..cfg.num_heads {
+                for t in 0..tokens.len() {
+                    for s in (t + 1)..tokens.len() {
+                        assert_eq!(
+                            lc.attn_probs[(hh * tokens.len() + t) * tokens.len() + s],
+                            0.0,
+                            "attention probability above the diagonal"
+                        );
+                    }
+                }
+            }
+        }
+
+        for l in 0..2 {
+            for t in 0..changed_pos {
+                for d in 0..cfg.hidden {
+                    let a = base.layers[l].x_out[t * cfg.hidden + d];
+                    let b = pert.layers[l].x_out[t * cfg.hidden + d];
+                    assert!(
+                        (a - b).abs() <= 1e-6,
+                        "layer {} output at position {} changed when token {} changed",
+                        l,
+                        t,
+                        changed_pos
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn shapes_and_param_count_consistent() {
-        let cfg = tiny_config(2, 2);
-        let model = F32Model::new_random(cfg, 7);
-        let tokens: Vec<u32> = vec![0, 1, 2, 3];
-        let (logits, cache) = model.forward(&tokens);
-        assert_eq!(logits.len(), tokens.len() * cfg.vocab);
-        assert_eq!(cache.seq, tokens.len());
+        for (cfg, block) in [
+            (tiny_config(2, 2), F32BlockConfig::plain()),
+            (two_block_config(), two_blocks()),
+        ] {
+            let model = F32Model::new_random_with_blocks(cfg, block, 7);
+            let tokens: Vec<u32> = vec![0, 1, 2, 3];
+            let (logits, cache) = model.forward(&tokens);
+            assert_eq!(logits.len(), tokens.len() * cfg.vocab);
+            assert_eq!(cache.seq, tokens.len());
 
-        let (_, d_logits) = F32Model::cross_entropy(&logits, &tokens, cfg.vocab);
-        let grads = model.backward(&cache, &d_logits);
+            let (_, d_logits) = F32Model::cross_entropy(&logits, &tokens, cfg.vocab);
+            let grads = model.backward(&cache, &d_logits);
 
-        let params = model.tensors();
-        let grad_tensors = grads.tensors();
-        assert_eq!(params.len(), grad_tensors.len());
+            let params = model.tensors();
+            let grad_tensors = grads.tensors();
+            assert_eq!(params.len(), grad_tensors.len());
 
-        let mut sum = 0usize;
-        for ((name, p), (gname, g)) in params.iter().zip(grad_tensors.iter()) {
-            assert_eq!(name, gname);
-            assert_eq!(p.len(), g.len(), "gradient length mismatch for {}", name);
-            sum += p.len();
+            let mut sum = 0usize;
+            for ((name, p), (gname, g)) in params.iter().zip(grad_tensors.iter()) {
+                assert_eq!(name, gname);
+                assert_eq!(p.len(), g.len(), "gradient length mismatch for {}", name);
+                sum += p.len();
+            }
+            assert_eq!(model.param_count(), sum);
+
+            // Adam state must be sized to the same layout.
+            let adam = Adam::new(&model);
+            assert_eq!(adam.m.len(), model.param_count());
+            assert_eq!(adam.v.len(), model.param_count());
         }
-        assert_eq!(model.param_count(), sum);
-
-        // Adam state must be sized to the same layout.
-        let adam = Adam::new(&model);
-        assert_eq!(adam.m.len(), model.param_count());
-        assert_eq!(adam.v.len(), model.param_count());
     }
 }
