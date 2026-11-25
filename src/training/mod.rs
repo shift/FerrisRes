@@ -1,4 +1,5 @@
 pub mod optimizer;
+pub mod dataset;
 pub mod optimizer_scale;
 pub mod optimizer_adamem;
 pub mod checkpointing;
@@ -14,6 +15,10 @@ pub mod shadow_weights;
 pub mod bit_moe;
 
 pub use optimizer::{SgdOptimizer, AdamOptimizer, CrossEntropyLoss, WeightOptimizer, OptimizerHint, optimizer_for_profile};
+pub use dataset::{
+    load_dataset, load_dataset_with, ChatTemplate, DataFormat, DatasetError, DatasetIter,
+    DatasetOptions, DatasetStats, Message, TrainingExample,
+};
 pub use optimizer_scale::ScaleOptimizer;
 pub use optimizer_adamem::AdaMeMOptimizer;
 pub use tool_triggered_lora::{ToolTriggeredLora, ToolTriggeredLoraConfig, StackedAdapter, FisherDiagonal, LearningEvent, ToolTriggeredLoraStats};
