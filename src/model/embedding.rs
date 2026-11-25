@@ -184,6 +184,20 @@ impl TokenEmbedding {
         &self.weight
     }
 
+    /// Upload the embedding table in `[vocab_size, hidden_dim]` row-major
+    /// layout (the layout the lookup kernel and the CPU model use).
+    pub fn set_weight(&self, queue: &Queue, data: &[f32]) {
+        assert_eq!(
+            data.len(),
+            self.vocab_size * self.hidden_dim,
+            "embedding weight len {} != vocab {} * hidden {}",
+            data.len(),
+            self.vocab_size,
+            self.hidden_dim
+        );
+        queue.write_buffer(self.weight.buffer(), 0, bytemuck::cast_slice(data));
+    }
+
     pub fn vocab_size(&self) -> usize {
         self.vocab_size
     }

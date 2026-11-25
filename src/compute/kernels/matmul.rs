@@ -493,7 +493,11 @@ impl MatMulOp {
         k: u32,
         n: u32,
     ) -> Result<()> {
-        let tile_size = 32u32;  // 32x32 output tile (16x16 WG × 2x2 register blocking)
+        // The bound pipeline is the simple one-output-per-thread 16x16 shader
+        // (`SHADER`, `@workgroup_size(16, 16)`), so each workgroup covers a
+        // 16x16 tile. Launching ceil(dim/32) groups left every column/row
+        // beyond 16 unwritten for any dimension in (16, 32].
+        let tile_size = 16u32;
         let workgroup_count_x = (m + tile_size - 1) / tile_size;
         let workgroup_count_y = (n + tile_size - 1) / tile_size;
 
@@ -566,7 +570,7 @@ impl MatMulOp {
         k: u32,
         n: u32,
     ) -> Result<()> {
-        let tile_size = 32u32;  // 32x32 output tile
+        let tile_size = 16u32;
         let workgroup_count_x = (m + tile_size - 1) / tile_size;
         let workgroup_count_y = (n + tile_size - 1) / tile_size;
 

@@ -9,11 +9,17 @@ const RMSNORM_WGSL: &str = r#"
 struct Params {
     hidden_dim: u32,
     rows: u32,
+    eps: f32,
+    _pad: u32,
 }
 
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
 @group(0) @binding(2) var<uniform> params: Params;
+// Learned per-channel scale. The CPU reference (`CpuRmsNorm`) always applies
+// one; callers that pass no weight bind an all-ones buffer, so the multiply is
+// exact and the previous weightless behaviour is preserved.
+@group(0) @binding(3) var<storage, read> weight: array<f32>;
 
 var<workgroup> wg_data: array<f32, 256>;
 
@@ -46,7 +52,7 @@ fn rmsnorm_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_in
     var inv_rms = 1.0;
     if (col == 0u) {
         let ss = wg_data[0u];
-        inv_rms = inverseSqrt(ss / f32(hidden_dim) + 1e-5);
+        inv_rms = inverseSqrt(ss / f32(hidden_dim) + params.eps);
         wg_data[0u] = inv_rms;
     }
     workgroupBarrier();
@@ -54,7 +60,7 @@ fn rmsnorm_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_in
 
     for (var c = col; c < hidden_dim; c = c + 256u) {
         let v = input[row * hidden_dim + c];
-        output[row * hidden_dim + c] = v * inv_rms;
+        output[row * hidden_dim + c] = v * inv_rms * weight[c];
     }
 }
 "#;
@@ -146,11 +152,33 @@ pub struct RmsNormOp {
     bind_group_layout: BindGroupLayout,
     backward_pipeline: ComputePipeline,
     backward_bind_group_layout: BindGroupLayout,
+    /// Learned scale, one entry per channel (max `MAX_HIDDEN_DIM`). Defaults to
+    /// all ones so unweighted callers are unaffected.
+    weight: GpuBuffer,
 }
+
+/// Upper bound on `hidden_dim` imposed by the 256-wide reduction workgroup.
+const MAX_HIDDEN_DIM: usize = 256;
 
 impl RmsNormOp {
     pub fn new(device: &Device) -> Result<Self> {
         tracing::info!(event = "creating_rmsnormop_compute_pipeline", "Creating RmsNormOp compute pipeline");
+
+        // Default weight is all ones, written at creation so no queue is needed.
+        let weight_bytes = MAX_HIDDEN_DIM * std::mem::size_of::<f32>();
+        let weight_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("RmsNorm Weight"),
+            size: weight_bytes as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        {
+            let mut view = weight_buffer.slice(..).get_mapped_range_mut();
+            let ones = vec![1.0f32; MAX_HIDDEN_DIM];
+            view.copy_from_slice(bytemuck::cast_slice(&ones));
+        }
+        weight_buffer.unmap();
+        let weight = GpuBuffer::from_existing(weight_buffer, weight_bytes);
 
         // === Forward pipeline ===
         let shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -186,6 +214,16 @@ impl RmsNormOp {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -285,7 +323,19 @@ impl RmsNormOp {
             bind_group_layout,
             backward_pipeline,
             backward_bind_group_layout: backward_bgl,
+            weight,
         })
+    }
+
+    /// Upload a learned per-channel scale. `data.len()` must be `<= 256`.
+    pub fn set_weight(&self, queue: &wgpu::Queue, data: &[f32]) {
+        assert!(
+            data.len() <= MAX_HIDDEN_DIM,
+            "RmsNorm weight len {} exceeds {}",
+            data.len(),
+            MAX_HIDDEN_DIM
+        );
+        queue.write_buffer(self.weight.buffer(), 0, bytemuck::cast_slice(data));
     }
 
     pub fn dispatch(
@@ -298,24 +348,41 @@ impl RmsNormOp {
         rows: u32,
         hidden_dim: u32,
     ) -> Result<()> {
+        // 1e-5 is the historical value; the CPU reference uses 1e-6.
+        self.dispatch_with_eps(device, queue, encoder, input, output, rows, hidden_dim, 1e-5)
+    }
+
+    /// Forward pass with an explicit epsilon.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_with_eps(
+        &self,
+        device: &Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        input: &GpuBuffer,
+        output: &GpuBuffer,
+        rows: u32,
+        hidden_dim: u32,
+        eps: f32,
+    ) -> Result<()> {
         tracing::debug!(
             "RmsNormOp::dispatch rows={} hidden_dim={}",
             rows,
             hidden_dim
         );
 
-        if hidden_dim > 256 {
+        if hidden_dim > MAX_HIDDEN_DIM as u32 {
             return Err(FerrisResError::Unsupported(format!(
-                "RmsNorm hidden_dim {} exceeds max workgroup size 256",
-                hidden_dim
+                "RmsNorm hidden_dim {} exceeds max workgroup size {}",
+                hidden_dim, MAX_HIDDEN_DIM
             )));
         }
 
-        let params_data: [u32; 2] = [hidden_dim, rows];
+        let params_data: [u32; 4] = [hidden_dim, rows, eps.to_bits(), 0];
 
         let params_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("RmsNorm Params"),
-            size: 8,
+            size: 16,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -336,6 +403,10 @@ impl RmsNormOp {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.weight.buffer().as_entire_binding(),
                 },
             ],
         });

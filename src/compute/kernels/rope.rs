@@ -3,6 +3,102 @@ use wgpu::{Device, BufferDescriptor, BufferUsages, BindGroupLayoutEntry, ShaderS
 use crate::compute::GpuBuffer;
 use crate::error::Result;
 
+const ROPE_HALF_WGSL: &str = r#"
+// Half-split ("GPT-NeoX") RoPE, matching the CPU reference
+// `gemma_mapper::apply_rope`: dim `d` rotates with dim `d + half`, the
+// frequency is `theta^(-2d/head_dim)` and only the first
+// `partial_rotary_factor * head_dim` dims rotate.
+struct Params {
+    seq_len:    u32,
+    num_heads:  u32,
+    head_dim:   u32,
+    start_pos:  u32,
+    theta:      f32,
+    partial:    f32,
+    _pad0:      u32,
+    _pad1:      u32,
+}
+
+@group(0) @binding(0) var<storage, read>       input:  array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform>             params: Params;
+
+@compute @workgroup_size(256)
+fn rope_half_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let head_dim = params.head_dim;
+    let rotary_dims = u32(f32(head_dim) * params.partial);
+    let half = rotary_dims / 2u;
+    if (half == 0u) {
+        return;
+    }
+    let total = params.seq_len * params.num_heads * half;
+    let flat = gid.x;
+    if (flat >= total) {
+        return;
+    }
+
+    let t = flat / (params.num_heads * half);
+    let rem = flat % (params.num_heads * half);
+    let h = rem / half;
+    let d = rem % half;
+
+    let pos = f32(params.start_pos + t);
+    let freq = 1.0 / pow(params.theta, f32(2u * d) / f32(head_dim));
+    let angle = pos * freq;
+    let cos_a = cos(angle);
+    let sin_a = sin(angle);
+
+    let base = t * params.num_heads * head_dim + h * head_dim;
+    let x0 = input[base + d];
+    let x1 = input[base + d + half];
+    output[base + d] = x0 * cos_a - x1 * sin_a;
+    output[base + d + half] = x0 * sin_a + x1 * cos_a;
+}
+"#;
+
+const ROPE_HALF_TABLE_WGSL: &str = r#"
+// Half-split RoPE driven by a host-computed cos/sin table. The driver's
+// `sin`/`cos` are only ~1e-4 accurate on some Vulkan backends, which is not
+// enough to match the CPU reference; the table is computed in f64 on the host
+// exactly as `gemma_mapper::apply_rope` does.
+struct Params {
+    seq_len:   u32,
+    num_heads: u32,
+    head_dim:  u32,
+    half:      u32,
+}
+
+@group(0) @binding(0) var<storage, read>       input:   array<f32>;
+@group(0) @binding(1) var<storage, read_write> output:  array<f32>;
+@group(0) @binding(2) var<storage, read>       cos_tab: array<f32>;
+@group(0) @binding(3) var<storage, read>       sin_tab: array<f32>;
+@group(0) @binding(4) var<uniform>             params:  Params;
+
+@compute @workgroup_size(256)
+fn rope_half_table_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let half = params.half;
+    let total = params.seq_len * params.num_heads * half;
+    let flat = gid.x;
+    if (flat >= total) {
+        return;
+    }
+    let t = flat / (params.num_heads * half);
+    let rem = flat % (params.num_heads * half);
+    let h = rem / half;
+    let d = rem % half;
+
+    let tab = t * half + d;
+    let c = cos_tab[tab];
+    let s = sin_tab[tab];
+
+    let base = t * params.num_heads * params.head_dim + h * params.head_dim;
+    let x0 = input[base + d];
+    let x1 = input[base + d + half];
+    output[base + d] = x0 * c - x1 * s;
+    output[base + d + half] = x0 * s + x1 * c;
+}
+"#;
+
 const ROPE_WGSL: &str = r#"
 struct Params {
     seq_len: u32,
@@ -268,6 +364,9 @@ fn rope_backward_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 pub struct RopeOp {
     pipeline: wgpu::ComputePipeline,
+    half_pipeline: wgpu::ComputePipeline,
+    half_table_pipeline: wgpu::ComputePipeline,
+    half_table_bgl: wgpu::BindGroupLayout,
     inplace_pipeline: wgpu::ComputePipeline,
     backward_pipeline: wgpu::ComputePipeline,
     yarn_pipeline: wgpu::ComputePipeline,
@@ -337,6 +436,94 @@ impl RopeOp {
         });
 
         tracing::debug!(event = "ropeop_pipeline_created", "RopeOp pipeline created");
+
+        // --- Half-split pipeline (CPU-reference layout) ---
+        let half_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("RoPE Half-Split Shader"),
+            source: wgpu::ShaderSource::Wgsl(ROPE_HALF_WGSL.into()),
+        });
+        let half_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("RoPE Half-Split Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &half_shader,
+            entry_point: Some("rope_half_main"),
+            cache: None,
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+
+        // --- Half-split with host cos/sin table ---
+        let table_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("RoPE Half Table Shader"),
+            source: wgpu::ShaderSource::Wgsl(ROPE_HALF_TABLE_WGSL.into()),
+        });
+        let table_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("RoPE Half Table BGL"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let table_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("RoPE Half Table Pipeline Layout"),
+            bind_group_layouts: &[Some(&table_bgl)],
+            immediate_size: 0,
+        });
+        let half_table_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("RoPE Half Table Pipeline"),
+            layout: Some(&table_layout),
+            module: &table_shader,
+            entry_point: Some("rope_half_table_main"),
+            cache: None,
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
 
         // --- In-place pipeline ---
         let inplace_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -481,6 +668,9 @@ impl RopeOp {
 
         Ok(Self {
             pipeline,
+            half_pipeline,
+            half_table_pipeline,
+            half_table_bgl: table_bgl,
             bgl,
             inplace_pipeline,
             inplace_bgl,
@@ -629,6 +819,142 @@ impl RopeOp {
             start_pos
         );
 
+        Ok(())
+    }
+
+    /// Half-split RoPE with the CPU reference's frequency schedule.
+    ///
+    /// `gemma_mapper::apply_rope` rotates `(d, d + half)` and uses
+    /// `theta^(-2d/head_dim)`. The interleaved kernel above rotates
+    /// `(2d, 2d + 1)` with a fixed base 10000; this variant is what the
+    /// Block AttnRes path uses so it matches the CPU model exactly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_half_split(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        input: &GpuBuffer,
+        output: &GpuBuffer,
+        seq_len: u32,
+        num_heads: u32,
+        head_dim: u32,
+        start_pos: u32,
+        theta: f32,
+        partial_rotary_factor: f32,
+    ) -> Result<()> {
+        if seq_len == 0 || num_heads == 0 || head_dim == 0 {
+            return Ok(());
+        }
+
+        let params_data: [u32; 8] = [
+            seq_len,
+            num_heads,
+            head_dim,
+            start_pos,
+            theta.to_bits(),
+            partial_rotary_factor.to_bits(),
+            0,
+            0,
+        ];
+        let params_buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("RoPE Half Params"),
+            size: 32,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        params_buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .copy_from_slice(bytemuck::cast_slice(&params_data));
+        params_buffer.unmap();
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("RoPE Half Bind Group"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: output.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let rotary_dims = (head_dim as f32 * partial_rotary_factor) as u32;
+        let half = rotary_dims / 2;
+        let total_elements = seq_len * num_heads * half;
+        let wg_count = (total_elements + 255) / 256;
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("RoPE Half Compute Pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.half_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(wg_count.max(1), 1, 1);
+        drop(pass);
+        Ok(())
+    }
+
+    /// Half-split RoPE driven by a host-computed `[seq_len, half]` cos/sin
+    /// table. `cos` and `sin` must each hold `seq_len * half` f32 values for
+    /// positions `start_pos..start_pos + seq_len`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_half_split_table(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        input: &GpuBuffer,
+        output: &GpuBuffer,
+        seq_len: u32,
+        num_heads: u32,
+        head_dim: u32,
+        cos: &GpuBuffer,
+        sin: &GpuBuffer,
+        half: u32,
+    ) -> Result<()> {
+        if seq_len == 0 || num_heads == 0 || head_dim == 0 || half == 0 {
+            return Ok(());
+        }
+        let params_data: [u32; 4] = [seq_len, num_heads, head_dim, half];
+        let params_buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("RoPE Half Table Params"),
+            size: 16,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        params_buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .copy_from_slice(bytemuck::cast_slice(&params_data));
+        params_buffer.unmap();
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("RoPE Half Table Bind Group"),
+            layout: &self.half_table_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: input.buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: output.buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: cos.buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: sin.buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: params_buffer.as_entire_binding() },
+            ],
+        });
+        let total = seq_len * num_heads * half;
+        let wg_count = (total + 255) / 256;
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("RoPE Half Table Pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.half_table_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(wg_count.max(1), 1, 1);
+        drop(pass);
         Ok(())
     }
 

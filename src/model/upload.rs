@@ -8,12 +8,29 @@ use wgpu::Queue;
 use crate::compute::GpuBuffer;
 use crate::model::cpu_block_attn_res::{CpuBlockAttnResModel, CpuBlockAttnResLayer};
 use crate::model::cpu_linear::CpuLinear;
-use crate::model::block_attn_res::BlockAttnResLayer;
+use crate::model::block_attn_res::{BlockAttnResLayer, NormWeights};
+
+/// Transpose a row-major `[rows, cols]` matrix.
+fn transpose(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = data[r * cols + c];
+        }
+    }
+    out
+}
 
 /// Upload a CPU-trained model's linear layer weights to a GPU linear layer.
+///
+/// `CpuLinear` stores `[out_features, in_features]`; the GPU matmul reads
+/// `[in_features, out_features]`, so the weight is transposed on upload.
 fn upload_linear(gpu_linear: &crate::model::linear::Linear, cpu_linear: &CpuLinear, queue: &Queue) {
     let w = cpu_linear.weight();
-    gpu_linear.set_weight(queue, &w);
+    let out_f = cpu_linear.out_features();
+    let in_f = cpu_linear.in_features();
+    let transposed = transpose(&w, out_f, in_f);
+    gpu_linear.set_weight(queue, &transposed);
 }
 
 /// Upload a single CPU layer's weights to a GPU layer.
@@ -21,9 +38,7 @@ fn upload_linear(gpu_linear: &crate::model::linear::Linear, cpu_linear: &CpuLine
 /// This transfers all weights for one transformer layer:
 /// - Attention: q/k/v/out projections
 /// - FFN: gate/up/down projections (dense) or MoE experts
-/// - Norms: note that RMSNorm weight upload requires the weight-aware
-///   dispatch variant (currently the GPU RMSNorm uses all-ones internally;
-///   weight binding will be added in a follow-up)
+/// - Norms: every learned RMSNorm scale
 pub fn upload_layer(
     gpu_layer: &BlockAttnResLayer,
     cpu_layer: &CpuBlockAttnResLayer,
@@ -83,6 +98,18 @@ pub fn upload_layer(
         upload_linear(gpu_proj, cpu_proj, queue);
     }
 
+    // Learned norm scales.
+    gpu_layer.set_norm_weights(queue, &NormWeights {
+        attn_norm: Some(cpu_layer.attn_norm.weight()),
+        ff_norm: Some(cpu_layer.pre_ffn_norm.weight()),
+        q_norm: Some(cpu_layer.q_norm.weight()),
+        k_norm: Some(cpu_layer.k_norm.weight()),
+        v_norm: Some(cpu_layer.v_norm.weight()),
+        post_attn_norm: Some(cpu_layer.post_attn_norm.weight()),
+        post_ffn_norm: Some(cpu_layer.post_ffn_norm.weight()),
+        attn_res_norm: None,
+    });
+
     tracing::info!(
         "Uploaded weights for layer {} (hidden={} heads={} head_dim={})",
         cpu_layer.layer_number,
@@ -90,6 +117,19 @@ pub fn upload_layer(
         cpu_layer.num_heads,
         cpu_layer.head_dim,
     );
+}
+
+/// Upload the inter-block key norm (`block_config.attn_res_norm`) to a GPU
+/// layer. Every layer shares the same weights.
+pub fn upload_attn_res_norm(
+    gpu_layer: &BlockAttnResLayer,
+    weights: &[f32],
+    queue: &Queue,
+) {
+    gpu_layer.set_norm_weights(queue, &NormWeights {
+        attn_res_norm: Some(weights),
+        ..NormWeights::default()
+    });
 }
 
 /// Upload model-level weights (embeddings, LM head, final norm) to GPU buffers.

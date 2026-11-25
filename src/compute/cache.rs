@@ -11,6 +11,9 @@ pub struct BlockCache {
     buffer: GpuBuffer,
     cache_capacity: usize,
     hidden_dim: usize,
+    /// Number of token positions stored per slot. Prefill caches a summary for
+    /// every position, so a slot is `[positions, hidden_dim]`, not one vector.
+    positions: usize,
     head: AtomicUsize,
     count: AtomicUsize,
     #[allow(dead_code)]
@@ -23,12 +26,24 @@ impl BlockCache {
         hidden_dim: usize,
         cache_capacity: usize,
     ) -> Result<Self> {
-        let total_size = cache_capacity * hidden_dim * std::mem::size_of::<f32>();
+        Self::new_with_positions(device, hidden_dim, cache_capacity, 1)
+    }
+
+    /// Create a cache that stores `positions` vectors per slot.
+    pub fn new_with_positions(
+        device: Arc<Device>,
+        hidden_dim: usize,
+        cache_capacity: usize,
+        positions: usize,
+    ) -> Result<Self> {
+        let positions = positions.max(1);
+        let total_size = cache_capacity * positions * hidden_dim * std::mem::size_of::<f32>();
         let buffer = GpuBuffer::new(&device, total_size, Some("ferris_block_cache"))?;
         Ok(Self {
             buffer,
             cache_capacity,
             hidden_dim,
+            positions,
             head: AtomicUsize::new(0),
             count: AtomicUsize::new(0),
             device,
@@ -51,6 +66,7 @@ impl BlockCache {
             buffer,
             cache_capacity,
             hidden_dim,
+            positions: 1,
             head: AtomicUsize::new(0),
             count: AtomicUsize::new(0),
             device,
@@ -71,7 +87,7 @@ impl BlockCache {
         block_rep: &GpuBuffer,
     ) {
         let head = self.head.load(Ordering::Relaxed);
-        let block_bytes = self.hidden_dim * std::mem::size_of::<f32>();
+        let block_bytes = self.positions * self.hidden_dim * std::mem::size_of::<f32>();
         let src_size = block_rep.size().min(block_bytes);
         let dst_offset = head * block_bytes;
 
@@ -118,6 +134,16 @@ impl BlockCache {
 
     pub fn capacity(&self) -> usize {
         self.cache_capacity
+    }
+
+    /// Number of token positions stored per slot.
+    pub fn positions(&self) -> usize {
+        self.positions
+    }
+
+    /// Bytes of one slot (`positions * hidden_dim * 4`).
+    pub fn slot_bytes(&self) -> usize {
+        self.positions * self.hidden_dim * std::mem::size_of::<f32>()
     }
 }
 

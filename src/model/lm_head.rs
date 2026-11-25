@@ -33,4 +33,14 @@ impl LMHead {
     pub fn vocab_size(&self) -> usize {
         self.vocab_size
     }
+
+    /// Upload LM-head weights in `[hidden_dim, vocab_size]` row-major layout,
+    /// which is the layout the GPU matmul reads and the CPU model stores.
+    pub fn set_weight(&self, queue: &Queue, data: &[f32]) {
+        self.linear.set_weight(queue, data);
+    }
+
+    pub fn linear(&self) -> &Linear {
+        &self.linear
+    }
 }

@@ -71,6 +71,26 @@ impl CpuBlockAttnResModel {
         let mut activations = Vec::with_capacity(self.num_layers);
         let lora_m = self.lora_manager.as_ref();
 
+        if has_blocks && lora_m.is_some() {
+            // The distillation/LoRA gradient code consumes `LayerActivations`
+            // and uses the per-position `d_hidden` as the gradient for every
+            // projection. That is already an approximation for plain
+            // attention; with causal inter-block attention it is wrong: entry
+            // `e`'s summary at position `t` is a prefix sum over positions
+            // `0..=t`, so a parameter in layer `l` also receives a suffix-sum
+            // gradient from every later boundary position. `forward_train`
+            // records the inter-block output but the gradient path does not
+            // backpropagate it. Gradients produced from this forward in a
+            // blocked config are not trustworthy; see
+            // `docs/block-attnres-causal.md`.
+            tracing::error!(
+                event = "lora_gradient_invalid_with_blocks",
+                "forward_train is running with block boundaries AND a LoRA manager: \
+                 the LoRA gradient path does not backpropagate the causal inter-block \
+                 attention (triangular summary dependency), so its gradients are wrong"
+            );
+        }
+
         let mut per_layer_hidden: Vec<Vec<f32>> = Vec::with_capacity(self.num_layers);
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -203,7 +223,7 @@ impl CpuBlockAttnResModel {
             };
 
             let ffn_out = layer.post_ffn_norm.forward(&ffn_out);
-            for i in 0..hidden.len() { hidden[i] = _residual_ffn[i] + ffn_out[i] * layer.layer_scalar; }
+            for i in 0..hidden.len() { hidden[i] = _residual_ffn[i] + ffn_out[i]; }
 
             // PLE injection
             if let Some(ref ple_s) = ple_slice {
@@ -219,6 +239,12 @@ impl CpuBlockAttnResModel {
                     let ple_final = norm.forward(&proj_out);
                     for i in 0..hidden.len() { hidden[i] += ple_final[i]; }
                 }
+            }
+
+            // Layer scalar: once per layer, on the whole layer output, exactly
+            // as the inference reference (`CpuBlockAttnResModel::forward`) does.
+            if layer.layer_scalar != 1.0 {
+                for h in hidden.iter_mut() { *h *= layer.layer_scalar; }
             }
 
             if let Some(rd) = layer_routing { routing_data.push(rd); }

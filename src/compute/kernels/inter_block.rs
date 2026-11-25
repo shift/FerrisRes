@@ -22,10 +22,10 @@ use crate::error::Result;
 
 const CAUSAL_PREFIX_WGSL: &str = r#"
     struct Params {
-        rows:    u32,
-        hidden:  u32,
-        divisor: f32,
-        _pad:    u32,
+        rows:      u32,
+        hidden:    u32,
+        divisor:   f32,
+        normalize: u32,
     }
 
     @group(0) @binding(0) var<storage, read>       input:  array<f32>;
@@ -43,7 +43,12 @@ const CAUSAL_PREFIX_WGSL: &str = r#"
         for (var t: u32 = 0u; t < params.rows; t = t + 1u) {
             let idx = t * params.hidden + d;
             run = run + input[idx];
-            output[idx] = run / (f32(t + 1u) * params.divisor);
+            if (params.normalize == 0u) {
+                // Raw running prefix sum: out[t] = sum_{s <= t} in[s].
+                output[idx] = run;
+            } else {
+                output[idx] = run / (f32(t + 1u) * params.divisor);
+            }
         }
     }
 "#;
@@ -258,11 +263,29 @@ impl CausalPrefixOp {
         hidden: u32,
         divisor: f32,
     ) -> Result<()> {
+        self.dispatch_with_normalize(encoder, input, output, rows, hidden, divisor, true)
+    }
+
+    /// When `normalize` is false the raw running prefix sum is written instead
+    /// of the causal mean. The decode state needs the sums so a new position
+    /// can be added before the divisor changes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_with_normalize(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        input: &GpuBuffer,
+        output: &GpuBuffer,
+        rows: u32,
+        hidden: u32,
+        divisor: f32,
+        normalize: bool,
+    ) -> Result<()> {
         let params: [u8; 16] = {
             let mut bytes = [0u8; 16];
             bytes[0..4].copy_from_slice(&rows.to_le_bytes());
             bytes[4..8].copy_from_slice(&hidden.to_le_bytes());
             bytes[8..12].copy_from_slice(&divisor.to_le_bytes());
+            bytes[12..16].copy_from_slice(&(normalize as u32).to_le_bytes());
             bytes
         };
         let params_buffer =

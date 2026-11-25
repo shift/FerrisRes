@@ -5,6 +5,7 @@ use wgpu::{Device, Queue};
 use crate::compute::cache::BlockCache;
 use crate::compute::buffer::GpuBuffer;
 use crate::compute::kernels::elementwise::ElementWiseOp;
+use crate::compute::kernels::inter_block::CausalPrefixOp;
 use crate::compute::turboquant::{TurboQuantConfig, OutlierChannelSplitter};
 use crate::model::config::BlockAttnResConfig;
 use crate::model::model::BlockAttnResModel;
@@ -82,6 +83,7 @@ pub struct TwoPhaseInference {
     block_cache: BlockCache,
     lse_buffer: GpuBuffer,
     elementwise: ElementWiseOp,
+    causal_prefix: CausalPrefixOp,
     // TurboQuant compression state
     #[allow(dead_code)]
     turboquant_config: Option<TurboQuantConfig>,
@@ -119,16 +121,18 @@ impl TwoPhaseInference {
             1
         };
 
-        let block_cache = BlockCache::new(
+        let block_cache = BlockCache::new_with_positions(
             Arc::clone(&device),
             model_config.hidden_dim,
             cache_capacity,
+            inference_config.max_batch_inference.max(1) as usize,
         )?;
 
         let lse_bytes = model_config.hidden_dim * std::mem::size_of::<f32>();
         let lse_buffer = GpuBuffer::zeros(&device, &queue, lse_bytes, Some("LSE Buffer"))?;
 
         let elementwise = ElementWiseOp::new(&device, &queue);
+        let causal_prefix = CausalPrefixOp::new(&device, &queue)?;
 
         // Initialize TurboQuant configuration if enabled
         let (turboquant_config, outlier_splitter) = if inference_config.use_turboquant {
@@ -168,6 +172,7 @@ impl TwoPhaseInference {
             block_cache,
             lse_buffer,
             elementwise,
+            causal_prefix,
             turboquant_config,
             outlier_splitter,
             device,
@@ -191,8 +196,15 @@ impl TwoPhaseInference {
         let hidden_dim = model_config.hidden_dim;
         let num_blocks = model_config.num_blocks;
         let hidden_dim_bytes = (hidden_dim * std::mem::size_of::<f32>()) as u64;
+        let positions = self.block_cache.positions();
 
         if self.config.cache_block_reps {
+            if batch_size as usize > positions {
+                return Err(crate::error::FerrisResError::Shape(format!(
+                    "batch_size {} exceeds cached block positions {}",
+                    batch_size, positions
+                )));
+            }
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("TwoPhase Cache Clear"),
             });
@@ -200,26 +212,42 @@ impl TwoPhaseInference {
             self.queue.submit(std::iter::once(encoder.finish()));
         }
 
-        self.model.forward(input, output, batch_size)?;
+        // The model exports the per-position causal means it actually used:
+        // `[(num_blocks + 1), batch, hidden]`.
+        let summaries_bytes = (num_blocks + 1)
+            * batch_size as usize
+            * hidden_dim
+            * std::mem::size_of::<f32>();
+        let summaries = GpuBuffer::zeros(
+            &self.device,
+            &self.queue,
+            summaries_bytes,
+            Some("TwoPhase Block Summaries"),
+        )?;
+
+        self.model.forward_with_summaries(
+            input,
+            output,
+            batch_size,
+            if self.config.cache_block_reps { Some(&summaries) } else { None },
+        )?;
 
         if self.config.cache_block_reps {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("TwoPhase Cache Reps"),
             });
 
-            let rep_slot_size = hidden_dim * std::mem::size_of::<f32>();
+            let entry_bytes = batch_size as u64 * hidden_dim_bytes;
             let cache_buf = self.block_cache.buffer().buffer();
 
+            // Slot `b` holds entry `b + 1` (block `b`) for every position.
             for block_n in 0..num_blocks {
-                let slot_offset = (block_n + 1) as u64 * hidden_dim_bytes;
-                let cache_offset = block_n as u64 * rep_slot_size as u64;
-
                 encoder.copy_buffer_to_buffer(
-                    output.buffer(),
-                    slot_offset,
+                    summaries.buffer(),
+                    ((block_n + 1) as u64) * entry_bytes,
                     cache_buf,
-                    cache_offset,
-                    hidden_dim_bytes,
+                    (block_n as u64) * entry_bytes,
+                    entry_bytes,
                 );
             }
 
@@ -246,7 +274,6 @@ impl TwoPhaseInference {
         let model_config = self.model.config();
         let hidden_dim = model_config.hidden_dim;
         let block_size = model_config.block_size;
-        let hidden_dim_bytes = (hidden_dim * std::mem::size_of::<f32>()) as u64;
 
         if block_idx >= model_config.num_blocks {
             return Err(crate::error::FerrisResError::Shape(format!(
@@ -300,13 +327,32 @@ impl TwoPhaseInference {
         }
 
         if self.config.cache_block_reps {
-            let slot = block_idx as u64 * hidden_dim_bytes;
+            // The cache stores the causal mean at each position, not the raw
+            // layer sum: `partial_sum[t] / ((t + 1) * layers_per_block)`.
+            let positions = self.block_cache.positions();
+            if batch_size as usize > positions {
+                return Err(crate::error::FerrisResError::Shape(format!(
+                    "batch_size {} exceeds cached block positions {}",
+                    batch_size, positions
+                )));
+            }
+            let mean_bytes = batch_size as usize * hidden_dim * std::mem::size_of::<f32>();
+            let means = GpuBuffer::new(&self.device, mean_bytes, Some("block_means"))?;
+            self.causal_prefix.dispatch(
+                &mut encoder,
+                &partial_sum,
+                &means,
+                batch_size,
+                hidden_dim as u32,
+                block_size as f32,
+            )?;
+            let slot = block_idx as u64 * mean_bytes as u64;
             encoder.copy_buffer_to_buffer(
-                partial_sum.buffer(),
+                means.buffer(),
                 0,
                 self.block_cache.buffer().buffer(),
                 slot,
-                hidden_dim_bytes,
+                mean_bytes as u64,
             );
         }
 

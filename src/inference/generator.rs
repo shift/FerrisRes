@@ -3,6 +3,8 @@ use std::sync::Arc;
 use wgpu::{Device, Queue};
 
 use crate::compute::buffer::GpuBuffer;
+use crate::compute::kernels::elementwise::ElementWiseOp;
+use crate::compute::kernels::rmsnorm::RmsNormOp;
 use crate::inference::kv_cache::ModelKVCache;
 use crate::inference::logit_processors::{LogitProcessor, LogitProcessorConfig};
 use crate::inference::prompt_templates::{PromptTemplateRegistry, TemplateFormat};
@@ -104,6 +106,9 @@ pub struct TokenGenerator {
     kv_cache: ModelKVCache,
     device: Arc<Device>,
     queue: Arc<Queue>,
+    /// Final RMSNorm before the LM head (the CPU reference has one).
+    final_norm: RmsNormOp,
+    elementwise: ElementWiseOp,
     #[allow(dead_code)]
     max_seq_len: u32,
 }
@@ -178,6 +183,9 @@ impl TokenGenerator {
             head_dim,
         )?;
 
+        let final_norm = RmsNormOp::new(&device)?;
+        let elementwise = ElementWiseOp::new(&device, &queue);
+
         Ok(Self {
             model,
             lm_head: Arc::new(lm_head),
@@ -185,8 +193,35 @@ impl TokenGenerator {
             kv_cache,
             device,
             queue,
+            final_norm,
+            elementwise,
             max_seq_len,
         })
+    }
+
+    /// Upload the final RMSNorm scale applied before the LM head.
+    pub fn set_final_norm(&self, weights: &[f32]) {
+        self.final_norm.set_weight(&self.queue, weights);
+    }
+
+    /// `sqrt(hidden_dim)` embedding scale, as in the CPU reference
+    /// (`CpuBlockAttnResModel::forward`).
+    fn embedding_scale(&self) -> f32 {
+        (self.model.config().hidden_dim as f32).sqrt()
+    }
+
+    /// Apply the final RMSNorm to `input` (rows x hidden) into `output`.
+    fn apply_final_norm(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        input: &GpuBuffer,
+        output: &GpuBuffer,
+        rows: u32,
+    ) -> Result<()> {
+        let hidden_dim = self.model.config().hidden_dim as u32;
+        self.final_norm.dispatch_with_eps(
+            &self.device, &self.queue, encoder, input, output, rows, hidden_dim, 1e-6,
+        )
     }
 
     #[allow(dead_code)]
@@ -252,28 +287,41 @@ impl TokenGenerator {
         self.queue.write_buffer(token_ids_buf.buffer(), 0, bytemuck::cast_slice(&final_tokens));
 
         self.embedding.forward(&mut encoder, &token_ids_buf, &hidden_states, seq_len)?;
-
-        let mut current_hidden = hidden_states;
-        for (i, layer) in self.model.layers().iter().enumerate() {
-            let kv = self.kv_cache.layer(i);
-            current_hidden = layer.forward_prefill(&mut encoder, &current_hidden, kv, seq_len)?;
+        let embed_scale = self.embedding_scale();
+        if (embed_scale - 1.0).abs() > 1e-8 {
+            self.elementwise.dispatch_scale(
+                &mut encoder, &hidden_states, &hidden_states, embed_scale,
+                seq_len * hidden_dim as u32,
+            )?;
         }
+
+        let prefill_out = GpuBuffer::new(&self.device, hidden_bytes, Some("prefill_out"))?;
+        let mut block_state = self.model.forward_prefill_cached(
+            &mut encoder,
+            &hidden_states,
+            &prefill_out,
+            &self.kv_cache,
+            seq_len,
+        )?;
 
         let last_hidden_bytes = hidden_dim * f32_size;
         let last_hidden = GpuBuffer::new(&self.device, last_hidden_bytes, Some("prefill_last_hidden"))?;
         let last_offset = ((seq_len - 1) as u64) * (hidden_dim as u64) * (f32_size as u64);
         encoder.copy_buffer_to_buffer(
-            current_hidden.buffer(),
+            prefill_out.buffer(),
             last_offset,
             last_hidden.buffer(),
             0,
             Some(last_hidden_bytes as u64),
         );
 
+        let normed_last = GpuBuffer::new(&self.device, last_hidden_bytes, Some("prefill_normed_last"))?;
+        self.apply_final_norm(&mut encoder, &last_hidden, &normed_last, 1)?;
+
         let vocab_size = self.lm_head.vocab_size();
         let logits_bytes = vocab_size * f32_size;
         let logits_buf = GpuBuffer::new(&self.device, logits_bytes, Some("prefill_logits"))?;
-        self.lm_head.forward(&mut encoder, &last_hidden, &logits_buf, 1)?;
+        self.lm_head.forward(&mut encoder, &normed_last, &logits_buf, 1)?;
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -303,15 +351,29 @@ impl TokenGenerator {
             self.queue.write_buffer(token_buf.buffer(), 0, &next_token.to_le_bytes());
 
             self.embedding.forward(&mut encoder, &token_buf, &embed_buf, 1)?;
-
-            let mut current = embed_buf;
-            for (i, layer) in self.model.layers().iter().enumerate() {
-                let kv = self.kv_cache.layer(i);
-                current = layer.forward_decode_token_direct(&mut encoder, &current, kv, Some(effective_pos as u32))?;
+            let embed_scale = self.embedding_scale();
+            if (embed_scale - 1.0).abs() > 1e-8 {
+                self.elementwise.dispatch_scale(
+                    &mut encoder, &embed_buf, &embed_buf, embed_scale,
+                    hidden_dim as u32,
+                )?;
             }
 
+            let decode_out = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_out"))?;
+            self.model.forward_decode_cached(
+                &mut encoder,
+                &embed_buf,
+                &decode_out,
+                &self.kv_cache,
+                &mut block_state,
+                Some(effective_pos as u32),
+            )?;
+
+            let normed = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_normed"))?;
+            self.apply_final_norm(&mut encoder, &decode_out, &normed, 1)?;
+
             let logits_buf = GpuBuffer::new(&self.device, logits_bytes, Some("decode_logits"))?;
-            self.lm_head.forward(&mut encoder, &current, &logits_buf, 1)?;
+            self.lm_head.forward(&mut encoder, &normed, &logits_buf, 1)?;
 
             self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -410,15 +472,30 @@ impl TokenGenerator {
             if self.embedding.forward(&mut encoder, &token_ids_buf, &hidden_states, seq_len).is_err() {
                 return;
             }
-
-            let mut current_hidden = hidden_states;
-            for (i, layer) in self.model.layers().iter().enumerate() {
-                let kv = self.kv_cache.layer(i);
-                current_hidden = match layer.forward_prefill(&mut encoder, &current_hidden, kv, seq_len) {
-                    Ok(h) => h,
-                    Err(_) => return,
-                };
+            let embed_scale = self.embedding_scale();
+            if (embed_scale - 1.0).abs() > 1e-8
+                && self.elementwise.dispatch_scale(
+                    &mut encoder, &hidden_states, &hidden_states, embed_scale,
+                    seq_len * hidden_dim as u32,
+                ).is_err()
+            {
+                return;
             }
+
+            let prefill_out = match GpuBuffer::new(&self.device, hidden_bytes, Some("stream_prefill_out")) {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+            let mut block_state = match self.model.forward_prefill_cached(
+                &mut encoder,
+                &hidden_states,
+                &prefill_out,
+                &self.kv_cache,
+                seq_len,
+            ) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
 
             let last_hidden_bytes = hidden_dim * f32_size;
             let last_hidden = match GpuBuffer::new(&self.device, last_hidden_bytes, Some("stream_prefill_last_hidden")) {
@@ -427,12 +504,20 @@ impl TokenGenerator {
             };
             let last_offset = ((seq_len - 1) as u64) * (hidden_dim as u64) * (f32_size as u64);
             encoder.copy_buffer_to_buffer(
-                current_hidden.buffer(),
+                prefill_out.buffer(),
                 last_offset,
                 last_hidden.buffer(),
                 0,
                 Some(last_hidden_bytes as u64),
             );
+
+            let normed_last = match GpuBuffer::new(&self.device, last_hidden_bytes, Some("stream_prefill_normed_last")) {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+            if self.apply_final_norm(&mut encoder, &last_hidden, &normed_last, 1).is_err() {
+                return;
+            }
 
             let vocab_size = self.lm_head.vocab_size();
             let logits_bytes = vocab_size * f32_size;
@@ -440,7 +525,7 @@ impl TokenGenerator {
                 Ok(b) => b,
                 Err(_) => return,
             };
-            if self.lm_head.forward(&mut encoder, &last_hidden, &logits_buf, 1).is_err() {
+            if self.lm_head.forward(&mut encoder, &normed_last, &logits_buf, 1).is_err() {
                 return;
             }
 
@@ -490,21 +575,44 @@ impl TokenGenerator {
                 if self.embedding.forward(&mut encoder, &token_buf, &embed_buf, 1).is_err() {
                     return;
                 }
+                let embed_scale = self.embedding_scale();
+                if (embed_scale - 1.0).abs() > 1e-8
+                    && self.elementwise.dispatch_scale(
+                        &mut encoder, &embed_buf, &embed_buf, embed_scale,
+                        hidden_dim as u32,
+                    ).is_err()
+                {
+                    return;
+                }
 
-                let mut current = embed_buf;
-                for (i, layer) in self.model.layers().iter().enumerate() {
-                    let kv = self.kv_cache.layer(i);
-                    current = match layer.forward_decode_token_direct(&mut encoder, &current, kv, Some(effective_pos as u32)) {
-                        Ok(h) => h,
-                        Err(_) => return,
-                    };
+                let decode_out = match GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("stream_decode_out")) {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                if self.model.forward_decode_cached(
+                    &mut encoder,
+                    &embed_buf,
+                    &decode_out,
+                    &self.kv_cache,
+                    &mut block_state,
+                    Some(effective_pos as u32),
+                ).is_err() {
+                    return;
+                }
+
+                let normed = match GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("stream_decode_normed")) {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                if self.apply_final_norm(&mut encoder, &decode_out, &normed, 1).is_err() {
+                    return;
                 }
 
                 let logits_buf = match GpuBuffer::new(&self.device, logits_bytes, Some("stream_decode_logits")) {
                     Ok(b) => b,
                     Err(_) => return,
                 };
-                if self.lm_head.forward(&mut encoder, &current, &logits_buf, 1).is_err() {
+                if self.lm_head.forward(&mut encoder, &normed, &logits_buf, 1).is_err() {
                     return;
                 }
 
