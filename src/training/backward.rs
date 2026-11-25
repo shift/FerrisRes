@@ -54,11 +54,18 @@ impl CpuBlockAttnResModel {
         // 3. Per-layer forward with activation storage
         let first_shared_layer = self.num_layers.saturating_sub(self.num_kv_shared_layers);
         let mut shared_kv: std::collections::HashMap<usize, (Vec<f32>, Vec<f32>)> = std::collections::HashMap::new();
-        let mut block_reps = Vec::new();
-        let mut partial_sum = vec![0.0f32; hd];
-        for t in 0..seq { for d in 0..hd { partial_sum[d] += hidden[t * hd + d]; } }
-        for d in 0..hd { partial_sum[d] /= seq as f32; }
-        block_reps.push(partial_sum.clone());
+        let boundaries = &self.block_config.boundary_layers;
+        let has_blocks = !boundaries.is_empty();
+        let lpb = self.block_config.layers_per_block.max(1);
+        let num_entries = boundaries.len() + 1;
+        let mut prefix_sums: Vec<Vec<f32>> = if has_blocks {
+            vec![vec![0.0f32; seq * hd]; num_entries]
+        } else {
+            Vec::new()
+        };
+        if has_blocks {
+            prefix_sums[0] = crate::model::cpu_block_attn_res::embedding_prefix(&hidden, seq, hd);
+        }
 
         let mut routing_data = Vec::new();
         let mut activations = Vec::with_capacity(self.num_layers);
@@ -225,13 +232,19 @@ impl CpuBlockAttnResModel {
             // Store per-layer hidden state for MSE loss
             per_layer_hidden.push(hidden.clone());
 
-            for t in 0..seq { for d in 0..hd { partial_sum[d] += hidden[t * hd + d]; } }
-            if self.is_block_boundary(layer_idx) {
-                for d in 0..hd { partial_sum[d] /= ((seq) * (self.block_config.layers_per_block)) as f32; }
-                block_reps.push(partial_sum.clone());
-                let inter_out = self.inter_block_attention(&hidden, &block_reps, seq);
-                for t in 0..seq { for d in 0..hd { hidden[t * hd + d] += inter_out[d]; } }
-                partial_sum = vec![0.0f32; hd];
+            // Causal block tracking (same rule as the inference model).
+            if has_blocks {
+                let bi = crate::model::cpu_block_attn_res::block_index_of_layer(boundaries, layer_idx);
+                crate::model::cpu_block_attn_res::add_layer_prefix(
+                    &mut prefix_sums[bi + 1], &hidden, seq, hd,
+                );
+                if self.is_block_boundary(layer_idx) {
+                    let means = crate::model::cpu_block_attn_res::prefix_means(
+                        &prefix_sums, bi + 1, seq, hd, lpb,
+                    );
+                    let inter_out = self.inter_block_attention(&hidden, &means, seq);
+                    for i in 0..seq * hd { hidden[i] += inter_out[i]; }
+                }
             }
         }
 

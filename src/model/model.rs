@@ -2,6 +2,7 @@ use std::sync::Arc;
 use wgpu::{Device, Queue};
 use crate::compute::GpuBuffer;
 use crate::compute::kernels::elementwise::ElementWiseOp;
+use crate::compute::kernels::inter_block::CausalPrefixOp;
 use crate::model::config::BlockAttnResConfig;
 use crate::model::block_attn_res::BlockAttnResLayer;
 use crate::error::Result;
@@ -10,12 +11,8 @@ pub struct BlockAttnResModel {
     config: BlockAttnResConfig,
     layers: Vec<BlockAttnResLayer>,
     _embedding: GpuBuffer,
-    block_reps: GpuBuffer,
-    partial_sum: GpuBuffer,
-    attn_keys_buf: GpuBuffer,
-    attn_out: GpuBuffer,
-    scratch_a: GpuBuffer,
     elementwise: ElementWiseOp,
+    causal_prefix: CausalPrefixOp,
     device: Arc<Device>,
     queue: Arc<Queue>,
 }
@@ -44,42 +41,12 @@ impl BlockAttnResModel {
         }
 
         let hidden_dim = config.hidden_dim;
-        let num_blocks = config.num_blocks;
 
         let embedding_bytes = hidden_dim * std::mem::size_of::<f32>();
         let embedding = GpuBuffer::zeros(&device, &queue, embedding_bytes, Some("Token Embedding"))?;
 
-        let block_reps_bytes = (num_blocks + 1) * hidden_dim * std::mem::size_of::<f32>();
-        let block_reps = GpuBuffer::zeros(&device, &queue, block_reps_bytes, Some("Block Representations"))?;
-
-        let partial_sum_bytes = hidden_dim * std::mem::size_of::<f32>();
-        let partial_sum = GpuBuffer::new(
-            &device,
-            partial_sum_bytes,
-            Some("Partial Sum (single row)"),
-        )?;
-
-        let attn_keys_bytes = (num_blocks + 1) * hidden_dim * std::mem::size_of::<f32>();
-        let attn_keys_buf = GpuBuffer::new(
-            &device,
-            attn_keys_bytes,
-            Some("Attention Keys Buffer"),
-        )?;
-
-        let attn_out_bytes = hidden_dim * std::mem::size_of::<f32>();
-        let attn_out = GpuBuffer::new(
-            &device,
-            attn_out_bytes,
-            Some("Inter-block Attention Output"),
-        )?;
-
-        let scratch_a = GpuBuffer::new(
-            &device,
-            hidden_dim * std::mem::size_of::<f32>(),
-            Some("Scratch Buffer A"),
-        )?;
-
         let elementwise = ElementWiseOp::new(&device, &queue);
+        let causal_prefix = CausalPrefixOp::new(&device, &queue)?;
 
         tracing::info!(event = "blockattnresmodel_created_with_layers", "BlockAttnResModel created with {} layers", total_layers);
 
@@ -87,12 +54,8 @@ impl BlockAttnResModel {
             config,
             layers,
             _embedding: embedding,
-            block_reps,
-            partial_sum,
-            attn_keys_buf,
-            attn_out,
-            scratch_a,
             elementwise,
+            causal_prefix,
             device,
             queue,
         })
@@ -112,28 +75,62 @@ impl BlockAttnResModel {
         let hidden_dim = self.config.hidden_dim;
         let num_blocks = self.config.num_blocks;
         let block_size = self.config.block_size;
-        let hidden_dim_bytes = (hidden_dim * std::mem::size_of::<f32>()) as u64;
+        let f32_size = std::mem::size_of::<f32>();
+        let numel = batch_size as usize * hidden_dim;
+        let numel_bytes = numel * f32_size;
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("BlockAttnResModel Forward"),
         });
 
-        let partial_sum_size = hidden_dim * std::mem::size_of::<f32>();
+        // Buffers are sized for the actual batch (positions). `block_reps`
+        // holds [num_blocks + 1, batch, hidden] per-position causal means.
+        let block_reps = GpuBuffer::zeros(
+            &self.device,
+            &self.queue,
+            (num_blocks + 1) * numel_bytes,
+            Some("Causal Block Representations"),
+        )?;
+        let partial_sum = GpuBuffer::zeros(
+            &self.device,
+            &self.queue,
+            numel_bytes,
+            Some("Block Layer Sum"),
+        )?;
+        let scratch = GpuBuffer::new(
+            &self.device,
+            numel_bytes,
+            Some("Block Scratch"),
+        )?;
+        let attn_out = GpuBuffer::new(
+            &self.device,
+            numel_bytes,
+            Some("Inter-block Attention Output"),
+        )?;
+        let entry_buf = GpuBuffer::new(
+            &self.device,
+            numel_bytes,
+            Some("Causal Prefix Entry"),
+        )?;
 
-        encoder.clear_buffer(self.partial_sum.buffer(), 0, Some(partial_sum_size as u64));
-
-        let hidden = input.buffer();
-        let block_reps_buf = self.block_reps.buffer();
-
+        // Entry 0: per-position causal mean of the initial hidden state.
+        self.causal_prefix.dispatch(
+            &mut encoder,
+            input,
+            &entry_buf,
+            batch_size,
+            hidden_dim as u32,
+            1.0,
+        )?;
         encoder.copy_buffer_to_buffer(
-            hidden,
+            entry_buf.buffer(),
             0,
-            block_reps_buf,
+            block_reps.buffer(),
             0,
-            Some(hidden_dim_bytes),
+            Some(numel_bytes as u64),
         );
 
-        let mut current_hidden = hidden;
+        let mut first_layer = true;
 
         for block_n in 0..num_blocks {
             tracing::debug!(event = "processing_block", "Processing block {}", block_n);
@@ -143,86 +140,76 @@ impl BlockAttnResModel {
 
             for l in layer_start..layer_end {
                 let layer = &self.layers[l];
-
-                if current_hidden == hidden {
+                if first_layer {
                     layer.forward_intra_block(
                         &mut encoder,
                         input,
-                        &self.scratch_a,
-                        &self.partial_sum,
+                        &scratch,
+                        &partial_sum,
                         batch_size,
                         crate::training::CheckpointGranularity::None,
                         None,
                     )?;
-                    current_hidden = self.scratch_a.buffer();
+                    first_layer = false;
                 } else {
                     layer.forward_intra_block(
                         &mut encoder,
-                        &self.scratch_a,
-                        &self.scratch_a,
-                        &self.partial_sum,
+                        &scratch,
+                        &scratch,
+                        &partial_sum,
                         batch_size,
                         crate::training::CheckpointGranularity::None,
                         None,
                     )?;
-                    current_hidden = self.scratch_a.buffer();
                 }
             }
 
-            let block_slot = (block_n + 1) as u64;
-
+            // Turn this block's per-position layer sum into its causal prefix
+            // mean and append it as entry block_n + 1.
+            self.causal_prefix.dispatch(
+                &mut encoder,
+                &partial_sum,
+                &entry_buf,
+                batch_size,
+                hidden_dim as u32,
+                block_size as f32,
+            )?;
             encoder.copy_buffer_to_buffer(
-                self.partial_sum.buffer(),
+                entry_buf.buffer(),
                 0,
-                block_reps_buf,
-                block_slot * hidden_dim_bytes,
-                Some(hidden_dim_bytes),
+                block_reps.buffer(),
+                ((block_n + 1) * numel_bytes) as u64,
+                Some(numel_bytes as u64),
             );
 
-            let entries_to_copy = block_n + 2;
-            let src_block_reps = self.block_reps.buffer();
-
-            for i in 0..entries_to_copy {
-                let src_offset = (i as u64) * hidden_dim_bytes;
-                let dst_offset = (i as u64) * hidden_dim_bytes;
-                encoder.copy_buffer_to_buffer(
-                    src_block_reps,
-                    src_offset,
-                    self.attn_keys_buf.buffer(),
-                    dst_offset,
-                    Some(hidden_dim_bytes),
-                );
-            }
-
-            let last_layer = &self.layers[layer_end - 1];
-            let num_keys = entries_to_copy as u32;
-
-            last_layer.forward_inter_block(
+            // Query is the current block output; keys are entries 0..=block_n+1.
+            let num_entries = (block_n + 2) as u32;
+            self.layers[layer_end - 1].forward_inter_block(
                 &mut encoder,
-                &self.attn_keys_buf,
-                &self.partial_sum,
-                &self.attn_out,
-                num_keys,
+                &block_reps,
+                &scratch,
+                &attn_out,
+                num_entries,
                 batch_size,
             )?;
 
-            let numel = batch_size * hidden_dim as u32;
             self.elementwise.dispatch_add(
                 &mut encoder,
-                &self.scratch_a,
-                &self.attn_out,
-                &self.scratch_a,
-                numel,
+                &scratch,
+                &attn_out,
+                &scratch,
+                numel as u32,
             )?;
 
-            current_hidden = self.scratch_a.buffer();
+            // Next block starts its own layer sum from zero.
+            encoder.clear_buffer(partial_sum.buffer(), 0, Some(numel_bytes as u64));
         }
 
         self.elementwise.dispatch_copy(
             &mut encoder,
-            &self.scratch_a,
+            &scratch,
             output,
-            batch_size * hidden_dim as u32,
+            numel as u32,
         )?;
 
         self.queue.submit(std::iter::once(encoder.finish()));

@@ -1,3 +1,28 @@
+//! CPU implementation of the Block AttnRes transformer.
+//!
+//! # Causal inter-block attention
+//!
+//! Inter-block attention is a causal mechanism. For the token at position `t`:
+//!
+//! 1. The query is that token's own hidden state `h[t]`.
+//! 2. The keys are the RMS-normed (with `block_config.attn_res_norm`) causal
+//!    summaries of every entry that exists at or before `t`: entry 0 is the
+//!    initial embedding, entry `b + 1` is block `b`'s layer outputs.
+//! 3. Entry 0's summary at `t` is `(1 / (t + 1)) * sum_{s <= t} embed[s]`.
+//!    Entry `b + 1`'s summary at `t` is
+//!    `(1 / ((t + 1) * layers_per_block)) * sum_{s <= t} sum_{l in block b} x_l[s]`,
+//!    where `x_l[s]` is layer `l`'s post-`layer_scalar` output at position `s`.
+//!    The divisor includes `layers_per_block` because the numerator sums over
+//!    both positions and the block's layers.
+//! 4. `score_e = (h[t] . key_e) / sqrt(hidden_dim)`, a softmax over the entries
+//!    gives the weights, and the output is `sum_e w_e * key_e`, added to `h[t]`.
+//!
+//! The summary of the block that just completed at a boundary layer is used by
+//! every position at that layer, but each position uses its own prefix mean, so
+//! position `t` sees only positions `0..=t`. Positions `t' < t` never see token
+//! `t`. `forward` (full sequence), `forward_prefill` + `forward_decode`
+//! (cached) and the f32 trainer implement the same rule.
+
 use crate::model::cpu_linear::{CpuLinear, CpuRmsNorm};
 use crate::model::cpu_moe::CpuMoELayer;
 use crate::model::gemma_mapper::{matmul, rms_norm, apply_rope, apply_rope_gqa, gelu_tanh};
@@ -219,7 +244,7 @@ impl CpuBlockAttnResLayer {
         };
 
         // GQA attention with scale=1.0 (after per-head norm)
-        let attn_out = self.cpu_attention(&q, &k, &v, seq, nh, nkv, head_d, q_dim, kv_dim);
+        let attn_out = self.cpu_attention(&q, &k, &v, seq, seq, nh, nkv, head_d, q_dim, kv_dim);
 
         // Post-attention norm (feature 1)
         let attn_out = self.post_attn_norm.forward(&attn_out);
@@ -464,16 +489,42 @@ impl CpuBlockAttnResLayer {
         q_dim: usize,
         kv_dim: usize,
     ) -> Vec<f32> {
+        self.cpu_attention_cached(
+            q, k, v, seq, seq, num_heads, num_kv_heads, head_dim, q_dim, kv_dim,
+        )
+    }
+
+    /// CPU causal attention for `q_len` queries over `kv_len` cached keys.
+    ///
+    /// Query `t` is the absolute position `kv_len - q_len + t` and may attend
+    /// to keys `0..=that position`. Prefill passes `q_len == kv_len`; decode
+    /// passes `q_len == 1` with `kv_len` equal to the cache length.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cpu_attention_cached(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        q_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        q_dim: usize,
+        kv_dim: usize,
+    ) -> Vec<f32> {
         let heads_per_kv = num_heads / num_kv_heads;
         let scale = 1.0f32; // Per-head RMSNorm replaces 1/sqrt(d)
-        let mut attn_out = vec![0.0f32; seq * q_dim];
+        let mut attn_out = vec![0.0f32; q_len * q_dim];
+        assert!(kv_len >= q_len, "kv_len {} < q_len {}", kv_len, q_len);
 
         for h in 0..num_heads {
             let kv_h = h / heads_per_kv;
-            for t in 0..seq {
+            for t in 0..q_len {
+                let q_pos = kv_len - q_len + t;
                 let mut max_score = f32::NEG_INFINITY;
-                let mut scores = vec![0.0f32; seq];
-                for s in 0..=t {
+                let mut scores = vec![0.0f32; q_pos + 1];
+                for s in 0..=q_pos {
                     let mut dot = 0.0f32;
                     for d in 0..head_dim {
                         dot += q[t * q_dim + h * head_dim + d]
@@ -483,14 +534,14 @@ impl CpuBlockAttnResLayer {
                     if scores[s] > max_score { max_score = scores[s]; }
                 }
                 let mut sum_exp = 0.0f32;
-                for s in 0..=t {
+                for s in 0..=q_pos {
                     scores[s] = (scores[s] - max_score).exp();
                     sum_exp += scores[s];
                 }
-                for s in 0..=t { scores[s] /= sum_exp; }
+                for s in 0..=q_pos { scores[s] /= sum_exp; }
                 for d in 0..head_dim {
                     let mut sum = 0.0f32;
-                    for s in 0..=t {
+                    for s in 0..=q_pos {
                         sum += scores[s] * v[s * kv_dim + kv_h * head_dim + d];
                     }
                     attn_out[t * q_dim + h * head_dim + d] = sum;
@@ -502,38 +553,48 @@ impl CpuBlockAttnResLayer {
     }
 
     /// Full attention computation including output projection.
-    /// Returns [seq × hidden_dim].
+    /// `q_len` queries attend causally over `kv_len` cached keys.
+    /// Returns `[q_len × hidden_dim]`.
+    #[allow(clippy::too_many_arguments)]
     pub fn cpu_attention(
         &self,
         q: &[f32],
         k: &[f32],
         v: &[f32],
-        seq: usize,
+        q_len: usize,
+        kv_len: usize,
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
         q_dim: usize,
         kv_dim: usize,
     ) -> Vec<f32> {
-        let attn_out = self.cpu_attention_raw(q, k, v, seq, num_heads, num_kv_heads, head_dim, q_dim, kv_dim);
-        self.out_proj.forward(&attn_out, seq)
+        let attn_out = self.cpu_attention_cached(
+            q, k, v, q_len, kv_len, num_heads, num_kv_heads, head_dim, q_dim, kv_dim,
+        );
+        self.out_proj.forward(&attn_out, q_len)
     }
 
     /// CPU attention with packed parallel O projection (for decode path).
+    /// `q_len` queries attend causally over `kv_len` cached keys.
+    #[allow(clippy::too_many_arguments)]
     pub fn cpu_attention_packed_parallel(
         &self,
         q: &[f32],
         k: &[f32],
         v: &[f32],
-        seq: usize,
+        q_len: usize,
+        kv_len: usize,
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
         q_dim: usize,
         kv_dim: usize,
     ) -> Vec<f32> {
-        let attn_out = self.cpu_attention_raw(q, k, v, seq, num_heads, num_kv_heads, head_dim, q_dim, kv_dim);
-        self.out_proj.forward_packed_parallel(&attn_out, seq)
+        let attn_out = self.cpu_attention_cached(
+            q, k, v, q_len, kv_len, num_heads, num_kv_heads, head_dim, q_dim, kv_dim,
+        );
+        self.out_proj.forward_packed_parallel(&attn_out, q_len)
     }
 
     /// CPU dense FFN with configurable activation (feature 10).
@@ -637,17 +698,22 @@ impl CpuBlockAttnResModel {
         let first_shared_layer = self.num_layers.saturating_sub(self.num_kv_shared_layers);
         let mut shared_kv: std::collections::HashMap<usize, (Vec<f32>, Vec<f32>)> = std::collections::HashMap::new();
 
-        // Block representations: block_reps[0] = mean of initial embedding
-        let mut block_reps: Vec<Vec<f32>> = Vec::new();
-        let mut partial_sum = vec![0.0f32; hd];
-        // Initialize: mean pool the initial embedding across seq dimension
-        for t in 0..seq {
-            for d in 0..hd {
-                partial_sum[d] += hidden[t * hd + d];
-            }
+        // Block representations are causal: entry 0 is the per-position prefix
+        // mean of the initial embedding, entry b+1 is the per-position prefix
+        // mean of block b's layer outputs. `prefix_sums` stores the raw prefix
+        // sums; the means are formed at each boundary.
+        let boundaries = &self.block_config.boundary_layers;
+        let has_blocks = !boundaries.is_empty();
+        let lpb = self.block_config.layers_per_block.max(1);
+        let num_entries = boundaries.len() + 1;
+        let mut prefix_sums: Vec<Vec<f32>> = if has_blocks {
+            vec![vec![0.0f32; seq * hd]; num_entries]
+        } else {
+            Vec::new()
+        };
+        if has_blocks {
+            prefix_sums[0] = embedding_prefix(&hidden, seq, hd);
         }
-        for d in 0..hd { partial_sum[d] /= seq as f32; }
-        block_reps.push(partial_sum.clone());
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // Get PLE slice for this layer
@@ -688,31 +754,18 @@ impl CpuBlockAttnResModel {
                 shared_kv.insert(layer_idx, (k_states, v_states));
             }
 
-            // Accumulate into partial_sum for block representation
-            for t in 0..seq {
-                for d in 0..hd {
-                    partial_sum[d] += hidden[t * hd + d];
-                }
-            }
+            if has_blocks {
+                let bi = block_index_of_layer(boundaries, layer_idx);
+                add_layer_prefix(&mut prefix_sums[bi + 1], &hidden, seq, hd);
 
-            // Block boundary: inter-block attention
-            if self.is_block_boundary(layer_idx) {
-                // Finalize this block's representation
-                for d in 0..hd { partial_sum[d] /= ((seq) * (self.block_config.layers_per_block)) as f32; }
-                block_reps.push(partial_sum.clone());
-
-                // Inter-block attention: query=current hidden, keys=block_reps
-                let inter_out = self.inter_block_attention(&hidden, &block_reps, seq);
-
-                // Add as residual
-                for t in 0..seq {
-                    for d in 0..hd {
-                        hidden[t * hd + d] += inter_out[d];
+                // Block boundary: inter-block attention.
+                if self.is_block_boundary(layer_idx) {
+                    let means = prefix_means(&prefix_sums, bi + 1, seq, hd, lpb);
+                    let inter_out = self.inter_block_attention(&hidden, &means, seq);
+                    for i in 0..seq * hd {
+                        hidden[i] += inter_out[i];
                     }
                 }
-
-                // Reset partial_sum for next block
-                partial_sum = vec![0.0f32; hd];
             }
         }
 
@@ -771,19 +824,22 @@ impl CpuBlockAttnResModel {
         let first_shared_layer = self.num_layers.saturating_sub(self.num_kv_shared_layers);
         let mut shared_kv: std::collections::HashMap<usize, (Vec<f32>, Vec<f32>)> = std::collections::HashMap::new();
 
-        // Block tracking
-        cache.block_reps.clear();
-        cache.partial_sum = vec![0.0f32; hd];
-        cache.block_token_count = seq;
-        // Initialize block_rep[0] = mean of embeddings
-        for t in 0..seq {
-            for d in 0..hd {
-                cache.partial_sum[d] += hidden[t * hd + d];
-            }
+        // Causal block tracking. `prefix_sums[e]` is `[seq, hidden]`: row t is
+        // entry e's prefix sum over positions 0..=t. The cache keeps only the
+        // final running sums (row seq-1), which is what decode extends.
+        let boundaries = &self.block_config.boundary_layers;
+        let has_blocks = !boundaries.is_empty();
+        let lpb = self.block_config.layers_per_block.max(1);
+        let num_entries = boundaries.len() + 1;
+        let mut prefix_sums: Vec<Vec<f32>> = if has_blocks {
+            vec![vec![0.0f32; seq * hd]; num_entries]
+        } else {
+            Vec::new()
+        };
+        if has_blocks {
+            prefix_sums[0] = embedding_prefix(&hidden, seq, hd);
         }
-        let mut init_rep = cache.partial_sum.clone();
-        for d in 0..hd { init_rep[d] /= seq as f32; }
-        cache.block_reps.push(init_rep);
+        cache.block_token_count = seq;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let ple_slice = ple_precomputed.as_ref().map(|pre| {
@@ -818,22 +874,25 @@ impl CpuBlockAttnResModel {
                 cache.layers[layer_idx].append_batch(&k_states, &v_states, seq);
             }
 
-            // Block tracking
-            for t in 0..seq {
-                for d in 0..hd {
-                    cache.partial_sum[d] += hidden[t * hd + d];
+            if has_blocks {
+                let bi = block_index_of_layer(boundaries, layer_idx);
+                add_layer_prefix(&mut prefix_sums[bi + 1], &hidden, seq, hd);
+
+                if self.is_block_boundary(layer_idx) {
+                    let means = prefix_means(&prefix_sums, bi + 1, seq, hd, lpb);
+                    let inter_out = self.inter_block_attention(&hidden, &means, seq);
+                    for i in 0..seq * hd {
+                        hidden[i] += inter_out[i];
+                    }
                 }
             }
-            if self.is_block_boundary(layer_idx) {
-                let mut block_rep = cache.partial_sum.clone();
-                for d in 0..hd { block_rep[d] /= (seq * self.block_config.layers_per_block) as f32; }
-                cache.block_reps.push(block_rep);
-                cache.partial_sum = vec![0.0f32; hd];
+        }
 
-                let inter_out = self.inter_block_attention(&hidden, &cache.block_reps, seq);
-                for t in 0..seq {
-                    for d in 0..hd { hidden[t * hd + d] += inter_out[d]; }
-                }
+        // Store the full-prefix running sums for decode.
+        cache.block_reps.clear();
+        if has_blocks && seq > 0 {
+            for entry in &prefix_sums {
+                cache.block_reps.push(entry[(seq - 1) * hd..].to_vec());
             }
         }
 
@@ -873,6 +932,16 @@ impl CpuBlockAttnResModel {
         }
         let scale = (hd as f32).sqrt();
         for h in hidden.iter_mut() { *h *= scale; }
+
+        // Causal block state: extend the running sums with this position. The
+        // number of processed positions includes the new token.
+        let boundaries = &self.block_config.boundary_layers;
+        let has_blocks = !boundaries.is_empty();
+        let lpb = self.block_config.layers_per_block.max(1);
+        if has_blocks {
+            self.begin_decode_block_state(cache, &hidden);
+            debug_assert_eq!(cache.block_token_count, pos + 1);
+        }
 
         // 2. PLE: compute PLE input for just this token at this position
         let ple_dim = self.hidden_size_per_layer_input;
@@ -956,7 +1025,8 @@ impl CpuBlockAttnResModel {
             let _total_seq = full_k.len() / kv_dim;
 
             // Attention: Q[1, heads, head_dim] × K[total_seq, kv_heads, head_dim]
-            let attn_out = layer.cpu_attention_packed_parallel(&q, full_k, full_v, 1, layer.num_heads, layer.num_kv_heads, layer.head_dim, q_dim, kv_dim);
+            let kv_len = full_k.len() / kv_dim;
+            let attn_out = layer.cpu_attention_packed_parallel(&q, full_k, full_v, 1, kv_len, layer.num_heads, layer.num_kv_heads, layer.head_dim, q_dim, kv_dim);
 
             // Post-attention norm + residual
             let attn_out = layer.post_attn_norm.forward_single(&attn_out);
@@ -965,18 +1035,24 @@ impl CpuBlockAttnResModel {
             // === FFN for single token (parallel) ===
             layer.forward_ffn_parallel(&mut hidden, ple_input.as_ref().map(|p| p.as_slice()));
 
-            // Block tracking
-            for d in 0..hd { cache.partial_sum[d] += hidden[d]; }
-            if self.is_block_boundary(layer_idx) {
-                cache.block_token_count += 1;
-                let mut block_rep = cache.partial_sum.clone();
-                for d in 0..hd { block_rep[d] /= (cache.block_token_count * self.block_config.layers_per_block) as f32; }
-                cache.block_reps.push(block_rep);
-                cache.partial_sum = vec![0.0f32; hd];
-                cache.block_token_count = 0;
+            // Block tracking: extend every block's running sum with this
+            // position's layer output, then apply causal inter-block attention
+            // at a boundary.
+            if has_blocks {
+                let bi = block_index_of_layer(boundaries, layer_idx);
+                let entry = bi + 1;
+                for d in 0..hd { cache.block_reps[entry][d] += hidden[d]; }
 
-                let inter_out = self.inter_block_attention_single(&hidden, &cache.block_reps);
-                for d in 0..hd { hidden[d] += inter_out[d]; }
+                if self.is_block_boundary(layer_idx) {
+                    let means = running_means(
+                        &cache.block_reps,
+                        entry,
+                        cache.block_token_count,
+                        lpb,
+                    );
+                    let inter_out = self.inter_block_attention_single(&hidden, &means);
+                    for d in 0..hd { hidden[d] += inter_out[d]; }
+                }
             }
         }
 
@@ -1064,11 +1140,18 @@ impl CpuBlockAttnResModel {
         // 3. Per-layer transformer
         let first_shared_layer = self.num_layers.saturating_sub(self.num_kv_shared_layers);
         let mut shared_kv: std::collections::HashMap<usize, (Vec<f32>, Vec<f32>)> = std::collections::HashMap::new();
-        let mut block_reps: Vec<Vec<f32>> = Vec::new();
-        let mut partial_sum = vec![0.0f32; hd];
-        for t in 0..seq { for d in 0..hd { partial_sum[d] += hidden[t * hd + d]; } }
-        for d in 0..hd { partial_sum[d] /= seq as f32; }
-        block_reps.push(partial_sum.clone());
+        let boundaries = &self.block_config.boundary_layers;
+        let has_blocks = !boundaries.is_empty();
+        let lpb = self.block_config.layers_per_block.max(1);
+        let num_entries = boundaries.len() + 1;
+        let mut prefix_sums: Vec<Vec<f32>> = if has_blocks {
+            vec![vec![0.0f32; seq * hd]; num_entries]
+        } else {
+            Vec::new()
+        };
+        if has_blocks {
+            prefix_sums[0] = embedding_prefix(&hidden, seq, hd);
+        }
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let ple_slice = ple_precomputed.as_ref().map(|pre| {
@@ -1214,13 +1297,14 @@ impl CpuBlockAttnResModel {
                 }
             }
 
-            for t in 0..seq { for d in 0..hd { partial_sum[d] += hidden[t * hd + d]; } }
-            if self.is_block_boundary(layer_idx) {
-                for d in 0..hd { partial_sum[d] /= ((seq) * (self.block_config.layers_per_block)) as f32; }
-                block_reps.push(partial_sum.clone());
-                let inter_out = self.inter_block_attention(&hidden, &block_reps, seq);
-                for t in 0..seq { for d in 0..hd { hidden[t * hd + d] += inter_out[d]; } }
-                partial_sum = vec![0.0f32; hd];
+            if has_blocks {
+                let bi = block_index_of_layer(boundaries, layer_idx);
+                add_layer_prefix(&mut prefix_sums[bi + 1], &hidden, seq, hd);
+                if self.is_block_boundary(layer_idx) {
+                    let means = prefix_means(&prefix_sums, bi + 1, seq, hd, lpb);
+                    let inter_out = self.inter_block_attention(&hidden, &means, seq);
+                    for i in 0..seq * hd { hidden[i] += inter_out[i]; }
+                }
             }
         }
 
@@ -1267,11 +1351,18 @@ impl CpuBlockAttnResModel {
         // 3. Per-layer transformer — attention + FFN separated for routing collection
         let first_shared_layer = self.num_layers.saturating_sub(self.num_kv_shared_layers);
         let mut shared_kv: std::collections::HashMap<usize, (Vec<f32>, Vec<f32>)> = std::collections::HashMap::new();
-        let mut block_reps: Vec<Vec<f32>> = Vec::new();
-        let mut partial_sum = vec![0.0f32; hd];
-        for t in 0..seq { for d in 0..hd { partial_sum[d] += hidden[t * hd + d]; } }
-        for d in 0..hd { partial_sum[d] /= seq as f32; }
-        block_reps.push(partial_sum.clone());
+        let boundaries = &self.block_config.boundary_layers;
+        let has_blocks = !boundaries.is_empty();
+        let lpb = self.block_config.layers_per_block.max(1);
+        let num_entries = boundaries.len() + 1;
+        let mut prefix_sums: Vec<Vec<f32>> = if has_blocks {
+            vec![vec![0.0f32; seq * hd]; num_entries]
+        } else {
+            Vec::new()
+        };
+        if has_blocks {
+            prefix_sums[0] = embedding_prefix(&hidden, seq, hd);
+        }
 
         let mut routing_data = Vec::new();
 
@@ -1365,13 +1456,14 @@ impl CpuBlockAttnResModel {
             );
 
             // Block boundary
-            for t in 0..seq { for d in 0..hd { partial_sum[d] += hidden[t * hd + d]; } }
-            if self.is_block_boundary(layer_idx) {
-                for d in 0..hd { partial_sum[d] /= ((seq) * (self.block_config.layers_per_block)) as f32; }
-                block_reps.push(partial_sum.clone());
-                let inter_out = self.inter_block_attention(&hidden, &block_reps, seq);
-                for t in 0..seq { for d in 0..hd { hidden[t * hd + d] += inter_out[d]; } }
-                partial_sum = vec![0.0f32; hd];
+            if has_blocks {
+                let bi = block_index_of_layer(boundaries, layer_idx);
+                add_layer_prefix(&mut prefix_sums[bi + 1], &hidden, seq, hd);
+                if self.is_block_boundary(layer_idx) {
+                    let means = prefix_means(&prefix_sums, bi + 1, seq, hd, lpb);
+                    let inter_out = self.inter_block_attention(&hidden, &means, seq);
+                    for i in 0..seq * hd { hidden[i] += inter_out[i]; }
+                }
             }
         }
 
@@ -1543,67 +1635,169 @@ impl CpuBlockAttnResModel {
 // Inter-Block Attention
 // ---------------------------------------------------------------------------
 
+/// Zero-based block index of `layer_idx`: the number of block boundaries that
+/// are strictly before it. Layers `0..=boundary[0]` are block 0, layers
+/// `boundary[0]+1..=boundary[1]` are block 1, and so on.
+pub(crate) fn block_index_of_layer(boundaries: &[usize], layer_idx: usize) -> usize {
+    boundaries.iter().filter(|&&b| b < layer_idx).count()
+}
+
+/// Add one layer's per-position prefix sums into a block accumulator.
+///
+/// `acc` is `[seq, hidden]`; after the call `acc[t]` contains the previous
+/// value plus `sum_{s <= t} hidden[s]`.
+pub(crate) fn add_layer_prefix(acc: &mut [f32], hidden: &[f32], seq: usize, hd: usize) {
+    let mut run = vec![0.0f32; hd];
+    for t in 0..seq {
+        for d in 0..hd {
+            run[d] += hidden[t * hd + d];
+        }
+        for d in 0..hd {
+            acc[t * hd + d] += run[d];
+        }
+    }
+}
+
+/// Per-position prefix sums of the initial embeddings: `acc[t] = sum_{s <= t} embed[s]`.
+pub(crate) fn embedding_prefix(hidden: &[f32], seq: usize, hd: usize) -> Vec<f32> {
+    let mut acc = vec![0.0f32; seq * hd];
+    let mut run = vec![0.0f32; hd];
+    for t in 0..seq {
+        for d in 0..hd {
+            run[d] += hidden[t * hd + d];
+        }
+        acc[t * hd..(t + 1) * hd].copy_from_slice(&run);
+    }
+    acc
+}
+
+/// Turn per-position prefix sums into per-position causal means for entries
+/// `0..=last_entry`. Entry 0 divides by `t + 1`; every block entry divides by
+/// `(t + 1) * layers_per_block`.
+pub(crate) fn prefix_means(
+    prefix_sums: &[Vec<f32>],
+    last_entry: usize,
+    seq: usize,
+    hd: usize,
+    layers_per_block: usize,
+) -> Vec<Vec<f32>> {
+    let lpb = layers_per_block.max(1) as f32;
+    (0..=last_entry)
+        .map(|e| {
+            let div = if e == 0 { 1.0 } else { lpb };
+            let mut means = vec![0.0f32; seq * hd];
+            for t in 0..seq {
+                let denom = (t + 1) as f32 * div;
+                for d in 0..hd {
+                    means[t * hd + d] = prefix_sums[e][t * hd + d] / denom;
+                }
+            }
+            means
+        })
+        .collect()
+}
+
+/// Turn running sums (one `[hidden]` vector per entry, accumulated over all
+/// processed positions) into the causal means for the *current* position.
+pub(crate) fn running_means(
+    block_sums: &[Vec<f32>],
+    last_entry: usize,
+    count: usize,
+    layers_per_block: usize,
+) -> Vec<Vec<f32>> {
+    let count = count.max(1) as f32;
+    let lpb = layers_per_block.max(1) as f32;
+    (0..=last_entry)
+        .map(|e| {
+            let denom = count * if e == 0 { 1.0 } else { lpb };
+            block_sums[e].iter().map(|v| v / denom).collect()
+        })
+        .collect()
+}
+
 impl CpuBlockAttnResModel {
-    /// Inter-block attention: cross-attention between current hidden state
-    /// and accumulated block representations. Mirrors GPU forward_inter_block().
+    /// Start (or extend) the causal block state for one decode position.
     ///
-    /// query = current hidden (partial_sum or mean-pooled token states)
-    /// keys = normed block representations [num_blocks_so_far, hidden_dim]
-    /// values = normed block representations (same as keys)
+    /// Adds the new token's embedding to entry 0 and increments the processed
+    /// position count. Per-layer outputs are added by the caller with
+    /// [`block_index_of_layer`].
+    fn begin_decode_block_state(
+        &self,
+        cache: &mut crate::inference::student_kv_cache::ModelKVCache,
+        embedding: &[f32],
+    ) {
+        let boundaries = &self.block_config.boundary_layers;
+        if boundaries.is_empty() {
+            return;
+        }
+        let hd = self.hidden_dim;
+        if cache.block_reps.len() < boundaries.len() + 1 {
+            cache.block_reps = vec![vec![0.0f32; hd]; boundaries.len() + 1];
+        }
+        cache.block_token_count += 1;
+        for d in 0..hd {
+            cache.block_reps[0][d] += embedding[d];
+        }
+    }
+
+    /// Inter-block attention over a full sequence, with causal prefix-mean keys.
     ///
-    /// Returns: attention output [hidden_dim] to add as residual.
+    /// `hidden` is `[seq, hidden_dim]` (the query for position `t` is
+    /// `hidden[t]`). `block_reps[e]` is `[seq, hidden_dim]`, where row `t` is
+    /// entry `e`'s causal mean at position `t` (see the module docs). The
+    /// result is `[seq, hidden_dim]`, the residual to add at each position.
     pub fn inter_block_attention(
         &self,
-        hidden: &[f32],      // [seq, hidden_dim] current token states
-        block_reps: &[Vec<f32>], // block representations so far (each [hidden_dim])
+        hidden: &[f32],          // [seq, hidden_dim] current token states
+        block_reps: &[Vec<f32>], // [num_entries][seq, hidden_dim] causal means
         seq: usize,
     ) -> Vec<f32> {
         let hd = self.hidden_dim;
-        let num_entries = block_reps.len(); // completed blocks + initial
-        if num_entries == 0 { return vec![0.0; hd]; }
-
-        // Mean-pool current hidden across seq dimension as query
-        let mut query = vec![0.0f32; hd];
-        for t in 0..seq {
-            for d in 0..hd {
-                query[d] += hidden[t * hd + d];
-            }
+        let num_entries = block_reps.len();
+        let mut output = vec![0.0f32; seq * hd];
+        if num_entries == 0 || seq == 0 {
+            return output;
         }
-        for d in 0..hd { query[d] /= seq as f32; }
 
-        // Normalize block representations with attn_res_norm
         let norm_weights = &self.block_config.attn_res_norm;
-        let mut normed_reps = Vec::with_capacity(num_entries);
-        for rep in block_reps {
-            let normed = crate::model::gemma_mapper::rms_norm(rep, norm_weights, hd, 1e-6);
-            normed_reps.push(normed);
-        }
-
-        // Flatten normed reps into [num_entries, hd] matrix
-        let mut flat_keys = vec![0.0f32; num_entries * hd];
-        for (i, nr) in normed_reps.iter().enumerate() {
-            flat_keys[i * hd..(i + 1) * hd].copy_from_slice(nr);
-        }
-
-        // Compute scores: query [1, hd] @ keys^T [hd, num_entries] = [1, num_entries]
         let scale = 1.0f32 / (hd as f32).sqrt();
-        let scores = crate::model::gemma_mapper::matmul(&query, &flat_keys, 1, hd, num_entries);
 
-        // Softmax
-        let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut weights = vec![0.0f32; num_entries];
-        let mut sum_exp = 0.0f32;
-        for (i, &s) in scores.iter().enumerate() {
-            weights[i] = ((s - max_score) * scale).exp();
-            sum_exp += weights[i];
-        }
-        for w in &mut weights { *w /= sum_exp; }
+        for t in 0..seq {
+            let query = &hidden[t * hd..(t + 1) * hd];
 
-        // Weighted sum of block representations
-        let mut output = vec![0.0f32; hd];
-        for (i, &w) in weights.iter().enumerate() {
-            for d in 0..hd {
-                output[d] += w * normed_reps[i][d];
+            // key_e = rms_norm(block_reps[e][t], attn_res_norm)
+            let mut keys = Vec::with_capacity(num_entries);
+            for rep in block_reps {
+                let row = &rep[t * hd..(t + 1) * hd];
+                keys.push(rms_norm(row, norm_weights, hd, 1e-6));
+            }
+
+            // scores[e] = dot(query, key_e) * scale. Softmax over e.
+            let mut max_score = f32::NEG_INFINITY;
+            let mut scores = vec![0.0f32; num_entries];
+            for (e, key) in keys.iter().enumerate() {
+                let mut dot = 0.0f32;
+                for d in 0..hd {
+                    dot += query[d] * key[d];
+                }
+                scores[e] = dot * scale;
+                if scores[e] > max_score {
+                    max_score = scores[e];
+                }
+            }
+            let mut sum_exp = 0.0f32;
+            for s in scores.iter_mut() {
+                *s = (*s - max_score).exp();
+                sum_exp += *s;
+            }
+            let inv = 1.0 / sum_exp;
+
+            let out = &mut output[t * hd..(t + 1) * hd];
+            for (e, key) in keys.iter().enumerate() {
+                let w = scores[e] * inv;
+                for d in 0..hd {
+                    out[d] += w * key[d];
+                }
             }
         }
 
@@ -1611,7 +1805,9 @@ impl CpuBlockAttnResModel {
     }
 
     /// Inter-block attention for a single token (decode mode).
-    /// Same as inter_block_attention but hidden is [hd] not [seq × hd].
+    ///
+    /// `hidden` is `[hidden_dim]`; `block_reps[e]` is entry `e`'s causal mean
+    /// at the current position, also `[hidden_dim]`.
     pub fn inter_block_attention_single(
         &self,
         hidden: &[f32],       // [hidden_dim] single token
@@ -1619,39 +1815,43 @@ impl CpuBlockAttnResModel {
     ) -> Vec<f32> {
         let hd = self.hidden_dim;
         let num_entries = block_reps.len();
-        if num_entries == 0 { return vec![0.0; hd]; }
+        if num_entries == 0 {
+            return vec![0.0; hd];
+        }
 
-        // Query is the hidden state directly (single token, no mean pooling needed)
-        let query = hidden;
-
-        // Normalize block representations
         let norm_weights = &self.block_config.attn_res_norm;
-        let mut normed_reps = Vec::with_capacity(num_entries);
-        for rep in block_reps {
-            let normed = crate::model::gemma_mapper::rms_norm(rep, norm_weights, hd, 1e-6);
-            normed_reps.push(normed);
-        }
-
-        let mut flat_keys = vec![0.0f32; num_entries * hd];
-        for (i, nr) in normed_reps.iter().enumerate() {
-            flat_keys[i * hd..(i + 1) * hd].copy_from_slice(nr);
-        }
-
         let scale = 1.0f32 / (hd as f32).sqrt();
-        let scores = crate::model::gemma_mapper::matmul(query, &flat_keys, 1, hd, num_entries);
 
-        let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut weights = vec![0.0f32; num_entries];
-        let mut sum_exp = 0.0f32;
-        for (i, &s) in scores.iter().enumerate() {
-            weights[i] = ((s - max_score) * scale).exp();
-            sum_exp += weights[i];
+        let mut keys = Vec::with_capacity(num_entries);
+        for rep in block_reps {
+            keys.push(rms_norm(rep, norm_weights, hd, 1e-6));
         }
-        for w in &mut weights { *w /= sum_exp; }
+
+        let mut max_score = f32::NEG_INFINITY;
+        let mut scores = vec![0.0f32; num_entries];
+        for (e, key) in keys.iter().enumerate() {
+            let mut dot = 0.0f32;
+            for d in 0..hd {
+                dot += hidden[d] * key[d];
+            }
+            scores[e] = dot * scale;
+            if scores[e] > max_score {
+                max_score = scores[e];
+            }
+        }
+        let mut sum_exp = 0.0f32;
+        for s in scores.iter_mut() {
+            *s = (*s - max_score).exp();
+            sum_exp += *s;
+        }
+        let inv = 1.0 / sum_exp;
 
         let mut output = vec![0.0f32; hd];
-        for (i, &w) in weights.iter().enumerate() {
-            for d in 0..hd { output[d] += w * normed_reps[i][d]; }
+        for (e, key) in keys.iter().enumerate() {
+            let w = scores[e] * inv;
+            for d in 0..hd {
+                output[d] += w * key[d];
+            }
         }
         output
     }
@@ -1908,6 +2108,8 @@ impl CpuBlockAttnResModel {
         let scale = (hd as f32).sqrt();
         for h in hidden.iter_mut() { *h *= scale; }
 
+        self.begin_decode_block_state(cache, &hidden);
+
         let ple_dim = self.hidden_size_per_layer_input;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -1953,7 +2155,8 @@ impl CpuBlockAttnResModel {
             };
 
             // Attention (CPU — small matrices)
-            let attn_out = layer.cpu_attention_packed_parallel(&q, full_k, full_v, 1, layer.num_heads, layer.num_kv_heads, layer.head_dim, q_dim, kv_dim);
+            let kv_len = full_k.len() / kv_dim;
+            let attn_out = layer.cpu_attention_packed_parallel(&q, full_k, full_v, 1, kv_len, layer.num_heads, layer.num_kv_heads, layer.head_dim, q_dim, kv_dim);
 
             // O projection via GPU ternary matmul
             let (o_packed, o_scales) = layer.out_proj.gpu_packed();
@@ -2028,17 +2231,21 @@ impl CpuBlockAttnResModel {
                 }
             }
 
-            // Block tracking
-            for d in 0..hd { cache.partial_sum[d] += hidden[d]; }
-            if self.is_block_boundary(layer_idx) {
-                cache.block_token_count += 1;
-                let mut block_rep = cache.partial_sum.clone();
-                for d in 0..hd { block_rep[d] /= (cache.block_token_count * self.block_config.layers_per_block) as f32; }
-                cache.block_reps.push(block_rep);
-                cache.partial_sum = vec![0.0f32; hd];
-                cache.block_token_count = 0;
-                let inter_out = self.inter_block_attention_single(&hidden, &cache.block_reps);
-                for d in 0..hd { hidden[d] += inter_out[d]; }
+            if !self.block_config.boundary_layers.is_empty() {
+                let boundaries = &self.block_config.boundary_layers;
+                let bi = block_index_of_layer(boundaries, layer_idx);
+                let entry = bi + 1;
+                for d in 0..hd { cache.block_reps[entry][d] += hidden[d]; }
+                if self.is_block_boundary(layer_idx) {
+                    let means = running_means(
+                        &cache.block_reps,
+                        entry,
+                        cache.block_token_count,
+                        self.block_config.layers_per_block,
+                    );
+                    let inter_out = self.inter_block_attention_single(&hidden, &means);
+                    for d in 0..hd { hidden[d] += inter_out[d]; }
+                }
             }
         }
 
@@ -2074,6 +2281,8 @@ impl CpuBlockAttnResModel {
         }
         let scale = (hd as f32).sqrt();
         for h in hidden.iter_mut() { *h *= scale; }
+
+        self.begin_decode_block_state(cache, &hidden);
 
         let ple_dim = self.hidden_size_per_layer_input;
 
@@ -2112,7 +2321,8 @@ impl CpuBlockAttnResModel {
             let (full_k, full_v) = cache.layers[layer_idx].get();
 
             // Attention (CPU)
-            let attn_out = layer.cpu_attention_packed_parallel(&q, full_k, full_v, 1, layer.num_heads, layer.num_kv_heads, layer.head_dim, q_dim, kv_dim);
+            let kv_len = full_k.len() / kv_dim;
+            let attn_out = layer.cpu_attention_packed_parallel(&q, full_k, full_v, 1, kv_len, layer.num_heads, layer.num_kv_heads, layer.head_dim, q_dim, kv_dim);
 
             // O — cached
             let attn_out = Self::gpu_ternary_mm(gpu, &lw.o_packed, &lw.o_scales, &attn_out, 1, layer.out_proj.in_features(), layer.out_proj.out_features());
@@ -2182,17 +2392,21 @@ impl CpuBlockAttnResModel {
                 }
             }
 
-            // Block tracking
-            for d in 0..hd { cache.partial_sum[d] += hidden[d]; }
-            if self.is_block_boundary(layer_idx) {
-                cache.block_token_count += 1;
-                let mut block_rep = cache.partial_sum.clone();
-                for d in 0..hd { block_rep[d] /= (cache.block_token_count * self.block_config.layers_per_block) as f32; }
-                cache.block_reps.push(block_rep);
-                cache.partial_sum = vec![0.0f32; hd];
-                cache.block_token_count = 0;
-                let inter_out = self.inter_block_attention_single(&hidden, &cache.block_reps);
-                for d in 0..hd { hidden[d] += inter_out[d]; }
+            if !self.block_config.boundary_layers.is_empty() {
+                let boundaries = &self.block_config.boundary_layers;
+                let bi = block_index_of_layer(boundaries, layer_idx);
+                let entry = bi + 1;
+                for d in 0..hd { cache.block_reps[entry][d] += hidden[d]; }
+                if self.is_block_boundary(layer_idx) {
+                    let means = running_means(
+                        &cache.block_reps,
+                        entry,
+                        cache.block_token_count,
+                        self.block_config.layers_per_block,
+                    );
+                    let inter_out = self.inter_block_attention_single(&hidden, &means);
+                    for d in 0..hd { hidden[d] += inter_out[d]; }
+                }
             }
         }
 
@@ -2228,6 +2442,8 @@ impl CpuBlockAttnResModel {
         }
         let scale = (hd as f32).sqrt();
         for h in hidden.iter_mut() { *h *= scale; }
+
+        self.begin_decode_block_state(cache, &hidden);
 
         let ple_dim = self.hidden_size_per_layer_input;
 
@@ -2269,7 +2485,8 @@ impl CpuBlockAttnResModel {
             let (full_k, full_v) = cache.layers[layer_idx].get();
 
             // Attention (CPU)
-            let attn_out = layer.cpu_attention_packed_parallel(&q, full_k, full_v, 1, layer.num_heads, layer.num_kv_heads, layer.head_dim, q_dim, kv_dim);
+            let kv_len = full_k.len() / kv_dim;
+            let attn_out = layer.cpu_attention_packed_parallel(&q, full_k, full_v, 1, kv_len, layer.num_heads, layer.num_kv_heads, layer.head_dim, q_dim, kv_dim);
 
             // O
             let attn_out = gpu.gpu_ternary_matmul_vram(&vl.o_weights, &vl.o_scales, &attn_out, 1, layer.out_proj.in_features(), layer.out_proj.out_features())
@@ -2346,17 +2563,21 @@ impl CpuBlockAttnResModel {
                 }
             }
 
-            // Block tracking
-            for d in 0..hd { cache.partial_sum[d] += hidden[d]; }
-            if self.is_block_boundary(layer_idx) {
-                cache.block_token_count += 1;
-                let mut block_rep = cache.partial_sum.clone();
-                for d in 0..hd { block_rep[d] /= (cache.block_token_count * self.block_config.layers_per_block) as f32; }
-                cache.block_reps.push(block_rep);
-                cache.partial_sum = vec![0.0f32; hd];
-                cache.block_token_count = 0;
-                let inter_out = self.inter_block_attention_single(&hidden, &cache.block_reps);
-                for d in 0..hd { hidden[d] += inter_out[d]; }
+            if !self.block_config.boundary_layers.is_empty() {
+                let boundaries = &self.block_config.boundary_layers;
+                let bi = block_index_of_layer(boundaries, layer_idx);
+                let entry = bi + 1;
+                for d in 0..hd { cache.block_reps[entry][d] += hidden[d]; }
+                if self.is_block_boundary(layer_idx) {
+                    let means = running_means(
+                        &cache.block_reps,
+                        entry,
+                        cache.block_token_count,
+                        self.block_config.layers_per_block,
+                    );
+                    let inter_out = self.inter_block_attention_single(&hidden, &means);
+                    for d in 0..hd { hidden[d] += inter_out[d]; }
+                }
             }
         }
 

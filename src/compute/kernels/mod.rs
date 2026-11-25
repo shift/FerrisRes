@@ -1,3 +1,4 @@
+pub mod inter_block;
 pub mod matmul;
 pub mod softmax;
 pub mod elementwise;
