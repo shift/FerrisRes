@@ -94,6 +94,15 @@ Two consequences:
   content, not a safety oracle, and it is not a source of German labels —
   those must be translated and human-checked as in §3.2.
 
+Considered and rejected: `potemin/jailbreak_detector_v2` (Apache-2.0, 0.2B).
+It is a fine-tune of the v2 teacher with an undocumented training set (its
+card says "the None dataset"), a lower reported F1 than the base (0.8824 on
+its own eval against 0.9549), and no intended-use or limitation section. Its
+provenance cannot be established, so it is neither a teacher nor an
+evaluation set for this task — contamination cannot be ruled out. If
+jailbreak detection becomes a requirement, it needs its own documented corpus
+and its own gate; it is not a substitute for the injection scanner.
+
 ## 4. Model
 
 Keep the encoder shape, change the input representation.
