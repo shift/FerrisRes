@@ -44,9 +44,12 @@ binary SAFE/INJECTION classification.
 
 **Current state: the weights are hash-initialised, not trained and not loaded.**
 The code shape is real; the classifier is not. The distillation source
-(`protectai/deberta-v3-base-prompt-injection`, 183M params) is a *candidate*
-teacher for the training task, not a completed distillation. The threshold
-(0.7) is a default, not a measured operating point.
+(`protectai/deberta-v3-base-prompt-injection-v2`, Apache-2.0, 184M params) is
+the *candidate* teacher, not a completed distillation. Its published
+post-training numbers on 20k unseen prompts are 99.74% recall at 91.59%
+precision. It is English-only, does not detect jailbreak attacks, and
+false-positives on system prompts. The threshold (0.7) is a default, not a
+measured operating point.
 
 The training corpus, the model changes (3 layers, hidden 192, byte-level plus
 hashed word buckets), the FNR/FPR gate, the versioned weight format and the

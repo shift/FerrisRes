@@ -76,6 +76,24 @@ cannot name its licence, it does not train a shipped artefact.
 `revision` (commit or dataset hash), `n_examples`, `sha256` of the built
 JSONL. The build step refuses an entry without a licence.
 
+### 3.5 Teacher (optional, for distillation)
+
+`protectai/deberta-v3-base-prompt-injection-v2` — Apache-2.0, 184M params,
+English-only. Published on 20k unseen prompts: accuracy 95.25%, precision
+91.59%, recall 99.74%, F1 95.49%. The v1 model is superseded; do not use it.
+
+Two consequences:
+
+- **Its operating point is high-recall, lower-precision.** The gate below
+  (FNR ≤ 5% at FPR ≤ 1%) is stricter on false positives than the teacher's
+  published numbers. If the student cannot reach it, either move the
+  threshold and accept more false positives under quarantine, or report the
+  failure and leave L1 off. Do not loosen the gate silently.
+- **It is English-only and does not detect jailbreaks**, and it
+  false-positives on system prompts. It is a label source for tool/RAG
+  content, not a safety oracle, and it is not a source of German labels —
+  those must be translated and human-checked as in §3.2.
+
 ## 4. Model
 
 Keep the encoder shape, change the input representation.
