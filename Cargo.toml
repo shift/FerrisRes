@@ -81,3 +81,8 @@ path = "benches/sparse_ternary_bench.rs"
 name = "ternary_bench"
 harness = false
 path = "benches/ternary_bench.rs"
+
+[[bench]]
+name = "ternary_kernels"
+harness = false
+path = "benches/ternary_kernels.rs"

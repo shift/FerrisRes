@@ -28,6 +28,26 @@ use crate::model::cpu_moe::CpuMoELayer;
 use crate::model::gemma_mapper::{matmul, rms_norm, apply_rope, apply_rope_gqa, gelu_tanh};
 use crate::model::gemma_mapper::{MappedGemma4Model, Gemma4FfnWeights};
 
+/// One attention projection (q, k, v or o).
+///
+/// Decode (`seq == 1`) reads the 2-bit packed weights, which is a quarter of
+/// the memory traffic and the whole point of the packed representation.
+/// Prefill (`seq > 1`) uses the unpacked parallel kernel, which splits the
+/// sequence positions across threads.
+///
+/// Both kernels compute the same arithmetic. The unpacked one is bit-identical
+/// to the previous serial kernel; the packed one sums in eight lanes, so a
+/// decode projection and a prefill projection of the same vector can differ in
+/// the last few bits (~1e-6 relative). No model semantics depend on that.
+#[inline]
+fn attn_projection(linear: &CpuLinear, input: &[f32], seq: usize) -> Vec<f32> {
+    if seq == 1 {
+        linear.forward_packed_parallel(input, seq)
+    } else {
+        linear.forward_parallel(input, seq)
+    }
+}
+
 /// Stored activations from a forward pass, used for proper backward.
 ///
 /// Rather than storing ALL intermediate tensors (which would be ~4GB for 35 layers),
@@ -217,7 +237,7 @@ impl CpuBlockAttnResLayer {
         let normed = self.attn_norm.forward(hidden);
 
         // Q projection + per-head norm + RoPE
-        let mut q = self.q_proj.forward(&normed, seq);
+        let mut q = attn_projection(&self.q_proj, &normed, seq);
         q = crate::model::gemma_mapper::per_head_rms_norm(&q, self.q_norm.weight(), seq, nh, head_d);
         apply_rope(&mut q, seq, nh, head_d, 0, self.rope_theta, self.partial_rotary_factor);
 
@@ -229,8 +249,8 @@ impl CpuBlockAttnResLayer {
             }
             None => {
                 // Normal layer — compute own K/V
-                let mut k = self.k_proj.forward(&normed, seq);
-                let v_raw = self.v_proj.forward(&normed, seq);
+                let mut k = attn_projection(&self.k_proj, &normed, seq);
+                let v_raw = attn_projection(&self.v_proj, &normed, seq);
 
                 // Per-head K/V norms
                 k = crate::model::gemma_mapper::per_head_rms_norm(&k, self.k_norm.weight(), seq, nkv, head_d);
@@ -427,7 +447,7 @@ impl CpuBlockAttnResLayer {
         let normed = self.attn_norm.forward(hidden);
 
         // Q projection + LoRA
-        let mut q = self.q_proj.forward(&normed, seq);
+        let mut q = attn_projection(&self.q_proj, &normed, seq);
         if let Some(lora_out) = lora_m.forward(layer_idx, "q_proj", &normed, seq) {
             for (i, v) in lora_out.iter().enumerate() { q[i] += v; }
         }
@@ -438,11 +458,11 @@ impl CpuBlockAttnResLayer {
         let (k, v, should_share) = match shared_kv {
             Some((sk, sv)) => (sk.to_vec(), sv.to_vec(), false),
             None => {
-                let mut k = self.k_proj.forward(&normed, seq);
+                let mut k = attn_projection(&self.k_proj, &normed, seq);
                 if let Some(lora_out) = lora_m.forward(layer_idx, "k_proj", &normed, seq) {
                     for (i, l) in lora_out.iter().enumerate() { k[i] += l; }
                 }
-                let mut v_raw = self.v_proj.forward(&normed, seq);
+                let mut v_raw = attn_projection(&self.v_proj, &normed, seq);
                 if let Some(lora_out) = lora_m.forward(layer_idx, "v_proj", &normed, seq) {
                     for (i, l) in lora_out.iter().enumerate() { v_raw[i] += l; }
                 }
@@ -458,7 +478,7 @@ impl CpuBlockAttnResLayer {
         // Raw attention output (before out_proj) — LoRA needs the same input as the base weight
         let attn_raw = self.cpu_attention_raw(&q, &k, &v, seq, nh, nkv, head_d, q_dim, kv_dim);
         // Apply out_proj + LoRA on O projection
-        let mut attn_out = self.out_proj.forward(&attn_raw, seq);
+        let mut attn_out = attn_projection(&self.out_proj, &attn_raw, seq);
         if let Some(lora_out) = lora_m.forward(layer_idx, "o_proj", &attn_raw, seq) {
             for (i, l) in lora_out.iter().enumerate() { attn_out[i] += l; }
         }
@@ -572,7 +592,7 @@ impl CpuBlockAttnResLayer {
         let attn_out = self.cpu_attention_cached(
             q, k, v, q_len, kv_len, num_heads, num_kv_heads, head_dim, q_dim, kv_dim,
         );
-        self.out_proj.forward(&attn_out, q_len)
+        attn_projection(&self.out_proj, &attn_out, q_len)
     }
 
     /// CPU attention with packed parallel O projection (for decode path).

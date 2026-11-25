@@ -113,7 +113,15 @@ impl CpuLinear {
 
     /// Packed parallel forward — 4× less memory bandwidth than unpacked.
     /// Fastest path for decode (seq=1) on memory-bound systems.
+    ///
+    /// The packed kernel decodes one activation row against 2-bit weights and
+    /// assumes a row stride of `in_features / 4` bytes. Any other shape — more
+    /// than one token, or a width that is not a multiple of 4 — falls back to
+    /// the unpacked parallel kernel rather than computing a wrong result.
     pub fn forward_packed_parallel(&self, input: &[f32], seq: usize) -> Vec<f32> {
+        if seq != 1 || self.in_features % 4 != 0 {
+            return self.forward_parallel(input, seq);
+        }
         let mut output = crate::model::ternary::ternary_matmul_packed_parallel(
             &self.packed, self.scale, input,
             self.out_features, self.in_features, seq,
