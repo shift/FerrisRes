@@ -6,10 +6,11 @@ use ferrisres::{WgpuCompute, DeviceProfile, BlockAttnResConfig, BlockAttnResMode
 use ferrisres::compute::{GpuBuffer, MatMulOp, RmsNormOp, SoftmaxOp, ElementWiseOp};
 use ferrisres::training::AdamOptimizer;
 use ferrisres::model::gemma_mapper::{
-    self, Gemma4Config, Gemma4Teacher,
+    self, Gemma4Teacher, TeacherSpec,
     load_gemma4_model_mmap,
     DistillationCheckpoint, load_gemma4_model_gguf,
 };
+use ferrisres::model::gguf::load_gguf;
 use ferrisres::model::tokenizer::HfTokenizer;
 
 #[derive(Parser)]
@@ -49,7 +50,7 @@ enum Commands {
         /// Path to a distilled/GGUF model file to load. Omit to use a blank skeleton model.
         #[arg(long)]
         model_path: Option<String>,
-        /// Model config preset: e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b, llama3-8b, llama3-70b, mistral-7b, mixtral-8x7b, phi3-mini, qwen2-7b.
+        /// Model config preset: e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b, llama3-8b, llama3-70b, mistral-7b, mixtral-8x7b, phi3-mini, qwen2-7b, qwen3-1.7b, qwen3-0.6b.
         /// Required when using --model-path. Ignored for skeleton models.
         #[arg(long, default_value = "e2b")]
         config: String,
@@ -120,12 +121,12 @@ enum Commands {
         iterations: u32,
     },
 
-    /// Distill a Gemma 4 model into Block AttnRes format.
+    /// Distill a teacher model into Block AttnRes format.
     Distill {
-        /// Path to Gemma 4 safetensors file.
+        /// Path to model weights (safetensors or GGUF).
         #[arg(long)]
         model_path: String,
-        /// Model config: e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b, llama3-8b, llama3-70b, mistral-7b, mixtral-8x7b, phi3-mini, qwen2-7b.
+        /// Model config: e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b, llama3-8b, llama3-70b, mistral-7b, mixtral-8x7b, phi3-mini, qwen2-7b, qwen3-1.7b, qwen3-0.6b.
         #[arg(long, default_value = "e2b")]
         config: String,
         /// Sequence length for training.
@@ -178,14 +179,17 @@ enum Commands {
     },
 
     /// Evaluate teacher/student perplexity.
-    /// Evaluate teacher/student perplexity.
     Evaluate {
-        /// Path to Gemma 4 safetensors file.
+        /// Path to model weights (safetensors or GGUF).
         #[arg(long)]
         model_path: String,
-        /// Model config: e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b.
+        /// Model config: e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b, 31b, llama3-8b,
+        /// llama3-70b, mistral-7b, phi3-mini, qwen2-7b, qwen3-1.7b, qwen3-0.6b.
         #[arg(long, default_value = "e2b")]
         config: String,
+        /// Model file format: safetensors or gguf.
+        #[arg(long, default_value = "safetensors")]
+        model_format: String,
         /// Text to evaluate on.
         #[arg(long)]
         text: String,
@@ -196,7 +200,7 @@ enum Commands {
         /// Path to model file (safetensors or GGUF).
         #[arg(long)]
         model_path: Option<String>,
-        /// Model config preset: e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b, llama3-8b, llama3-70b, mistral-7b, mixtral-8x7b, phi3-mini, qwen2-7b.
+        /// Model config preset: e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b, llama3-8b, llama3-70b, mistral-7b, mixtral-8x7b, phi3-mini, qwen2-7b, qwen3-1.7b, qwen3-0.6b.
         #[arg(long, default_value = "e2b")]
         config: String,
         /// Model file format: safetensors or gguf.
@@ -263,8 +267,8 @@ async fn main() -> anyhow::Result<()> {
             armor: _, armor_config: _,
         } => cmd_distill(model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every, resume, model_format, tokenizer, checkpoint_every, converge, converge_patience).await,
         Commands::Evaluate {
-            model_path, config, text,
-        } => cmd_evaluate(model_path, config, text).await,
+            model_path, config, model_format, text,
+        } => cmd_evaluate(model_path, config, model_format, text).await,
         Commands::Serve {
             model_path, config, model_format, tokenizer,
             host, port, model_name, armor, cognitive, concepts_path,
@@ -1138,62 +1142,53 @@ async fn cmd_benchmark(
 }
 
 /// Resolve a model config name to a Gemma4Config.
+///
+/// All name knowledge lives in [`TeacherSpec`] so `distill`, `infer`,
+/// `serve` and `evaluate` cannot drift apart.
 fn resolve_model_config(config_name: &str) -> anyhow::Result<gemma_mapper::Gemma4Config> {
-    use ferrisres::model::gemma_mapper::Gemma4Config;
-    match config_name {
-        "e2b" => {
-            info!(event = "model_config_selected", config = "e2b", "Using Gemma 4 E2B config");
-            Ok(Gemma4Config::gemma4_e2b())
-        }
-        "e4b" => {
-            info!(event = "model_config_selected", config = "e4b", "Using Gemma 4 E4B config");
-            Ok(Gemma4Config::gemma4_e4b())
-        }
-        "12b" => {
-            info!(event = "model_config_selected", config = "12b", "Using Gemma 4 12B config");
-            Ok(Gemma4Config::gemma4_12b())
-        }
-        "27b" => {
-            info!(event = "model_config_selected", config = "27b", "Using Gemma 4 27B config");
-            Ok(Gemma4Config::gemma4_27b())
-        }
-        "27b-mm" => {
-            info!(event = "model_config_selected", config = "27b-mm", "Using Gemma 4 27B Multimodal config");
-            Ok(Gemma4Config::gemma4_27b_mm())
-        }
-        "26b-a4b" => {
-            info!(event = "model_config_selected", config = "26b-a4b", "Using Gemma 4 26B A4B config");
-            Ok(Gemma4Config::gemma4_26b_a4b())
-        }
-        "31b" => {
-            info!(event = "model_config_selected", config = "31b", "Using Gemma 4 31B config");
-            Ok(Gemma4Config::gemma4_31b())
-        }
-        "llama3-8b" => {
-            info!(event = "model_config_selected", config = "llama3-8b", "Using LLaMA 3.1 8B config");
-            Ok(Gemma4Config::llama3_8b())
-        }
-        "llama3-70b" => {
-            info!(event = "model_config_selected", config = "llama3-70b", "Using LLaMA 3.1 70B config");
-            Ok(Gemma4Config::llama3_70b())
-        }
-        "mistral-7b" => {
-            info!(event = "model_config_selected", config = "mistral-7b", "Using Mistral 7B config");
-            Ok(Gemma4Config::mistral_7b())
-        }
-        "mixtral-8x7b" => {
-            info!(event = "model_config_selected", config = "mixtral-8x7b", "Using Mixtral 8x7B config");
-            Ok(Gemma4Config::mixtral_8x7b())
-        }
-        "phi3-mini" => {
-            info!(event = "model_config_selected", config = "phi3-mini", "Using Phi-3 Mini config");
-            Ok(Gemma4Config::phi3_mini())
-        }
-        "qwen2-7b" => {
-            info!(event = "model_config_selected", config = "qwen2-7b", "Using Qwen 2.5 7B config");
-            Ok(Gemma4Config::qwen2_7b())
-        }
-        other => anyhow::bail!("Unknown model config: '{}'. Valid: e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b, 31b, llama3-8b, llama3-70b, mistral-7b, mixtral-8x7b, phi3-mini, qwen2-7b", other),
+    let spec = TeacherSpec::from_config_name(config_name)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    info!(
+        event = "model_config_selected",
+        config = config_name,
+        arch = %spec.arch,
+        experts = spec.experts.map(|e| e.count).unwrap_or(0),
+        "Using teacher config"
+    );
+    Ok(spec.to_gemma4_config())
+}
+
+/// Resolve a teacher spec from `--config`, and for GGUF also from the file's
+/// metadata. Dense teachers are checked strictly; Gemma keeps its preset for
+/// fields GGUF metadata cannot express.
+fn resolve_teacher_spec(
+    config_name: &str,
+    model_path: &str,
+    model_format: &str,
+) -> anyhow::Result<TeacherSpec> {
+    let spec = TeacherSpec::from_config_name(config_name)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    if !spec.supports_distillation() {
+        anyhow::bail!(
+            "Teacher '{}' ({}) is a non-Gemma MoE model. Expert mapping is only \
+             implemented for Gemma 4; see docs/distillation.md.",
+            config_name,
+            spec.arch
+        );
+    }
+
+    let path = std::path::Path::new(model_path);
+    if !path.exists() {
+        anyhow::bail!("Model file not found: {}", model_path);
+    }
+
+    if model_format == "gguf" {
+        let gguf = load_gguf(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read GGUF metadata: {:?}", e))?;
+        spec.reconcile_with_gguf(&gguf, !spec.is_gemma())
+            .map_err(|e| anyhow::anyhow!("{}", e))
+    } else {
+        Ok(spec)
     }
 }
 
@@ -1215,47 +1210,27 @@ async fn cmd_distill(
     converge_patience: usize,
     // use_gpu removed — now determined by DispatchPlan from model size + device capabilities
 ) -> anyhow::Result<()> {
-    info!(event = "ferrisres_gemma_4_block_attnres_distillation", "=== FerrisRes Gemma 4 → Block AttnRes Distillation ===");
-
-    // Parse config
-    let config = match config_name.as_str() {
-        "e2b" => { info!(event = "model_config_selected", config = "e2b", "Using Gemma 4 E2B config (dense, ~4 GB)"); Gemma4Config::gemma4_e2b() }
-
-        "e4b" => { info!(event = "model_config_selected", config = "e4b", "Using Gemma 4 E4B config (MoE-16, ~8 GB)"); Gemma4Config::gemma4_e4b() }
-
-        "12b" => { info!(event = "model_config_selected", config = "12b", "Using Gemma 4 12B config (MoE-128, ~24 GB)"); Gemma4Config::gemma4_12b() }
-
-        "27b" => { info!(event = "model_config_selected", config = "27b", "Using Gemma 4 27B config (MoE-128, ~54 GB)"); Gemma4Config::gemma4_27b() }
-
-        "27b-mm" => { info!(event = "model_config_selected", config = "27b-mm", "Using Gemma 4 27B Multimodal IT config (dense, 35 layers, ~10 GB)"); Gemma4Config::gemma4_27b_mm() }
-
-        "26b-a4b" => { info!(event = "model_config_selected", config = "26b-a4b", "Using Gemma 4 26B A4B config (MoE-128, 30 layers)"); Gemma4Config::gemma4_26b_a4b() }
-
-        "31b" => { info!(event = "model_config_selected", config = "31b", "Using Gemma 4 31B config (dense, 60 layers, ~62 GB)"); Gemma4Config::gemma4_31b() }
-
-        "llama3-8b" => { info!(event = "model_config_selected", config = "llama3-8b", "Using LLaMA 3.1 8B config"); Gemma4Config::llama3_8b() }
-
-        "llama3-70b" => { info!(event = "model_config_selected", config = "llama3-70b", "Using LLaMA 3.1 70B config"); Gemma4Config::llama3_70b() }
-
-        "mistral-7b" => { info!(event = "model_config_selected", config = "mistral-7b", "Using Mistral 7B config"); Gemma4Config::mistral_7b() }
-
-        "mixtral-8x7b" => { info!(event = "model_config_selected", config = "mixtral-8x7b", "Using Mixtral 8x7B config"); Gemma4Config::mixtral_8x7b() }
-
-        "phi3-mini" => { info!(event = "model_config_selected", config = "phi3-mini", "Using Phi-3 Mini config"); Gemma4Config::phi3_mini() }
-
-        "qwen2-7b" => { info!(event = "model_config_selected", config = "qwen2-7b", "Using Qwen 2.5 7B config"); Gemma4Config::qwen2_7b() }
-
-        other => anyhow::bail!("Unknown config '{}'. Use: e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b, 31b, llama3-8b, llama3-70b, mistral-7b, mixtral-8x7b, phi3-mini, qwen2-7b", other),
-    };
-
-    info!(event = "model_config", hidden = config.hidden_dim, layers = config.num_layers, heads = config.num_heads, vocab = config.vocab_size, "model config");
+    info!(event = "ferrisres_block_attnres_distillation", "=== FerrisRes Teacher → Block AttnRes Distillation ===");
 
     // Load weights
     info!(event = "loading_weights_from", "Loading weights from: {}", model_path);
+    let spec = resolve_teacher_spec(&config_name, &model_path, &model_format)?;
+    let config = spec.to_gemma4_config();
+
+    info!(
+        event = "model_config",
+        arch = %spec.arch,
+        attention = ?spec.attention,
+        experts = spec.experts.map(|e| e.count).unwrap_or(0),
+        hidden = config.hidden_dim,
+        layers = config.num_layers,
+        heads = config.num_heads,
+        vocab = config.vocab_size,
+        blocks = spec.block_boundaries().len(),
+        "model config"
+    );
+
     let path = std::path::Path::new(&model_path);
-    if !path.exists() {
-        anyhow::bail!("Model file not found: {}", model_path);
-    }
 
     // Check RAM BEFORE loading — decide skeleton vs full
     let model_file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -2892,22 +2867,21 @@ fn chrono_hash(s: &str) -> String {
 async fn cmd_evaluate(
     model_path: String,
     config_name: String,
+    model_format: String,
     text: String,
 ) -> anyhow::Result<()> {
     info!(event = "ferrisres_evaluation", "=== FerrisRes Evaluation ===");
 
-    let config = match config_name.as_str() {
-        "e2b" => Gemma4Config::gemma4_e2b(),
-        "e4b" => Gemma4Config::gemma4_e4b(),
-        "27b-mm" => Gemma4Config::gemma4_27b_mm(),
-        "26b-a4b" => Gemma4Config::gemma4_26b_a4b(),
-        "31b" => Gemma4Config::gemma4_31b(),
-        _ => anyhow::bail!("Use e2b, e4b, 27b-mm, 26b-a4b, or 31b for evaluation"),
-    };
+    let spec = resolve_teacher_spec(&config_name, &model_path, &model_format)?;
+    let config = spec.to_gemma4_config();
 
     let path = std::path::Path::new(&model_path);
-    let model = load_gemma4_model_mmap(path, config.clone())
-        .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
+    let model = match model_format.as_str() {
+        "gguf" => load_gemma4_model_gguf(path, config.clone()),
+        "safetensors" => load_gemma4_model_mmap(path, config.clone()),
+        other => anyhow::bail!("Unknown model format: '{}'. Use 'gguf' or 'safetensors'.", other),
+    }
+    .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
 
     let teacher = Gemma4Teacher::new(model);
 
@@ -3095,4 +3069,77 @@ fn truncate_grad(d_hidden: &[f32], seq: usize, out_dim: usize, hd: usize) -> Vec
         }
     }
     out
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// `--config qwen3-1.7b` must parse and resolve to a dense teacher with
+    /// no expert path. This is the CLI half of the test; the mapping half is
+    /// in `gemma_mapper::tests`.
+    #[test]
+    fn test_cli_config_qwen3_1_7b_parses() {
+        let cli = Cli::try_parse_from([
+            "ferrisres",
+            "distill",
+            "--model-path",
+            "Qwen3-1.7B.Q4_K_M.gguf",
+            "--config",
+            "qwen3-1.7b",
+        ])
+        .expect("qwen3-1.7b must parse");
+        match cli.command {
+            Commands::Distill { config, .. } => assert_eq!(config, "qwen3-1.7b"),
+            _ => panic!("expected Distill"),
+        }
+        let spec = TeacherSpec::from_config_name("qwen3-1.7b").unwrap();
+        assert!(spec.experts.is_none());
+        assert_eq!(spec.to_gemma4_config().num_experts, 1);
+    }
+
+    #[test]
+    fn test_cli_config_qwen3_0_6b_parses() {
+        let cli = Cli::try_parse_from([
+            "ferrisres",
+            "distill",
+            "--model-path",
+            "Qwen3-0.6B.Q4_K_M.gguf",
+            "--config",
+            "qwen3-0.6b",
+        ])
+        .expect("qwen3-0.6b must parse");
+        match cli.command {
+            Commands::Distill { config, .. } => assert_eq!(config, "qwen3-0.6b"),
+            _ => panic!("expected Distill"),
+        }
+        let spec = TeacherSpec::from_config_name("qwen3-0.6b").unwrap();
+        assert!(spec.experts.is_none());
+        assert_eq!(spec.to_gemma4_config().num_experts, 1);
+    }
+
+    #[test]
+    fn test_cli_evaluate_qwen3_0_6b_gguf_parses() {
+        let cli = Cli::try_parse_from([
+            "ferrisres",
+            "evaluate",
+            "--model-path",
+            "Qwen3-0.6B.Q4_K_M.gguf",
+            "--config",
+            "qwen3-0.6b",
+            "--model-format",
+            "gguf",
+            "--text",
+            "hello",
+        ])
+        .expect("evaluate with qwen3-0.6b must parse");
+        match cli.command {
+            Commands::Evaluate { config, model_format, .. } => {
+                assert_eq!(config, "qwen3-0.6b");
+                assert_eq!(model_format, "gguf");
+            }
+            _ => panic!("expected Evaluate"),
+        }
+    }
 }
