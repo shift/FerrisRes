@@ -19,6 +19,7 @@ use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion
 use ferrisres::inference::student_kv_cache::ModelKVCache;
 use ferrisres::model::cpu_block_attn_res::{BlockConfig, CpuBlockAttnResLayer, CpuBlockAttnResModel};
 use ferrisres::model::cpu_linear::{CpuLinear, CpuRmsNorm};
+use ferrisres::model::gemma_mapper::gelu_tanh;
 use ferrisres::model::ternary::{
     pack_ternary, ternary_matmul, ternary_matmul_parallel, ternary_matmul_packed_parallel,
 };
@@ -510,6 +511,81 @@ fn bench_layer_attention(c: &mut Criterion) {
     group.finish();
 }
 
+/// The dense FFN as it was before the projection dispatch: gate/up/down
+/// through the serial `CpuLinear::forward` (unpacked, branchy, one thread),
+/// with the same pre/post norm and residual as `forward_ffn`.
+fn baseline_forward_ffn(layer: &CpuBlockAttnResLayer, hidden: &mut Vec<f32>, seq: usize) {
+    let id = layer.intermediate_dim;
+    let residual2 = hidden.clone();
+    let normed2 = layer.pre_ffn_norm.forward(hidden);
+
+    let gate = layer.ffn_gate.as_ref().expect("dense FFN");
+    let up = layer.ffn_up.as_ref().expect("dense FFN");
+    let down = layer.ffn_down.as_ref().expect("dense FFN");
+
+    let gated = gate.forward(&normed2, seq);
+    let gated: Vec<f32> = if layer.use_gelu {
+        gated.iter().map(|&x| gelu_tanh(x)).collect()
+    } else {
+        gated.iter().map(|&x| x / (1.0 + (-x).exp())).collect()
+    };
+    let upped = up.forward(&normed2, seq);
+    let mut combined = vec![0.0; seq * id];
+    for i in 0..combined.len() {
+        combined[i] = gated[i] * upped[i];
+    }
+    let ffn_out = down.forward(&combined, seq);
+
+    let ffn_out = layer.post_ffn_norm.forward(&ffn_out);
+    for i in 0..hidden.len() {
+        hidden[i] = residual2[i] + ffn_out[i];
+    }
+    if layer.layer_scalar != 1.0 {
+        for h in hidden.iter_mut() {
+            *h *= layer.layer_scalar;
+        }
+    }
+}
+
+/// Time one layer's dense FFN only — pre-FFN norm, gate/up/down projections,
+/// activation, post-FFN norm and residual. Decode uses `forward_ffn_parallel`,
+/// prefill uses `forward_ffn`; both reach `cpu_ffn`, which is where the
+/// projection dispatch now lives.
+///
+/// `baseline` is the pre-dispatch FFN compiled into this bench, so the pair is
+/// measured in one process and does not depend on the host load.
+fn bench_layer_ffn(c: &mut Criterion) {
+    let model = build_model();
+    let layer = &model.layers[0];
+    let mut rng = Rng(0xB10C_0003);
+    let input: Vec<f32> = (0..8 * MODEL_HIDDEN).map(|_| rng.unit() * 2.0 - 1.0).collect();
+
+    let mut group = c.benchmark_group("layer_ffn");
+    group.sample_size(20);
+    for seq in [1usize, 8] {
+        let row = &input[..seq * MODEL_HIDDEN];
+        group.bench_function(format!("seq{seq}/baseline"), |b| {
+            b.iter(|| {
+                let mut hidden = row.to_vec();
+                baseline_forward_ffn(layer, &mut hidden, seq);
+                black_box(hidden)
+            })
+        });
+        group.bench_function(format!("seq{seq}/current"), |b| {
+            b.iter(|| {
+                let mut hidden = row.to_vec();
+                if seq == 1 {
+                    layer.forward_ffn_parallel(&mut hidden, None);
+                } else {
+                    layer.forward_ffn(&mut hidden, None);
+                }
+                black_box(hidden)
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_unpacked_serial,
@@ -518,5 +594,6 @@ criterion_group!(
     bench_model_decode,
     bench_model_prefill,
     bench_layer_attention,
+    bench_layer_ffn,
 );
 criterion_main!(benches);
