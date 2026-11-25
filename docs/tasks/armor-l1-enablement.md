@@ -103,6 +103,24 @@ evaluation set for this task — contamination cannot be ruled out. If
 jailbreak detection becomes a requirement, it needs its own documented corpus
 and its own gate; it is not a substitute for the injection scanner.
 
+### 3.6 Fine-tunes reviewed
+
+Only 14 fine-tunes of the v2 model exist. The ones that matter:
+
+| model | licence | what it is | verdict |
+|---|---|---|---|
+| `fredstrey/deberta-v3-base-prompt-injection-v3` | MIT | Brazilian-Portuguese adaptation for one domain (SUFRAMA); first 8 of 12 encoder layers frozen, top 4 + head trained on translated public injection sets and synthetic domain samples | **not a teacher** — it is PT-BR and domain-specific. It is the **template for a German adaptation**: translate the public sets, native review, freeze the bottom layers, train the top |
+| `edaerer/promptwaf-command-injection` | Apache-2.0 | detects shell patterns in prompts (`; rm -rf`, `$(whoami)`, backticks); custom internal data, no metrics, 256 tokens | **evaluate as a tool-argument filter, not as L1** — the assistant runs shell commands, so this is a real threat, but it must pass our own corpus first |
+| `edaerer/promptwaf-path-traversal` | Apache-2.0 | companion detector for `../../etc/passwd`-style paths | same: a file-tool argument filter, evaluated before trusted |
+| `eugeneaptus/prompt-injection-ru-v2`, `dangvansam/vietnamese-prompt-injection` | unchecked | language adaptations | evidence that the translate-and-free-tune recipe works; no German coverage |
+| `mozilla-ai/protectai-…-encoderfile` | Apache-2.0 | a compiled packaging of the base model | not a new model |
+| `rootxhacker/…-weight-edited` | unclear | weight-edited checkpoint | reject: provenance |
+| `potemin/jailbreak_detector_v2` | Apache-2.0 | fine-tune with "None dataset" | reject: provenance, and F1 below its base |
+
+The useful conclusion is not a new teacher; it is the **German recipe**: take the public injection sets, translate them, review natively, freeze the lower encoder layers and fine-tune the top four plus the head, then evaluate on a held-out German set. That is a cheaper path to German coverage than training a German scanner from scratch, and it is the same recipe the PT-BR model documents.
+
+The PromptWAF pair is a separate layer with a separate gate: it filters **tool arguments**, not model input. It is worth an evaluation because the product executes shell commands and touches files, but the control plane remains the authority — a classifier on the argument string is defence in depth, not a boundary.
+
 ## 4. Model
 
 Keep the encoder shape, change the input representation.
