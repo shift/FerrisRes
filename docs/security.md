@@ -2,6 +2,15 @@
 
 FerrisRes Armor is a 4-layer defensive security proxy that sits in front of LLM workloads. It uses distilled neural scanners, regex pattern matching, and representation engineering to detect and block malicious inputs, sanitize outputs, and self-improve over time.
 
+> **Status: L0 and L3 are implemented and deterministic. L1 and L2 are
+> scaffolded and disabled by default.** Their weights are not trained or
+> loaded today — `L1Scanner::new()` and `ProbeHead::new()` initialise from a
+> deterministic hash, so their scores are noise. Do not enable them until
+> the training and evaluation gate in
+> [`tasks/armor-l1-enablement.md`](tasks/armor-l1-enablement.md) passes.
+> The CLI `--armor` flag is off by default; `ArmorLayer::new()` defaults all
+> four layers on, which is a mismatch this document should not hide.
+
 ## Architecture
 
 ```
@@ -23,23 +32,39 @@ Instant blocking of known malicious strings and PII patterns. 31 regex recognize
 
 Bloom filter provides O(1) lookup for custom blocklist entries. Default 1MB (~8M bits, ~0.01% FPR for 1M entries).
 
-### L1: Neural Scanner (~3.5M params)
+### L1: Neural Scanner (~3.5M params, not yet trained)
 
-ArmorGuardTiny: a 4-layer BERT-style transformer for binary SAFE/INJECTION classification. Distilled from protectai/deberta-v3-base-prompt-injection (183M params).
+ArmorGuardTiny is the intended architecture: a 4-layer BERT-style encoder for
+binary SAFE/INJECTION classification.
 
 - Token embedding (vocab=1000, hidden=256) + position embedding
 - 4 encoder layers with multi-head self-attention (4 heads) + FFN (256→1024→256)
 - [CLS] pooling → linear classifier → sigmoid
-- CPU-only with `Vec<f32>` weights, Xavier initialization
-- Threshold: 0.7 (configurable)
+- CPU-only with `Vec<f32>` weights
 
-### L2: RepE Safety Probe
+**Current state: the weights are hash-initialised, not trained and not loaded.**
+The code shape is real; the classifier is not. The distillation source
+(`protectai/deberta-v3-base-prompt-injection`, 183M params) is a *candidate*
+teacher for the training task, not a completed distillation. The threshold
+(0.7) is a default, not a measured operating point.
 
-Representation Engineering (Zou et al.) shows safety features live in linear subspaces of transformer hidden states. L2 uses independent logistic regression probes on BlockSummaryLayer outputs.
+The training corpus, the model changes (3 layers, hidden 192, byte-level plus
+hashed word buckets), the FNR/FPR gate, the versioned weight format and the
+quarantine policy are specified in
+[`tasks/armor-l1-enablement.md`](tasks/armor-l1-enablement.md).
+
+### L2: RepE Safety Probe (not yet trained)
+
+Representation Engineering (Zou et al.) shows safety features live in linear subspaces of transformer hidden states. L2 is intended to use independent logistic regression probes on BlockSummaryLayer outputs.
 
 6 categories: violence, self-harm, sexual, hate, harassment, injection.
 
 Each probe is a single linear layer `[hidden_dim → 1]` + sigmoid. Cost: <1ms per probe.
+
+**Current state: the probes are hash-initialised and there is no hidden-state
+hook wired into generation.** L2 is disabled in every supported configuration.
+Enabling it needs trained probes per model and a forward hook that measures its
+latency on the target device.
 
 ### L3: Output Sanitizer
 
@@ -53,6 +78,10 @@ Injection heuristic recognizers are excluded from output redaction (input-only c
 
 ## Self-Learning Feedback Loop
 
+> **Only the Bloom-filter addition is real today.** The ConceptMap → LoRA
+> update of ArmorGuardTiny is not implemented, and with hash-initialised
+> weights it would have nothing meaningful to update.
+
 When the WASM Sandbox or external sources detect a violation:
 
 1. `feedback_violation()` records the violation with source and reason
@@ -65,7 +94,9 @@ When the WASM Sandbox or external sources detect a violation:
 ```rust
 use ferrisres::security::armor::{ArmorLayer, ArmorConfig};
 
-// Default: all layers enabled
+// Default: all layers enabled (library default). The CLI --armor flag is off
+// by default, and enabling L1/L2 without trained weights must be refused once
+// the loader lands — see tasks/armor-l1-enablement.md.
 let mut armor = ArmorLayer::new();
 
 // Custom config
@@ -125,6 +156,9 @@ println!("Checks: {}, Blocked: {}, Rate: {:.1}%",
 
 ## Performance
 
+> The L1 and L2 rows are the **target** for a trained scanner on this hardware.
+> They are not measurements of the current hash-initialised code.
+
 | Layer | Latency | Notes |
 |-------|---------|-------|
 | L0 Regex | ~10-100μs | Dominated by regex scan, depends on input length |
@@ -134,6 +168,25 @@ println!("Checks: {}, Blocked: {}, Rate: {:.1}%",
 | L3 Redact | ~10-100μs | Same as L0 regex + string replacement |
 
 Total input check (L0+L1): ~1-5ms. Total output check (L3): ~10-100μs.
+
+## Security claims and limits
+
+- **Armor is a detector, not the safety boundary.** Tool allowlists, least
+  privilege and the control plane decide whether an action happens. A false
+  negative in Armor must still be caught there.
+- **L0 and L3 are deterministic** and can be enabled today: regex PII
+  detection, a custom Bloom blocklist, and output redaction.
+- **L1 and L2 are not protection yet.** Their scores are noise until trained
+  weights exist. Describing them as scanners in a security review would be
+  wrong.
+- **No adversarial guarantee.** A 2.5–3.5M classifier will be evaded by
+  obfuscation and novel phrasing. German coverage is unmeasured until the
+  corpus in the task spec exists.
+- **Violation records must not contain raw untrusted text.** The current
+  `ViolationRecord.input` does; it must become `content_sha256` plus length
+  and source.
+- **Quarantine, not silent drop.** When L1 is enabled, withheld content is
+  replaced by a typed notice the model can see, and the verdict is recorded.
 
 ## API Stability
 
