@@ -33,6 +33,24 @@ pub struct WgpuCompute {
     pipeline: Option<ComputePipeline>,
 }
 
+/// Limits to request for a device, given the adapter's limits and the features
+/// we enable.
+///
+/// `wgpu::Limits::default()` carries `max_immediate_size: 0`. If `IMMEDIATES`
+/// is enabled while that limit stays 0, every pipeline layout that declares
+/// immediate data fails validation with
+/// `Immediate data has size N which exceeds device immediate data size limit
+/// 0..0`. The adapter reports the real size (Vulkan push-constant bytes), so
+/// take it whenever the feature is on. With the feature off the limit stays 0,
+/// which is correct: no layout may declare immediate data.
+pub(crate) fn device_limits(adapter: &wgpu::Limits, features: wgpu::Features) -> wgpu::Limits {
+    let mut limits = wgpu::Limits::default();
+    if features.contains(wgpu::Features::IMMEDIATES) {
+        limits.max_immediate_size = adapter.max_immediate_size;
+    }
+    limits
+}
+
 impl WgpuCompute {
     pub async fn new() -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -63,7 +81,7 @@ impl WgpuCompute {
                 &wgpu::DeviceDescriptor {
                     label: Some("FerrisRes Device"),
                     required_features,
-                    required_limits: wgpu::Limits::default(),
+                    required_limits: device_limits(&adapter.limits(), required_features),
                     memory_hints: wgpu::MemoryHints::default(),
                     trace: wgpu::Trace::Off,
                     experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -184,5 +202,52 @@ impl WgpuCompute {
 
         self.pipeline = Some(pipeline.clone());
         Ok(pipeline)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::device_limits;
+
+    /// The regression this module exists for: `Limits::default()` reports no
+    /// immediate space, so a device that enables `IMMEDIATES` on top of it
+    /// cannot create any pipeline layout that declares immediate data.
+    #[test]
+    fn default_limits_have_no_immediate_space() {
+        assert_eq!(wgpu::Limits::default().max_immediate_size, 0);
+    }
+
+    #[test]
+    fn immediates_take_the_adapter_size() {
+        let adapter = wgpu::Limits {
+            max_immediate_size: 256,
+            ..wgpu::Limits::default()
+        };
+        let limits = device_limits(&adapter, wgpu::Features::IMMEDIATES);
+        assert_eq!(limits.max_immediate_size, 256);
+    }
+
+    #[test]
+    fn without_immediates_the_limit_stays_zero() {
+        let adapter = wgpu::Limits {
+            max_immediate_size: 256,
+            ..wgpu::Limits::default()
+        };
+        let limits = device_limits(&adapter, wgpu::Features::empty());
+        assert_eq!(limits.max_immediate_size, 0);
+    }
+
+    /// Every immediate-data pipeline in the tree declares at most 16 bytes
+    /// (`softmax` 4, `embedding` 8, `backward` up to 16). If the adapter offers
+    /// less than that, the feature must not be enabled or the layout will
+    /// fail, so this asserts the value the guard relies on.
+    #[test]
+    fn smallest_supported_immediate_size_covers_the_tree() {
+        let adapter = wgpu::Limits {
+            max_immediate_size: 4,
+            ..wgpu::Limits::default()
+        };
+        let limits = device_limits(&adapter, wgpu::Features::IMMEDIATES);
+        assert!(limits.max_immediate_size >= 4);
     }
 }

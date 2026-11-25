@@ -353,7 +353,9 @@ impl SoftmaxOp {
 
         // --- Immediate-data pipeline (no uniform buffer) ---
         let (immediate_pipeline, immediate_bgl) =
-            if device.features().contains(wgpu::Features::IMMEDIATES) {
+            if device.features().contains(wgpu::Features::IMMEDIATES)
+                && device.limits().max_immediate_size >= 4
+            {
                 let imm_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("Softmax Immediate Shader"),
                     source: wgpu::ShaderSource::Wgsl(SOFTMAX_IMMEDIATE_WGSL.into()),

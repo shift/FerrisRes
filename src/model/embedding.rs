@@ -8,19 +8,24 @@ const EMBED_WGSL: &str = r#"
 @group(0) @binding(1) var<storage, read> input_ids: array<u32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
-var<private> vocab_size: u32;
-var<private> hidden_dim: u32;
+struct EmbedParams {
+    vocab_size: u32,
+    hidden_dim: u32,
+}
+
+// Host writes 8 bytes with `set_immediates`; the layout must declare 8.
+var<immediate> params: EmbedParams;
 
 @compute @workgroup_size(256)
 fn embed_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tid = gid.x;
     let token_id = input_ids[tid];
-    if (token_id >= vocab_size) {
+    if (token_id >= params.vocab_size) {
         return;
     }
-    let row_offset = token_id * hidden_dim;
-    let out_offset = tid * hidden_dim;
-    for (var j: u32 = 0u; j < hidden_dim; j = j + 1u) {
+    let row_offset = token_id * params.hidden_dim;
+    let out_offset = tid * params.hidden_dim;
+    for (var j: u32 = 0u; j < params.hidden_dim; j = j + 1u) {
         output[out_offset + j] = weights[row_offset + j];
     }
 }
