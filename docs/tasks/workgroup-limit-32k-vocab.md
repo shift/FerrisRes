@@ -1,6 +1,6 @@
 # A 32k vocabulary cannot be trained: the dispatch exceeds 65535 workgroups
 
-Status: **blocks every real training run on every device.** Found 2026-11-26 on a
+Status: **fixed in `fa74d2f` (`fix/workgroup-2d-grid`), verified on lavapipe.** Found 2026-11-26 on a
 T4 with `0.2.7`, `--hidden-dim 768 --tokenizer <32k> --seq-len 512 --batch-size 4`.
 
 ## The failure
@@ -69,3 +69,36 @@ so the 2D grid is the real answer.
 
 The iGPU device-lost at 768×256 (`igpu-device-lost.md`), which is a different
 defect: that one has no validation error and happens with the 259 vocabulary.
+
+
+## Resolution (2026-11-26)
+
+`fa74d2f` on `fix/workgroup-2d-grid`:
+
+- `TrainOps::dispatch` asserts `gx/gy/gz <= 65_535` and names the kernel and
+  element count, so the next oversized tensor reports itself instead of panicking
+  inside wgpu.
+- `grid(groups)` returns `(min(groups, 65_535), ceil(groups / 65_535))`; the
+  shaders flatten with `(gid.y * grid_x + gid.x) * 256 + lid.x`, or read `gx`
+  from `@builtin(num_workgroups)` where the immediate block had to stay 32 bytes.
+- Converted: the elementwise family, `mul_bcast_*`, `silu_mul`, `rope`, `gqa`,
+  `embedding`, `layer_scale`, and **Adam** — the last two were needed or the 32k
+  run would have panicked one step later in accumulate/step rather than in
+  backward.
+- Left 1D with the assert as a guard: RMSNorm (per row), attention (per seq×head),
+  matmul (already 2D).
+
+Tests: `grid_arithmetic_covers_every_element` 1/1, and
+`no_dispatch_exceeds_the_spec_limit` **1/1 on a real adapter** — lavapipe — which
+performed forward, backward, accumulate and one Adam step at hidden 768, vocab
+32,768. `--lib` 1,636 passed. The new test was also observed failing with
+`InvalidGroupSize { current: [98304, 1, 1], limit: 65535 }` before the fix, so it
+catches the regression rather than merely passing.
+
+**Residual risk, measured:** the loss-gradient dispatch is
+`(seq-1) × vocab = 16,744,448` at seq 512 and vocab 32,768 — **65,408 groups**,
+thirty under the cap. At seq ≥ 513 it overflows. That is the next wall after this
+one and it is arithmetic, not speculation.
+
+**Not verified:** no real NVIDIA GPU was available for the gate; lavapipe is a CPU
+Vulkan implementation. The 32k path needs one `.deb` build and one T4 run.
