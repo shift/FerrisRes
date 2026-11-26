@@ -51,6 +51,9 @@ fact, not a broken GPU.
 | multi-GPU launcher not wired to training | only fake-adapter tests | `int/train-multi-gpu` |
 | `.deb` built only on ubuntu-22.04 | Kaggle install path | `int/train-deb` |
 
+Expected performance per device is in `performance-this-host.md`; this table is
+only what was measured.
+
 ## Generating this table
 
 The evidence section is generated, not hand-written:

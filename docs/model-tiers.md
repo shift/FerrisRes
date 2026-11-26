@@ -21,7 +21,8 @@ Large.
 ## Tested hardware
 
 What is verified and what is only designed is in `hardware-matrix.md`; a tier
-claim without a measured row there is a design target.
+claim without a measured row there is a design target. The per-host decode,
+prefill and training expectations are in `performance-this-host.md`.
 
 ## Other points in the space
 
