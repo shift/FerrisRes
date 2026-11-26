@@ -1,65 +1,75 @@
 # Kaggle readiness
 
-Status: **checklist, 2026-11-26.** Two different goals: a **pipeline smoke** on
-Kaggle (days) and a **real training run** (weeks). They need different things.
+Status: **checklist, 2026-11-26. GPU only.** A CPU run on Kaggle is **not an
+acceptable milestone**: it burns quota without using the T4 and proves nothing
+about the target. The smoke must run `--device gpu` and show the T4.
 
-## A. The smallest "try it" — CPU smoke
+## The gate stack
 
 | # | item | state | owner |
 |---|---|---|---|
-| 1 | `.deb` **0.2.4** with `train` + `export` + `devices` | building (`int/kaggle-deb`) | agent |
-| 2 | clean-container gate: install → train 20 steps → export → infer | in the same agent | agent |
-| 3 | upload the `.deb` as a private Kaggle dataset at `/kaggle/input/ferrisres-deb/` | **operator**; the token is yours and the `.deb` is not in git | you |
-| 4 | `train_smoke.ipynb` attached to that dataset | done, `dc30aa0` | — |
-| 5 | Kaggle account with **GPU T4** enabled and internet on | operator | you |
-| 6 | run: install → train → resume → export → infer; record loss and tokens | operator | you |
+| 1 | **GPU training loop** — wgpu forward, backward, Adam, `train --device gpu`, FRTRAIN1 read-back | **critical path**, branch not pushed (`feat/gpu-train-loop`) | agent |
+| 2 | parity and learning gates: logits/gradients vs f32, loss falls, parameters change | the agent's Phase B/C | agent |
+| 3 | **Vulkan on the Kaggle T4** — `ferrisres devices` must list the T4, not llvmpipe | **unverified**; the `.deb` ships an NVIDIA ICD, the image must expose the driver | first session |
+| 4 | `.deb` with the GPU loop, built on ubuntu:22.04 with `--features vulkan` | after 1 | agent |
+| 5 | GPU smoke notebook: `nvidia-smi`, `devices` shows T4, `train --device gpu` 20 steps, loss falls, tokens/s recorded | updated, not runnable until 1 | — |
+| 6 | checkpoint read-back, export, infer from the GPU-trained checkpoint | after 1 | agent |
+| 7 | resume from a GPU checkpoint across a 12-hour session | after 1 | agent |
+| 8 | upload the `.deb` as a private Kaggle dataset | operator | you |
+| 9 | Kaggle account with GPU T4 + internet | operator | you |
 
-What this proves: the packaged binary runs on Kaggle, the data path, the CPU f32
-trainer, checkpoint/resume, export and infer. **It does not use the T4 for
-training** — the trainer is CPU until the wgpu loop lands.
+**If item 3 fails, the plan fails.** wgpu needs a Vulkan device; if the Kaggle
+image cannot expose one to the container, GPU training there is not possible and
+we say so rather than falling back to CPU. The first session is therefore a
+**probe**, not a training run: `nvidia-smi -L`, `ferrisres devices --json`, and the
+Vulkan loader/ICD paths. Only after the T4 appears does a training step run.
 
-Expected: minutes of GPU quota for the smoke (it is CPU-bound), a small
-checkpoint, and a clean pass/fail.
+## The first GPU session, in order
 
-## B. A real training run
+1. `nvidia-smi -L` — a T4 must be listed.
+2. `ferrisres devices --json` — an adapter with `software: false` and a T4 name.
+   If it is llvmpipe, stop and report the missing ICD/driver; do not train.
+3. A 20-step run at a tiny config with `--device gpu`:
+   - logits/gradient parity was proven in the branch, not in the session;
+   - the session proves the device path, the data path, checkpoint and export;
+   - record tokens/s and the adapter name.
+4. Only then a real corpus run, with resume.
 
-| # | item | state |
-|---|---|---|
-| 1 | corpus builder: source rows → licensed, deduped, tokenised shards | spec only (`corpus-builder.md`) |
-| 2 | a licensed corpus (even a small one, e.g. Rust/Nix docs) | none fetched |
-| 3 | the 32k tokenizer, or an explicit decision to use the byte tokenizer | spec only (`tokenizer.md`) |
-| 4 | **GPU training loop** (`--device gpu`) | branch not pushed (`feat/gpu-train-loop`) |
-| 5 | resume at corpus scale, with the data offset | only tiny tests |
-| 6 | checkpoint save/restore across 12-hour sessions via a Kaggle dataset | notebook lacks the dataset round-trip |
-| 7 | GGUF/ternary export (for serving the result) | open |
-| 8 | multi-GPU local SGD on two T4s | coordination layer only |
+## A real training run
 
-Until items 1–4 exist, a "real" run is the CPU loop on a tiny corpus: useful as a
-pipeline test, not as a model.
+Still needed after the GPU smoke:
 
-## C. What is *not* blocking, despite being open
+| item | state |
+|---|---|
+| corpus builder: source rows → licensed, deduped, tokenised shards | spec only (`corpus-builder.md`) |
+| a licensed corpus (small is fine) | none fetched |
+| the 32k tokenizer, or a recorded decision to use the byte tokenizer | spec only |
+| resume at corpus scale with the data offset | tiny tests only |
+| checkpoint save/restore across 12-hour sessions via a Kaggle dataset | missing |
+| GGUF/ternary export for serving | open |
+| multi-GPU local SGD on two T4s | coordination layer only |
+
+## What is *not* blocking
 
 - `compute_lora_grad` wiring: affects `distill`, not `train`.
-- prefix KV cache and parallel prefill: inference speed.
-- recall/notebook branch: harness, not training.
-- PLE competition: a separate track.
+- prefix KV cache and parallel prefill: inference.
+- the harness recall branch: not training.
+- PLE: a separate competition.
 
-## D. Risks to check on the first Kaggle session
+## Risks
 
 | risk | check |
 |---|---|
-| the `.deb` glibc floor | install in the Kaggle image; 2.34 ≤ 2.35 |
-| the GPU is visible to wgpu | `ferrisres devices` on the T4; Vulkan ICD is shipped in the `.deb`, but NVIDIA's driver must expose it |
-| CPU training is slow | the smoke's tokens/s is the number; do not extrapolate from a laptop |
-| 12-hour session | resume from the checkpoint; nothing in `/kaggle/working` survives without an output/dataset |
-| quota | 30 h/week; a CPU run can consume it without using the T4 |
+| wgpu sees no T4 | `devices`; NVIDIA driver ICD and `libvulkan1` in the image |
+| wgpu runs but is slower than CPU at this size | measure; a 111M f32 model on a T4 should still win, but the kernel path matters |
+| 12-hour session | checkpoint to `/kaggle/working` and a dataset round-trip |
+| quota | a GPU hour is one quota hour; the smoke is minutes, a real run hours |
+| export from GPU weights | read back to FRTRAIN1 before export; verify tensor equality |
 
-## The order
+## Order
 
-1. Wait for the 0.2.4 agent; read its gate output.
-2. Upload the `.deb`; run the smoke.
-3. In parallel, start the corpus builder and the tokenizer; those are the gates
-   for a real run.
-4. When `feat/gpu-train-loop` lands, rebuild the `.deb`, run the same smoke with
-   `--device gpu`, and compare tokens/s with the CPU run.
-5. Then the first real corpus run, then multi-GPU.
+1. **Land `feat/gpu-train-loop`** with its parity and learning gates. Nothing
+   else on this list can start.
+2. Build the GPU `.deb`; probe the T4 with `devices`.
+3. GPU smoke (20 steps) only if the T4 is visible.
+4. Corpus + tokenizer; then a real run; then multi-GPU.
