@@ -132,3 +132,24 @@ Without it, a training run cannot be repeated, a licence cannot be defended, and
 a contamination claim cannot be checked. It is also the natural Kaggle dataset
 artefact: the notebook attaches the shards the builder produced, not a checkout
 of scraped text.
+
+## The 32k rebuild (2026-11-26)
+
+Same six sources, same splits, only the tokenizer changed:
+
+| | byte tokenizer | 32k BPE |
+|---|---:|---:|
+| tokens | 22,713,344 | **6,076,416** |
+| documents | 1,472 | 1,472 |
+| assigned train / val / heldout | 1,430 / 11 / 31 | 1,430 / 11 / 31 |
+| documents with ≥512-token windows | 1,379 | **1,143** |
+| licence mix | identical | identical |
+| verify checks | 9 | 9 |
+
+Two consequences worth carrying forward:
+
+1. **512 BPE tokens is a much longer document than 512 bytes**, so 236 more
+   documents fall below one window and contribute no tokens. A shorter
+   `seq_len`, or smaller windows for short documents, would recover them.
+2. 6.08M tokens is a **slice**, not a training corpus. At ~3.7 bytes/token the
+   ratio is expected; the volume gap is separate and unchanged.
