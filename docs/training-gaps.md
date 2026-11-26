@@ -12,7 +12,7 @@ one thing that closes it, not a programme.
 | 5 | replay+KL term not in the trainer | non-collapse during SFT | `docs/tasks/replay-kl.md` | task only |
 | 6 | no eval suite | any claim that training worked | harness integration + eval runner | missing |
 | 7 | no persona/soul data | persona adherence | `soul-*` source rows | planned |
-| 8 | **prefill uses one core** | prefill UX on every CPU host | call the rayon kernels the model path already has (`docs/tasks/cpu-prefill-threads.md`) | ready, same file as the AVX2 work |
+| 8 | **prefill uses one core** | prefill UX on every CPU host | `perf/parallel-prefill` `21e966f`: **2.84× at 512, 3.0× at 2048**, bit-identical logits, 1634 lib tests | **implemented, unmerged** |
 | 9 | prefix KV cache not wired to `infer` | prefill UX | wiring task | library only |
 | 10 | multi-GPU not wired | throughput | local-SGD coordination | CPU-only proof |
 
@@ -30,6 +30,20 @@ one thing that closes it, not a programme.
 4. **#5 and #6** before the first long run, not after. A run without an eval is
    a number, not a result.
 5. **#7–#10** after the first checkpoint exists.
+
+## The CPU ceiling the prefill work exposed
+
+`perf/parallel-prefill` measured the parallel ternary kernel at **0.88–0.96
+GFLOP/s on 4 threads**, against **36 GFLOP/s** for `matrixmultiply` fp32 GEMM on
+the same shape. Threads are now exhausted: the remaining ~40× is the branchy
+`if w > 0` inner loop, not the number of cores. Three branches overlap there and
+must be reconciled once, not merged blind:
+
+| branch | what it adds | file |
+|---|---|---|
+| `feat/cpu-bmi2-ternary` `42cf762` | BMI2 `pext` + AVX2 masked adds for the packed path | `src/model/ternary.rs` |
+| `perf/ternary-kernels` `9fe334f` | branchless scalar kernels, same dispatch | `src/model/ternary.rs` |
+| `perf/parallel-prefill` `21e966f` | MoE expert grouping, attention scratch, batched projections | `cpu_moe.rs`, `cpu_block_attn_res.rs`, `cpu_linear.rs` |
 
 ## What this register deliberately excludes
 
