@@ -10,7 +10,7 @@ about the target. The smoke must run `--device gpu` and show the T4.
 |---|---|---|---|
 | 1 | **GPU training loop** — wgpu forward, backward, Adam, `train --device gpu`, FRTRAIN1 read-back | **landed** at `73a6902`: parity, learning, CLI and resume; 1634 lib + 8 GPU tests | done |
 | 2 | parity and learning gates: logits/gradients vs f32, loss falls, parameters change | **passed**: logits 1.892e-4, grads ~1e-4, post-step 5e-5, loss 3.557→0.0026 | done |
-| 3 | **Vulkan on the Kaggle T4** — `ferrisres devices` must list the T4, not llvmpipe | **closed: Kaggle cannot do Vulkan.** `NVIDIA_DRIVER_CAPABILITIES=compute,utility`, so no `libGLX_nvidia.so` is mounted; installing `libnvidia-gl-580` in-session leaves the library absent and `-server` conflicts with `libnvidia-egl-gbm1`. `devices` reports only `llvmpipe` on `gl`. The T4 is unreachable by a wgpu/Vulkan engine on Kaggle | answered |
+| 3 | **Vulkan on the Kaggle T4** — `ferrisres devices` must list the T4, not llvmpipe | **PASS on run 4**: two `Tesla T4`, `vulkan`, `Discrete`, `software: false`, after installing `libnvidia-gl-580-server` with `--force-overwrite` in-session. Install cost ~10 s per session | done |
 | 4 | `.deb` with the GPU loop, built on ubuntu:22.04 with `--features vulkan` | **done**: 0.2.5 at `int/gpu-deb` `21aed9c`, 5.7 MiB, sha `db443ac2…`; gate PASS (version, devices, `--device`, CPU smoke, export, infer, glibc 2.34) | agent |
 | 5 | GPU smoke notebook: `nvidia-smi`, `devices` shows T4, `train --device gpu` 20 steps, loss falls, tokens/s recorded | **kernel `sectionme/ferrisres-gpu-probe`** pushed; v1 confirmed the T4 and the missing ICD, then stopped | agent |
 | 6 | checkpoint read-back, export, infer from the GPU-trained checkpoint | **done in the loop branch**; the packaged path is after 0.2.5 | agent |
@@ -61,7 +61,8 @@ Still needed after the GPU smoke:
 
 Both cost a run to learn. Do not re-discover them.
 
-1. **There is no Vulkan ICD manifest *and* no NVIDIA graphics userspace.** `libvulkan.so.1` is present;
+1. **There is no Vulkan ICD manifest *and* no NVIDIA graphics userspace — both
+   are installable in-session, and this is what unblocks the T4.** `libvulkan.so.1` is present;
    `/usr/share/vulkan/icd.d/` does not exist and there is no `nvidia_icd.json`.
    A Vulkan loader with no ICD enumerates **zero** adapters, so `devices` would
    report nothing even with the driver loaded. The fix is local and does not
@@ -76,16 +77,46 @@ Both cost a run to learn. Do not re-discover them.
    `VK_ICD_FILENAMES` before the first wgpu call. Every notebook that trains does
    this; it is not a packaging change to the `.deb`.
 
-   **The manifest alone is not enough.** `devices` on run 2 installed the `.deb`
-   and still reported only `llvmpipe (LLVM 20.1.2)`, backend `gl`, `software:
-   true`, because `/usr/lib/x86_64-linux-gnu/libGLX_nvidia.so*` **does not
-   exist** in the image: the container runs with compute-only driver
-   capabilities, so the kernel driver and `nvidia-smi` are mounted but the
-   graphics userspace is not. A manifest pointing at a missing library is a
-   loader with no device, which is why wgpu fell back to software GL. The fix
-   under test is to install `libnvidia-gl-<driver-major>` in the session; if apt
-   has no matching build, this container cannot do Vulkan at all and the T4 path
-   needs a host that mounts the graphics libraries.
+   **The manifest alone is not enough.** The image runs with
+   `NVIDIA_DRIVER_CAPABILITIES=compute,utility`, so the kernel driver and
+   `nvidia-smi` are mounted but `/usr/lib/x86_64-linux-gnu/libGLX_nvidia.so*`
+   and `/usr/share/vulkan/icd.d/` are absent. A manifest pointing at a missing
+   library is a loader with no device, which is why wgpu fell back to software
+   GL.
+
+   **Install the graphics userspace in the session.** Ubuntu publishes the exact
+   matching build (`580.178.04-0ubuntu0.24.04.1` for driver `580.178.04`), so
+   it works:
+
+   ```bash
+   apt-get update -qq
+   DEBIAN_FRONTEND=noninteractive apt-get install -y \
+     -o Dpkg::Options::="--force-overwrite" \
+     -o Dpkg::Options::="--force-confold" \
+     libnvidia-gl-580-server
+   ```
+
+   `--force-overwrite` is required: the package ships
+   `/usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json`, which
+   `libnvidia-egl-gbm1` already owns, and without the flag dpkg aborts and
+   leaves nothing behind. Two details that cost runs:
+
+   - `libnvidia-gl-580` (without `-server`) installs and exits 0 but ships **no**
+     `libGLX_nvidia.so` in this image; use `-server`.
+   - verify with `ls /usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.0` and
+     `/usr/share/vulkan/icd.d/nvidia_icd.json` before believing apt.
+
+   After the install, run 4 measured: `devices --json` reports
+
+   ```json
+   [{"index":0,"name":"Tesla T4","kind":"Discrete","backend":"vulkan","software":false},
+    {"index":1,"name":"Tesla T4","kind":"Discrete","backend":"vulkan","software":false},
+    {"index":2,"name":"Tesla T4/PCIe/SSE2","kind":"Other","backend":"gl","software":false}]
+   ```
+
+   Index 0 and 1 are Vulkan; select one with `WGPU_ADAPTER_INDEX`. The install is
+   per session — the container is fresh each run — so it belongs in every
+   training notebook and costs about ten seconds.
 
 2. **The mount blue-pages twice before it works, and the path is nested.**
    The first run after attaching a dataset starts with an empty `/kaggle/input`
@@ -101,21 +132,18 @@ Both cost a run to learn. Do not re-discover them.
    `Path('/kaggle/input').rglob(...)` and falls back to
    `kagglehub.dataset_download('sectionme/ferrisres')`.
 
-The T4 answer is settled twice over: 2× Tesla T4, 15,360 MiB each, driver
-580.178.04, `NVRM` open kernel module, `/dev/nvidia0..1` present — and
-`NVIDIA_DRIVER_CAPABILITIES=compute,utility`. The container is built for CUDA,
-not graphics. Measured on run 3:
+The T4 is reachable. Run 4 measured `Tesla T4`, backend `vulkan`, kind
+`Discrete`, `software: false`, twice — index 0 and index 1 — after the in-session
+install above. What remains unmeasured is **speed**: no FerrisRes step has run on
+the T4 yet, so there is no tokens/s figure for any tier on this hardware. That
+number is the next run, and it is the only thing standing between this row and a
+real training campaign.
 
-- `libnvidia-gl-580` installs (exit 0) but `libGLX_nvidia.so*` and
-  `/usr/share/vulkan/icd.d/` remain absent, so no ICD can load;
-- `libnvidia-gl-580-server` fails: it overwrites
-  `/usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json`, owned by
-  `libnvidia-egl-gbm1`.
-
-Consequence: **a wgpu/Vulkan engine cannot use a Kaggle T4.** This is not
-fixable from a notebook. The GPU trainer needs a host that mounts the graphics
-capabilities (most rented pods do), or the engine needs a CUDA backend. Until
-one of those exists, Kaggle is a data-preparation host, not the compute host.
+A second lesson from the same run, in the notebook rather than the host:
+`devices --json` writes tracing log lines to **stdout** before the JSON array, so
+`json.loads(stdout)` fails with `Expecting value: line 1 column 1`. Parse from the
+first `[` (`json.JSONDecoder().raw_decode(stdout, stdout.find('['))`). It cost run
+4 its training stages after the GPU had already been found.
 
 ## Risks
 
