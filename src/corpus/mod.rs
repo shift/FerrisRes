@@ -1,17 +1,20 @@
-//! Corpus builder v1: local licensed files -> reproducible token shards.
+//! Corpus builder: licensed sources -> reproducible token shards.
 //!
 //! See `docs/corpus-builder.md` for the full design. This module implements the
-//! local-file subset: no network fetchers, no near-dedupe, byte tokenizer only.
+//! local, git and hf source adapters, the local-file stages, and a byte
+//! tokenizer. Near-dedupe and the shipped 32k tokenizer are still to come.
 
 pub mod build;
 pub mod inspect;
 pub mod plan;
 pub mod secret;
+pub mod sources;
 pub mod stats;
 
 pub use build::{build, BuildSummary, Index, Manifest, ShardRecord};
 pub use inspect::{sample, stats, verify, SampleOutput, VerifySummary};
-pub use plan::{classify_split, Plan, Split};
+pub use plan::{classify_split, Plan, SourceKind, SourceSpec, Split};
+pub use sources::{acquire, AcquiredFile, AcquiredSource, Source};
 pub use stats::Stats;
 
 use anyhow::{Context, Result};
