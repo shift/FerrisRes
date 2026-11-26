@@ -32,7 +32,7 @@ Integration is a protocol, not a tone. Three things make it real:
 | **Surface formatting** | Telegram length, markdown, keyboards, no wall of text | surface examples and run outputs | format/length validity |
 | **Self-routing** | when the task exceeds this tier's context, tools or quality, escalate | routing outcomes, tier descriptors | route choice on a labelled set |
 | **Report discipline** | verified / implemented / designed, counts not percentages | review reports and the feature register | unsupported claims counted |
-| **Documentation grounding** | the user asks about a command, flag, error or ADP operation; a memorised answer drifts | user docs, CLI help, error strings, ADP docs, doc-QA pairs | citation present; no invented flag/operation; stale-doc question → retrieve or refuse |
+| **Documentation grounding** | the user asks about a command, flag, error or ADP operation; a memorised answer drifts | `cli_help`, installed docs, doc-QA pairs (`tasks/versioned-docs-tool.md`) | citation present; no invented flag/operation; stale-doc question → retrieve or refuse |
 
 The first two are the ones a generic model cannot have: injection resistance in
 *observed* content, and knowing that evidence is bound to a revision.
