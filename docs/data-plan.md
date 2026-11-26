@@ -71,7 +71,8 @@ gets its own soul, grants and gate rather than a checkpoint. The SFT set must
 carry the same task in several registers under different system prompts, so the
 model learns to follow the conditioner instead of collapsing to one tone. Child
 examples are authored and parent-reviewed; no real minor data is used. See
-`persona-and-principals.md`.
+`persona-and-principals.md`; the soul field, synthetic souls and violation pairs
+are in `soul-training.md`.
 
 ## Contamination
 

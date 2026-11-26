@@ -55,6 +55,12 @@ edits them. The model may propose a change; only the parent commits it.
 
 ## Data requirements
 
+The training side — schema, synthetic souls, violation pairs and the adherence
+matrix — is in `soul-training.md`. The short version: the SFT set carries a
+`soul` block per example, and the model is scored on obeying an **unseen** soul,
+not on reproducing a memorised one.
+
+
 - Persona-conditioned examples: at least three registers per task family, with
   the register carried by the system prompt, not by the task text.
 - Child-safe examples: authored, parent-reviewed, no real minor data; refusal
