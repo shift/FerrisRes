@@ -1,8 +1,9 @@
 # Multi-GPU
 
-Status: **designed; phase 1 not implemented.** Today `WgpuCompute::new()` calls
-`request_adapter` with no index, so two processes on a 2×T4 host both get the
-same card. The second T4 is idle by construction.
+Status: **phase 1 implemented at `4d6141e`; phase 2 open.** `ferrisres devices`
+lists adapters and `WGPU_ADAPTER_INDEX` selects one, so two processes can reach
+two cards. The launcher, rank plumbing, sharding, barrier and per-rank evidence
+are still missing.
 
 ## Topology
 
