@@ -39,6 +39,16 @@ assert_matches = "1"
 criterion = { version = "0.5", features = ["async_tokio"] }
 proptest = "1"
 
+# The Armor bootstrap end-to-end test trains the full L1 encoder (3 layers,
+# hidden 192) on CPU. At the default dev opt-level that is hours; optimised
+# tests bring it to minutes. Dependencies stay unoptimised so the build does
+# not pay for wgpu/naga at -O3. `cargo build` keeps the dev profile.
+[profile.test]
+opt-level = 3
+
+[profile.test.package."*"]
+opt-level = 0
+
 [features]
 default = ["vulkan"]
 vulkan = ["wgpu/vulkan"]

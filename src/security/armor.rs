@@ -6,10 +6,30 @@
 //! - `sanitize_output()`: L3 PII redaction
 //! - Self-learning feedback loop via ViolationRecord storage
 
+use std::path::Path;
+
+use thiserror::Error;
+
 use crate::security::armor_l0::L0Scanner;
-use crate::security::armor_l1::L1Scanner;
+use crate::security::armor_l1::{L1LoadError, L1Scanner};
 use crate::security::armor_l2::L2Prober;
 use crate::security::armor_l3::L3Sanitizer;
+
+// ---------------------------------------------------------------------------
+// Construction errors
+// ---------------------------------------------------------------------------
+
+/// Failure to build an [`ArmorLayer`] with a usable configuration.
+#[derive(Debug, Error)]
+pub enum ArmorError {
+    /// `l1_enabled` was requested without a weights path. There is no random
+    /// fallback: an untrained L1 scanner is noise, not protection.
+    #[error("L1 is enabled but no weights path is configured")]
+    MissingWeights,
+    /// The weights file failed to load.
+    #[error("failed to load L1 weights: {0}")]
+    L1Load(#[from] L1LoadError),
+}
 
 // ---------------------------------------------------------------------------
 // Security verdict
@@ -124,26 +144,51 @@ pub struct ArmorLayer {
 }
 
 impl ArmorLayer {
-    /// Create with default config and scanners.
+    /// Create the default layer set with L1 **disabled**.
+    ///
+    /// L1 needs trained weights, so this constructor cannot enable it. The
+    /// `--armor` CLI path uses this constructor today; it gets L0/L2/L3 and a
+    /// placeholder L1 that is never consulted. Production code that wants L1
+    /// must use [`ArmorLayer::try_with_config`] with a weights path.
     pub fn new() -> Self {
-        Self {
-            l0: L0Scanner::new(),
-            l1: L1Scanner::new(),
-            l2: L2Prober::new(),
-            l3: L3Sanitizer::default(),
-            config: ArmorConfig::default(),
-            violation_history: Vec::new(),
-            total_violations: 0,
-            total_checks: 0,
-            total_allowed: 0,
-        }
+        let mut config = ArmorConfig::default();
+        config.l1_enabled = false;
+        Self::build(config, L1Scanner::placeholder())
     }
 
-    /// Create with custom config.
+    /// Create with custom config and no trained L1 weights.
+    ///
+    /// **Test-only.** If `l1_enabled` is set, the scanner is hash-initialised
+    /// and its score is meaningless. Production code must use
+    /// [`ArmorLayer::try_with_config`].
+    #[cfg(test)]
     pub fn with_config(config: ArmorConfig) -> Self {
+        Self::build(config, L1Scanner::placeholder())
+    }
+
+    /// Create with custom config and optional L1 weights.
+    ///
+    /// Refuses `l1_enabled` with no weights path
+    /// ([`ArmorError::MissingWeights`]) and refuses an invalid weights file
+    /// ([`ArmorError::L1Load`]). The configured `l1_threshold` is applied to
+    /// the loaded scanner.
+    pub fn try_with_config(
+        config: ArmorConfig,
+        weights_path: Option<&Path>,
+    ) -> Result<Self, ArmorError> {
+        let mut l1 = match weights_path {
+            Some(path) => L1Scanner::load(path)?,
+            None if config.l1_enabled => return Err(ArmorError::MissingWeights),
+            None => L1Scanner::placeholder(),
+        };
+        l1.set_threshold(config.l1_threshold);
+        Ok(Self::build(config, l1))
+    }
+
+    fn build(config: ArmorConfig, l1: L1Scanner) -> Self {
         Self {
             l0: L0Scanner::new(),
-            l1: L1Scanner::new(),
+            l1,
             l2: L2Prober::new(),
             l3: L3Sanitizer::default(),
             config,
@@ -456,5 +501,109 @@ mod tests {
     fn test_violation_source_variants() {
         assert_ne!(ViolationSource::L0Regex, ViolationSource::L0Bloom);
         assert_ne!(ViolationSource::L1Neural, ViolationSource::L2Probe);
+    }
+
+    #[test]
+    fn test_armor_new_disables_l1() {
+        let armor = ArmorLayer::new();
+        assert!(!armor.config.l1_enabled, "L1 must not run without weights");
+        assert!((armor.l1.forward("anything") - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_armor_try_with_config_refuses_l1_without_weights() {
+        let config = ArmorConfig {
+            l1_enabled: true,
+            ..Default::default()
+        };
+        match ArmorLayer::try_with_config(config, None) {
+            Err(ArmorError::MissingWeights) => {}
+            Ok(_) => panic!("expected MissingWeights, got a layer"),
+            Err(e) => panic!("expected MissingWeights, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_armor_try_with_config_allows_l1_disabled_without_weights() {
+        let config = ArmorConfig {
+            l1_enabled: false,
+            ..Default::default()
+        };
+        let armor = ArmorLayer::try_with_config(config, None).expect("L1 disabled needs no weights");
+        assert!(!armor.config.l1_enabled);
+    }
+
+    #[test]
+    fn test_armor_try_with_config_loads_weights_and_applies_threshold() {
+        let dir = std::env::temp_dir().join("ferrisres-armor-layer-tests");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join(format!("l1-{}.bin", std::process::id()));
+        L1Scanner::new_random().save(&path).expect("save weights");
+
+        let config = ArmorConfig {
+            l1_enabled: true,
+            l1_threshold: 0.42,
+            ..Default::default()
+        };
+        let armor = ArmorLayer::try_with_config(config, Some(&path)).expect("load weights");
+        assert!(armor.config.l1_enabled);
+        assert!((armor.l1.config().threshold - 0.42).abs() < 1e-6);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_armor_try_with_config_rejects_bad_weights() {
+        let dir = std::env::temp_dir().join("ferrisres-armor-layer-tests");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join(format!("bad-{}.bin", std::process::id()));
+        std::fs::write(&path, b"not a weight file").expect("write");
+        let config = ArmorConfig {
+            l1_enabled: true,
+            ..Default::default()
+        };
+        match ArmorLayer::try_with_config(config, Some(&path)) {
+            Err(ArmorError::L1Load(_)) => {}
+            other => panic!("expected L1Load, got {:?}", other.err()),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_armor_l1_threshold_changes_verdict() {
+        let dir = std::env::temp_dir().join("ferrisres-armor-layer-tests");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join(format!("threshold-{}.bin", std::process::id()));
+        L1Scanner::new_random().save(&path).expect("save weights");
+
+        // A threshold of 0.0 marks every non-empty score as unsafe.
+        let block_config = ArmorConfig {
+            l0_enabled: false,
+            l1_enabled: true,
+            l2_enabled: false,
+            l3_enabled: false,
+            l1_threshold: 0.0,
+            ..Default::default()
+        };
+        let mut armor = ArmorLayer::try_with_config(block_config, Some(&path)).expect("load");
+        assert!(matches!(
+            armor.verify_input("ordinary sentence"),
+            SecurityVerdict::Block(_)
+        ));
+
+        // A threshold of 1.0 can never be reached by a sigmoid below 1.
+        let allow_config = ArmorConfig {
+            l0_enabled: false,
+            l1_enabled: true,
+            l2_enabled: false,
+            l3_enabled: false,
+            l1_threshold: 1.0,
+            ..Default::default()
+        };
+        let mut armor = ArmorLayer::try_with_config(allow_config, Some(&path)).expect("load");
+        assert_eq!(
+            armor.verify_input("ordinary sentence"),
+            SecurityVerdict::Allow
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -14,6 +14,15 @@ pub mod backward;
 pub mod shadow_weights;
 pub mod bit_moe;
 pub mod f32_trainer;
+pub mod armor_trainer;
+#[cfg(test)]
+pub mod armor_corpus;
+
+pub use armor_trainer::{
+    operating_point, score_items, AdamState, ArmorCache, ArmorEncoder, ArmorGrads,
+    ArmorLayerWeights, ArmorTrainerConfig, ArmorWeights, EpochReport, OperatingPoint,
+    SplitMix64, TrainReport,
+};
 
 pub use optimizer::{SgdOptimizer, AdamOptimizer, CrossEntropyLoss, WeightOptimizer, OptimizerHint, optimizer_for_profile};
 pub use dataset::{
