@@ -19,6 +19,9 @@ pub use inference::rag::{ElasticRagStore, EmbedProfile};
 pub use inference::sampling::{sample_argmax, sample_temperature, sample_top_k, sample_top_p};
 pub use compute::turboquant::{TurboQuantConfig, TurboQuantEngine, TurboQuantError, OutlierChannelSplitter};
 pub use training::{CrossEntropyLoss, AdamOptimizer, SgdOptimizer};
+pub use training::decision_head::{
+    Answer, DecisionHead, DecisionHeadError, LabelSpec, OptionSpec, Question,
+};
 pub use training::lora::{LoraConfig, LoraLayer, LoraManager};
 pub mod server;
 pub mod security;

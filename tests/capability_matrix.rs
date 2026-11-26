@@ -306,6 +306,35 @@ fn draft_is_a_runtime_choice() {
 }
 
 #[test]
+fn decision_is_refused_without_a_declared_head() {
+    for tier in TIERS {
+        let (_dir, _path, features) = saved_features(tier);
+        assert!(!features.decision, "{:?} declares no head", tier);
+
+        let resolution = resolve(&features, &hd530(), &Workload::Decision);
+        let (_, why) = resolution
+            .refusals
+            .iter()
+            .find(|(feature, _)| feature == "decision")
+            .unwrap_or_else(|| panic!("{:?} must refuse decisions: {:?}", tier, resolution));
+        assert!(why.contains("no decision head"), "{:?}: {}", tier, why);
+        assert!(!resolution.enabled.iter().any(|f| f == "decision"));
+
+        // The same descriptor answers decisions once the checkpoint declares
+        // the head. No tier preset does, so this is a declaration, not a tier.
+        let mut declared = features.clone();
+        declared.decision = true;
+        let enabled = resolve(&declared, &hd530(), &Workload::Decision);
+        assert!(enabled.enabled.iter().any(|f| f == "decision"), "{:?}", tier);
+        assert!(
+            !enabled.refusals.iter().any(|(f, _)| f == "decision"),
+            "{:?}",
+            tier
+        );
+    }
+}
+
+#[test]
 fn short_context_falls_back_to_dense_on_every_tier() {
     for tier in TIERS {
         let (_dir, _path, features) = saved_features(tier);

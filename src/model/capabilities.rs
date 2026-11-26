@@ -48,6 +48,8 @@ pub struct ModelFeatures {
     pub mtp: bool,
     pub vision: bool,
     pub audio: bool,
+    /// The checkpoint ships a decision head and may answer `Workload::Decision`.
+    pub decision: bool,
     pub tier: Option<Tier>,
 }
 
@@ -127,6 +129,7 @@ impl ModelFeatures {
             mtp: has("mtp"),
             vision: has("vision"),
             audio: has("audio"),
+            decision: has("decision"),
             tier,
         }
     }
@@ -149,6 +152,7 @@ impl ModelFeatures {
             mtp: false,
             vision: false,
             audio: false,
+            decision: false,
             tier: Some(tier),
         }
     }
@@ -173,6 +177,9 @@ impl ModelFeatures {
         }
         if self.audio {
             out.push("audio".to_string());
+        }
+        if self.decision {
+            out.push("decision".to_string());
         }
         if let Some(tier) = self.tier {
             out.push(format!("tier:{}", tier.name()));
@@ -238,6 +245,8 @@ pub enum Workload {
     Vision,
     Draft,
     Training,
+    /// Answer bounded typed questions with a declared decision head.
+    Decision,
 }
 
 impl Workload {
@@ -374,6 +383,16 @@ pub fn resolve(model: &ModelFeatures, device: &DeviceFeatures, workload: &Worklo
                 ));
             }
         }
+        Workload::Decision => {
+            if model.decision {
+                r.enabled.push("decision".to_string());
+            } else {
+                r.refusals.push((
+                    "decision".to_string(),
+                    "checkpoint declares no decision head".to_string(),
+                ));
+            }
+        }
         Workload::Training => {
             r.enabled.push("training".to_string());
             if model.num_layers < 8 || model.experts < 4 {
@@ -430,6 +449,7 @@ mod tests {
             mtp: false,
             vision: false,
             audio: false,
+            decision: false,
             tier: Some(Tier::Base),
         }
     }
@@ -494,6 +514,7 @@ mod tests {
             Workload::Vision,
             Workload::Draft,
             Workload::Training,
+            Workload::Decision,
         ] {
             let r = resolve(&text_model(), &device(16384, true), &workload);
             assert!(
@@ -673,8 +694,40 @@ mod tests {
     }
 
     #[test]
-    fn device_from_capability_is_conservative_without_an_adapter() {
-        let cap = Capability {
+    fn decision_is_refused_without_a_declared_head() {
+        let r = resolve(&text_model(), &device(16384, true), &Workload::Decision);
+        assert!(r
+            .refusals
+            .iter()
+            .any(|(f, why)| f == "decision" && why.contains("no decision head")));
+        assert!(!r.enabled.iter().any(|f| f == "decision"));
+    }
+
+    #[test]
+    fn decision_is_enabled_when_the_checkpoint_declares_it() {
+        let mut m = text_model();
+        m.decision = true;
+        assert!(m.declared_features().iter().any(|f| f == "decision"));
+        let r = resolve(&m, &device(16384, true), &Workload::Decision);
+        assert!(r.enabled.iter().any(|f| f == "decision"));
+        assert!(
+            !r.refusals.iter().any(|(f, _)| f == "decision"),
+            "{:?}",
+            r
+        );
+    }
+
+    #[test]
+    fn tier_presets_do_not_declare_a_decision_head() {
+        for tier in [Tier::Nano, Tier::Small, Tier::Base, Tier::Large] {
+            let features = ModelFeatures::from_tier(tier);
+            assert!(!features.decision, "{:?}", tier);
+            assert!(!features.declared_features().iter().any(|f| f == "decision"));
+        }
+    }
+
+    #[test]
+    fn device_from_capability_is_conservative_without_an_adapter() {        let cap = Capability {
             vram_mb: 0,
             shared_ram_mb: 8192,
             gpu_kind: crate::device::capability::GpuKind::Other,
