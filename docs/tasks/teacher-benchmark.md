@@ -1,8 +1,8 @@
 # Teacher benchmark
 
-Status: **protocol, not implemented.** The existing `benchmark` measures GPU
-kernels only; `infer` maps a teacher into an untrained student. Neither answers
-"which teacher can I afford to distil from on this runtime?"
+Status: **implemented at `9f83183`; measured on this host; the second runtime
+(T4) is not measured.** `ferrisres benchmark teacher` runs the teacher-forcing
+forward through the same loader as `evaluate`, with no student and no sampling.
 
 ## The right metric
 
@@ -48,6 +48,45 @@ metric=teacher_prefill_tps value=<f64>
 
 plus a JSON record with the fields above and the derived hours/bytes.
 
+## Measured on this host (CPU, HD 530 idle)
+
+`warmup 1`, `iterations 2`, mapped `gemma_mapper` teacher forward, GGUF
+dequantized to f32 on load. Host load was 5.6–10.8 from other work, so treat the
+absolute numbers as a floor with noise and the **shape** as the result.
+
+| model | quant | seq | tokens/s | hours / 1B tokens | peak RSS | median s/pass |
+|---|---|---:|---:|---:|---:|---:|
+| Qwen3-0.6B | Q8_0 | 128 | 7.73 | 35,924 | 5,938 MB | 16.55 |
+| Qwen3-0.6B | Q8_0 | 512 | 1.90 | 146,406 | 5,938 MB | 269.85 |
+| Qwen3-0.6B | Q4_K_M | 128 | 6.34 | 43,825 | 5,938 MB | 20.19 |
+| Qwen3-0.6B | Q4_K_M | 512 | 2.62 | 106,199 | 5,937 MB | 195.75 |
+
+Three conclusions, in order of importance:
+
+1. **The cost is quadratic in sequence length, as expected for a full forward.**
+   4x the tokens cost ~16x the time (16.55 s → 269.85 s). Extrapolating the
+   512 number to a 2k window is ~16x again, and to 8k ~256x: one 8k sequence
+   would take about 14 hours on this host. **Teacher labelling at the training
+   window cannot run on this CPU.** It runs on a T4, or not at all.
+2. **Quantisation saves nothing on this path.** Q4_K_M and Q8_0 both dequantize
+   to f32 on load, so peak RSS is identical (5.9 GB) and the forward is the same
+   f32 code. The Q4/Q8 spread in the table is host contention, not quantisation.
+   This invalidates the assumption that a Q4 E4B fits a 16 GB card: the loader
+   would still hold roughly 20 GB of f32 weights.
+3. **5.9 GB for a 0.6B f32 model is 2.4x the weights alone.** The load path
+   keeps more than one copy; reducing that is the cheapest way to make a larger
+   teacher fit, and it should be fixed before E4B is attempted.
+
+## Derived budget
+
+| tokens | seq 128 | seq 512 | seq 2k (extrapolated) |
+|---:|---:|---:|---:|
+| 10M | 359 h | 1,464 h | ~23,000 h |
+| 100M | 3,594 h | 14,641 h | — |
+
+The 128-token number is the only one that is a measurement at the window; the
+rest are the quadratic projection and must be confirmed on the T4.
+
 ## Candidates
 
 | teacher | quant | notes |
@@ -72,3 +111,8 @@ per token; that difference decides whether a corpus run takes a day or a week.
   dense path would change the numbers. Report which path was measured.
 - Storage of the targets can exceed the compute cost: fp32 logits at 151k vocab
   are ~600 KB per token; a 1B-token run needs compression or top-k logits.
+- **E4B is unmeasured.** The ~5B-parameter teacher needs roughly 20 GB resident
+  in f32; this host had ~17 GB free under load, so running it risked OOM. It
+  remains the target for the T4 run, not for this host.
+- The measured path is `gemma_mapper`, not the native ternary student and not a
+  GPU path. A GPU number from a different path is not comparable.
