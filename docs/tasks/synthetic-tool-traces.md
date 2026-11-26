@@ -53,16 +53,29 @@ A rejection rate of 40–60% is normal and healthy: the kept set is what teaches
 
 ## Seeding, which is where diversity comes from
 
-Templates alone collapse to one tone. Seeds come from three places, in this order:
+Templates alone collapse to one tone, but the obvious fix is **forbidden**:
 
-1. **real work** — every task in the engram queue that a human or agent actually
-   ran, including the ones that failed (a failure trace with a recovery is the
-   most valuable kind);
-2. **combinatorial templates** over the tool schemas — `(verb, target, constraint)`
-   where the target is drawn from our own corpora: a file that exists, a symbol
-   that exists, a command that is legal;
+> `agentic-loop dataset export` is metadata-only *by design*. Its module doc says
+> the raw dogfood logs contain task text, prompts, tool arguments and repository
+> paths, "so they must never be published", and content export is not implemented —
+> the command refuses rather than falling back to a larger row shape.
+
+Harvesting real runs would therefore be both a privacy violation and a breach of
+`docs/dataset-publication-policy.md`. **Seeds are generated, never harvested**, and
+the generator runs in a disposable sandbox whose contents are synthetic by
+construction:
+
+1. **combinatorial templates** over the tool schemas — `(verb, target, constraint)`
+   where the target is a file or symbol that exists *in the sandbox we just made*;
+2. **corpus-derived tasks** — questions whose answers are in our permissive
+   corpora (a function in `rust-lang/book`, a package in the nixpkgs slice), so the
+   task text is licensable and the answer is verifiable;
 3. **counterfactual probes** — the same task with one impossible element, to teach
    refusal and clarification rather than a confident wrong call.
+
+A trace from a real queue item must never enter this pipeline. If a real failure is
+interesting enough to teach, re-create it as a synthetic seed that contains no
+private text.
 
 ## The arithmetic, because it decides the plan
 
