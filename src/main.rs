@@ -25,6 +25,16 @@ struct Cli {
 enum Commands {
     Info,
 
+    /// Build and inspect the 32k source tokenizer.
+    ///
+    /// `train` writes `tokenizer.json`, `special_tokens.json`,
+    /// `sample-manifest.jsonl` and `SHA256SUMS`. Training is deterministic:
+    /// the corpus is sorted by path and hashed before the BPE is trained.
+    Tokenizer {
+        #[command(subcommand)]
+        command: TokenizerCommand,
+    },
+
     /// Train the f32 reference model on a text or JSONL corpus.
     ///
     /// One step is next-token prediction over a `--seq-len` window. Because the
@@ -285,6 +295,44 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum TokenizerCommand {
+    /// Train a BPE tokenizer with byte fallback and no normalisation.
+    Train {
+        /// Corpus directory or single file.
+        #[arg(long)]
+        corpus: std::path::PathBuf,
+        /// Requested vocabulary size, including the 256 bytes and the specials.
+        #[arg(long, default_value_t = 32768)]
+        vocab: usize,
+        /// Output directory for the artefacts.
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Licence recorded for every file with no entry in --licence-map.
+        #[arg(long, default_value = "unspecified")]
+        licence: String,
+        /// JSON object mapping a path prefix to a licence, for example
+        /// `{"book/": "MIT OR Apache-2.0"}`. Longest prefix wins.
+        #[arg(long)]
+        licence_map: Option<std::path::PathBuf>,
+    },
+    /// Print a tokenizer's vocabulary size and the SHA-256 of its bytes.
+    Inspect {
+        /// Path to tokenizer.json.
+        #[arg(long, default_value = "tokenizer.json")]
+        tokenizer: std::path::PathBuf,
+    },
+    /// Print tokens per byte and the token count for a text file.
+    Fertility {
+        /// Path to tokenizer.json.
+        #[arg(long, default_value = "tokenizer.json")]
+        tokenizer: std::path::PathBuf,
+        /// Text file to measure.
+        #[arg(long)]
+        text: std::path::PathBuf,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -293,6 +341,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Info => cmd_info().await,
+        Commands::Tokenizer { command } => cmd_tokenizer(command),
         Commands::Train {
             hidden_dim, num_blocks, block_size, epochs, batch_size,
             learning_rate, data, data_format, chat_template, seq_len, vocab,
@@ -328,6 +377,53 @@ async fn main() -> anyhow::Result<()> {
             model_path, config, model_format, tokenizer,
             host, port, model_name, armor, cognitive, concepts_path,
         } => cmd_serve(model_path, config, model_format, tokenizer, host, port, model_name, armor, cognitive, concepts_path).await,
+    }
+}
+
+fn cmd_tokenizer(command: TokenizerCommand) -> anyhow::Result<()> {
+    use ferrisres::tokenizer::{fertility, inspect};
+    use ferrisres::tokenizer::train::{train, TrainConfig};
+
+    match command {
+        TokenizerCommand::Train {
+            corpus,
+            vocab,
+            out,
+            licence,
+            licence_map,
+        } => {
+            let mut config = TrainConfig::new(corpus, vocab, out);
+            config.default_licence = licence;
+            if let Some(path) = licence_map {
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| anyhow::anyhow!("read licence map {}: {e}", path.display()))?;
+                config.licence_map = serde_json::from_str(&text)
+                    .map_err(|e| anyhow::anyhow!("parse licence map {}: {e}", path.display()))?;
+            }
+            let report = train(&config)?;
+            println!("tokenizer.json  sha256={}", report.tokenizer_sha256);
+            println!("vocab_size      {}", report.vocab_size);
+            println!(
+                "files           {} ({} non-UTF-8 skipped)",
+                report.files, report.skipped_non_utf8
+            );
+            println!("output          {}", report.out_dir.display());
+            Ok(())
+        }
+        TokenizerCommand::Inspect { tokenizer } => {
+            let report = inspect(&tokenizer)?;
+            println!("vocab_size  {}", report.vocab_size);
+            println!("sha256      {}", report.sha256);
+            println!("path        {}", report.path.display());
+            Ok(())
+        }
+        TokenizerCommand::Fertility { tokenizer, text } => {
+            let report = fertility(&tokenizer, &text)?;
+            println!("tokens       {}", report.tokens);
+            println!("bytes        {}", report.bytes);
+            println!("tokens/byte  {:.6}", report.tokens_per_byte);
+            Ok(())
+        }
     }
 }
 

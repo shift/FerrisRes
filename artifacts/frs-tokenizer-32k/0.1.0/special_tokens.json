@@ -1,0 +1,20 @@
+{
+  "</assistant>": 8,
+  "</system>": 4,
+  "</tool>": 10,
+  "</tool_call>": 12,
+  "</tool_result>": 14,
+  "</user>": 6,
+  "<assistant>": 7,
+  "<bos>": 1,
+  "<eos>": 2,
+  "<fim_middle>": 17,
+  "<fim_prefix>": 15,
+  "<fim_suffix>": 16,
+  "<pad>": 0,
+  "<system>": 3,
+  "<tool>": 9,
+  "<tool_call>": 11,
+  "<tool_result>": 13,
+  "<user>": 5
+}

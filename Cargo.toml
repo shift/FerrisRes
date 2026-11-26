@@ -33,6 +33,7 @@ ureq = { version = "2", features = ["json"] }
 matrixmultiply = "0.3"
 regex = "1"
 tokenizers = "0.21"
+sha2 = "0.10"
 
 [dev-dependencies]
 assert_matches = "1"
