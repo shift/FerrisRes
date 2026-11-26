@@ -204,6 +204,18 @@ A mode is behaviour plus routing plus budget, not two checkpoints
 | deliberate accuracy over instant on tasks that need it | must improve, else cut the mode |
 | p95 TTFT and total per mode | within the target table |
 
+## 16. Text-aligned distillation
+
+Distilling a 151k-vocab teacher into a 32k student (`text-aligned-kd.md`).
+
+| metric | gate |
+|---|---|
+| position mismatch between the two encodings | **0** |
+| soft target used with coverage < 0.5 | **0** |
+| held-out perplexity vs hard-CE-only at equal compute | strictly better, else do not ship KD |
+| KD share of the loss | reported; < 10% means it is SFT |
+| coverage per language (English/Rust/Nix/German) | reported; < 30% uses SeqKD for that slice |
+
 ## Contamination
 
 Hash every evaluation set (GSM8K, MATH, SWE-bench, BFCL test, MT-Bench, our own

@@ -94,10 +94,11 @@ three honest options:
 1. **Match the teacher for the first student.** Train the 111M shape with a 151k
    vocab for the pipeline and the gradient work. It is not the shipping Small —
    the head dominates — but it proves distillation end to end.
-2. **Align on text, not token ids.** Decode the teacher's tokens, re-tokenise
-   with the student, run both forwards, and aggregate teacher probabilities over
-   each student token's character span. Correct but more code and a slower data
-   path; the spans must be exact.
+2. **Align on text, not token ids.** Use byte offsets to find positions where a
+   teacher boundary equals a student boundary, project the teacher's top-k through
+   a byte-equality table, and train with hard CE plus a soft KL on the aligned
+   positions only. Specified in `text-aligned-kd.md`; the spans must be exact and
+   the dropped mass reported.
 3. **Skip logit distillation for the small tier.** Use SFT and preference
    training on rendered text, and keep distillation for Base.
 
