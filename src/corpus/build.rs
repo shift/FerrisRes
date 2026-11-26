@@ -1,7 +1,7 @@
-//! Deterministic local-file corpus builder.
+//! Deterministic corpus builder.
 //!
-//! Pipeline: acquire (local files) -> licence gate -> scan -> filter -> dedupe
-//! -> tokenize -> pack -> shard -> split -> manifest.
+//! Pipeline: acquire (local, git or hf source) -> licence gate -> scan ->
+//! filter -> dedupe -> tokenize -> pack -> shard -> split -> manifest.
 
 use crate::corpus::plan::{classify_split, sha256_hex, Plan, Split, TokenizerRecord};
 use crate::corpus::secret;
@@ -45,6 +45,9 @@ pub struct SplitRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceRecord {
     pub id: String,
+    /// `local`, `git` or `hf`. Empty on manifests written before kinds existed.
+    #[serde(default)]
+    pub kind: String,
     pub path: String,
     pub licence: String,
     pub revision: String,
@@ -247,26 +250,48 @@ pub fn build(plan_path: &Path, out: &Path, resume: bool) -> Result<BuildSummary>
     sources.sort_by(|a, b| a.id.cmp(&b.id));
 
     let mut files_seen_by_source: BTreeMap<String, u64> = BTreeMap::new();
+    let mut resolved_revisions: BTreeMap<String, String> = BTreeMap::new();
+    let cache = crate::corpus::sources::default_cache_dir();
     let mut raw_files = Vec::new();
     for source in &sources {
-        let root = PathBuf::from(&source.path);
-        if !root.exists() {
-            bail!("source '{}' path does not exist: {}", source.id, root.display());
-        }
-        let discovered =
-            discover_files(&root).with_context(|| format!("cannot scan source '{}'", source.id))?;
-        *files_seen_by_source.entry(source.id.clone()).or_insert(0) += discovered.len() as u64;
-        for (rel_path, abs_path, extension) in discovered {
-            let bytes = std::fs::read(&abs_path)
-                .with_context(|| format!("cannot read {}", abs_path.display()))?;
-            let sha256 = sha256_hex(&bytes);
-            raw_files.push(RawFile {
-                source_id: source.id.clone(),
-                rel_path,
-                extension,
-                bytes,
-                sha256,
-            });
+        let acquired = crate::corpus::sources::acquire(source, &cache)
+            .with_context(|| format!("cannot acquire source '{}'", source.id))?;
+        resolved_revisions.insert(source.id.clone(), acquired.revision.clone());
+
+        match acquired.files {
+            Some(files) => {
+                *files_seen_by_source.entry(source.id.clone()).or_insert(0) += files.len() as u64;
+                for file in files {
+                    let extension = path_extension(&file.rel_path);
+                    let bytes = std::fs::read(&file.path)
+                        .with_context(|| format!("cannot read {}", file.path.display()))?;
+                    raw_files.push(RawFile {
+                        source_id: source.id.clone(),
+                        rel_path: file.rel_path,
+                        extension,
+                        bytes,
+                        sha256: file.sha256,
+                    });
+                }
+            }
+            None => {
+                let discovered = discover_files(&acquired.root)
+                    .with_context(|| format!("cannot scan source '{}'", source.id))?;
+                *files_seen_by_source.entry(source.id.clone()).or_insert(0) +=
+                    discovered.len() as u64;
+                for (rel_path, abs_path, extension) in discovered {
+                    let bytes = std::fs::read(&abs_path)
+                        .with_context(|| format!("cannot read {}", abs_path.display()))?;
+                    let sha256 = sha256_hex(&bytes);
+                    raw_files.push(RawFile {
+                        source_id: source.id.clone(),
+                        rel_path,
+                        extension,
+                        bytes,
+                        sha256,
+                    });
+                }
+            }
         }
     }
 
@@ -417,9 +442,13 @@ pub fn build(plan_path: &Path, out: &Path, resume: bool) -> Result<BuildSummary>
         .iter()
         .map(|source| SourceRecord {
             id: source.id.clone(),
-            path: source.path.clone(),
+            kind: source.kind.as_str().to_string(),
+            path: crate::corpus::sources::redact_credentials(&source.path),
             licence: source.licence.clone().unwrap_or_default(),
-            revision: source.revision.clone().unwrap_or_default(),
+            revision: resolved_revisions
+                .get(&source.id)
+                .cloned()
+                .unwrap_or_else(|| source.revision.clone().unwrap_or_default()),
             weight: source.weight,
             files_seen: files_seen_by_source.get(&source.id).copied().unwrap_or(0),
             files_kept: files_kept_by_source.get(&source.id).copied().unwrap_or(0),
@@ -537,7 +566,11 @@ fn discover_files(root: &Path) -> Result<Vec<(String, PathBuf, String)>> {
             let file_type = entry.file_type()?;
             let path = entry.path();
             if file_type.is_dir() {
-                stack.push(path);
+                // A git clone lives under the source root; its internals are
+                // not corpus documents.
+                if entry.file_name() != ".git" {
+                    stack.push(path);
+                }
             } else if file_type.is_file() {
                 if let Some(ext) = supported_extension(&path) {
                     let rel = path
@@ -562,6 +595,13 @@ fn supported_extension(path: &Path) -> Option<String> {
     } else {
         None
     }
+}
+
+fn path_extension(rel_path: &str) -> String {
+    Path::new(rel_path)
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 /// Extract the `text` field from every non-empty JSONL line. One file is one

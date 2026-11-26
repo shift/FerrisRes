@@ -51,12 +51,66 @@ pub struct TokenizerSpec {
     pub kind: String,
 }
 
+/// Where a source's bytes come from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceKind {
+    /// A directory (or single file) already on this machine.
+    #[default]
+    Local,
+    /// A git remote, checked out at an exact commit.
+    Git,
+    /// A Hugging Face dataset store. Only the files named in `files` are read.
+    Hf,
+}
+
+impl SourceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SourceKind::Local => "local",
+            SourceKind::Git => "git",
+            SourceKind::Hf => "hf",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "local" => Ok(SourceKind::Local),
+            "git" => Ok(SourceKind::Git),
+            "hf" => Ok(SourceKind::Hf),
+            other => bail!("unknown source kind '{other}' (expected local, git or hf)"),
+        }
+    }
+}
+
+/// One file named by an `hf` source. The sha256 is the contract: a byte that
+/// does not hash to this value is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SourceFileSpec {
+    pub path: String,
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SourceSpec {
     pub id: String,
+    /// `local`, `git` or `hf`. Defaults to `local` so v1 plans keep working.
+    #[serde(default)]
+    pub kind: SourceKind,
+    /// Local directory, git URL, or HF dataset store (`file://`, `https://`).
     pub path: String,
     pub licence: Option<String>,
+    /// A pinned revision: the git commit, or the HF dataset snapshot.
     pub revision: Option<String>,
+    /// Refuse any network access for this source.
+    #[serde(default)]
+    pub offline: bool,
+    /// The source needs a credential. A gated source without a token is refused.
+    #[serde(default)]
+    pub gated: bool,
+    /// The only files an `hf` source may read. Each carries its sha256.
+    #[serde(default)]
+    pub files: Vec<SourceFileSpec>,
     #[serde(default = "default_weight")]
     pub weight: f64,
 }
@@ -146,7 +200,34 @@ impl Plan {
             }
             match source.revision.as_deref() {
                 Some(value) if !value.trim().is_empty() => {}
-                _ => bail!("source '{}' is missing a revision", source.id),
+                _ => bail!(
+                    "source '{}' ({}) is missing a revision; every source must pin one",
+                    source.id,
+                    source.kind.as_str()
+                ),
+            }
+            if source.path.trim().is_empty() {
+                bail!("source '{}' ({}) is missing a path", source.id, source.kind.as_str());
+            }
+            if source.kind == SourceKind::Hf {
+                if source.files.is_empty() {
+                    bail!(
+                        "hf source '{}' names no files; list every file and its sha256",
+                        source.id
+                    );
+                }
+                for file in &source.files {
+                    if file.path.trim().is_empty() {
+                        bail!("hf source '{}' contains a file with an empty path", source.id);
+                    }
+                    if !is_sha256_hex(&file.sha256) {
+                        bail!(
+                            "hf source '{}' file '{}' does not have a 64-character sha256",
+                            source.id,
+                            file.path
+                        );
+                    }
+                }
             }
             if !source.weight.is_finite() || source.weight < 0.0 {
                 bail!("source '{}' has an invalid weight", source.id);
@@ -211,6 +292,11 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
+}
+
+/// True when `value` is exactly 64 hexadecimal characters.
+pub fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
