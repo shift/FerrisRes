@@ -50,7 +50,7 @@ up one task at a time without making design decisions. If a task needs a decisio
 | `int/kaggle-deb` | 0.2.4 `.deb` (train + export) | **landed** at `efdde0b`, 15/15 gate; CPU only |
 | `feat/gpu-train-loop` | wgpu training loop | agent running, not pushed |
 | `int/train-multi-gpu` | multi-process local SGD | **landed (CPU only)** at `11fb681`; GPU wiring still needs the wgpu loop |
-| `feat/prefix-kv-cache` | prefix KV cache | agent running, not pushed |
+| `feat/prefix-kv-cache` | prefix KV cache | **landed** at `9960441`, 12/12; CLI wiring is `tasks/prefix-cache-wiring.md` |
 | `perf/parallel-prefill` | parallel prefill | agent running, not pushed |
 
 If one of these stalls, its task file is the specification: use the same one

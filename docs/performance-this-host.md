@@ -79,7 +79,9 @@ Measured training throughput that does exist:
 ## How to improve prefill
 
 The levers, the roofline and the measurement plan are in
-`prefill-performance.md`.
+`prefill-performance.md`. The prefix KV cache is implemented (`9960441`):
+2,000 → 500 prefilled on a 1,500-token shared prefix, equality 1.19e-7, but not
+wired to `infer` yet.
 
 ## What to measure next
 

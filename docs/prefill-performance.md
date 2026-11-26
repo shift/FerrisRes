@@ -25,7 +25,7 @@ also badly underpriced**.
 
 | # | lever | expected | effort | evidence |
 |---|---|---|---|---|
-| 1 | **Don't prefill: prefix/KV cache** (soul, tools, conversation, retrieved chunks, suffix after an edit) | minutes → milliseconds on a warm turn | days | `runtime-caches.md`; the NVIDIA context-API paper reports 15% from suffix reuse alone |
+| 1 | **Don't prefill: prefix/KV cache** | **implemented** at `9960441`: 2,000 → 500 prefilled, equality 1.19e-7; CLI wiring open | done (library) | `runtime-caches.md`; the NVIDIA context-API paper reports 15% from suffix reuse alone |
 | 2 | **Fewer tokens** (retrieval top-k, compact tool results, skeleton reads, tool-block selection, compaction) | ~linear in FFN cost | hours–days | `token-economics.md`, `reasoning-and-retention.md` |
 | 3 | **Parallel matmul over 4 cores** for prefill, not only decode | their comments claim 4–8× on rayon paths; the status says the **MoE prefill path is serial** | hours | `cpu_moe.rs:forward_parallel` has no prefill call site; `cpu_linear.rs`, `ternary.rs` are rayon-parallel |
 | 4 | **Fused/tiled kernels**: RMSNorm+QKV, fused attention (`PrefillAttnOp`), blocked scores, avoid materialising the full matrix | 2–4× prefill plausible | days | kernel work already gave 2.6× prefill; the 512-token quadratic is visible in the teacher numbers |

@@ -10,11 +10,22 @@ Cache **stable work**, key it by everything that changes the result, scope it to
 the principal, and prove a hit equals a fresh computation. Never cache a user's
 answer, a time-dependent decision, or a secret.
 
+## Prefix KV cache (implemented)
+
+`feat/prefix-kv-cache` @ `9960441`: SHA-256 key over model fingerprint, tokenizer
+version, principal scope and the exact token ids; longest-prefix lookup; an LRU
+bounded by real buffer bytes; a checksummed disk tier where corruption is a miss;
+scope isolation. The equality gate is a next-token logit difference of
+**1.19e-7** against a cold prefill. The wall win is smaller than the token win —
+12.98 s → 6.46 s on this host — because the suffix currently goes through
+`forward_decode` one token at a time; batched suffix prefill needs a `start_pos`
+API. The cache is not wired to `infer` yet (`tasks/prefix-cache-wiring.md`).
+
 ## The inventory
 
 | cache | what it avoids | expected | effort | risk |
 |---|---|---|---|---|
-| **Soul/tool/principal prefix KV** (`tasks/soul-cache.md`) | re-prefilling 1–5k stable tokens every turn | large TTFT win | days | **privacy: the key must include the principal**, or two people share a prefix |
+| **Soul/tool/principal prefix KV** (`tasks/soul-cache.md`) | re-prefilling 1–5k stable tokens every turn | **implemented at `9960441`**: 2,000 → 500 prefilled on a 1,500 shared prefix; equality 1.19e-7; 12 tests | done (library); CLI wiring open | **privacy: the key includes the principal**; no cross-principal hit |
 | **Conversation prefix KV** | re-prefilling the whole history each turn | **large on multi-turn** | days | window/summary staleness |
 | **Unchanged suffix after an edit** | re-prefilling text a notebook edit did not change | up to 15% prefill (reported) | days | an edit must be an invalidation point, not a flush |
 | **Rendered tool/skill text** | re-rendering the same tool block and skill text | small CPU, feeds the KV cache | hours | tool-set hash |
