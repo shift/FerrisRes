@@ -1,0 +1,16 @@
+{
+  "id": "sectionme/ferrisres-train-32k",
+  "title": "FerrisRes train 32k",
+  "code_file": "train_32k.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "sectionme/ferrisres",
+    "sectionme/ferrisres-corpus-32k"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}
