@@ -153,3 +153,7 @@ Two consequences worth carrying forward:
    `seq_len`, or smaller windows for short documents, would recover them.
 2. 6.08M tokens is a **slice**, not a training corpus. At ~3.7 bytes/token the
    ratio is expected; the volume gap is separate and unchanged.
+
+Gates, all measured: build **153 s**, `corpus verify` **9/9**, and a second build
+into a separate directory produced an identical `manifest.json`
+(`ef3fc0709d8c…`) and identical `SHA256SUMS`, so the BPE path is deterministic.
