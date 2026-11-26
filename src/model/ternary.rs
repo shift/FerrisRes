@@ -364,6 +364,62 @@ fn ternary_row_sum(kernel: F32Kernel, weight_row: &[i8], input_row: &[f32]) -> f
     }
 }
 
+/// Dot product of one ternary weight row with one activation row.
+///
+/// Returns `pos - neg`, where `pos` accumulates the activations whose weight is
+/// `+1` and `neg` those whose weight is `-1`, both in ascending column order.
+/// Only the final scaling is a multiply of the whole row.
+///
+/// The masks are arithmetic: `(w > 0) as u8 as f32` is `1.0` or `0.0`, so the
+/// inner loop has no data-dependent branch. The previous form,
+/// `if w > 0 { v } else { 0.0 }`, compiled to two branches per element and
+/// mispredicted on the ~1/3-each ternary distribution, which dominated the
+/// cost of the loop.
+///
+/// The unroll is 8 elements and the accumulation order is unchanged, so the
+/// result is bit-identical to the previous kernel (see
+/// `test_ternary_matmul_matches_previous_kernel`).
+#[inline]
+fn ternary_row_dot(weight_row: &[i8], input_row: &[f32]) -> f32 {
+    debug_assert_eq!(weight_row.len(), input_row.len());
+    let n = weight_row.len();
+    let mut pos = 0.0f32;
+    let mut neg = 0.0f32;
+    let mut j = 0usize;
+
+    while j + 8 <= n {
+        let w = &weight_row[j..j + 8];
+        let v = &input_row[j..j + 8];
+        pos += v[0] * ((w[0] > 0) as u8 as f32);
+        neg += v[0] * ((w[0] < 0) as u8 as f32);
+        pos += v[1] * ((w[1] > 0) as u8 as f32);
+        neg += v[1] * ((w[1] < 0) as u8 as f32);
+        pos += v[2] * ((w[2] > 0) as u8 as f32);
+        neg += v[2] * ((w[2] < 0) as u8 as f32);
+        pos += v[3] * ((w[3] > 0) as u8 as f32);
+        neg += v[3] * ((w[3] < 0) as u8 as f32);
+        pos += v[4] * ((w[4] > 0) as u8 as f32);
+        neg += v[4] * ((w[4] < 0) as u8 as f32);
+        pos += v[5] * ((w[5] > 0) as u8 as f32);
+        neg += v[5] * ((w[5] < 0) as u8 as f32);
+        pos += v[6] * ((w[6] > 0) as u8 as f32);
+        neg += v[6] * ((w[6] < 0) as u8 as f32);
+        pos += v[7] * ((w[7] > 0) as u8 as f32);
+        neg += v[7] * ((w[7] < 0) as u8 as f32);
+        j += 8;
+    }
+
+    while j < n {
+        let w = weight_row[j];
+        let v = input_row[j];
+        pos += v * ((w > 0) as u8 as f32);
+        neg += v * ((w < 0) as u8 as f32);
+        j += 1;
+    }
+
+    pos - neg
+}
+
 /// Ternary matrix multiply: `output = scale * (ternary @ input)`.
 ///
 /// - `ternary`: `[out_rows * in_cols]` values in {-1, 0, +1} (row-major)
@@ -371,10 +427,7 @@ fn ternary_row_sum(kernel: F32Kernel, weight_row: &[i8], input_row: &[f32]) -> f
 /// - `input`: `[seq * in_cols]` FP32 activations (row-major)
 /// - Returns `[seq * out_rows]` FP32 output
 ///
-/// The inner loop uses branchless sign-as-mask:
-///   accumulator += (sign as f32) * input[j]
-/// where sign ∈ {-1.0, 0.0, +1.0} — the compiler auto-vectorizes this
-/// to SIMD add/sub instructions.
+/// The inner loop is the branchless, 8-way unrolled `ternary_row_dot`.
 pub fn ternary_matmul(
     ternary: &[i8],
     scale: f32,
@@ -428,19 +481,11 @@ pub fn ternary_matmul_parallel(
         let batch_size = (out_rows / 32).max(1);
         output.par_chunks_mut(batch_size).enumerate().for_each(|(batch_idx, chunk)| {
             let start_row = batch_idx * batch_size;
+            let input_row = &input[..in_cols];
             for r in 0..chunk.len() {
                 let row = start_row + r;
                 let weight_row = &ternary[row * in_cols..(row + 1) * in_cols];
-                let input_row = &input[..in_cols];
-                let mut pos_sum = 0.0f32;
-                let mut neg_sum = 0.0f32;
-                for j in 0..in_cols {
-                    let w = weight_row[j];
-                    let v = input_row[j];
-                    pos_sum += if w > 0 { v } else { 0.0 };
-                    neg_sum += if w < 0 { v } else { 0.0 };
-                }
-                chunk[r] = scale * (pos_sum - neg_sum);
+                chunk[r] = scale * ternary_row_dot(weight_row, input_row);
             }
         });
         return output;
@@ -452,15 +497,7 @@ pub fn ternary_matmul_parallel(
         let input_row = &input[s * in_cols..(s + 1) * in_cols];
         for r in 0..out_rows {
             let weight_row = &ternary[r * in_cols..(r + 1) * in_cols];
-            let mut pos_sum = 0.0f32;
-            let mut neg_sum = 0.0f32;
-            for j in 0..in_cols {
-                let w = weight_row[j];
-                let v = input_row[j];
-                pos_sum += if w > 0 { v } else { 0.0 };
-                neg_sum += if w < 0 { v } else { 0.0 };
-            }
-            out_slice[r] = scale * (pos_sum - neg_sum);
+            out_slice[r] = scale * ternary_row_dot(weight_row, input_row);
         }
     });
     output
@@ -770,6 +807,18 @@ fn ternary_matmul_packed_kernel(
 /// Single-token (seq=1): parallelize across output rows in batches.
 /// Multi-token: parallelize across sequence positions.
 /// Uses 4× less memory bandwidth than unpacked ternary matmul.
+///
+/// The sign is extracted arithmetically from the 2-bit code — the packed
+/// alphabet is `{0b00, 0b01, 0b10} = {-1, 0, +1}`, so `code as f32 - 1.0`
+/// decodes it — instead of four lookups into `TERNARY_DECODE` per byte. Two
+/// bytes (8 values) are consumed per iteration into eight independent
+/// accumulators, so the adds are not one serial dependency chain. The padding
+/// code `0b11` only occurs past `in_cols` and is never read.
+///
+/// The row stride assumes `in_cols % 4 == 0` (as before); every caller passes a
+/// projection width that is a multiple of 4, and
+/// `CpuLinear::forward_packed_parallel` falls back to the unpacked path when it
+/// is not.
 pub fn ternary_matmul_packed_parallel(
     packed: &[u8],
     scale: f32,
@@ -781,45 +830,61 @@ pub fn ternary_matmul_packed_parallel(
     use rayon::prelude::*;
     let mut output = vec![0.0f32; out_rows];
     let batch_size = (out_rows / 32).max(1);
+    let bytes_per_row = (in_cols + 3) / 4;
+    let full_bytes = in_cols / 4;
+    let remainder = in_cols % 4;
 
     output.par_chunks_mut(batch_size).enumerate().for_each(|(batch_idx, chunk)| {
         let start_row = batch_idx * batch_size;
         let input_row = &input[..in_cols];
-        let full_quads = in_cols / 4;
-        let remainder = in_cols % 4;
 
         for r in 0..chunk.len() {
             let row = start_row + r;
-            // Each row is full_quads bytes (or full_quads+1 if remainder)
-            let row_packed_start = row * ((in_cols + 3) / 4);
-            let mut sum = 0.0f32;
+            // Each row is `bytes_per_row` bytes; slicing it lets the compiler
+            // drop the per-byte bounds checks.
+            let start = row * bytes_per_row;
+            let row_packed = &packed[start..start + bytes_per_row];
+            let mut acc = [0.0f32; 8];
+            let mut q = 0usize;
 
-            // Process 4 values at a time from packed bytes
-            for q in 0..full_quads {
-                let byte_idx = row_packed_start + q;
-                let packed_byte = packed[byte_idx];
-
-                // Unrolled: extract 4 signs and accumulate
-                let s0 = TERNARY_DECODE[(packed_byte & 0b11) as usize] as f32;
-                let s1 = TERNARY_DECODE[((packed_byte >> 2) & 0b11) as usize] as f32;
-                let s2 = TERNARY_DECODE[((packed_byte >> 4) & 0b11) as usize] as f32;
-                let s3 = TERNARY_DECODE[((packed_byte >> 6) & 0b11) as usize] as f32;
-
+            // Two bytes (8 values) per iteration.
+            while q + 2 <= full_bytes {
+                let b0 = row_packed[q];
+                let b1 = row_packed[q + 1];
                 let base = q * 4;
-                sum += s0 * input_row[base]
-                     + s1 * input_row[base + 1]
-                     + s2 * input_row[base + 2]
-                     + s3 * input_row[base + 3];
+                let v = &input_row[base..base + 8];
+                acc[0] += ((b0 & 0b11) as f32 - 1.0) * v[0];
+                acc[1] += (((b0 >> 2) & 0b11) as f32 - 1.0) * v[1];
+                acc[2] += (((b0 >> 4) & 0b11) as f32 - 1.0) * v[2];
+                acc[3] += (((b0 >> 6) & 0b11) as f32 - 1.0) * v[3];
+                acc[4] += ((b1 & 0b11) as f32 - 1.0) * v[4];
+                acc[5] += (((b1 >> 2) & 0b11) as f32 - 1.0) * v[5];
+                acc[6] += (((b1 >> 4) & 0b11) as f32 - 1.0) * v[6];
+                acc[7] += (((b1 >> 6) & 0b11) as f32 - 1.0) * v[7];
+                q += 2;
             }
 
-            // Handle remainder
+            // Odd trailing full byte (in_cols % 8 in {4, 5, 6, 7}).
+            if q < full_bytes {
+                let b = row_packed[q];
+                let base = q * 4;
+                let v = &input_row[base..base + 4];
+                acc[0] += ((b & 0b11) as f32 - 1.0) * v[0];
+                acc[1] += (((b >> 2) & 0b11) as f32 - 1.0) * v[1];
+                acc[2] += (((b >> 4) & 0b11) as f32 - 1.0) * v[2];
+                acc[3] += (((b >> 6) & 0b11) as f32 - 1.0) * v[3];
+            }
+
+            let mut sum = ((acc[0] + acc[1]) + (acc[2] + acc[3]))
+                + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+
+            // Handle remainder (not a full quad)
             if remainder > 0 {
-                let byte_idx = row_packed_start + full_quads;
-                let packed_byte = packed[byte_idx];
-                let base = full_quads * 4;
+                let packed_byte = row_packed[full_bytes];
+                let base = full_bytes * 4;
                 for bit_pos in 0..remainder {
-                    let code = ((packed_byte >> (bit_pos * 2)) & 0b11) as usize;
-                    sum += TERNARY_DECODE[code] as f32 * input_row[base + bit_pos];
+                    let code = (packed_byte >> (bit_pos * 2)) & 0b11;
+                    sum += (code as f32 - 1.0) * input_row[base + bit_pos];
                 }
             }
 
@@ -1955,6 +2020,292 @@ mod tests {
             REPS, seq1_ms, seq512_ms, F32Kernel::detect()
         );
     }
+    // ── Equivalence with the pre-rewrite kernels ─────────────────────────
+    //
+    // The functions below are verbatim copies of `ternary_matmul`,
+    // `ternary_matmul_parallel` and `ternary_matmul_packed_parallel` as they
+    // were before the branchless rewrite. They are the reference for the
+    // `*_matches_previous_kernel` tests; they are not used by the library.
+
+    fn old_ternary_matmul(
+        ternary: &[i8],
+        scale: f32,
+        input: &[f32],
+        out_rows: usize,
+        in_cols: usize,
+        seq: usize,
+    ) -> Vec<f32> {
+        assert_eq!(ternary.len(), out_rows * in_cols);
+        assert_eq!(input.len(), seq * in_cols);
+        let mut output = vec![0.0f32; seq * out_rows];
+        for s in 0..seq {
+            let input_row = &input[s * in_cols..(s + 1) * in_cols];
+            let out_slice = &mut output[s * out_rows..(s + 1) * out_rows];
+            for r in 0..out_rows {
+                let weight_row = &ternary[r * in_cols..(r + 1) * in_cols];
+                let mut pos_sum = 0.0f32;
+                let mut neg_sum = 0.0f32;
+                for j in 0..in_cols {
+                    let w = weight_row[j];
+                    let v = input_row[j];
+                    pos_sum += if w > 0 { v } else { 0.0 };
+                    neg_sum += if w < 0 { v } else { 0.0 };
+                }
+                out_slice[r] = scale * (pos_sum - neg_sum);
+            }
+        }
+        output
+    }
+
+    fn old_ternary_matmul_parallel(
+        ternary: &[i8],
+        scale: f32,
+        input: &[f32],
+        out_rows: usize,
+        in_cols: usize,
+        seq: usize,
+    ) -> Vec<f32> {
+        use rayon::prelude::*;
+        if seq <= 1 {
+            let mut output = vec![0.0f32; out_rows];
+            let batch_size = (out_rows / 32).max(1);
+            output.par_chunks_mut(batch_size).enumerate().for_each(
+                |(batch_idx, chunk)| {
+                    let start_row = batch_idx * batch_size;
+                    for r in 0..chunk.len() {
+                        let row = start_row + r;
+                        let weight_row = &ternary[row * in_cols..(row + 1) * in_cols];
+                        let input_row = &input[..in_cols];
+                        let mut pos_sum = 0.0f32;
+                        let mut neg_sum = 0.0f32;
+                        for j in 0..in_cols {
+                            let w = weight_row[j];
+                            let v = input_row[j];
+                            pos_sum += if w > 0 { v } else { 0.0 };
+                            neg_sum += if w < 0 { v } else { 0.0 };
+                        }
+                        chunk[r] = scale * (pos_sum - neg_sum);
+                    }
+                },
+            );
+            return output;
+        }
+        let mut output = vec![0.0f32; seq * out_rows];
+        output.par_chunks_mut(out_rows).enumerate().for_each(|(s, out_slice)| {
+            let input_row = &input[s * in_cols..(s + 1) * in_cols];
+            for r in 0..out_rows {
+                let weight_row = &ternary[r * in_cols..(r + 1) * in_cols];
+                let mut pos_sum = 0.0f32;
+                let mut neg_sum = 0.0f32;
+                for j in 0..in_cols {
+                    let w = weight_row[j];
+                    let v = input_row[j];
+                    pos_sum += if w > 0 { v } else { 0.0 };
+                    neg_sum += if w < 0 { v } else { 0.0 };
+                }
+                out_slice[r] = scale * (pos_sum - neg_sum);
+            }
+        });
+        output
+    }
+
+    fn old_ternary_matmul_packed_parallel(
+        packed: &[u8],
+        scale: f32,
+        input: &[f32],
+        out_rows: usize,
+        in_cols: usize,
+        _seq: usize,
+    ) -> Vec<f32> {
+        use rayon::prelude::*;
+        let mut output = vec![0.0f32; out_rows];
+        let batch_size = (out_rows / 32).max(1);
+        output.par_chunks_mut(batch_size).enumerate().for_each(
+            |(batch_idx, chunk)| {
+                let start_row = batch_idx * batch_size;
+                let input_row = &input[..in_cols];
+                let full_quads = in_cols / 4;
+                let remainder = in_cols % 4;
+                for r in 0..chunk.len() {
+                    let row = start_row + r;
+                    let row_packed_start = row * ((in_cols + 3) / 4);
+                    let mut sum = 0.0f32;
+                    for q in 0..full_quads {
+                        let packed_byte = packed[row_packed_start + q];
+                        let s0 = TERNARY_DECODE[(packed_byte & 0b11) as usize] as f32;
+                        let s1 = TERNARY_DECODE[((packed_byte >> 2) & 0b11) as usize] as f32;
+                        let s2 = TERNARY_DECODE[((packed_byte >> 4) & 0b11) as usize] as f32;
+                        let s3 = TERNARY_DECODE[((packed_byte >> 6) & 0b11) as usize] as f32;
+                        let base = q * 4;
+                        sum += s0 * input_row[base]
+                            + s1 * input_row[base + 1]
+                            + s2 * input_row[base + 2]
+                            + s3 * input_row[base + 3];
+                    }
+                    if remainder > 0 {
+                        let packed_byte = packed[row_packed_start + full_quads];
+                        let base = full_quads * 4;
+                        for bit_pos in 0..remainder {
+                            let code = ((packed_byte >> (bit_pos * 2)) & 0b11) as usize;
+                            sum += TERNARY_DECODE[code] as f32 * input_row[base + bit_pos];
+                        }
+                    }
+                    chunk[r] = scale * sum;
+                }
+            },
+        );
+        output
+    }
+
+    /// Deterministic SplitMix64 — the tests must not depend on `rand`'s state.
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn unit(&mut self) -> f32 {
+            (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+        }
+        /// {-1, 0, +1} with the ~1/3 each of an absmean-quantized tensor.
+        fn ternary(&mut self) -> i8 {
+            (self.next_u64() % 3) as i8 - 1
+        }
+    }
+
+    fn random_ternary(n: usize, seed: u64) -> Vec<i8> {
+        let mut rng = TestRng(seed);
+        (0..n).map(|_| rng.ternary()).collect()
+    }
+
+    fn random_activations(n: usize, seed: u64) -> Vec<f32> {
+        let mut rng = TestRng(seed);
+        (0..n).map(|_| rng.unit() * 2.0 - 1.0).collect()
+    }
+
+    /// Returns (max_abs_diff, max_relative_diff, rows_over_1e-6).
+    fn diff_stats(new: &[f32], old: &[f32]) -> (f32, f64, usize) {
+        assert_eq!(new.len(), old.len());
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f64;
+        let mut over = 0usize;
+        for (&a, &b) in new.iter().zip(old.iter()) {
+            let d = (a - b).abs();
+            max_abs = max_abs.max(d);
+            // Relative to the reference magnitude; rows whose result is near
+            // zero are counted separately rather than inflating the maximum.
+            let rel = (d as f64) / (b.abs() as f64).max(1e-30);
+            max_rel = max_rel.max(rel);
+            if rel > 1e-6 {
+                over += 1;
+            }
+        }
+        (max_abs, max_rel, over)
+    }
+
+    #[test]
+    fn test_ternary_matmul_matches_previous_kernel() {
+        // Realistic layer shape plus a non-multiple-of-8 column count.
+        for &(out_rows, in_cols) in &[(64usize, 1024usize), (37, 130)] {
+            let ternary = random_ternary(out_rows * in_cols, 0xA11CE);
+            let scale = 0.0173f32;
+
+            for &seq in &[1usize, 3] {
+                let input = random_activations(seq * in_cols, 0xB0B);
+                let new = ternary_matmul(&ternary, scale, &input, out_rows, in_cols, seq);
+                let old = old_ternary_matmul(&ternary, scale, &input, out_rows, in_cols, seq);
+                let (max_abs, max_rel, over) = diff_stats(&new, &old);
+                println!(
+                    "unpacked serial {}x{} seq={}: max_abs={:.3e} max_rel={:.3e} over_1e-6={}",
+                    out_rows, in_cols, seq, max_abs, max_rel, over
+                );
+                // Bit-identical: the unroll keeps the column order.
+                assert_eq!(
+                    new, old,
+                    "unpacked serial kernel changed the result for {}x{} seq={}",
+                    out_rows, in_cols, seq
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_ternary_matmul_parallel_matches_previous_kernel() {
+        for &(out_rows, in_cols) in &[(64usize, 1024usize), (37, 130)] {
+            let ternary = random_ternary(out_rows * in_cols, 0xC0FFEE);
+            let scale = 0.0173f32;
+
+            for &seq in &[1usize, 5] {
+                let input = random_activations(seq * in_cols, 0xD00D);
+                let new =
+                    ternary_matmul_parallel(&ternary, scale, &input, out_rows, in_cols, seq);
+                let old = old_ternary_matmul_parallel(
+                    &ternary, scale, &input, out_rows, in_cols, seq,
+                );
+                let (max_abs, max_rel, over) = diff_stats(&new, &old);
+                println!(
+                    "unpacked parallel {}x{} seq={}: max_abs={:.3e} max_rel={:.3e} over_1e-6={}",
+                    out_rows, in_cols, seq, max_abs, max_rel, over
+                );
+                assert_eq!(
+                    new, old,
+                    "unpacked parallel kernel changed the result for {}x{} seq={}",
+                    out_rows, in_cols, seq
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_ternary_matmul_packed_parallel_matches_previous_kernel() {
+        for &(out_rows, in_cols) in &[(64usize, 1024usize), (37, 128), (1, 6)] {
+            let ternary = random_ternary(out_rows * in_cols, 0xFEED);
+            let packed = pack_ternary(&ternary);
+            let input = random_activations(in_cols, 0xF00D);
+            let scale = 0.0173f32;
+
+            let new = ternary_matmul_packed_parallel(
+                &packed, scale, &input, out_rows, in_cols, 1,
+            );
+            let old = old_ternary_matmul_packed_parallel(
+                &packed, scale, &input, out_rows, in_cols, 1,
+            );
+            let unpacked = ternary_matmul(&ternary, scale, &input, out_rows, in_cols, 1);
+            let old_vs_unpacked = old_ternary_matmul_parallel(
+                &ternary, scale, &input, out_rows, in_cols, 1,
+            );
+
+            let (abs_new_old, rel_new_old, over_new_old) = diff_stats(&new, &old);
+            let (abs_new_unp, _, _) = diff_stats(&new, &unpacked);
+            let (abs_old_unp, _, _) = diff_stats(&old, &old_vs_unpacked);
+            println!(
+                "packed {}x{}: new_vs_old abs={:.3e} rel={:.3e} over_1e-6={} | \
+                 new_vs_unpacked abs={:.3e} | old_vs_unpacked abs={:.3e}",
+                out_rows, in_cols, abs_new_old, rel_new_old, over_new_old,
+                abs_new_unp, abs_old_unp
+            );
+
+            // The packed kernel reorders the accumulation (eight lanes), so it
+            // is not bit-identical to the table-lookup version. The bound is
+            // the same order as the pre-existing packed-vs-unpacked
+            // difference, and far below the 1e-4 the model tests use.
+            assert!(
+                abs_new_old <= 1e-4,
+                "packed kernel drifted from the previous one: max_abs={:.3e} for {}x{}",
+                abs_new_old, out_rows, in_cols
+            );
+            assert!(
+                abs_new_unp <= 1e-4,
+                "packed kernel disagrees with the unpacked kernel: max_abs={:.3e} for {}x{}",
+                abs_new_unp, out_rows, in_cols
+            );
+        }
+    }
+
 }
 
 /// Repack 2-bit ternary from u8 (4 values/byte) to u32 (16 values/u32)

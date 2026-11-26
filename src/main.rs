@@ -176,11 +176,20 @@ enum Commands {
         lora_path: Option<String>,
     },
 
+    /// GPU microbenchmark: matmul, RMSNorm, softmax and elementwise kernels.
+    ///
+    /// GPU-only. This subcommand never runs the CPU ternary model, so the
+    /// shape flags below are accepted for compatibility but unused. For the
+    /// CPU model — ternary kernels, decode/prefill and per-layer attention and
+    /// FFN timings — run `cargo bench --bench ternary_kernels`.
     Benchmark {
+        /// Accepted for compatibility; unused by this GPU benchmark.
         #[arg(long, default_value_t = 512)]
         hidden_dim: usize,
+        /// Accepted for compatibility; unused by this GPU benchmark.
         #[arg(long, default_value_t = 8)]
         num_blocks: usize,
+        /// Accepted for compatibility; unused by this GPU benchmark.
         #[arg(long, default_value_t = 8)]
         block_size: usize,
         #[arg(long, default_value_t = 100)]
@@ -1140,8 +1149,23 @@ async fn cmd_benchmark(
     iterations: u32,
 ) -> anyhow::Result<()> {
     info!(event = "initializing_benchmark_iterations", "Initializing benchmark ({} iterations)", iterations);
+    warn!(
+        event = "benchmark_gpu_only",
+        "This subcommand measures GPU kernels only (matmul, RMSNorm, softmax, elementwise). \
+         It never runs a ternary CPU kernel, and --hidden-dim/--num-blocks/--block-size are \
+         accepted but unused. For the CPU model, run `cargo bench --bench ternary_kernels`."
+    );
 
-    let compute = WgpuCompute::new().await?;
+    let compute = match WgpuCompute::new().await {
+        Ok(compute) => compute,
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "`benchmark` is GPU-only and no usable wgpu adapter was found ({e}). \
+                 It does not measure the CPU ternary model. For the CPU kernels and the \
+                 decode/prefill path, run: cargo bench --bench ternary_kernels"
+            ));
+        }
+    };
     let capability = compute.detect_capability();
     info!(event = "adapter", "Adapter: {} ({})", capability.adapter_name, capability.backend);
 
