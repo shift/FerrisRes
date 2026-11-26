@@ -1,0 +1,15 @@
+{
+  "id": "sectionme/ferrisres-tool-traces",
+  "title": "FerrisRes tool traces",
+  "code_file": "tool_traces.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "sectionme/ferrisres-lab-tools"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}
