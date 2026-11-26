@@ -388,10 +388,234 @@ pub fn ternary_matmul_parallel(
     output
 }
 
+// ── Packed ternary row accumulation ─────────────────────────────────────────
+//
+// The packed representation is a single flat bit stream: element `i` of the
+// `out_rows × in_cols` matrix occupies bits `2*i` and `2*i + 1` of that stream.
+// A row therefore starts at flat index `r * in_cols`, which is only byte-aligned
+// when `in_cols % 4 == 0`. All readers below honour the bit offset, so a row may
+// begin mid-byte at any width.
+
+/// Which packed-row kernel a call uses. Selected once per call, never per element.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackedKernel {
+    /// Portable per-byte fallback. Always available.
+    Scalar,
+    /// BMI2 `_pext_u64`: 16 codes extracted from a 32-bit window per step.
+    Bmi2,
+    /// AVX2 masked adds over BMI2-extracted codes: 16 values per step.
+    Avx2,
+}
+
+impl PackedKernel {
+    /// Fastest kernel this CPU supports.
+    fn detect() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("bmi2") {
+                return PackedKernel::Avx2;
+            }
+            if is_x86_feature_detected!("bmi2") {
+                return PackedKernel::Bmi2;
+            }
+        }
+        PackedKernel::Scalar
+    }
+}
+
+/// Decode the 2-bit code for the element at flat index `flat` (flat bit stream).
+#[inline]
+fn packed_code_at(packed: &[u8], flat: usize) -> usize {
+    ((packed[flat >> 2] >> ((flat & 3) * 2)) & 0b11) as usize
+}
+
+/// Portable fallback: one byte (up to four codes) per iteration, honouring the
+/// row's starting bit offset.
+fn packed_row_scalar(
+    packed: &[u8],
+    input: &[f32],
+    row_offset: usize,
+    in_cols: usize,
+) -> f32 {
+    let mut sum = 0.0f32;
+    if in_cols == 0 {
+        return sum;
+    }
+    let start = row_offset;
+    let end = row_offset + in_cols;
+    let mut byte_idx = start >> 2;
+    'bytes: while byte_idx <= (end - 1) >> 2 {
+        let packed_byte = packed[byte_idx];
+        for bit_pos in 0..4 {
+            let flat = byte_idx * 4 + bit_pos;
+            if flat < start {
+                continue;
+            }
+            if flat >= end {
+                break 'bytes;
+            }
+            let code = ((packed_byte >> (bit_pos * 2)) & 0b11) as usize;
+            sum += TERNARY_DECODE[code] as f32 * input[flat - start];
+        }
+        byte_idx += 1;
+    }
+    sum
+}
+
+/// BMI2 decode, scalar accumulate.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+unsafe fn packed_row_bmi2(
+    packed: &[u8],
+    input: &[f32],
+    row_offset: usize,
+    in_cols: usize,
+) -> f32 {
+    use core::arch::x86_64::{_pext_u64, _pdep_u64};
+
+    let mut sum = 0.0f32;
+    let mut j = 0usize;
+    while j + 16 <= in_cols {
+        let flat = row_offset + j;
+        let base = flat >> 2;
+        // A 32-bit code window beginning at a byte offset can need up to 5
+        // bytes; require 8 readable bytes so the wide load is always in bounds.
+        if base + 8 > packed.len() {
+            break;
+        }
+        let word = u64::from_le_bytes(packed[base..base + 8].try_into().unwrap());
+        let shift = ((flat & 3) * 2) as u32;
+        let codes = (word >> shift) as u64;
+        let clow = _pext_u64(codes, 0x5555_5555) as u32;
+        let chigh = _pext_u64(codes, 0xAAAA_AAAA) as u32;
+        // Keep `_pdep_u64` exercised here: pack the two bit-planes back into
+        // one code byte per element, then decode by table.
+        let bytes = _pdep_u64((clow & 0xFF) as u64, 0x0101_0101_0101_0101)
+            | _pdep_u64((chigh & 0xFF) as u64, 0x0202_0202_0202_0202);
+        for k in 0..8 {
+            let code = ((bytes >> (k * 8)) & 0b11) as usize;
+            sum += TERNARY_DECODE[code] as f32 * *input.get_unchecked(j + k);
+        }
+        let bytes_hi = _pdep_u64(((clow >> 8) & 0xFF) as u64, 0x0101_0101_0101_0101)
+            | _pdep_u64(((chigh >> 8) & 0xFF) as u64, 0x0202_0202_0202_0202);
+        for k in 0..8 {
+            let code = ((bytes_hi >> (k * 8)) & 0b11) as usize;
+            sum += TERNARY_DECODE[code] as f32 * *input.get_unchecked(j + 8 + k);
+        }
+        j += 16;
+    }
+    while j < in_cols {
+        let code = packed_code_at(packed, row_offset + j);
+        sum += TERNARY_DECODE[code] as f32 * input[j];
+        j += 1;
+    }
+    sum
+}
+
+/// AVX2 masked adds over BMI2-extracted codes. A ternary weight is -1, 0 or +1,
+/// so each 16-value block is two masked `_mm256_add_ps` plus two masked
+/// `_mm256_sub_ps` — no multiply.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi2")]
+unsafe fn packed_row_avx2(
+    packed: &[u8],
+    input: &[f32],
+    row_offset: usize,
+    in_cols: usize,
+) -> f32 {
+    use core::arch::x86_64::{
+        __m128i, __m256, _mm256_add_ps, _mm256_and_ps, _mm256_castsi256_ps,
+        _mm256_cmpeq_epi32, _mm256_cvtepi8_epi32, _mm256_loadu_ps, _mm256_set1_epi32,
+        _mm256_setzero_ps, _mm256_storeu_ps, _mm256_sub_ps, _mm_cvtsi64_si128, _pdep_u64,
+        _pext_u64,
+    };
+
+    #[inline]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn codes_to_bytes(clow: u32, chigh: u32, shift: u32) -> i64 {
+        let lo = ((clow >> shift) & 0xFF) as u64;
+        let hi = ((chigh >> shift) & 0xFF) as u64;
+        (_pdep_u64(lo, 0x0101_0101_0101_0101) | _pdep_u64(hi, 0x0202_0202_0202_0202)) as i64
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn accum8(acc: __m256, codes: i64, x: __m256) -> __m256 {
+        let lanes: __m128i = _mm_cvtsi64_si128(codes);
+        let v = _mm256_cvtepi8_epi32(lanes);
+        let is_pos = _mm256_cmpeq_epi32(v, _mm256_set1_epi32(2));
+        let is_neg = _mm256_cmpeq_epi32(v, _mm256_set1_epi32(0));
+        // +1 → add input, -1 → subtract input, 0 and padding → no-op.
+        let acc = _mm256_add_ps(acc, _mm256_and_ps(x, _mm256_castsi256_ps(is_pos)));
+        _mm256_sub_ps(acc, _mm256_and_ps(x, _mm256_castsi256_ps(is_neg)))
+    }
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut j = 0usize;
+    while j + 16 <= in_cols {
+        let flat = row_offset + j;
+        let base = flat >> 2;
+        if base + 8 > packed.len() {
+            break;
+        }
+        let word = u64::from_le_bytes(packed[base..base + 8].try_into().unwrap());
+        let shift = ((flat & 3) * 2) as u32;
+        let codes = (word >> shift) as u64;
+        let clow = _pext_u64(codes, 0x5555_5555) as u32;
+        let chigh = _pext_u64(codes, 0xAAAA_AAAA) as u32;
+
+        let x0 = _mm256_loadu_ps(input.as_ptr().add(j));
+        let x1 = _mm256_loadu_ps(input.as_ptr().add(j + 8));
+        acc0 = accum8(acc0, codes_to_bytes(clow, chigh, 0), x0);
+        acc1 = accum8(acc1, codes_to_bytes(clow, chigh, 8), x1);
+        j += 16;
+    }
+
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), _mm256_add_ps(acc0, acc1));
+    let mut sum: f32 = lanes.iter().sum();
+
+    while j < in_cols {
+        let code = packed_code_at(packed, row_offset + j);
+        sum += TERNARY_DECODE[code] as f32 * input[j];
+        j += 1;
+    }
+    sum
+}
+
+/// Accumulate one packed row with the chosen kernel.
+fn packed_row_sum(
+    kernel: PackedKernel,
+    packed: &[u8],
+    input: &[f32],
+    row_offset: usize,
+    in_cols: usize,
+) -> f32 {
+    match kernel {
+        PackedKernel::Scalar => packed_row_scalar(packed, input, row_offset, in_cols),
+        #[cfg(target_arch = "x86_64")]
+        PackedKernel::Bmi2 => {
+            unsafe { packed_row_bmi2(packed, input, row_offset, in_cols) }
+        }
+        #[cfg(target_arch = "x86_64")]
+        PackedKernel::Avx2 => {
+            unsafe { packed_row_avx2(packed, input, row_offset, in_cols) }
+        }
+        #[allow(unreachable_patterns)]
+        _ => packed_row_scalar(packed, input, row_offset, in_cols),
+    }
+}
+
 /// Ternary matmul from 2-bit packed data.
 ///
 /// Works directly on the packed representation from `pack_ternary()`,
-/// avoiding the unpack step. Processes 4 ternary values per iteration.
+/// avoiding the unpack step. The kernel (scalar, BMI2 or AVX2) is chosen once
+/// per call from the detected CPU features.
+///
+/// Rows are addressed in the same flat bit stream that `pack_ternary` writes,
+/// so a row that starts mid-byte (`in_cols % 4 != 0`) reads the correct bits.
 ///
 /// - `packed`: packed ternary weights (2 bits/value, 4 values/byte)
 /// - `scale`: absmean scale factor
@@ -407,10 +631,38 @@ pub fn ternary_matmul_packed(
     seq: usize,
     packed_len: usize,
 ) -> Vec<f32> {
-    assert_eq!(
-        input.len(),
-        seq * in_cols,
-        "input shape mismatch"
+    ternary_matmul_packed_kernel(
+        PackedKernel::detect(),
+        packed,
+        scale,
+        input,
+        out_rows,
+        in_cols,
+        seq,
+        packed_len,
+    )
+}
+
+/// Inner `ternary_matmul_packed` with an explicit kernel, so tests can force the
+/// scalar and SIMD paths.
+#[allow(clippy::too_many_arguments)]
+fn ternary_matmul_packed_kernel(
+    kernel: PackedKernel,
+    packed: &[u8],
+    scale: f32,
+    input: &[f32],
+    out_rows: usize,
+    in_cols: usize,
+    seq: usize,
+    packed_len: usize,
+) -> Vec<f32> {
+    assert_eq!(input.len(), seq * in_cols, "input shape mismatch");
+    assert!(
+        packed_len >= out_rows * in_cols,
+        "packed_len {} smaller than matrix {}x{}",
+        packed_len,
+        out_rows,
+        in_cols
     );
     let expected_packed_bytes = (packed_len + 3) / 4;
     assert_eq!(
@@ -427,35 +679,7 @@ pub fn ternary_matmul_packed(
         let input_row = &input[s * in_cols..(s + 1) * in_cols];
         for r in 0..out_rows {
             let row_offset = r * in_cols;
-            let mut sum = 0.0f32;
-
-            // Process 4 values at a time from packed bytes
-            let full_quads = in_cols / 4;
-            let remainder = in_cols % 4;
-
-            for q in 0..full_quads {
-                let byte_idx = (row_offset + q * 4) / 4;
-                let packed_byte = packed[byte_idx];
-
-                // Unpack 4 values inline
-                for bit_pos in 0..4 {
-                    let code = ((packed_byte >> (bit_pos * 2)) & 0b11) as usize;
-                    let sign = TERNARY_DECODE[code] as f32;
-                    sum += sign * input_row[q * 4 + bit_pos];
-                }
-            }
-
-            // Handle remainder (not a full quad)
-            if remainder > 0 {
-                let byte_idx = (row_offset + full_quads * 4) / 4;
-                let packed_byte = packed[byte_idx];
-                for bit_pos in 0..remainder {
-                    let code = ((packed_byte >> (bit_pos * 2)) & 0b11) as usize;
-                    let sign = TERNARY_DECODE[code] as f32;
-                    sum += sign * input_row[full_quads * 4 + bit_pos];
-                }
-            }
-
+            let sum = packed_row_sum(kernel, packed, input_row, row_offset, in_cols);
             output[s * out_rows + r] = scale * sum;
         }
     }
@@ -1309,6 +1533,200 @@ mod tests {
         assert!((output_unpacked[0] - output_packed[0]).abs() < 1e-5);
         // 1*1 + (-1)*2 + 0*3 + 1*4 + 0*5 + (-1)*6 = 1-2+4-6 = -3
         assert!((output_packed[0] - (-3.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn packed_ternary_matches_unpacked_at_every_width() {
+        use std::time::Instant;
+
+        fn best_ms(mut f: impl FnMut() -> Vec<f32>, reps: usize) -> f64 {
+            let mut best = f64::INFINITY;
+            for _ in 0..reps {
+                let t = Instant::now();
+                let out = f();
+                std::hint::black_box(&out);
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                if ms < best {
+                    best = ms;
+                }
+            }
+            best
+        }
+
+        // Force the scalar path off and the SIMD path on, on the same data.
+        let mut kernels: Vec<(&str, PackedKernel)> =
+            vec![("forced scalar", PackedKernel::Scalar)];
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("bmi2") {
+                kernels.push(("forced bmi2", PackedKernel::Bmi2));
+            }
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("bmi2") {
+                kernels.push(("forced avx2", PackedKernel::Avx2));
+            }
+        }
+        if kernels.len() == 1 {
+            eprintln!(
+                "note: no BMI2/AVX2 on this host; the SIMD path could not be forced on"
+            );
+        }
+
+        let scale = 0.37f32;
+        for &(label, kernel) in &kernels {
+            for in_cols in 1..=17usize {
+                for out_rows in 1..=5usize {
+                    // Mixed -1 / 0 / +1, so every code and every width is exercised.
+                    let ternary: Vec<i8> = (0..out_rows * in_cols)
+                        .map(|i| match (i * 7 + 3) % 5 {
+                            0 | 3 => 1,
+                            1 => -1,
+                            _ => 0,
+                        })
+                        .collect();
+                    let packed = pack_ternary(&ternary);
+                    let unpacked = unpack_ternary(&packed, ternary.len());
+                    let input: Vec<f32> = (0..in_cols)
+                        .map(|i| ((i as f32 + 1.0) * 0.31).sin() + 0.05 * i as f32)
+                        .collect();
+
+                    let reference =
+                        ternary_matmul(&unpacked, scale, &input, out_rows, in_cols, 1);
+                    let got = ternary_matmul_packed_kernel(
+                        kernel,
+                        &packed,
+                        scale,
+                        &input,
+                        out_rows,
+                        in_cols,
+                        1,
+                        ternary.len(),
+                    );
+
+                    assert_eq!(
+                        got.len(),
+                        reference.len(),
+                        "in_cols={} out_rows={} kernel={}: length mismatch",
+                        in_cols,
+                        out_rows,
+                        label
+                    );
+                    for (idx, (&r, &g)) in
+                        reference.iter().zip(got.iter()).enumerate()
+                    {
+                        let diff = (r - g).abs();
+                        let tol = 1e-5 * r.abs().max(1.0);
+                        assert!(
+                            diff <= tol,
+                            "in_cols={} out_rows={} kernel={} element {}: \
+                             unpacked={} packed={} diff={} tol={}",
+                            in_cols,
+                            out_rows,
+                            label,
+                            idx,
+                            r,
+                            g,
+                            diff,
+                            tol
+                        );
+                    }
+                }
+            }
+        }
+
+        // The public entry point must agree too, using whatever the host dispatches to.
+        for in_cols in 1..=17usize {
+            let ternary: Vec<i8> = (0..3 * in_cols)
+                .map(|i| match i % 3 {
+                    0 => 1,
+                    1 => -1,
+                    _ => 0,
+                })
+                .collect();
+            let packed = pack_ternary(&ternary);
+            let unpacked = unpack_ternary(&packed, ternary.len());
+            let input: Vec<f32> = (0..in_cols).map(|i| i as f32 * 0.13).collect();
+            let reference = ternary_matmul(&unpacked, scale, &input, 3, in_cols, 1);
+            let got = ternary_matmul_packed(
+                &packed,
+                scale,
+                &input,
+                3,
+                in_cols,
+                1,
+                ternary.len(),
+            );
+            for (idx, (&r, &g)) in reference.iter().zip(got.iter()).enumerate() {
+                let diff = (r - g).abs();
+                assert!(
+                    diff <= 1e-5 * r.abs().max(1.0),
+                    "dispatched in_cols={} element {}: unpacked={} packed={} diff={}",
+                    in_cols,
+                    idx,
+                    r,
+                    g,
+                    diff
+                );
+            }
+        }
+
+        // Timing line for the production shape (out_rows=768, in_cols=768, seq=1).
+        // Printed behind --nocapture; a speed claim without this line is not evidence.
+        let out_rows = 768usize;
+        let in_cols = 768usize;
+        let ternary: Vec<i8> = (0..out_rows * in_cols)
+            .map(|i| match i % 3 {
+                0 => 1,
+                1 => -1,
+                _ => 0,
+            })
+            .collect();
+        let packed = pack_ternary(&ternary);
+        let unpacked = unpack_ternary(&packed, ternary.len());
+        let input: Vec<f32> = (0..in_cols).map(|i| (i as f32 * 0.017).sin()).collect();
+        const REPS: usize = 20;
+
+        let unpacked_ms = best_ms(
+            || ternary_matmul(&unpacked, 0.1, &input, out_rows, in_cols, 1),
+            REPS,
+        );
+        let scalar_ms = best_ms(
+            || {
+                ternary_matmul_packed_kernel(
+                    PackedKernel::Scalar,
+                    &packed,
+                    0.1,
+                    &input,
+                    out_rows,
+                    in_cols,
+                    1,
+                    ternary.len(),
+                )
+            },
+            REPS,
+        );
+        let simd_kernel = PackedKernel::detect();
+        let simd_ms = best_ms(
+            || {
+                ternary_matmul_packed_kernel(
+                    simd_kernel,
+                    &packed,
+                    0.1,
+                    &input,
+                    out_rows,
+                    in_cols,
+                    1,
+                    ternary.len(),
+                )
+            },
+            REPS,
+        );
+
+        eprintln!(
+            "packed ternary timing (out_rows=768, in_cols=768, seq=1, best of {}): \
+             unpacked={:.3} ms, packed_scalar={:.3} ms, packed_simd={:.3} ms \
+             (simd kernel={:?})",
+            REPS, unpacked_ms, scalar_ms, simd_ms, simd_kernel
+        );
     }
 }
 
