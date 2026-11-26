@@ -33,7 +33,14 @@ def read_u16(path):
 
 
 def byte_decode(ids):
-    return bytes(i & 0xFF for i in ids).decode("utf-8", errors="strict")
+    """SimpleTokenizer: byte b is id b+3; ids 0-2 are <unk>/<eos>/<pad>."""
+    out = bytearray()
+    for i in ids:
+        if 3 <= i <= 258:
+            out.append(i - 3)
+        elif i == 1:
+            out.extend(b"\n")
+    return bytes(out).decode("utf-8", errors="replace")
 
 
 def main():
