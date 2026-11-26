@@ -1,9 +1,10 @@
 # Multi-GPU
 
-Status: **phase 1 implemented at `4d6141e`; phase 2 open.** `ferrisres devices`
-lists adapters and `WGPU_ADAPTER_INDEX` selects one, so two processes can reach
-two cards. The launcher, rank plumbing, sharding, barrier and per-rank evidence
-are still missing.
+Status: **coordination layer implemented at `68e1cc0`; the real two-GPU gate and
+the training wiring are open.** Phase 1 (`4d6141e`) made two cards reachable;
+this adds the launcher, deterministic sharding, init identity, `/dev/shm`
+averaging, the timeout barrier, per-rank evidence and the resume rule. None of
+it has run on two physical GPUs, and the training loop does not call it yet.
 
 ## Topology
 
@@ -25,6 +26,27 @@ doubles throughput per quota hour.
 
 A 0.6B teacher + student fits one card with room for the optimizer, so neither
 model needs to be split. The second card exists to process a second shard.
+
+## What landed at `68e1cc0`
+
+| piece | behaviour | evidence |
+|---|---|---|
+| `ShardPlan` | step `k` owns one id from `k*W..k*W+W-1`; the seed rotates the slot per step | union covers every batch once, ranks disjoint, reproducible, resume at step 37 equals the uninterrupted tail |
+| init identity | `(seed, FNV-1a parameter hash)`; a mismatch names the rank and field | same seed/hash, changed seed, changed weights, zero world |
+| weight exchange | 40-byte header (`FRSWGT01`), temp + atomic rename, rank-0 average, every rank verifies count and checksum | 4-rank mean within 1e-6, missing rank times out naming it, corrupt checksum refused |
+| barrier | poll every 2 ms against a deadline (default 60 s) | `BarrierTimeout { step, missing ranks }`; cannot hang |
+| launcher | `ferrisres workers --world-size N -- <cmd>`; refuses before spawn when adapters < N | world 3 with 2 adapters refused; two fake adapters spawn two children with the env/flags; one failure kills the group in <5 s |
+| resume rule | `RunParallelism { world_size, rank }` + `check_resume` | a changed world size is refused, naming both |
+
+Verification: `cargo test -p ferrisres multi_gpu` → 32 passed, 0 failed, 1
+ignored; `cargo test -p ferrisres --lib` → 1667 passed, 0 failed, 2 ignored. The
+ignored host test was not run (no Vulkan ICD in that shell).
+
+**Still open:** a real world-size-2 run on two T4s, the per-rank tokens/s from
+hardware, `--rank`/`--world-size` parsing in `train` and the averaging call in
+the training loop, and a PCI bus id in the phase-1 adapter listing — two T4s
+share the name `NVIDIA T4`, so "two distinct names" is only checkable once the
+bus id is in the evidence.
 
 ## Requirements
 
