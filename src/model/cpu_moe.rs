@@ -55,6 +55,18 @@ impl TernaryExpert {
         )
     }
 
+    /// Batch projection: parallel over rows for `seq > 1`, serial for one row.
+    ///
+    /// The per-row accumulation is unchanged, so the result is bit-identical to
+    /// [`Self::forward`].
+    pub fn forward_batch(&self, input: &[f32], seq: usize) -> Vec<f32> {
+        if seq > 1 {
+            self.forward_parallel(input, seq)
+        } else {
+            self.forward(input, seq)
+        }
+    }
+
     /// Single-token forward.
     pub fn forward_single(&self, input: &[f32]) -> Vec<f32> {
         ternary_matmul(&self.values, self.scale, input, self.rows, self.cols, 1)
@@ -140,6 +152,97 @@ impl CpuMoELayer {
     /// Fastest path for decode (seq=1).
     pub fn forward_packed_parallel(&self, input: &[f32], seq: usize) -> Vec<f32> {
         self.forward_packed_parallel_impl(input, seq, None, 0, None)
+    }
+
+    /// Prefill forward: batch the tokens that chose each expert and run the
+    /// parallel expert kernel on the batch.
+    ///
+    /// The serial path runs one expert matmul per (token, top-k slot); at
+    /// prefill lengths those are hundreds of independent one-row matmuls, so no
+    /// thread ever has more than one row to work on. This groups the rows of a
+    /// top-k slot by expert, which lets the existing rayon kernel split a real
+    /// token batch across threads.
+    ///
+    /// The arithmetic is unchanged: each token still accumulates its top-k
+    /// contributions in top-k order, and each row of a batched ternary matmul
+    /// uses the same accumulation loop as the single-row kernel. `seq <= 1` is
+    /// routed to the serial path, so decode is untouched.
+    ///
+    /// LoRA and routing collection need the per-token path; the caller must not
+    /// use this method when either is active.
+    pub fn forward_prefill(&self, input: &[f32], seq: usize) -> Vec<f32> {
+        if seq <= 1 {
+            return self.forward(input, seq);
+        }
+
+        let h = self.hidden_dim;
+        let ne = self.num_experts;
+        let tk = self.top_k;
+
+        let gate_logits = matmul(input, &self.gate_weights, seq, h, ne);
+        let (selected_experts, expert_weights, _gate_probs) =
+            self.top_k_select_with_probs(&gate_logits, seq);
+
+        let mut output = vec![0.0f32; seq * h];
+        let mut groups: Vec<Vec<usize>> = vec![Vec::new(); ne];
+
+        // One top-k slot at a time, so every token receives its contributions
+        // in the same order as the serial loop.
+        for k_idx in 0..tk {
+            for toks in groups.iter_mut() {
+                toks.clear();
+            }
+            for t in 0..seq {
+                if expert_weights[t * tk + k_idx].abs() < 1e-8 {
+                    continue;
+                }
+                groups[selected_experts[t * tk + k_idx]].push(t);
+            }
+
+            for (expert_idx, toks) in groups.iter().enumerate() {
+                if toks.is_empty() {
+                    continue;
+                }
+                let batch: Vec<f32> = toks
+                    .iter()
+                    .flat_map(|&t| input[t * h..(t + 1) * h].iter().copied())
+                    .collect();
+                let expert_out = self.expert_forward_batch(expert_idx, &batch, toks.len());
+
+                for (row, &t) in toks.iter().enumerate() {
+                    let weight = expert_weights[t * tk + k_idx];
+                    let src = row * h;
+                    let dst = t * h;
+                    for i in 0..h {
+                        output[dst + i] += weight * expert_out[src + i];
+                    }
+                }
+            }
+        }
+
+        output
+    }
+
+    /// Expert forward for a token batch: the three projections on the parallel
+    /// kernel, with the same activation as the serial expert path.
+    fn expert_forward_batch(&self, expert_idx: usize, input: &[f32], rows: usize) -> Vec<f32> {
+        let id = self.intermediate_dim;
+
+        let gated = self.expert_gate[expert_idx].forward_batch(input, rows);
+        let gated: Vec<f32> = if self.use_gelu {
+            gated.iter().map(|&x| crate::model::gemma_mapper::gelu_tanh(x)).collect()
+        } else {
+            gated.iter().map(|&x| x / (1.0 + (-x).exp())).collect()
+        };
+
+        let upped = self.expert_up[expert_idx].forward_batch(input, rows);
+
+        let mut combined = vec![0.0f32; rows * id];
+        for i in 0..combined.len() {
+            combined[i] = gated[i] * upped[i];
+        }
+
+        self.expert_down[expert_idx].forward_batch(&combined, rows)
     }
 
     /// Forward pass that also collects routing data for loss/gradient computation.
@@ -504,6 +607,99 @@ impl CpuMoELayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deterministic SplitMix64 so a failing case is reproducible without a
+    /// fixture.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn unit(&mut self) -> f32 {
+            (self.next_u64() >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        }
+
+        fn ternary(&mut self) -> i8 {
+            ((self.next_u64() >> 33) % 3) as i8 - 1
+        }
+    }
+
+    fn random_expert(rng: &mut Rng, rows: usize, cols: usize) -> TernaryExpert {
+        let values: Vec<i8> = (0..rows * cols).map(|_| rng.ternary()).collect();
+        TernaryExpert { packed: pack_ternary(&values), values, scale: 0.02, rows, cols }
+    }
+
+    /// Random router and distinct random experts, so both the top-k selection
+    /// and the per-expert weight matter.
+    fn random_moe(
+        rng: &mut Rng,
+        hidden_dim: usize,
+        intermediate_dim: usize,
+        num_experts: usize,
+        top_k: usize,
+    ) -> CpuMoELayer {
+        let mut moe = CpuMoELayer::new(hidden_dim, intermediate_dim, num_experts, top_k);
+        moe.use_gelu = true;
+        for w in moe.gate_weights.iter_mut() {
+            *w = rng.unit() * 0.5;
+        }
+        for e in 0..num_experts {
+            moe.expert_gate[e] = random_expert(rng, intermediate_dim, hidden_dim);
+            moe.expert_up[e] = random_expert(rng, intermediate_dim, hidden_dim);
+            moe.expert_down[e] = random_expert(rng, hidden_dim, intermediate_dim);
+        }
+        moe
+    }
+
+    /// The batched prefill path must reproduce the serial path exactly: same
+    /// top-k choice, same expert order, same per-row accumulation.
+    #[test]
+    fn moe_prefill_matches_serial() {
+        let (hd, id, ne, tk, seq) = (16usize, 24usize, 4usize, 2usize, 12usize);
+        let mut rng = Rng(0xE0E0_0003);
+        let moe = random_moe(&mut rng, hd, id, ne, tk);
+        let input: Vec<f32> = (0..seq * hd).map(|_| rng.unit()).collect();
+
+        // The batch must exercise more than one expert at more than one slot,
+        // otherwise the grouping would be a no-op.
+        let logits = matmul(&input, &moe.gate_weights, seq, hd, ne);
+        let (selected, weights, _) = moe.top_k_select_with_probs(&logits, seq);
+        let mut pairs: Vec<Vec<usize>> =
+            (0..seq).map(|t| selected[t * tk..(t + 1) * tk].to_vec()).collect();
+        pairs.sort();
+        pairs.dedup();
+        assert!(pairs.len() > 1, "router picked one expert pair for every token: {pairs:?}");
+        assert!(
+            weights.iter().skip(1).step_by(tk).any(|&w| w > 0.05),
+            "top-k weights are degenerate, the second slot would not matter"
+        );
+
+        let serial = moe.forward(&input, seq);
+        let batched = moe.forward_prefill(&input, seq);
+        assert_eq!(serial.len(), batched.len());
+        let mut worst = 0.0f32;
+        for (&a, &b) in serial.iter().zip(&batched) {
+            worst = worst.max((a - b).abs());
+        }
+        assert!(serial.iter().any(|x| x.abs() > 1e-6), "test produced zero output");
+        assert_eq!(worst, 0.0, "batched MoE differs from serial by {worst}");
+    }
+
+    /// One top-k slot: the result must be exactly the weight times the expert
+    /// output, and a single-token prefill must go through the serial path.
+    #[test]
+    fn moe_prefill_single_token_is_serial() {
+        let mut rng = Rng(0xE0E0_0004);
+        let moe = random_moe(&mut rng, 8, 16, 2, 1);
+        let input: Vec<f32> = (0..8).map(|_| rng.unit()).collect();
+        assert_eq!(moe.forward(&input, 1), moe.forward_prefill(&input, 1));
+    }
 
     #[test]
     fn test_cpu_moe_basic() {

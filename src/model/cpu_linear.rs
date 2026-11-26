@@ -111,6 +111,21 @@ impl CpuLinear {
         output
     }
 
+    /// Batch/prefill projection: parallel over rows when there is more than one
+    /// row, serial otherwise.
+    ///
+    /// Both kernels perform the same per-row accumulation, so the result is
+    /// bit-identical to [`Self::forward`]; only the schedule differs. This is
+    /// the dispatch prefill should use — `seq == 1` (decode) is left on the
+    /// serial path.
+    pub fn forward_batch(&self, input: &[f32], seq: usize) -> Vec<f32> {
+        if seq > 1 {
+            self.forward_parallel(input, seq)
+        } else {
+            self.forward(input, seq)
+        }
+    }
+
     /// Packed parallel forward — 4× less memory bandwidth than unpacked.
     /// Fastest path for decode (seq=1) on memory-bound systems.
     pub fn forward_packed_parallel(&self, input: &[f32], seq: usize) -> Vec<f32> {
