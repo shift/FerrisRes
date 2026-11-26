@@ -76,7 +76,7 @@ last release — so retrieval, not recall, is the target.
 | source | licence | target | notes |
 |---|---|---:|---|
 | Glaive FC, xLAM, BFCL train | per card | 60M | real tool calls |
-| agentic-loop traces (redacted, reviewed) | internal | 40M | derived, never raw |
+| agentic-loop traces (redacted, reviewed) | internal | 40M | derived, never raw; self-generated rows in `self-generated-data.md` |
 | **soul corpus** — 30 authored soul templates, 500+ synthetic souls across the eight dimensions, 5–10 tasks per soul, one violation pair per adhering answer | CC0 | **20M** | no real user soul; unseen-soul eval matrix held out |
 | **child-safe corpus** — authored, parent-reviewed, plus a red-team set | CC0 | **5M** | no real minor data |
 | math/reason (OpenR1, Numina subset) | Apache-2.0 | 60M | |

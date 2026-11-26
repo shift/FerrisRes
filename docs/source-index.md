@@ -98,6 +98,9 @@ Nix training data teaches code, not the AST edit path.
 | `tool-glaive` | Glaive function calling v2 | Apache-2.0 | pin | `hf:glaiveai/...` | 20M | strip synthetic dialogues that invent tools | planned |
 | `tool-registry` | MCP catalogue + OpenAPI specs | per server/repo | pin | mixed | 5M | ids and schemas only; no secrets in examples | planned |
 | `tool-traces` | reviewed run records | internal | redacted | ours | 40M | derived, never raw; consent recorded | planned |
+| `selfgen-trajectories` | harness-generated tool trajectories, generator + verifier ids | ours / per generator | pin | ours | 20M | `verified: true` only; dedupe against eval; redacted | planned |
+| `selfgen-workflows` | generated `.workflow` files that parse, validate and dry-run | ours | pin | ours | 2M | generate → verify; a failed parse is a negative example, not a row | planned |
+| `selfgen-docqa` | question → retrieval → cited answer | ours | pin | ours | 5M | the citation must resolve; version stamped | planned |
 | `harness-workflows` | `dataset workflows` (63 shipped, generated) | ours | pin | ours | 2M | generate -> validate -> keep | planned |
 | `harness-evidence` | revision-bound evidence records | ours | pin | ours | 5M | counts and verdict, raw by reference | planned |
 

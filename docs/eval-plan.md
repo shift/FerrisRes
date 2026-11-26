@@ -327,6 +327,21 @@ The principal block is retrieved; the authority is enforced
 | prefix-cache hit across principals | **0** |
 | principal inferred from text without a block | **0** |
 
+## 24. Self-generated data
+
+The harness can generate its own trajectories; the verifier is the filter
+(`self-generated-data.md`).
+
+| metric | gate |
+|---|---|
+| generated row without a verifier id or with `verified: false` trained on | **0** |
+| overlap with a held-out set | **0** |
+| held-out split by row rather than task family | refused |
+| generator outside the allowlist | refused |
+| yield per family | reported; low yield is a generator bug |
+| eval delta of the source | must improve, or the source is cut |
+| reviewed sample per 1k rows | recorded |
+
 ## Contamination
 
 Hash every evaluation set (GSM8K, MATH, SWE-bench, BFCL test, MT-Bench, our own
