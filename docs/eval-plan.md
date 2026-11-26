@@ -374,6 +374,9 @@ The model knows the map; the endpoint is retrieved; the fetch is policy-gated
 | living vs dated standard confused | **0** |
 | invented clause/section in a standard | **0** |
 | paywalled standard reproduced | **0** |
+| EN called harmonised without an OJ citation | **0** |
+| withdrawn OJ citation presented as current | **0** |
+| national adoption / EN / act confused | **0** |
 
 ## Contamination
 

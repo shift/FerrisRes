@@ -18,6 +18,11 @@ Training hours assume 2B tokens and 20 TFLOP/s effective on a T4; Kaggle's
 30 h/week quota therefore means ~0.6, 3.3 and 5.6 weeks for Small, Base and
 Large.
 
+## Parameters against data
+
+The token targets, the subject shares and the tokens-per-parameter per tier (and
+the 1.56B-vs-2B gap) are in `corpus-distribution.md`.
+
 ## Tested hardware
 
 What is verified and what is only designed is in `hardware-matrix.md`; a tier

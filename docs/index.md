@@ -64,6 +64,7 @@ Start here. The current state is `status-2026-11.md`; the decisions are
 | `architecture.md` | the engine's structure |
 | `cli-surface.md` | commands and flags by branch; release vs planned |
 | `corpus-builder.md` | sources → licensed, deduped, tokenised shards |
+| `corpus-distribution.md` | parameters against data subjects; tokens per parameter |
 | `corpus-manifest.md` | token targets per source family |
 | `data-plan.md` | data mix, teacher, distillation plan |
 | `data-retention.md` | data classes, deletion, hosted-provider rules |

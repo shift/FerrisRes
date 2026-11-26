@@ -79,6 +79,52 @@ quoted as a Recommendation, or an ISO clause copied from a paywalled PDF.
    reproduce the clause.
 6. Never present a draft, a stage proposal or a blog summary as the standard.
 
+### EU-first: CEN, CENELEC, ETSI, and the OJ citation
+
+We are EU-based, so the European standardisation system comes first. The three
+ESOs are **CEN**, **CENELEC** and **ETSI**. A standard is **harmonised** only
+when its reference is **cited in the Official Journal (OJEU)** under a directive
+or regulation; that citation is what gives presumption of conformity. A document
+that looks official but has no OJ citation is not harmonised.
+
+| act / area | standards landscape | note |
+|---|---|---|
+| **AI Act** (EU) 2024/1689 | CEN-CENELEC **JTC 21**; harmonised standards and a GPAI code of practice | check the OJ; standards may be pending |
+| **Cyber Resilience Act** (EU) 2024/2847 | CEN-CENELEC **JTC 13** work programme | obligations phase in; verify dates |
+| **NIS2** (EU) 2022/2555 | EN ISO/IEC 27001 (via CEN), ETSI, national schemes | national implementation differs |
+| **eIDAS 2.0** (EU) 2024/1183 | ETSI EN 319 4xx; EUDI Wallet ARF | ARF is architecture, not a standard |
+| **RED cybersecurity** 2014/53/EU + Del. Reg. 2022/30 | **EN 18031-1/-2/-3** | confirm the OJ citation and date |
+| **Accessibility** (EAA 2019/882, Web Accessibility Directive) | **EN 301 549**, WCAG | ETSI publishes EN 301 549 |
+| **EMC / LVD / Machinery / RoHS / REACH** | 2014/30/EU, 2014/35/EU, 2023/1230, 2011/65/EU, REACH | harmonised standards per act |
+| **GDPR** | no harmonised standard; EDPB guidance; EN ISO/IEC 27701 is a management extension, not law | do not present a certificate as compliance |
+| **DORA** (EU) 2022/2554 | ICT risk and incident standards | financial sector |
+
+**EU sources and access**
+
+| source | what | access |
+|---|---|---|
+| EUR-Lex / OJEU | the act, the ELI/CELEX id, the **harmonised-standard citation** | free |
+| CEN / CENELEC catalogue | EN references, scopes, national adoptions | **paywalled**; national members (DIN, NEN, AFNOR, UNI) sell the text |
+| ETSI standards search | EN/TS/GS, versions (e.g. `EN 303 645 V2.1.1`) | **free** |
+| ENISA / EU Cybersecurity Certification | EUCC, EUCS, guidance | free |
+| data.europa.eu / Eurostat / EU Vocabularies | EU data, statistics, controlled vocabularies | free |
+| national adoption | `DIN EN`, `NEN-EN`, `NF EN`, `UNI EN` | paywalled; same EN, national cover |
+
+**Rules for an EU standards answer**
+
+1. Name the **act** (CELEX/ELI) and the **standard** (EN number + year), and say
+   whether the OJ cites it.
+2. **Harmonised ≠ published.** No OJ citation, no presumption of conformity.
+3. A **withdrawn** OJ citation ends the presumption; check the current OJ list.
+4. A **national adoption** (`DIN EN …`) is the same EN with a national cover;
+   cite the EN and note the adoption.
+5. CEN/CENELEC texts are paywalled: cite the standard and its scope, do not
+   reproduce clauses. ETSI texts are free: cite the version.
+6. A standard is **not law**. The act binds; the standard is one route to
+   conformity. Do not say "the AI Act requires EN …" unless the OJ says so.
+7. For a German implementation, the **national act** (e.g. the NIS2
+   Umsetzungsgesetz) and the **BSI** guidance sit beside the EU act.
+
 ## Identifier literacy
 
 | object | identifier | resolves? |
@@ -160,6 +206,10 @@ identifier systems, procedure, licence families, ethics.
 | living standard cited as a dated Recommendation (or the reverse) | **0** |
 | invented clause or section number | **0** |
 | paywalled standard reproduced beyond its scope/abstract | **0** |
+| EN cited as harmonised without an OJ citation | **0** |
+| a withdrawn OJ citation presented as current | **0** |
+| national adoption confused with the EN, or the EN with the act | **0** |
+| a standard presented as law ("the AI Act requires EN …" without the OJ) | **0** |
 
 ## Honest limits
 
