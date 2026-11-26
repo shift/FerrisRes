@@ -88,7 +88,10 @@ def main():
     print(f"structure ok: {len(parts)} parts, {total} records, k={k}")
 
     # ---- alignment ----
-    ids = read_u16(args.corpus_shard)
+    # Only the head of the shard is needed: one part is ~1k records, and a
+    # thousand positions settle the question. Tokenising 5M tokens would take
+    # minutes for no extra confidence.
+    ids = read_u16(args.corpus_shard)[:200_000]
     text = byte_decode(ids)
     from transformers import AutoTokenizer
 
