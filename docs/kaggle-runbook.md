@@ -16,15 +16,18 @@ the procedure that keeps a 12-hour session from costing a week.
 
 ## Prerequisites
 
-1. A **tagged release** with the `.deb` that contains the kernel fixes
-   (`fix/immediates-limit` and later). The CI artifact expires in 30 days; a
-   release asset does not.
+1. The **`.deb` from `int/train-deb` @ `51b750a`** (version 0.2.3), which
+   contains `train` and `devices`. Built in ubuntu:22.04, max GLIBC 2.34,
+   sha256 `ff6a35ca…a9283d9`, 5.6 MiB; installs in a clean 22.04 container and
+   exposes `--seq-len`, `--resume` and `devices`. It is **not in git**; upload it
+   as a private Kaggle dataset at `/kaggle/input/ferrisres-deb/`. A tagged
+   release asset replaces it later.
 2. The corpus as a **private Kaggle dataset** (read-only at `/kaggle/input`),
    tokenised to uint16 where possible.
 3. A Kaggle API token stored in **Kaggle secrets**, used to version the
    checkpoint dataset.
-4. A **resumable** training command. `distill` already has `--resume`; `train`
-   does not until `tasks/train-and-export.md` is implemented.
+4. A **resumable** training command. `distill` has `--resume`; `train` has it
+   since `feat/train-cli` (`d81becf`).
 
 ## Credentials
 

@@ -9,7 +9,7 @@ released when it is in a tagged `.deb`. The Rust API reference is separate
 
 | command | state | notes |
 |---|---|---|
-| `ferrisres --version` | release | prints the crate version |
+| `ferrisres --version` | release (since `51b750a`; clap was missing the attribute) | prints the crate version |
 | `ferrisres info` | release | device/module summary |
 | `ferrisres devices [--json]` | `feat/gpu-selection` | adapters, index, limits, software flag |
 | `ferrisres grammars list/fetch` | release | tree-sitter wasm registry |
