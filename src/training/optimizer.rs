@@ -283,6 +283,36 @@ impl AdamOptimizer {
         numel: u32,
     ) -> Result<()> {
         let t = self.timestep.fetch_add(1, Ordering::SeqCst) + 1;
+        self.dispatch_at(encoder, name, param, grad, numel, t)
+    }
+
+    /// One optimizer step over every parameter.
+    ///
+    /// `step()` advances the timestep per *parameter*, so the first parameter
+    /// uses t=1 and the last t=N and their bias corrections differ. The CPU
+    /// reference advances once per step and uses that t for all tensors; a
+    /// parity check of post-step weights needs the same rule here.
+    pub fn step_all(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        items: &[(&str, &GpuBuffer, &GpuBuffer, u32)],
+    ) -> Result<()> {
+        let t = self.timestep.fetch_add(1, Ordering::SeqCst) + 1;
+        for (name, param, grad, numel) in items {
+            self.dispatch_at(encoder, name, param, grad, *numel, t)?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_at(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        name: &str,
+        param: &GpuBuffer,
+        grad: &GpuBuffer,
+        numel: u32,
+        t: u32,
+    ) -> Result<()> {
         let bias_correction_m = 1.0 - self.beta1.powi(t as i32);
         let bias_correction_v = 1.0 - self.beta2.powi(t as i32);
 
@@ -350,6 +380,50 @@ impl AdamOptimizer {
         drop(pass);
 
         Ok(())
+    }
+
+    /// Read one parameter's first and second moments back to the CPU, for the
+    /// existing `FRTRAIN1` checkpoint. Returns `(m, v)`.
+    pub fn read_state(&self, name: &str, numel: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        let m_buf = self.m_buffers.get(name).ok_or_else(|| {
+            FerrisResError::Device(format!("Adam: param '{}' not registered", name))
+        })?;
+        let v_buf = self.v_buffers.get(name).ok_or_else(|| {
+            FerrisResError::Device(format!("Adam: param '{}' not registered", name))
+        })?;
+        let mut m = vec![0u8; numel * std::mem::size_of::<f32>()];
+        let mut v = vec![0u8; numel * std::mem::size_of::<f32>()];
+        m_buf.read(&self.device, &self.queue, &mut m)?;
+        v_buf.read(&self.device, &self.queue, &mut v)?;
+        Ok((
+            bytemuck::cast_slice(&m).to_vec(),
+            bytemuck::cast_slice(&v).to_vec(),
+        ))
+    }
+
+    /// Restore one parameter's moments from a checkpoint.
+    pub fn load_state(&mut self, name: &str, m: &[f32], v: &[f32]) -> Result<()> {
+        let m_buf = self.m_buffers.get_mut(name).ok_or_else(|| {
+            FerrisResError::Device(format!("Adam: param '{}' not registered", name))
+        })?;
+        let v_buf = self.v_buffers.get_mut(name).ok_or_else(|| {
+            FerrisResError::Device(format!("Adam: param '{}' not registered", name))
+        })?;
+        self.queue.write_buffer(m_buf.buffer(), 0, bytemuck::cast_slice(m));
+        self.queue.write_buffer(v_buf.buffer(), 0, bytemuck::cast_slice(v));
+        Ok(())
+    }
+
+    pub fn set_timestep(&self, t: u32) {
+        self.timestep.store(t, Ordering::SeqCst);
+    }
+
+    pub fn set_learning_rate(&mut self, lr: f32) {
+        self.learning_rate = lr;
+    }
+
+    pub fn learning_rate(&self) -> f32 {
+        self.learning_rate
     }
 
     pub fn timestep(&self) -> u32 {

@@ -3,6 +3,7 @@ use wgpu::{Device, Queue};
 use crate::compute::buffer::GpuBuffer;
 use crate::compute::kernels::elementwise::ElementWiseOp;
 use crate::autodiff::graph::{ComputationGraph, NodeId, NodeKind};
+use crate::autodiff::gpu_ops::TrainOps;
 use crate::error::{FerrisResError, Result};
 
 const MATMUL_GRAD_A_WGSL: &str = r#"
@@ -18,7 +19,7 @@ struct Params {
 
 var<immediate> params: Params;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(8, 8)
 fn matmul_grad_a(@builtin(global_invocation_id) gid: vec3<u32>) {
     let row = gid.x;
     let col = gid.y;
@@ -29,7 +30,9 @@ fn matmul_grad_a(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var i: u32 = 0u; i < params.N; i = i + 1u) {
         acc = acc + grad_output[row * params.N + i] * b_transposed[col * params.N + i];
     }
-    grad_a[row * params.K + col] = acc;
+    // Accumulate: an activation can feed several consumers (h_attn feeds Q,
+    // K and V; x feeds the attention residual and the MLP residual).
+    grad_a[row * params.K + col] = grad_a[row * params.K + col] + acc;
 }
 "#;
 
@@ -46,7 +49,7 @@ struct Params {
 
 var<immediate> params: Params;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(8, 8)
 fn matmul_grad_b(@builtin(global_invocation_id) gid: vec3<u32>) {
     let row = gid.x;
     let col = gid.y;
@@ -55,9 +58,12 @@ fn matmul_grad_b(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     var acc: f32 = 0.0;
     for (var i: u32 = 0u; i < params.M; i = i + 1u) {
-        acc = acc + a_transposed[row * params.M + i] * grad_output[i * params.N + col];
+        // `a_transposed` is the raw row-major A [M, K]. The original shader
+        // indexed it as [K, M], so every parameter gradient from a matmul was
+        // wrong until the parity test caught it.
+        acc = acc + a_transposed[i * params.K + row] * grad_output[i * params.N + col];
     }
-    grad_b[row * params.N + col] = acc;
+    grad_b[row * params.N + col] = grad_b[row * params.N + col] + acc;
 }
 "#;
 
@@ -206,6 +212,10 @@ pub struct BackwardPass {
     rmsnorm_grad_layout: wgpu::BindGroupLayout,
     loss_grad_pipeline: wgpu::ComputePipeline,
     loss_grad_layout: wgpu::BindGroupLayout,
+    /// Transformer ops (RoPE, attention, SwiGLU, GQA, norms) added for the GPU
+    /// training loop. Constructing them here keeps one set of pipelines per
+    /// model, and the graph arms below just dispatch.
+    ops: TrainOps,
 }
 
 impl BackwardPass {
@@ -373,7 +383,20 @@ impl BackwardPass {
             entries: &[
                 read_entry.clone(),
                 read_entry_b.clone(),
-                rw_entry.clone(),
+                // `grad_output` is read-only in RMSNORM_GRAD_WGSL; only the
+                // fourth binding (grad_input) is written. Using the shared
+                // read-write entry here fails pipeline validation, which is
+                // why this pipeline had never been created by a test.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
                 rmsnorm_read_c,
             ],
         });
@@ -415,6 +438,8 @@ impl BackwardPass {
 
         tracing::info!(event = "backwardpass_all_gradient_pipelines_created", "BackwardPass: all gradient pipelines created");
 
+        let ops = TrainOps::new(Arc::clone(&device), Arc::clone(&queue));
+
         Self {
             device,
             queue,
@@ -431,6 +456,7 @@ impl BackwardPass {
             rmsnorm_grad_layout,
             loss_grad_pipeline,
             loss_grad_layout,
+            ops,
         }
     }
 
@@ -504,8 +530,10 @@ impl BackwardPass {
                 let (b_buf, _) = Self::node_buf_info(graph, b_id)?;
                 let (b_grad, _) = Self::node_grad_info(graph, b_id)?;
 
-                let wg_x = (*m + 63) / 64;
-                let wg_y = (*k + 63) / 64;
+                // 8x8 workgroup: `gid.y` is the column, so a 1-D 64-thread
+                // group left every column but 0 unwritten.
+                let wg_x = (*m + 7) / 8;
+                let wg_y = (*k + 7) / 8;
 
                 let bg_a = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("MatMul Grad A Bind Group"),
@@ -527,8 +555,8 @@ impl BackwardPass {
                 pass.dispatch_workgroups(wg_x, wg_y, 1);
                 drop(pass);
 
-                let wg_x_b = (*k + 63) / 64;
-                let wg_y_b = (*n + 63) / 64;
+                let wg_x_b = (*k + 7) / 8;
+                let wg_y_b = (*n + 7) / 8;
 
                 let bg_b = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("MatMul Grad B Bind Group"),
@@ -1002,6 +1030,162 @@ impl BackwardPass {
                 tracing::debug!(event = "backward_block_summary_gpu_dispatch_nq", "Backward: block_summary GPU dispatch nq={} hd={} bs={}", nq, hd, bs);
             }
 
+            NodeKind::RmsNormNoScale { rows, dim, eps } => {
+                let input_id = inputs[0];
+                let (dy, dy_size) = Self::node_grad_info(graph, output_id)?;
+                let (x, x_size) = Self::node_buf_info(graph, input_id)?;
+                let (dx, dx_size) = Self::node_grad_info(graph, input_id)?;
+                let dy = GpuBuffer::from_existing(dy, dy_size);
+                let x = GpuBuffer::from_existing(x, x_size);
+                let dx = GpuBuffer::from_existing(dx, dx_size);
+                self.ops.rmsnorm_backward(encoder, &dy, &x, &dx, *rows, *dim, *eps)?;
+            }
+
+            NodeKind::MulBroadcast { rows, cols } => {
+                let a_id = inputs[0];
+                let w_id = inputs[1];
+                let (dout, dout_size) = Self::node_grad_info(graph, output_id)?;
+                let (a, a_size) = Self::node_buf_info(graph, a_id)?;
+                let (w, w_size) = Self::node_buf_info(graph, w_id)?;
+                let (da, da_size) = Self::node_grad_info(graph, a_id)?;
+                let (dw, dw_size) = Self::node_grad_info(graph, w_id)?;
+                self.ops.mul_broadcast_backward(
+                    encoder,
+                    &GpuBuffer::from_existing(dout, dout_size),
+                    &GpuBuffer::from_existing(a, a_size),
+                    &GpuBuffer::from_existing(w, w_size),
+                    &GpuBuffer::from_existing(da, da_size),
+                    &GpuBuffer::from_existing(dw, dw_size),
+                    *rows,
+                    *cols,
+                )?;
+            }
+
+            NodeKind::SiluMul { numel } => {
+                let gate_id = inputs[0];
+                let up_id = inputs[1];
+                let (dout, dout_size) = Self::node_grad_info(graph, output_id)?;
+                let (gate, gate_size) = Self::node_buf_info(graph, gate_id)?;
+                let (up, up_size) = Self::node_buf_info(graph, up_id)?;
+                let (dgate, dgate_size) = Self::node_grad_info(graph, gate_id)?;
+                let (dup, dup_size) = Self::node_grad_info(graph, up_id)?;
+                self.ops.silu_mul_backward(
+                    encoder,
+                    &GpuBuffer::from_existing(gate, gate_size),
+                    &GpuBuffer::from_existing(up, up_size),
+                    &GpuBuffer::from_existing(dout, dout_size),
+                    &GpuBuffer::from_existing(dgate, dgate_size),
+                    &GpuBuffer::from_existing(dup, dup_size),
+                    *numel,
+                )?;
+            }
+
+            NodeKind::Rope { seq, heads, head_dim, theta, offset } => {
+                let input_id = inputs[0];
+                let (dx, dx_size) = Self::node_grad_info(graph, output_id)?;
+                let (dout, dout_size) = Self::node_grad_info(graph, input_id)?;
+                self.ops.rope_backward(
+                    encoder,
+                    &GpuBuffer::from_existing(dx, dx_size),
+                    &GpuBuffer::from_existing(dout, dout_size),
+                    *seq,
+                    *heads,
+                    *head_dim,
+                    *theta,
+                    *offset,
+                )?;
+            }
+
+            NodeKind::GqaExpand { seq, heads, kv_heads, head_dim } => {
+                let input_id = inputs[0];
+                let (dout, dout_size) = Self::node_grad_info(graph, output_id)?;
+                let (dkv, dkv_size) = Self::node_grad_info(graph, input_id)?;
+                self.ops.gqa_expand_backward(
+                    encoder,
+                    &GpuBuffer::from_existing(dout, dout_size),
+                    &GpuBuffer::from_existing(dkv, dkv_size),
+                    *seq,
+                    *heads,
+                    *kv_heads,
+                    *head_dim,
+                )?;
+            }
+
+            NodeKind::Attention { seq, heads, head_dim, scale } => {
+                let (q_id, k_id, v_id) = (inputs[0], inputs[1], inputs[2]);
+                let (dout, dout_size) = Self::node_grad_info(graph, output_id)?;
+                let (q, q_size) = Self::node_buf_info(graph, q_id)?;
+                let (k, k_size) = Self::node_buf_info(graph, k_id)?;
+                let (v, v_size) = Self::node_buf_info(graph, v_id)?;
+                let (dq, dq_size) = Self::node_grad_info(graph, q_id)?;
+                let (dk, dk_size) = Self::node_grad_info(graph, k_id)?;
+                let (dv, dv_size) = Self::node_grad_info(graph, v_id)?;
+
+                // Softmax probabilities and d(score) for the generic attention
+                // backward. Both are per-call scratch; only the attention op
+                // needs them and they do not belong in the tape.
+                let scratch_bytes = (*heads as usize)
+                    * (*seq as usize)
+                    * (*seq as usize)
+                    * std::mem::size_of::<f32>();
+                let probs = GpuBuffer::zeros(&self.device, &self.queue, scratch_bytes, Some("attn_probs"))?;
+                let ds = GpuBuffer::zeros(&self.device, &self.queue, scratch_bytes, Some("attn_ds"))?;
+
+                self.ops.attention_backward(
+                    encoder,
+                    &GpuBuffer::from_existing(dout, dout_size),
+                    &GpuBuffer::from_existing(q, q_size),
+                    &GpuBuffer::from_existing(k, k_size),
+                    &GpuBuffer::from_existing(v, v_size),
+                    &GpuBuffer::from_existing(dq, dq_size),
+                    &GpuBuffer::from_existing(dk, dk_size),
+                    &GpuBuffer::from_existing(dv, dv_size),
+                    &probs,
+                    &ds,
+                    *seq,
+                    *heads,
+                    *head_dim,
+                    *scale,
+                )?;
+            }
+
+            NodeKind::EmbeddingGather { vocab, hidden } => {
+                let ids_id = inputs[0];
+                let weight_id = inputs[1];
+                let (ids, ids_size) = Self::node_buf_info(graph, ids_id)?;
+                let (dout, dout_size) = Self::node_grad_info(graph, output_id)?;
+                let (dweight, dweight_size) = Self::node_grad_info(graph, weight_id)?;
+                let seq = dout_size as u32 / (*hidden * std::mem::size_of::<f32>() as u32);
+                self.ops.embedding_backward(
+                    encoder,
+                    &GpuBuffer::from_existing(ids, ids_size),
+                    &GpuBuffer::from_existing(dout, dout_size),
+                    &GpuBuffer::from_existing(dweight, dweight_size),
+                    seq,
+                    *vocab,
+                    *hidden,
+                )?;
+            }
+
+            NodeKind::LayerScale { numel } => {
+                let x_id = inputs[0];
+                let scalar_id = inputs[1];
+                let (dout, dout_size) = Self::node_grad_info(graph, output_id)?;
+                let (x, x_size) = Self::node_buf_info(graph, x_id)?;
+                let (scalar, scalar_size) = Self::node_buf_info(graph, scalar_id)?;
+                let (dx, dx_size) = Self::node_grad_info(graph, x_id)?;
+                let (dscalar, dscalar_size) = Self::node_grad_info(graph, scalar_id)?;
+                self.ops.layer_scale_backward(
+                    encoder,
+                    &GpuBuffer::from_existing(dout, dout_size),
+                    &GpuBuffer::from_existing(x, x_size),
+                    &GpuBuffer::from_existing(scalar, scalar_size),
+                    &GpuBuffer::from_existing(dx, dx_size),
+                    &GpuBuffer::from_existing(dscalar, dscalar_size),
+                    *numel,
+                )?;
+            }
+
             NodeKind::Parameter { .. } | NodeKind::Input { .. } => {
                 tracing::debug!(event = "backward_skipping_leaf_node", "Backward: skipping leaf node");
             }
@@ -1020,8 +1204,8 @@ impl BackwardPass {
         n: u32,
         k: u32,
     ) -> Result<()> {
-        let wg_x = (m + 63) / 64;
-        let wg_y = (k + 63) / 64;
+        let wg_x = (m + 7) / 8;
+        let wg_y = (k + 7) / 8;
 
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("MatMul Grad A Bind Group"),
@@ -1056,8 +1240,8 @@ impl BackwardPass {
         k: u32,
         n: u32,
     ) -> Result<()> {
-        let wg_x = (k + 63) / 64;
-        let wg_y = (n + 63) / 64;
+        let wg_x = (k + 7) / 8;
+        let wg_y = (n + 7) / 8;
 
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("MatMul Grad B Bind Group"),

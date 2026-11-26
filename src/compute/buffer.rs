@@ -6,6 +6,19 @@ pub struct GpuBuffer {
     size: usize,
 }
 
+/// `wgpu::Buffer` is a cheap handle, so cloning a `GpuBuffer` yields a second
+/// view of the same allocation. The GPU trainer keeps weights outside the graph
+/// and adds them as parameter nodes; both views must refer to one buffer.
+impl Clone for GpuBuffer {
+    fn clone(&self) -> Self {
+        Self {
+            buffer: self.buffer.clone(),
+            size: self.size,
+        }
+    }
+}
+
+
 impl GpuBuffer {
     /// Create a GPU buffer with STORAGE + COPY_SRC + COPY_DST.
     /// Note: may end up in host-visible memory on some drivers.
