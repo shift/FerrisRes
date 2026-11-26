@@ -12,8 +12,9 @@ one thing that closes it, not a programme.
 | 5 | replay+KL term not in the trainer | non-collapse during SFT | `docs/tasks/replay-kl.md` | task only |
 | 6 | no eval suite | any claim that training worked | harness integration + eval runner | missing |
 | 7 | no persona/soul data | persona adherence | `soul-*` source rows | planned |
-| 8 | prefix KV cache not wired to `infer` | prefill UX | wiring task | library only |
-| 9 | multi-GPU not wired | throughput | local-SGD coordination | CPU-only proof |
+| 8 | **prefill uses one core** | prefill UX on every CPU host | call the rayon kernels the model path already has (`docs/tasks/cpu-prefill-threads.md`) | ready, same file as the AVX2 work |
+| 9 | prefix KV cache not wired to `infer` | prefill UX | wiring task | library only |
+| 10 | multi-GPU not wired | throughput | local-SGD coordination | CPU-only proof |
 
 ## The order that actually works
 
@@ -28,7 +29,7 @@ one thing that closes it, not a programme.
    signal. Neither needs the GPU defect fixed to be *built*.
 4. **#5 and #6** before the first long run, not after. A run without an eval is
    a number, not a result.
-5. **#7–#9** after the first checkpoint exists.
+5. **#7–#10** after the first checkpoint exists.
 
 ## What this register deliberately excludes
 
