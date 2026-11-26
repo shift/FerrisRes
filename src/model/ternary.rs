@@ -276,7 +276,93 @@ impl TernarySteResult {
 // This is 3-5× faster than FP32 matmul on CPU because:
 // - No multiplier hardware needed (adder-only)
 // - Zero weights are free (skip)
-// - Compiler auto-vectorizes the add/sub pattern
+// - The inner loop is vectorised once per call by the kernel below
+
+/// Which f32 ternary row kernel a call uses. Selected once per call, never per
+/// element — the same shape as [`PackedKernel`] for the 2-bit path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum F32Kernel {
+    /// Portable scalar fallback. Always available.
+    Scalar,
+    /// Eight `f32` lanes with `_mm256_fmadd_ps`: four to eight times the
+    /// scalar loop on prefill-sized rows.
+    #[cfg(target_arch = "x86_64")]
+    Avx2Fma,
+}
+
+impl F32Kernel {
+    /// Fastest kernel this CPU supports.
+    fn detect() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return F32Kernel::Avx2Fma;
+            }
+        }
+        F32Kernel::Scalar
+    }
+}
+
+/// Portable row kernel: branchless sign-as-mask over `pos_sum`/`neg_sum`.
+fn ternary_row_scalar(weight_row: &[i8], input_row: &[f32]) -> f32 {
+    let mut pos_sum = 0.0f32;
+    let mut neg_sum = 0.0f32;
+    for j in 0..weight_row.len() {
+        let w = weight_row[j];
+        let v = input_row[j];
+        pos_sum += if w > 0 { v } else { 0.0 };
+        neg_sum += if w < 0 { v } else { 0.0 };
+    }
+    pos_sum - neg_sum
+}
+
+/// AVX2+FMA row kernel: eight weights widened to `f32` per step, `fmadd`ed
+/// against eight input lanes. The tail (`len % 8`) stays scalar, so no width
+/// is assumed to be a multiple of eight.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn ternary_row_avx2(weight_row: &[i8], input_row: &[f32]) -> f32 {
+    use core::arch::x86_64::{
+        __m128i, _mm_loadl_epi64, _mm256_cvtepi32_ps, _mm256_cvtepi8_epi32, _mm256_fmadd_ps,
+        _mm256_loadu_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+    };
+
+    let n = weight_row.len();
+    let mut acc = _mm256_setzero_ps();
+    let mut j = 0usize;
+    while j + 8 <= n {
+        // Eight i8 weights → eight i32 lanes → eight f32 lanes.
+        let w8: __m128i = _mm_loadl_epi64(weight_row.as_ptr().add(j) as *const __m128i);
+        let w32 = _mm256_cvtepi8_epi32(w8);
+        let wf = _mm256_cvtepi32_ps(w32);
+        let x = _mm256_loadu_ps(input_row.as_ptr().add(j));
+        acc = _mm256_fmadd_ps(wf, x, acc);
+        j += 8;
+    }
+
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut sum: f32 = lanes.iter().sum();
+
+    // Scalar remainder: `in_cols` need not be a multiple of eight.
+    while j < n {
+        sum += weight_row[j] as f32 * input_row[j];
+        j += 1;
+    }
+    sum
+}
+
+/// Accumulate one unpacked ternary row with the chosen kernel. The `scale` is
+/// applied by the caller so the hot loop stays a plain dot product.
+fn ternary_row_sum(kernel: F32Kernel, weight_row: &[i8], input_row: &[f32]) -> f32 {
+    match kernel {
+        F32Kernel::Scalar => ternary_row_scalar(weight_row, input_row),
+        #[cfg(target_arch = "x86_64")]
+        F32Kernel::Avx2Fma => unsafe { ternary_row_avx2(weight_row, input_row) },
+        #[allow(unreachable_patterns)]
+        _ => ternary_row_scalar(weight_row, input_row),
+    }
+}
 
 /// Ternary matrix multiply: `output = scale * (ternary @ input)`.
 ///
@@ -302,6 +388,9 @@ pub fn ternary_matmul(
 
     let mut output = vec![0.0f32; seq * out_rows];
 
+    // Choose the kernel once per call, never per element.
+    let kernel = F32Kernel::detect();
+
     // Process each sequence position
     for s in 0..seq {
         let input_row = &input[s * in_cols..(s + 1) * in_cols];
@@ -309,18 +398,7 @@ pub fn ternary_matmul(
 
         for r in 0..out_rows {
             let weight_row = &ternary[r * in_cols..(r + 1) * in_cols];
-            // Split positive/negative accumulators — only 1 multiply at the end.
-            // The `if` branches are predictable (33% each of {-1, 0, +1})
-            // and the multiply-by-0 in the else branch is free.
-            let mut pos_sum = 0.0f32;
-            let mut neg_sum = 0.0f32;
-            for j in 0..in_cols {
-                let w = weight_row[j];
-                let v = input_row[j];
-                pos_sum += if w > 0 { v } else { 0.0 };
-                neg_sum += if w < 0 { v } else { 0.0 };
-            }
-            out_slice[r] = scale * (pos_sum - neg_sum);
+            out_slice[r] = scale * ternary_row_sum(kernel, weight_row, input_row);
         }
     }
 
@@ -824,33 +902,12 @@ pub fn ternary_matmul_decode(
 
     let mut output = vec![0.0f32; out_rows];
 
+    // Choose the kernel once per call, never per element.
+    let kernel = F32Kernel::detect();
+
     for r in 0..out_rows {
         let weight_row = &ternary[r * in_cols..(r + 1) * in_cols];
-        let mut sum = 0.0f32;
-
-        // Process in chunks for better cache behavior
-        const CHUNK: usize = 8;
-        let chunks = in_cols / CHUNK;
-
-        for c in 0..chunks {
-            let base = c * CHUNK;
-            // Unrolled accumulation
-            sum += weight_row[base] as f32 * input[base];
-            sum += weight_row[base + 1] as f32 * input[base + 1];
-            sum += weight_row[base + 2] as f32 * input[base + 2];
-            sum += weight_row[base + 3] as f32 * input[base + 3];
-            sum += weight_row[base + 4] as f32 * input[base + 4];
-            sum += weight_row[base + 5] as f32 * input[base + 5];
-            sum += weight_row[base + 6] as f32 * input[base + 6];
-            sum += weight_row[base + 7] as f32 * input[base + 7];
-        }
-
-        // Remainder
-        for j in (chunks * CHUNK)..in_cols {
-            sum += weight_row[j] as f32 * input[j];
-        }
-
-        output[r] = scale * sum;
+        output[r] = scale * ternary_row_sum(kernel, weight_row, input);
     }
 
     output
@@ -1726,6 +1783,176 @@ mod tests {
              unpacked={:.3} ms, packed_scalar={:.3} ms, packed_simd={:.3} ms \
              (simd kernel={:?})",
             REPS, unpacked_ms, scalar_ms, simd_ms, simd_kernel
+        );
+    }
+
+    /// The f32 SIMD row kernel must match the scalar row kernel at every width,
+    /// including widths that are not a multiple of eight.
+    #[test]
+    fn avx2_matvec_agrees_with_scalar() {
+        use std::time::Instant;
+
+        fn best_ms(mut f: impl FnMut() -> Vec<f32>, reps: usize) -> f64 {
+            let mut best = f64::INFINITY;
+            for _ in 0..reps {
+                let t = Instant::now();
+                let out = f();
+                std::hint::black_box(&out);
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                if ms < best {
+                    best = ms;
+                }
+            }
+            best
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        let simd: Option<F32Kernel> =
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                Some(F32Kernel::Avx2Fma)
+            } else {
+                None
+            };
+        #[cfg(not(target_arch = "x86_64"))]
+        let simd: Option<F32Kernel> = None;
+
+        if simd.is_none() {
+            // Not a silent pass: say so, then still run the scalar comparison.
+            eprintln!("skipped: no avx2");
+        }
+
+        const TOL: f32 = 1e-5;
+        let scale = 0.37f32;
+
+        for in_cols in 1..=23usize {
+            for out_rows in 1..=3usize {
+                // Mixed -1 / 0 / +1, deterministic, so every code is present.
+                let ternary: Vec<i8> = (0..out_rows * in_cols)
+                    .map(|i| match (i * 7 + 3) % 5 {
+                        0 | 3 => 1,
+                        1 => -1,
+                        _ => 0,
+                    })
+                    .collect();
+
+                for seq in [1usize, 4usize] {
+                    // Order-1 activations, mixed sign.
+                    let input: Vec<f32> = (0..seq * in_cols)
+                        .map(|i| ((i as f32 + 1.0) * 0.41).sin())
+                        .collect();
+
+                    // Forced-scalar reference, row by row.
+                    let mut reference = vec![0.0f32; seq * out_rows];
+                    for s in 0..seq {
+                        let x = &input[s * in_cols..(s + 1) * in_cols];
+                        for r in 0..out_rows {
+                            let w = &ternary[r * in_cols..(r + 1) * in_cols];
+                            reference[s * out_rows + r] =
+                                scale * ternary_row_sum(F32Kernel::Scalar, w, x);
+                        }
+                    }
+
+                    // Forced SIMD, at the kernel level.
+                    if let Some(kernel) = simd {
+                        for s in 0..seq {
+                            let x = &input[s * in_cols..(s + 1) * in_cols];
+                            for r in 0..out_rows {
+                                let w = &ternary[r * in_cols..(r + 1) * in_cols];
+                                let got = scale * ternary_row_sum(kernel, w, x);
+                                let want = reference[s * out_rows + r];
+                                let diff = (got - want).abs();
+                                assert!(
+                                    diff <= TOL,
+                                    "kernel in_cols={} out_rows={} seq={} row={}: \
+                                     simd={} scalar={} diff={}",
+                                    in_cols,
+                                    out_rows,
+                                    seq,
+                                    r,
+                                    got,
+                                    want,
+                                    diff
+                                );
+                            }
+                        }
+                    }
+
+                    // The public entry point, using whatever the host dispatches to.
+                    let got = ternary_matmul(&ternary, scale, &input, out_rows, in_cols, seq);
+                    assert_eq!(got.len(), reference.len());
+                    for (idx, (&g, &w)) in got.iter().zip(reference.iter()).enumerate() {
+                        let diff = (g - w).abs();
+                        assert!(
+                            diff <= TOL,
+                            "dispatched in_cols={} out_rows={} seq={} element {}: \
+                             got={} scalar={} diff={}",
+                            in_cols,
+                            out_rows,
+                            seq,
+                            idx,
+                            g,
+                            w,
+                            diff
+                        );
+                    }
+                }
+
+                // Decode entry point (seq=1 shape).
+                let input: Vec<f32> = (0..in_cols)
+                    .map(|i| ((i as f32 + 1.0) * 0.41).sin())
+                    .collect();
+                let mut reference = vec![0.0f32; out_rows];
+                for r in 0..out_rows {
+                    let w = &ternary[r * in_cols..(r + 1) * in_cols];
+                    reference[r] = scale * ternary_row_sum(F32Kernel::Scalar, w, &input);
+                }
+                let got = ternary_matmul_decode(&ternary, scale, &input, out_rows, in_cols);
+                for (idx, (&g, &w)) in got.iter().zip(reference.iter()).enumerate() {
+                    let diff = (g - w).abs();
+                    assert!(
+                        diff <= TOL,
+                        "decode in_cols={} out_rows={} element {}: got={} scalar={} diff={}",
+                        in_cols,
+                        out_rows,
+                        idx,
+                        g,
+                        w,
+                        diff
+                    );
+                }
+            }
+        }
+
+        // Timing line for the production shape, behind --nocapture. Debug terms
+        // unless this test runs in release.
+        let out_rows = 768usize;
+        let in_cols = 768usize;
+        let ternary: Vec<i8> = (0..out_rows * in_cols)
+            .map(|i| match i % 3 {
+                0 => 1,
+                1 => -1,
+                _ => 0,
+            })
+            .collect();
+        let input1: Vec<f32> = (0..in_cols).map(|i| (i as f32 * 0.017).sin()).collect();
+        let input512: Vec<f32> = (0..512 * in_cols)
+            .map(|i| (i as f32 * 0.017).sin())
+            .collect();
+        const REPS: usize = 20;
+
+        let seq1_ms = best_ms(
+            || ternary_matmul_decode(&ternary, 0.1, &input1, out_rows, in_cols),
+            REPS,
+        );
+        let seq512_ms = best_ms(
+            || ternary_matmul(&ternary, 0.1, &input512, out_rows, in_cols, 512),
+            REPS,
+        );
+
+        eprintln!(
+            "f32 ternary matvec timing (out_rows=768, in_cols=768, best of {}): \
+             seq=1 decode={:.3} ms, seq=512 prefill={:.3} ms (kernel={:?})",
+            REPS, seq1_ms, seq512_ms, F32Kernel::detect()
         );
     }
 }
