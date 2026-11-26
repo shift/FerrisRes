@@ -1,6 +1,7 @@
 # Source index
 
-Status: **index with per-source records, 2026-11-26.** It is the lookup the corpus
+Status: **index with per-source records, 2026-11-26.** The pipeline that turns
+these rows into reproducible shards is `corpus-builder.md`. It is the lookup the corpus
 manifest refers to: for each **data type**, which sources may be used, under
 which licence, fetched how, filtered how, and whether the row is trained or held
 out. A row is not usable until every field is filled.
