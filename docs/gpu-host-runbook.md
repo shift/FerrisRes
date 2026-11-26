@@ -179,10 +179,12 @@ their count; use the position among those. A software adapter is skipped unless
 
 ### Step 4 — train about 58 steps on the GPU
 
-Copy the shape of `notebooks/kaggle/gpu_probe/gpu_probe.ipynb`, cells 3 and 4.
-The kernel already refuses to fall back: it asserts `nvidia-smi` sees the card,
-asserts a non-software adapter exists, and asserts that the final loss is below
-the initial loss. It is written for Kaggle. On another card, replace the
+Copy the shape of `notebooks/kaggle/gpu_probe/gpu_probe.ipynb` from
+`origin/docs/kaggle-notebooks` at `8f17d03` (it is not on this branch). Its last
+code cell writes the corpus, runs training and asserts the loss fell. The kernel
+already refuses to fall back: it asserts `nvidia-smi` sees the card, asserts a
+non-software adapter exists, and asserts that the final loss is below the
+initial loss. It is written for Kaggle. On another card, replace the
 `'T4' in name` assertion with `software: false` and record the actual name.
 
 The notebook writes a small corpus and then runs:
