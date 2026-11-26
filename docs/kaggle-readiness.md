@@ -144,9 +144,13 @@ Training complete: steps=144 initial_loss=5.763604 final_loss=8.258290
 ```
 
 - **144 steps executed** on adapter 0 (`Tesla T4`, vulkan, Discrete);
-- **loss rose** 5.764 → 8.258. The identical config on the HD 530 fell
-  3.557 → 0.0026, so this is a T4-path defect, not a bad corpus or a bad
-  learning rate;
+- **loss rose** 5.764 → 8.258;
+- **the forward pass is correct.** Run 9 ran the same config on the same host on
+  the CPU: step-1 loss `5.763615` against the GPU's `5.763604`, a delta of
+  **1.1e-5**, and the CPU then fell to `0.396426` in 48 steps. Corpus, seed,
+  learning rate and forward pass are all sound;
+- **the CPU is 2.8× faster than the T4** on this config: 907 tok/s against 321.
+  Whatever is wrong in the backward pass also made the GPU the slower device;
 - **~1.6 s/step** derived from the log timestamps (~228 s for 144 steps of
   4×128 tokens, ≈320 tok/s). The HD 530 did the same config at ~0.16 s/step, so
   the T4 is **~10× slower per step** at this size: dispatch-bound, not
@@ -155,8 +159,16 @@ Training complete: steps=144 initial_loss=5.763604 final_loss=8.258290
 - the kernel is ERROR only because the probe asserts `final_loss <
   initial_loss`. That assertion is doing its job.
 
-Until the divergence is explained, "the GPU works" means *enumerates and
-executes*, not *trains*. No tokens/s figure may be quoted from this run as a
+The remaining suspect is the **backward pass or the optimiser update**, and the
+fingerprint is a race rather than a formula: forward identical, loss climbing
+monotonically. This engine has already had two gradient-buffer defects (a 16×16
+shader driven by 32×32 workgroups; grad shaders writing only column 0 while
+overwriting input grads), both fixed and verified on a 24-EU iGPU. A T4 has 40
+SMs, so a missing barrier or a non-atomic add in gradient accumulation is
+invisible there and double-counts on the larger adapter.
+
+Until that is fixed, "the GPU works" means *enumerates, executes and computes a
+correct forward pass*, not *trains*. No tokens/s figure may be quoted from this run as a
 performance expectation: the workload is a 64-hidden toy, and it is slower than
 the iGPU.
 

@@ -18,12 +18,33 @@ Same binary family, same config, same corpus, opposite outcome. The T4 path
 therefore has a defect in either the forward pass, the backward pass, or the
 optimiser update.
 
-## The first hypothesis to test
+## What run 9 ruled out (2026-11-26)
 
-The T4 driver advertises cooperative-matrix support and wgpu logs
-`Found 6 cooperative matrix configurations`. If a kernel path selected on that
-capability is used with f32 data, or if a matmul is dispatched with a workgroup
-shape tuned for another adapter, gradients can be wrong while still running.
+Same host, same seed, same corpus, CPU reference:
+
+| backend | steps | initial | final | throughput |
+|---|---:|---:|---:|---:|
+| Tesla T4 | 144 | 5.763604 | **8.258290** | 321 tok/s |
+| CPU (4 vCPU) | 48 | 5.763615 | **0.396426** | 907 tok/s |
+
+Step-1 delta is **1.1e-5**, so the **forward pass is correct**; the corpus, seed
+and learning rate are correct. The defect is in the **backward pass or the
+optimiser update**. Cooperative matrices are no longer the first suspect — a
+wrong matmul would have moved the forward too.
+
+## The first hypothesis to test now
+
+A race in gradient accumulation that scales with adapter parallelism. The
+evidence fits: forward bit-identical, loss climbing monotonically, and two
+previous gradient-buffer defects in this engine were both adapter-sensitive
+(a 16×16 shader driven by 32×32 workgroups; grad shaders writing only column 0
+and overwriting input grads). A T4 has 40 SMs against the HD 530's 24 EUs; a
+missing barrier or a non-atomic `+=` is invisible on the smaller adapter and
+double-counts on the larger one, which produces exactly a rising loss.
+
+The test: compare one gradient tensor for one step between CPU and GPU on the
+same batch. A ratio near 2.0 (or a count of duplicated contributions) names the
+race; a ratio of 1.0 with a rising loss points at the update itself.
 
 ## The test
 
