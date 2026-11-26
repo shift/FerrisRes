@@ -164,6 +164,16 @@ security configuration.
 Excluded: exploit payloads, malware, live targets, advisory text as memory,
 share-alike or NC security curricula.
 
+## 11c. Design patterns and architecture
+
+| id | source | licence | target | filter | status |
+|---|---|---|---:|---|---|
+| `dp-cards` | authored pattern cards: intent, forces, Rust shape, when not | CC0 | 2M | original summaries; never the GoF text | planned |
+| `dp-refactors` | authored before/after pairs with unchanged tests | CC0 | 2M | the test must pass before and after | planned |
+| `dp-recognition` | permissive OSS code with pattern/anti-pattern labels | per-file MIT/Apache | 3M | cite file and line; no generated code | planned |
+| `dp-adr` | architecture decisions with forces and rejected options | ours, CC0 | 1M | no customer names or secrets | planned |
+| `dp-nix` | module, overlay and flake patterns from nixpkgs / nix.dev | MIT / verify CC | 1M | no NixOS/nix (LGPL); no verbatim share-alike | planned |
+
 ## 12. Held-out evaluation sets
 
 These are never trained. If any of them appears in a training run, that run is

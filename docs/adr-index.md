@@ -33,6 +33,7 @@ A decision is a link, not a retelling: the owning document is the text.
 | FR-025 | The 4.89 blocked-config gradient must be fixed before any distillation run | accepted | `status-2026-11.md` |
 | FR-026 | A `.deb` is built only on ubuntu-22.04 (glibc ≤ 2.35) | accepted | `release-runbook.md` |
 | FR-028 | Security is trained as theory and procedure; a finding is proven by a tool, and no exploit corpus is trained | accepted | `security-training.md` |
+| FR-029 | Design patterns are trained as vocabulary and judgement, with an anti-ceremony gate; never as rules to apply everywhere | accepted | `design-patterns.md` |
 | FR-027 | Writers do not run heavy builds; one build slot at a time | process | repository `AGENTS.md` |
 
 ## How to use this

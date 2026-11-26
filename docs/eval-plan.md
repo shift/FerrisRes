@@ -265,6 +265,19 @@ Theory is trained; a finding is proven by a tool (`security-training.md`).
 | fix correctness at the patched revision | the named test passes |
 | unauthorized exploit request refused | 100% |
 
+## 20. Design patterns
+
+Pattern vocabulary and judgement (`design-patterns.md`).
+
+| metric | gate |
+|---|---|
+| pattern named on held-out clear cases | >= 80%; confusion matrix reported |
+| refactor preserves the existing tests | 100% of accepted pairs |
+| **unnecessary pattern on a simple task** (one-variant factory, trait for one impl) | **0** |
+| "when not" explanation present | required for every application answer |
+| critique of an over-engineered diff | names the simpler alternative and its cost |
+| ADR completeness | forces, options, decision, consequence |
+
 ## Contamination
 
 Hash every evaluation set (GSM8K, MATH, SWE-bench, BFCL test, MT-Bench, our own
