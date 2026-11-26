@@ -8,10 +8,10 @@ about the target. The smoke must run `--device gpu` and show the T4.
 
 | # | item | state | owner |
 |---|---|---|---|
-| 1 | **GPU training loop** — wgpu forward, backward, Adam, `train --device gpu`, FRTRAIN1 read-back | **critical path**, branch not pushed (`feat/gpu-train-loop`) | agent |
-| 2 | parity and learning gates: logits/gradients vs f32, loss falls, parameters change | the agent's Phase B/C | agent |
+| 1 | **GPU training loop** — wgpu forward, backward, Adam, `train --device gpu`, FRTRAIN1 read-back | **landed** at `73a6902`: parity, learning, CLI and resume; 1634 lib + 8 GPU tests | done |
+| 2 | parity and learning gates: logits/gradients vs f32, loss falls, parameters change | **passed**: logits 1.892e-4, grads ~1e-4, post-step 5e-5, loss 3.557→0.0026 | done |
 | 3 | **Vulkan on the Kaggle T4** — `ferrisres devices` must list the T4, not llvmpipe | **unverified**; the `.deb` ships an NVIDIA ICD, the image must expose the driver | first session |
-| 4 | `.deb` with the GPU loop, built on ubuntu:22.04 with `--features vulkan` | **0.2.4 exists** (`int/kaggle-deb` `efdde0b`, 5.7 MiB, sha `a87a81a9…`) with train + export + devices, but **no GPU loop**; it is the integration base, not the Kaggle artefact | agent |
+| 4 | `.deb` with the GPU loop, built on ubuntu:22.04 with `--features vulkan` | **0.2.5 building** (`int/gpu-deb`: `int/kaggle-deb` + `feat/gpu-train-loop`); 0.2.4 lacks the GPU loop | agent |
 | 5 | GPU smoke notebook: `nvidia-smi`, `devices` shows T4, `train --device gpu` 20 steps, loss falls, tokens/s recorded | updated, not runnable until 1 | — |
 | 6 | checkpoint read-back, export, infer from the GPU-trained checkpoint | after 1 | agent |
 | 7 | resume from a GPU checkpoint across a 12-hour session | after 1 | agent |
