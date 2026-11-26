@@ -76,6 +76,10 @@ pub struct ArmorTrainerConfig {
     pub adam_eps: f32,
     /// Maximum tokens per example during training (the artefact keeps 256).
     pub max_tokens: usize,
+    /// Train every batch at `max_tokens` with padding, instead of sampling a
+    /// shorter scan length. Removes the train/eval length mismatch; no new
+    /// parameters and no artefact change.
+    pub fixed_length: bool,
     /// BCE weight for the injection class.
     pub class_weight_injection: f32,
     /// BCE weight for the benign class.
@@ -99,6 +103,7 @@ impl Default for ArmorTrainerConfig {
             beta2: 0.999,
             adam_eps: 1e-8,
             max_tokens: 256,
+            fixed_length: false,
             class_weight_injection: 1.0,
             class_weight_benign: 1.0,
             early_stop_fpr: 0.01,
@@ -1393,7 +1398,11 @@ impl ArmorEncoder {
             while batch_start < order.len() {
                 let batch_end = (batch_start + cfg.batch_size).min(order.len());
                 let batch = &order[batch_start..batch_end];
-                let len = sample_length(&mut rng).min(max_tokens).max(1);
+                let len = if cfg.fixed_length {
+                    max_tokens.max(1)
+                } else {
+                    sample_length(&mut rng).min(max_tokens).max(1)
+                };
                 let items: Vec<(&[u32], u8, f32)> = batch
                     .iter()
                     .map(|&idx| {
@@ -1676,6 +1685,7 @@ mod tests {
             beta2: 0.999,
             adam_eps: 1e-8,
             max_tokens: 8,
+            fixed_length: false,
             class_weight_injection: 1.0,
             class_weight_benign: 1.0,
             early_stop_fpr: 0.01,
@@ -1821,6 +1831,97 @@ mod tests {
         cfg.model.num_layers = 2;
         cfg.model.max_seq_len = 8;
         run_gradient_check(&cfg, 0xA4A0_0003);
+    }
+
+    #[test]
+    fn test_armor_tiled_gemm_matches_scalar_at_real_shapes() {
+        // The tiled GEMM was only exercised at hidden 64 / seq 64. Train on the
+        // real model uses hidden 192, ffn 768, seq 128 and 4352 buckets; a tile
+        // bug at those shapes would corrupt every training step.
+        fn scalar(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize, seq: usize) -> Vec<f32> {
+            let mut out = vec![0.0f32; seq * out_dim];
+            for s in 0..seq {
+                for o in 0..out_dim {
+                    let mut acc = 0.0f32;
+                    for i in 0..in_dim {
+                        acc += w[o * in_dim + i] * x[s * in_dim + i];
+                    }
+                    out[s * out_dim + o] = acc;
+                }
+            }
+            out
+        }
+        let mut rng = SplitMix64::new(0xA4A0_9001);
+        for &(out_dim, in_dim) in &[(192usize, 192usize), (768, 192), (192, 768)] {
+            let seq = 128usize;
+            let w: Vec<f32> = (0..out_dim * in_dim).map(|_| rng.uniform(0.08)).collect();
+            let x: Vec<f32> = (0..seq * in_dim).map(|_| rng.uniform(0.08)).collect();
+            let tiled = linear_forward(&w, &x, out_dim, in_dim, seq);
+            let reference = scalar(&w, &x, out_dim, in_dim, seq);
+            assert_eq!(tiled.len(), reference.len());
+            let max_abs = tiled
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            println!(
+                "tiled vs scalar [{out_dim}x{in_dim}] seq={seq}: max_abs_diff={max_abs:.3e}"
+            );
+            assert!(
+                max_abs <= 1e-5,
+                "[{out_dim}x{in_dim}] seq {seq}: max abs diff {max_abs:.3e} > 1e-5"
+            );
+        }
+    }
+
+    #[test]
+    fn test_armor_gradient_spot_check_real_shape_seq128() {
+        // The finite-difference check only runs at hidden 16 / seq 8. Training
+        // uses hidden 192 / ffn 768 / seq up to 128. Spot-check one element per
+        // tensor at the real shape so a dimension- or sequence-dependent
+        // backward bug cannot hide behind the tiny check.
+        let mut cfg = ArmorTrainerConfig::default();
+        cfg.model.num_layers = 3;
+        cfg.max_tokens = 128;
+        let model = ArmorEncoder::new(&cfg);
+        let tokens: Vec<u32> = (0..128)
+            .map(|i| ((i * 37 + 11) % cfg.model.vocab_size) as u32)
+            .collect();
+        let (loss, grads) = model.loss_and_grads(&tokens, 1, 1.0);
+        assert!(loss.is_finite(), "loss not finite: {loss}");
+
+        let n_tensors = model.weights.num_tensors();
+        let picks: Vec<usize> = vec![0, 1, 2, 6, 8, 10, n_tensors - 2, n_tensors - 1];
+        let eps = 1e-2f32;
+        for ti in picks {
+            let len = model.weights.tensor_len(ti);
+            if len == 0 {
+                continue;
+            }
+            let idx = (ti * 7919) % len;
+            let analytic = grads.get_elem(ti, idx);
+            let base = model.weights.get_elem(ti, idx);
+            let mut plus = model.clone();
+            plus.weights.set_elem(ti, idx, base + eps);
+            let (lp, _) = plus.loss_and_grads(&tokens, 1, 1.0);
+            let mut minus = model.clone();
+            minus.weights.set_elem(ti, idx, base - eps);
+            let (lm, _) = minus.loss_and_grads(&tokens, 1, 1.0);
+            let numeric = (lp - lm) / (2.0 * eps);
+            let abs = (analytic - numeric).abs();
+            let rel = abs / numeric.abs().max(1.0);
+            println!(
+                "{}[{}]: analytic={analytic:.6} numeric={numeric:.6} abs={abs:.3e} rel={rel:.3e}",
+                model.weights.tensor_name(ti),
+                idx
+            );
+            assert!(
+                abs <= 2e-2 || rel <= 0.05,
+                "{}[{}]: analytic {analytic} vs numeric {numeric}",
+                model.weights.tensor_name(ti),
+                idx
+            );
+        }
     }
 
     #[test]

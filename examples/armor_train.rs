@@ -16,11 +16,20 @@
 //!
 //! `--train-limit` / `--dev-limit` take a deterministic shuffled prefix. They
 //! exist for a fast plumbing read; the full run uses every example.
+//!
+//! `--fixed-length` trains every batch at `--max-tokens` with a length mask
+//! instead of sampling a shorter scan. The sampled-length default is why the
+//! first full run collapsed at 128 tokens: the model learned a short-prefix cue
+//! that mean pooling diluted at the evaluation length.
+//!
+//! `--probe` prints train and dev AUROC in memory and after the FRAL
+//! round-trip; `--skip-test` leaves test unevaluated when dev does not clear
+//! the gate.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
-use ferrisres::security::armor_l1::{ArmorGuardConfig, L1TokenizerSpec};
+use ferrisres::security::armor_l1::{ArmorGuardConfig, L1Scanner, L1TokenizerSpec};
 use ferrisres::training::armor_jsonl::load_labeled;
 use ferrisres::training::{
     operating_point, score_items_at, ArmorEncoder, ArmorTrainerConfig, OperatingPoint,
@@ -36,12 +45,15 @@ struct Args {
     out: PathBuf,
     train_limit: Option<usize>,
     dev_limit: Option<usize>,
+    probe: bool,
+    fixed_length: bool,
+    skip_test: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: armor_train --train <jsonl> --dev <jsonl> --test <jsonl> \
-         [--epochs N] [--max-tokens N] [--out DIR] [--train-limit N] [--dev-limit N]"
+         [--epochs N] [--max-tokens N] [--out DIR] [--train-limit N] [--dev-limit N]          [--probe] [--fixed-length] [--skip-test]"
     );
     std::process::exit(2)
 }
@@ -56,6 +68,9 @@ fn parse_args() -> Args {
         out: PathBuf::from("armor-out"),
         train_limit: None,
         dev_limit: None,
+        probe: false,
+        fixed_length: false,
+        skip_test: false,
     };
     fn take(it: &mut std::vec::IntoIter<String>) -> String {
         it.next().unwrap_or_else(|| usage())
@@ -77,12 +92,15 @@ fn parse_args() -> Args {
             "--dev-limit" => {
                 args.dev_limit = Some(take(&mut it).parse().unwrap_or_else(|_| usage()))
             }
+            "--probe" => args.probe = true,
+            "--fixed-length" => args.fixed_length = true,
+            "--skip-test" => args.skip_test = true,
             _ => usage(),
         }
     }
     if args.train.as_os_str().is_empty()
         || args.dev.as_os_str().is_empty()
-        || args.test.as_os_str().is_empty()
+        || (args.test.as_os_str().is_empty() && !args.skip_test)
     {
         usage();
     }
@@ -169,6 +187,52 @@ fn op_json(op: &OperatingPoint, eval_tokens: usize) -> serde_json::Value {
     })
 }
 
+/// Rank AUROC with ties counted as 0.5.
+fn auroc_parts(pos: &[f32], neg: &[f32]) -> f32 {
+    if pos.is_empty() || neg.is_empty() {
+        return f32::NAN;
+    }
+    let mut all: Vec<(f32, u8)> =
+        pos.iter().map(|&s| (s, 1)).chain(neg.iter().map(|&s| (s, 0))).collect();
+    all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let mut rank_sum = 0.0f64;
+    let mut i = 0usize;
+    while i < all.len() {
+        let mut j = i + 1;
+        while j < all.len() && all[j].0 == all[i].0 {
+            j += 1;
+        }
+        let avg = ((i + 1) as f64 + j as f64) / 2.0;
+        for item in &all[i..j] {
+            if item.1 == 1 {
+                rank_sum += avg;
+            }
+        }
+        i = j;
+    }
+    let n_pos = pos.len() as f64;
+    let n_neg = neg.len() as f64;
+    ((rank_sum - n_pos * (n_pos + 1.0) / 2.0) / (n_pos * n_neg)) as f32
+}
+
+fn auroc_scores(scores: &[(f32, u8)]) -> f32 {
+    let pos: Vec<f32> = scores.iter().filter(|(_, y)| *y == 1).map(|(s, _)| *s).collect();
+    let neg: Vec<f32> = scores.iter().filter(|(_, y)| *y == 0).map(|(s, _)| *s).collect();
+    auroc_parts(&pos, &neg)
+}
+
+fn bce_at(scores: &[(f32, u8)]) -> f32 {
+    if scores.is_empty() {
+        return f32::NAN;
+    }
+    let mut sum = 0.0f64;
+    for &(s, y) in scores {
+        let p = (s as f64).clamp(1e-6, 1.0 - 1e-6);
+        sum += if y == 1 { -p.ln() } else { -(1.0 - p).ln() };
+    }
+    (sum / scores.len() as f64) as f32
+}
+
 fn counts(items: &[(String, u8)]) -> (usize, usize) {
     let pos = items.iter().filter(|(_, y)| *y == 1).count();
     (pos, items.len() - pos)
@@ -195,7 +259,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let train_all = load_labeled(&args.train)?;
     let dev_all = load_labeled(&args.dev)?;
-    let test = load_labeled(&args.test)?;
+    let test = if args.skip_test {
+        Vec::new()
+    } else {
+        load_labeled(&args.test)?
+    };
     let (train_pos, train_neg) = counts(&train_all);
     let (dev_pos_all, dev_neg_all) = counts(&dev_all);
     let (test_pos, test_neg) = counts(&test);
@@ -234,6 +302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_tokens: args.max_tokens,
         ..ArmorTrainerConfig::default()
     };
+    cfg.fixed_length = args.fixed_length;
     cfg.model = ArmorGuardConfig::default();
     cfg.tokenizer = L1TokenizerSpec::default();
     let eval_tokens = args.max_tokens.min(cfg.model.max_seq_len);
@@ -257,14 +326,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let train_seconds = started.elapsed().as_secs_f64();
     println!("training finished in {train_seconds:.1} s");
 
+    // In-memory probe: can the trained model separate *train* at the eval
+    // length? If train AUROC is ~0.5 the loop is broken; if train is high and
+    // dev is ~0.5 the corpus or the length mismatch is the cause.
+    let probe_train: Vec<(String, u8)> =
+        train.iter().step_by(8).cloned().collect();
+    let probe_dev: Vec<(String, u8)> = dev.iter().step_by(4).cloned().collect();
+    if args.probe {
+        let ptoks = tokenize_split(&encoder, &probe_train, eval_tokens);
+        let dtoks = tokenize_split(&encoder, &probe_dev, eval_tokens);
+        let ps = score_items_at(&encoder, &ptoks, eval_tokens);
+        let ds = score_items_at(&encoder, &dtoks, eval_tokens);
+        let (p_auc, d_auc) = (auroc_scores(&ps), auroc_scores(&ds));
+        let bce = bce_at(&ps);
+        println!(
+            "probe in-memory @{eval_tokens} tokens: train n={} AUROC={p_auc:.4} BCE={bce:.4} | dev n={} AUROC={d_auc:.4}",
+            ps.len(),
+            ds.len()
+        );
+    }
+
     // Final dev evaluation at the configured scan length. The trainer's
     // per-epoch dev pass uses a cheap 12-token scan for early stopping; these
     // numbers are the ones the operating point is chosen from.
     let dev_tokens = tokenize_split(&encoder, &dev, eval_tokens);
-    let test_tokens = tokenize_split(&encoder, &test, eval_tokens);
     let dev_scores = score_items_at(&encoder, &dev_tokens, eval_tokens);
     let dev_op = operating_point(&dev_scores, 0.01);
-    let test_op = confusion_at(&score_items_at(&encoder, &test_tokens, eval_tokens), dev_op.threshold);
+    let test_op = if args.skip_test {
+        None
+    } else {
+        let test_tokens = tokenize_split(&encoder, &test, eval_tokens);
+        Some(confusion_at(
+            &score_items_at(&encoder, &test_tokens, eval_tokens),
+            dev_op.threshold,
+        ))
+    };
     let total_seconds = started.elapsed().as_secs_f64();
 
     println!();
@@ -275,7 +371,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     print_row("dev  (max_tokens)", &dev_op);
-    print_row("test (dev threshold, scored once)", &test_op);
+    if let Some(op) = &test_op {
+        print_row("test (dev threshold, scored once)", op);
+    } else {
+        println!("test: not evaluated (--skip-test)");
+    }
     println!(
         "wall={total_seconds:.1} s (train {train_seconds:.1} s) best_epoch={} stopped_early={}",
         report.best_epoch, report.stopped_early
@@ -283,8 +383,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     std::fs::create_dir_all(&args.out)?;
     let fral = args.out.join("armor-l1.fral");
-    encoder.to_scanner().save(&fral)?;
+    let scanner = encoder.to_scanner();
+    scanner.save(&fral)?;
     println!("wrote {}", fral.display());
+    if args.probe {
+        // Export round-trip: the saved artefact must score the same as memory.
+        let loaded = L1Scanner::load(&fral)?;
+        let spec = *loaded.tokenizer_spec();
+        let (mut pos, mut neg) = (Vec::new(), Vec::new());
+        for (text, label) in &probe_dev {
+            let toks = ferrisres::security::armor_l1::tokenize_text(&spec, text, eval_tokens);
+            if toks.is_empty() {
+                continue;
+            }
+            let s = loaded.forward_tokens(&toks);
+            if *label == 1 { pos.push(s); } else { neg.push(s); }
+        }
+        println!("probe reloaded artefact on dev: AUROC={:.4}", auroc_parts(&pos, &neg));
+    }
 
     let epochs: Vec<serde_json::Value> = report
         .epochs
@@ -312,6 +428,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "early_stop_fpr": cfg.early_stop_fpr,
             "train_limit": args.train_limit,
             "dev_limit": args.dev_limit,
+            "fixed_length": cfg.fixed_length,
             "model": {
                 "vocab_size": cfg.model.vocab_size,
                 "hidden_dim": cfg.model.hidden_dim,
@@ -334,7 +451,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         "epochs": epochs,
         "dev": op_json(&dev_op, eval_tokens),
-        "test": op_json(&test_op, eval_tokens),
+        "test": test_op.as_ref().map(|op| op_json(op, eval_tokens)),
         "test_threshold_source": "dev",
         "wall_seconds": total_seconds,
         "train_seconds": train_seconds,
