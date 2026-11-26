@@ -265,15 +265,23 @@ mod tests {
         let linear = CpuLinear::from_weight(weight, 12, 24);
         let input: Vec<f32> = (0..5 * 12).map(|i| (i as f32 * 0.37).sin()).collect();
 
+        // AVX2+FMA reassociates the sum, so a batched row and a serial row are
+        // equal to within rounding, not bit-for-bit. Scalar exactness is covered
+        // by the ternary kernel's own forced-scalar tests.
+        let close = |a: &[f32], b: &[f32]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(x, y)| (x - y).abs() <= 1e-5 * (1.0 + y.abs()))
+        };
         let one = linear.forward(&input[..12], 1);
-        assert_eq!(linear.forward_batch(&input[..12], 1), one);
+        assert!(close(&linear.forward_batch(&input[..12], 1), &one), "one-row batch differs from serial");
 
         let batched = linear.forward_batch(&input, 5);
         for row in 0..5 {
             let serial = linear.forward(&input[row * 12..(row + 1) * 12], 1);
-            assert_eq!(
-                &batched[row * 24..(row + 1) * 24],
-                &serial[..],
+            assert!(
+                close(&batched[row * 24..(row + 1) * 24], &serial),
                 "row {row} differs between batch and serial"
             );
         }

@@ -688,7 +688,7 @@ mod tests {
             worst = worst.max((a - b).abs());
         }
         assert!(serial.iter().any(|x| x.abs() > 1e-6), "test produced zero output");
-        assert_eq!(worst, 0.0, "batched MoE differs from serial by {worst}");
+        assert!(worst < 1e-5, "batched MoE differs from serial by {worst}");
     }
 
     /// One top-k slot: the result must be exactly the weight times the expert

@@ -2223,10 +2223,11 @@ mod tests {
                     "unpacked serial {}x{} seq={}: max_abs={:.3e} max_rel={:.3e} over_1e-6={}",
                     out_rows, in_cols, seq, max_abs, max_rel, over
                 );
-                // Bit-identical: the unroll keeps the column order.
-                assert_eq!(
-                    new, old,
-                    "unpacked serial kernel changed the result for {}x{} seq={}",
+                // Within rounding: the AVX2/FMA kernel reassociates the sum.
+                // Exactness for the scalar path is asserted separately.
+                assert!(
+                    new.iter().zip(&old).all(|(a, b)| (a - b).abs() <= 1e-5 * (1.0 + b.abs())),
+                    "unpacked kernel changed the result for {}x{} seq={} beyond rounding",
                     out_rows, in_cols, seq
                 );
             }
