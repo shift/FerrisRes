@@ -82,3 +82,9 @@ not on reproducing a memorised one.
 A failure blocks the **child principal**, not the model: the adult assistant can
 ship while the child workflow stays disabled. That is the same fail-closed shape
 as the Armor gate.
+
+## Learning
+
+The child tutor's procedure and its integrity boundary are in
+`learning-theory.md`: hint ladder before answer, no ghostwritten work, a
+parent-visible summary, and curriculum facts supplied by the parent.

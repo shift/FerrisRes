@@ -183,6 +183,19 @@ share-alike or NC security curricula.
 | `theory-counterexamples` | where the principle does not apply | CC0 | 1M | review label | planned |
 | `theory-tool-cases` | principle predicts, tool confirms/refutes | ours | 2M | tool output at a revision | planned |
 
+## 11e. Learning theory and the child tutor
+
+| id | source | licence | target | filter | status |
+|---|---|---|---:|---|---|
+| `learn-theory` | authored learning-science cards | CC0 | 1M | original summaries; effect sizes stated honestly | planned |
+| `learn-dialogues` | authored tutoring turns, hint ladders, diagnosis | CC0 | 3M | no real child; reviewed | planned |
+| `learn-misconceptions` | wrong answer → the rule behind it → correction | CC0 | 2M | reviewed by a teacher or parent | planned |
+| `learn-ages` | the same idea at three reading levels | CC0 | 1M | age-calibration labels | planned |
+| `learn-parent` | parent summaries and next-practice suggestions | CC0 | 1M | no personal data | planned |
+
+No real child data, no textbook text, no copyrighted curriculum. Facts of a
+child's curriculum are supplied by the parent and retrieved, not trained.
+
 ## 12. Held-out evaluation sets
 
 These are never trained. If any of them appears in a training run, that run is

@@ -35,6 +35,7 @@ A decision is a link, not a retelling: the owning document is the text.
 | FR-028 | Security is trained as theory and procedure; a finding is proven by a tool, and no exploit corpus is trained | accepted | `security-training.md` |
 | FR-029 | Design patterns are trained as vocabulary and judgement, with an anti-ceremony gate; never as rules to apply everywhere | accepted | `design-patterns.md` |
 | FR-030 | Train durable, checkable theory; retrieve changing facts; execute effects. Every theory card names a check | accepted | `theory-corpus.md` |
+| FR-031 | The child tutor teaches: hint ladder before answer, no ghostwritten work, parent-visible summary, curriculum facts supplied by the parent | accepted | `learning-theory.md` |
 | FR-027 | Writers do not run heavy builds; one build slot at a time | process | repository `AGENTS.md` |
 
 ## How to use this
