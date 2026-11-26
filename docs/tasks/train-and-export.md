@@ -41,6 +41,8 @@ uses the streaming loader and the provenance gate from `dataset-formats`.
 6. Log loss, tokens/s, step, and the data offset every `--log-every`.
 7. Checkpoint every `--checkpoint-every`.
 
+The run record and the pinned hashes are in `reproducibility.md`.
+
 ## Checkpoint
 
 One directory per run:

@@ -50,6 +50,9 @@ with the weights names:
 - the modifications: architecture, tokenizer, training procedure, and the
   fact that the weights are distilled rather than the teacher's own.
 
+The third-party register is `provenance-register.md`; the card template is
+`model-card-template.md`.
+
 A teacher whose licence is not compatible (a custom or non-commercial licence)
 cannot be used for an open-weight release, whatever the quality gain. Gemma 1–3
 fall in that class; Gemma 4 does not.
