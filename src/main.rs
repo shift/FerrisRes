@@ -15,7 +15,7 @@ use ferrisres::training::dataset::{
 };
 
 #[derive(Parser)]
-#[command(name = "ferrisres", about = "Block AttnRes runtime for SLM/LLM training and inference")]
+#[command(name = "ferrisres", version, about = "Block AttnRes runtime for SLM/LLM training and inference")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
