@@ -82,6 +82,19 @@ enum Commands {
         lora_rank: Option<usize>,
     },
 
+    /// Export an FRTRAIN1 training checkpoint to an inference-ready model.
+    ///
+    /// Writes `<output>.safetensors` and `<output>.json` in the convention
+    /// `model::checkpoint::load_model` reads.
+    Export {
+        /// FRTRAIN1 checkpoint written by `train`.
+        #[arg(long)]
+        checkpoint: String,
+        /// Output prefix. Writes `<output>.safetensors` and `<output>.json`.
+        #[arg(long)]
+        output: String,
+    },
+
     /// Run inference on a prompt using a Block AttnRes model.
     ///
     /// Use --model-path to load a real model, or omit for a blank skeleton model.
@@ -302,6 +315,7 @@ async fn main() -> anyhow::Result<()> {
             learning_rate, data, data_format, chat_template, seq_len, vocab,
             seed, checkpoint_every, output, resume, log_every, lora_rank,
         ).await,
+        Commands::Export { checkpoint, output } => cmd_export(&checkpoint, &output).await,
         Commands::Infer {
             model_path, config, config_path, model_format, tokenizer,
             hidden_dim, num_blocks, block_size, prompt,
@@ -477,6 +491,27 @@ async fn cmd_train(
     Ok(())
 }
 
+async fn cmd_export(checkpoint: &str, output: &str) -> anyhow::Result<()> {
+    let report = ferrisres::training::export::export_checkpoint(
+        std::path::Path::new(checkpoint),
+        std::path::Path::new(output),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+/// A FerrisRes-native checkpoint sits next to a JSON config in the
+/// `load_model` convention. Detect it from the path alone so
+/// `infer --model-path <path>.safetensors` works without `--config-path`.
+fn native_checkpoint_prefix(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let text = path.to_str()?;
+    let prefix = text.strip_suffix(".safetensors")?;
+    let config_path = format!("{}.json", prefix);
+    let config = std::fs::read_to_string(config_path).ok()?;
+    serde_json::from_str::<ferrisres::model::checkpoint::BlockMoeResConfig>(&config).ok()?;
+    Some(std::path::PathBuf::from(prefix))
+}
+
 async fn cmd_infer(
     model_path: Option<String>,
     config_name: String,
@@ -531,13 +566,6 @@ async fn cmd_infer(
     if let Some(ref path) = model_path {
         info!(event = "cpu_inference_path", "Loading model from {} for CPU inference", path);
 
-        let gemma_config = if let Some(ref cp) = config_path {
-            info!(event = "loading_config", "Loading config from {}", cp);
-            gemma_mapper::Gemma4Config::from_config_file(std::path::Path::new(cp))
-                .map_err(|e| anyhow::anyhow!("Config load failed: {}", e))?
-        } else {
-            resolve_model_config(&config_name)?
-        };
         let model_path = std::path::Path::new(path);
 
         // Tokenize
@@ -587,6 +615,53 @@ async fn cmd_infer(
                 SimpleTokenizer::new().decode(ids)
             });
             (enc, dec)
+        };
+
+        // FerrisRes-native artefact exported from a training checkpoint.
+        // Its sibling JSON is a BlockMoeResConfig, not a HuggingFace config.
+        if let Some(prefix) = native_checkpoint_prefix(model_path) {
+            info!(
+                event = "native_checkpoint_inference_path",
+                path = %model_path.display(),
+                "Loading FerrisRes-native checkpoint"
+            );
+            let prefix = prefix.to_string_lossy();
+            let model = ferrisres::model::checkpoint::load_model(&prefix)
+                .map_err(|e| anyhow::anyhow!("native checkpoint load failed: {}", e))?;
+            let gen_tokens = generate_student(
+                &model,
+                &tokens,
+                max_tokens,
+                temperature as f32,
+                None,
+                None,
+                None,
+            );
+            let output_text = decoder(&gen_tokens);
+            let display_output = if let Some(ref mut layer) = armor_layer {
+                match layer.sanitize_output(&output_text) {
+                    ferrisres::SecurityVerdict::Redact(sanitized) => sanitized,
+                    _ => output_text.clone(),
+                }
+            } else {
+                output_text.clone()
+            };
+            info!(
+                event = "native_checkpoint_inference_complete",
+                prompt_tokens = tokens.len(),
+                generated_tokens = gen_tokens.len(),
+                "Native checkpoint inference complete"
+            );
+            println!("{}", display_output);
+            return Ok(());
+        }
+
+        let gemma_config = if let Some(ref cp) = config_path {
+            info!(event = "loading_config", "Loading config from {}", cp);
+            gemma_mapper::Gemma4Config::from_config_file(std::path::Path::new(cp))
+                .map_err(|e| anyhow::anyhow!("Config load failed: {}", e))?
+        } else {
+            resolve_model_config(&config_name)?
         };
 
         let loaded_model = match model_format.as_str() {

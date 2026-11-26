@@ -655,7 +655,13 @@ pub fn write_safetensors(path: &Path, tensors: &[TensorToWrite]) -> Result<()> {
 
     let header_str = serde_json::to_string(&header_json)
         .map_err(|e| FerrisResError::Shape(format!("Failed to serialize safetensors header: {}", e)))?;
-    let header_bytes = header_str.as_bytes();
+    // The safetensors spec requires the JSON header to be padded with spaces
+    // to an 8-byte boundary, so the tensor data starts aligned. Without this,
+    // `bytemuck::cast_slice` on an F32 tensor can panic on an unaligned mmap
+    // slice. Trailing spaces are legal JSON whitespace.
+    let mut header_bytes = header_str.into_bytes();
+    let padding = (8 - (header_bytes.len() % 8)) % 8;
+    header_bytes.extend(std::iter::repeat(b' ').take(padding));
     let header_len = header_bytes.len() as u64;
 
     use std::io::Write;
@@ -663,7 +669,7 @@ pub fn write_safetensors(path: &Path, tensors: &[TensorToWrite]) -> Result<()> {
         .map_err(|e| FerrisResError::Shape(format!("Failed to create safetensors file: {}", e)))?;
     file.write_all(&header_len.to_le_bytes())
         .map_err(|e| FerrisResError::Shape(format!("Failed to write header length: {}", e)))?;
-    file.write_all(header_bytes)
+    file.write_all(&header_bytes)
         .map_err(|e| FerrisResError::Shape(format!("Failed to write header: {}", e)))?;
     file.write_all(&data_blob)
         .map_err(|e| FerrisResError::Shape(format!("Failed to write tensor data: {}", e)))?;
