@@ -49,7 +49,7 @@ up one task at a time without making design decisions. If a task needs a decisio
 | `feat/corpus-builder` | corpus builder v1 | agent running |
 | `int/kaggle-deb` | 0.2.4 `.deb` (train + export) | agent running |
 | `feat/gpu-train-loop` | wgpu training loop | agent running, not pushed |
-| `int/train-multi-gpu` | multi-process local SGD | agent running, not pushed |
+| `int/train-multi-gpu` | multi-process local SGD | **landed (CPU only)** at `11fb681`; GPU wiring still needs the wgpu loop |
 | `feat/prefix-kv-cache` | prefix KV cache | agent running, not pushed |
 | `perf/parallel-prefill` | parallel prefill | agent running, not pushed |
 

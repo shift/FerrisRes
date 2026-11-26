@@ -1,7 +1,7 @@
 # Multi-GPU
 
-Status: **coordination layer implemented at `68e1cc0`; the real two-GPU gate and
-the training wiring are open.** Phase 1 (`4d6141e`) made two cards reachable;
+Status: **coordination layer at `68e1cc0`; CPU local SGD wired at `11fb681`;
+the wgpu training loop and the real two-T4 gate are open.** Phase 1 (`4d6141e`) made two cards reachable;
 this adds the launcher, deterministic sharding, init identity, `/dev/shm`
 averaging, the timeout barrier, per-rank evidence and the resume rule. None of
 it has run on two physical GPUs, and the training loop does not call it yet.

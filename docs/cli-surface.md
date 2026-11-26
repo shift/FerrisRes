@@ -25,7 +25,7 @@ released when it is in a tagged `.deb`. The Rust API reference is separate
 | `--checkpoint-every`, `--output`, `--resume`, `--log-every` | `feat/train-cli` | `FRTRAIN1` checkpoints |
 | `--lora-rank` | `feat/train-cli` | **rejected**: the block+LoRA path is the open defect |
 | `--device gpu` | in progress | `feat/gpu-train-loop`; default is CPU |
-| `--rank`, `--world-size`, `--exchange-dir`, `--exchange-every` | in progress | `int/train-multi-gpu` |
+| `--rank`, `--world-size`, `--exchange-dir`, `--exchange-every` | `int/train-multi-gpu` | window sharding, init identity, exchange, resume refusal; CPU path only |
 
 ## Distillation
 
@@ -52,7 +52,7 @@ released when it is in a tagged `.deb`. The Rust API reference is separate
 | command | state | notes |
 |---|---|---|
 | `ferrisres workers --world-size N -- <cmd>` | `feat/multi-gpu` | enumerates, refuses if adapters < N, spawns one child per adapter |
-| `--cpu` | in progress | `int/train-multi-gpu`; skips adapter enumeration |
+| `--cpu` | `int/train-multi-gpu` | skips adapter enumeration; one CPU slot per rank |
 | evidence `rank-*.json`, `launch.json` | `feat/multi-gpu` | adapter, rank, elapsed, tokens/s if written |
 
 ## Inference
