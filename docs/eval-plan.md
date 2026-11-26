@@ -162,6 +162,20 @@ Delegation is allowed as a granted capability with a tree budget
 | parent context growth per delegation | bounded by the summary, not the transcript |
 | wasted-delegation rate | report; train against it |
 
+## 13. Model catalogue and self-routing
+
+The catalogue is retrieved, not memorised (`model-catalogue.md`). These gates
+test provenance and choice.
+
+| metric | gate |
+|---|---|
+| invented model id | **0** |
+| capability or price claim without a snapshot id | **0** |
+| a model released after the snapshot described from memory | **0** |
+| tier choice on the labelled routing set | >= 85% |
+| "no model fits" under an impossible constraint | 100% |
+| local-tier overclaim (beyond 8k, not escalated) | **0** |
+
 ## Contamination
 
 Hash every evaluation set (GSM8K, MATH, SWE-bench, BFCL test, MT-Bench, our own
