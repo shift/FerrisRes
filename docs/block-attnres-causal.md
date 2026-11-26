@@ -66,13 +66,18 @@ The RoPE cos/sin table is computed in f64 on the host because the driver's
   the final norm.
 * `src/main.rs` does not upload final-norm weights to `TokenGenerator`; the
   setter (`set_final_norm`) exists but is not called.
-* The distillation/LoRA gradient path (`forward_train` + `compute_lora_grad`)
-  does not backpropagate the inter-block attention. The causal summaries make
-  a parameter in an early layer receive a suffix-sum gradient from every later
-  boundary position; the path uses `d_hidden` directly and ignores that term
-  (and the final-norm and attention Jacobians). `forward_train` now **panics**
-  (`lora_gradient_invalid_with_blocks`) when blocks and a LoRA manager are both
-  active. `training::grad_audit::max_rel_error_blocked_lora` measures the
-  mismatch against a central finite difference (currently 4.89), and
-  `examples/grad_audit.rs` prints it as the gate metric
-  `metric=grad_quality value=1 - min(error, 1)`.
+* The distillation/LoRA gradient path (`forward_train` +
+  `CpuBlockAttnResModel::lora_output_gradients`) now back-propagates the
+  inter-block attention: the block summary at position `t` is a prefix mean over
+  `0..=t`, so a parameter in an early layer receives a suffix-sum gradient from
+  every later boundary position. The reverse pass also carries the final-norm,
+  attention (softmax and value) and per-layer `d_hidden` Jacobians; see
+  `src/training/block_backward.rs`. The audit
+  `training::grad_audit::max_rel_error_blocked_lora` measures it against a
+  central finite difference (was 4.89, now ~1.8e-3), and
+  `examples/grad_audit.rs` prints the gate metric `metric=grad_quality value=1`
+  when the error is within `1e-2`.
+  **Still open:** the production distillation loop in `src/main.rs`
+  (`compute_lora_grad`) has not been switched to this library gradient, and the
+  reference backward covers the dense FFN path only — MoE, PLE and KV sharing
+  still return `None` from `lora_output_gradients`.

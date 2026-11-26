@@ -24,31 +24,19 @@ impl CpuBlockAttnResModel {
     /// Forward pass that stores all activations needed for proper backward.
     /// This is the ONLY forward that should be used during training.
     ///
-    /// # Panics
-    ///
-    /// When the model has block boundaries and a LoRA manager, the LoRA
-    /// gradient path cannot produce a correct gradient: the inter-block
-    /// summary at position `t` is a prefix sum over `0..=t`, so a parameter
-    /// receives a suffix-sum gradient from every later boundary position, and
-    /// the distillation path uses `d_hidden` directly without any of the
-    /// attention, norm or inter-block Jacobians. The defect is documented in
-    /// `docs/block-attnres-causal.md` and measured by
-    /// [`crate::training::grad_audit::max_rel_error_blocked_lora`]. Callers
-    /// must not train LoRA in a blocked config until it is fixed.
+    /// With block boundaries and a LoRA manager this forward is safe: the
+    /// gradient path is [`CpuBlockAttnResModel::lora_output_gradients`], which
+    /// back-propagates the inter-block suffix sum, the final-norm Jacobian, the
+    /// attention Jacobian and per-layer `d_hidden`. The blocked-config audit is
+    /// [`crate::training::grad_audit::max_rel_error_blocked_lora`]; see
+    /// `docs/block-attnres-causal.md`.
     pub fn forward_train(&self, token_ids: &[u32]) -> TrainForwardOutput {
-        if !self.block_config.boundary_layers.is_empty() && self.lora_manager.is_some() {
-            panic!(
-                "lora_gradient_invalid_with_blocks: forward_train with block boundaries \
-                 and a LoRA manager cannot produce correct gradients; see \
-                 docs/block-attnres-causal.md"
-            );
-        }
         self.forward_train_impl(token_ids)
     }
 
-    /// The guarded forward body. `pub(crate)` only so
-    /// [`crate::training::grad_audit`] can measure the gradient defect; every
-    /// other caller must use [`Self::forward_train`].
+    /// The guarded forward body. Exposed `pub(crate)` so
+    /// [`crate::training::grad_audit`] and [`crate::training::block_backward`]
+    /// consume exactly the forward whose activations the gradient uses.
     pub(crate) fn forward_train_impl(&self, token_ids: &[u32]) -> TrainForwardOutput {
         let seq = token_ids.len();
         let hd = self.hidden_dim;
