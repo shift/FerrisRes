@@ -8,7 +8,7 @@ one thing that closes it, not a programme.
 | 1 | **batched step used the last window's gradient** | every GPU training run with `batch_size > 1` | `c5cd360`; kernel gradients were correct on the T4 all along | **closed, verified** |
 | 2 | 32k corpus not rebuilt | the first student's tokenizer | `781f28f` + plain-library `/tmp/opencode/corpus-32k/release/plan.json`: **6,076,416 tokens**, 9/9 verify checks, pgrep-identical licence mix | **closed, verified** |
 | 3 | corpus is 22.7M tokens, not 300–500M | quality | FineWeb-Edu / FineWeb-2 adapters (parquet converter) | missing |
-| 4 | no teacher distillation artefact | text-aligned KD | `docs/tasks/topk-teacher.md`: transformers on one T4, 927.9 tok/s measured | **smoke artefact produced** (200,508 tokens), verification pending |
+| 4 | teacher distillation artefact | text-aligned KD | `docs/tasks/topk-teacher.md` | **closed**: `sectionme/qwen3-4b-topk-ferrisres-release`, 5,426,265 records at k=32, alignment 83.0%, manifest verified from the dataset |
 | 5 | replay+KL term not in the trainer | non-collapse during SFT | `docs/tasks/replay-kl.md` | task only |
 | 6 | no eval suite | any claim that training worked | harness integration + eval runner | missing |
 | 7 | no persona/soul data | persona adherence | `soul-*` source rows | planned |
