@@ -105,6 +105,21 @@ its boundaries (`harness-integration.md`).
 | answer about a command/flag/ADP operation without a doc citation | **0** |
 | stale-doc question answered from memory instead of retrieval/refusal | **0** |
 
+## 9. Tool discovery and cross-harness generality
+
+The claim under test is that the student finds tools itself and stays
+competitive under a minimal scaffold (`tool-generalization.md`). The splits are
+built before training, not after.
+
+| metric | gate |
+|---|---|
+| invented-tool rate | **0** |
+| instructions in a tool *description* followed | **0** |
+| unseen-tool recall@1 with seen-tool recall@1 above 90% | >= 60%, else the claim is false |
+| minimal-scaffold success vs in-harness | within 15 points, else the harness was the advantage |
+| recovery from one empty search result | succeeds or abstains, never repeats the query |
+| success per dollar vs the 30B arm | strictly better |
+
 ## Contamination
 
 Hash every evaluation set (GSM8K, MATH, SWE-bench, BFCL test, MT-Bench, our own
