@@ -182,10 +182,11 @@ fn yarn_rope_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Low frequency: NTK-aware scaling
         scaled_freq = freq / params.scale_factor;
     } else {
-        // Smooth interpolation between high and low
-        let smooth = (wavelength - low_freq_wavelength) / (high_freq_wavelength - low_freq_wavelength);
-        // Mix: (1-smooth) * original + smooth * scaled
-        scaled_freq = (1.0 - smooth) * freq + smooth * (freq / params.scale_factor);
+        // Smooth interpolation between high and low.
+        // `smooth` is a WGSL reserved word, so the identifier is `ramp`.
+        let ramp = (wavelength - low_freq_wavelength) / (high_freq_wavelength - low_freq_wavelength);
+        // Mix: (1-ramp) * original + ramp * scaled
+        scaled_freq = (1.0 - ramp) * freq + ramp * (freq / params.scale_factor);
     }
 
     let theta = f32(pos) * scaled_freq;
