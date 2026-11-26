@@ -64,6 +64,15 @@ Domain match beats volume for a 0.6B. A model trained on 2B well-chosen tokens
 beats one trained on 10B random tokens at this size, and the tool-use share is
 what makes it useful in this harness.
 
+## Persona and principals
+
+Persona is data, not weights: one model follows a soul, and the child principal
+gets its own soul, grants and gate rather than a checkpoint. The SFT set must
+carry the same task in several registers under different system prompts, so the
+model learns to follow the conditioner instead of collapsing to one tone. Child
+examples are authored and parent-reviewed; no real minor data is used. See
+`persona-and-principals.md`.
+
 ## Contamination
 
 Hash every evaluation set (GSM8K, MATH, SWE-bench, BFCL test, MT-Bench, our own
