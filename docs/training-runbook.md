@@ -32,7 +32,7 @@ One run, one id, one run record (`reproducibility.md`). The id is not a release.
 | 3 | launch | `ferrisres train --data … --output runs/<id>/ckpt --checkpoint-every …` |
 | 4 | monitor | loss, grad norm, tokens/s, RSS/VRAM; stop conditions below |
 | 5 | resume | `--resume runs/<id>/ckpt`; `resumed_from` must be the checkpoint step |
-| 6 | export | *(pending)* checkpoint → safetensors; `infer` loads it |
+| 6 | export | `ferrisres export --checkpoint …` → safetensors + config; `infer` loads it. GGUF/ternary pending; the CPU loader quantises to ternary, so the smoke proves plumbing, not f32 fidelity |
 | 7 | eval | the eval runner over the held-out suites |
 | 8 | record | run record with hashes + final loss + checkpoint hashes |
 

@@ -1,13 +1,19 @@
 # `train` and export
 
-Status: **learning implemented at `d81becf` on `feat/train-cli`; export open.**
+Status: **learning implemented at `d81becf`; safetensors export implemented at
+`44a9409`; GGUF/ternary/32k export open.**
 `train` now calls `training::train_loop::run` on the f32 reference model:
 forward → shifted cross-entropy → backward → Adam, gradient accumulation over
 the batch, `FRTRAIN1` checkpoints and `--resume`. Verified by
 `tests/train_learns.rs`: 300 steps on a fixed sequence, loss 3.652375 →
 0.000944, `params_changed=true`; `cargo test -p ferrisres --lib` 1630 passed.
-Remaining: export, the BPE/32k tokenizer, corpus-scale and 12-hour resume
-behaviour, and the block+LoRA path (separate defect).
+Safetensors export (`feat/train-export` @ `44a9409`): `FRTRAIN1` → `<out>.safetensors`
++ `<out>.json` in the `checkpoint::load_model` convention, an identity
+`block_config.attn_res_proj` counted as synthetic, `eps_not_representable`
+refused, and `infer` loads the native artefact. Four round-trip tests; a CLI
+smoke trains 20 steps (loss 5.68 → 3.66), exports 18 tensors, and generates 4
+tokens. Remaining: GGUF, ternary/quantised export, the BPE/32k tokenizer,
+corpus-scale and 12-hour resume, and the block+LoRA CLI wiring (separate task).
 
 ## Goal
 
