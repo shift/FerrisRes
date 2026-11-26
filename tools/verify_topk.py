@@ -50,6 +50,8 @@ def main():
     ap.add_argument("--k", type=int, default=32)
     ap.add_argument("--tokenizer", default="Qwen/Qwen3-8B")
     ap.add_argument("--vocab", type=int, default=None)
+    ap.add_argument("--allow-partial", action="store_true",
+                    help="a subset of the parts is present; the token-count check becomes a warning")
     args = ap.parse_args()
 
     import numpy as np
@@ -84,45 +86,58 @@ def main():
         fail(f"token id beyond vocab {vocab}")
 
     if manifest.get("tokens") not in (None, total):
-        fail(f"manifest says {manifest['tokens']} tokens, files hold {total}")
+        msg = f"manifest says {manifest['tokens']} tokens, files hold {total}"
+        if args.allow_partial:
+            print(f"warning: {msg} (partial set, {len(parts)} of {len(manifest.get('parts', []))} parts)")
+        else:
+            fail(msg)
     print(f"structure ok: {len(parts)} parts, {total} records, k={k}")
 
     # ---- alignment ----
-    # Only the head of the shard is needed: one part is ~1k records, and a
-    # thousand positions settle the question. Tokenising 5M tokens would take
-    # minutes for no extra confidence.
+    # The dump starts at token 1 by design (`logits[i-1]` predicts token `i`), so
+    # record i is NOT token i. Locate each record by the byte offset it stores —
+    # that is why the offset is in the record — and measure which hypothesis the
+    # top-1 supports.
     ids = read_u16(args.corpus_shard)[:200_000]
     text = byte_decode(ids)
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
+    tok.model_max_length = 10**9
     enc = tok(text, add_special_tokens=False, return_offsets_mapping=True)
     tids = enc["input_ids"]
+    by_offset = {o[0]: k for k, o in enumerate(enc["offset_mapping"])}
 
-    n = min(total, len(tids) - 1)
-    if n < 1000:
-        fail(f"only {n} records to compare; need >= 1000")
+    same = nxt = prev = 0
+    n = 0
+    for i in range(first_rec.size):
+        k = by_offset.get(int(first_rec["off"][i]))
+        if k is None:
+            continue
+        top1 = int(first_rec["idx"][i][0])
+        n += 1
+        if k < len(tids) and top1 == tids[k]:
+            same += 1
+        if k + 1 < len(tids) and top1 == tids[k + 1]:
+            nxt += 1
+        if k > 0 and top1 == tids[k - 1]:
+            prev += 1
+    if n < 500:
+        fail(f"only {n} records could be located by offset; needs >= 500")
 
-    hit_same = 0
-    hit_next = 0
-    for i in range(n):
-        top1 = int(first_rec["idx"][i][0]) if i < first_rec.size else None
-        if top1 is None:
-            break
-        if i < len(tids) and top1 == tids[i]:
-            hit_same += 1
-        if i + 1 < len(tids) and top1 == tids[i + 1]:
-            hit_next += 1
-
-    same = hit_same / n
-    nxt = hit_next / n
-    print(f"alignment: top-1 == token[i] {same:.1%}   top-1 == token[i+1] {nxt:.1%}")
+    same /= n
+    nxt /= n
+    prev /= n
+    print(f"alignment over {n} records:")
+    print(f"  top-1 == token[k]   {same:.1%}")
+    print(f"  top-1 == token[k+1] {nxt:.1%}")
+    print(f"  top-1 == token[k-1] {prev:.1%}")
     if nxt > same:
-        fail("the dump is one position off: its top-1 predicts the NEXT token, "
-             "so the consumer must shift by one or the dump must be re-read")
-    if same < 0.15:
-        fail(f"top-1 matches the aligned token only {same:.1%} of the time; "
-             "either the tokenizer differs from the teacher's or the dump is wrong")
+        fail("the dump predicts the NEXT token relative to the offsets it stores: "
+             "either the offsets or the logits slice is off by one")
+    if same < 0.20:
+        fail(f"top-1 agrees with the token at its own offset only {same:.1%}; "
+             "the teacher's tokenizer and the dump disagree")
     print("PASS")
 
 
