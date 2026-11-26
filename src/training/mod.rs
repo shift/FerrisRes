@@ -11,6 +11,7 @@ pub mod partial_backprop;
 pub mod qlora;
 pub mod tool_triggered_lora;
 pub mod backward;
+pub mod block_backward;
 pub mod grad_audit;
 pub mod shadow_weights;
 pub mod bit_moe;

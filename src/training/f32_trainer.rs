@@ -1291,7 +1291,7 @@ fn matmul_bwd_w(x: &[f32], dy: &[f32], dw: &mut [f32], rows: usize, in_dim: usiz
 }
 
 /// `dx[t, i] = sum_o dy[t, o] * w[i*out_dim + o]` (overwrites `dx`).
-fn matmul_bwd_x(dy: &[f32], w: &[f32], dx: &mut [f32], rows: usize, in_dim: usize, out_dim: usize) {
+pub(crate) fn matmul_bwd_x(dy: &[f32], w: &[f32], dx: &mut [f32], rows: usize, in_dim: usize, out_dim: usize) {
     debug_assert_eq!(dy.len(), rows * out_dim);
     debug_assert_eq!(w.len(), in_dim * out_dim);
     debug_assert_eq!(dx.len(), rows * in_dim);
@@ -1331,7 +1331,7 @@ fn rmsnorm_fwd(x: &[f32], w: &[f32], eps: f32, rows: usize, dim: usize, out: &mu
 /// RMSNorm backward: fills `dw` (accumulated) and `dx` (overwritten).
 ///
 /// `x` is the norm input, `dy` the gradient of the norm output.
-fn rmsnorm_bwd(
+pub(crate) fn rmsnorm_bwd(
     x: &[f32],
     w: &[f32],
     dy: &[f32],
@@ -1392,7 +1392,7 @@ fn rmsnorm_no_scale_fwd(x: &[f32], eps: f32, rows: usize, dim: usize, out: &mut 
 }
 
 /// Backward of [`rmsnorm_no_scale_fwd`]. `dx` is overwritten.
-fn rmsnorm_no_scale_bwd(
+pub(crate) fn rmsnorm_no_scale_bwd(
     x: &[f32],
     dy: &[f32],
     dx: &mut [f32],
@@ -1427,11 +1427,11 @@ fn rmsnorm_no_scale_bwd(
 }
 
 /// Forward result of one inter-block attention site.
-struct InterBlockForward {
+pub(crate) struct InterBlockForward {
     /// Softmax weights per position: `[seq, n]`.
-    weights: Vec<f32>,
+    pub(crate) weights: Vec<f32>,
     /// Per-position attention output: `[seq, hidden]`.
-    output: Vec<f32>,
+    pub(crate) output: Vec<f32>,
 }
 
 /// Inter-block attention, matching
@@ -1446,7 +1446,7 @@ struct InterBlockForward {
 ///
 /// `block_means[e]` is `[seq, hidden]` and already contains the causal prefix
 /// mean for each position, so the keys are causal by construction.
-fn inter_block_attention_fwd(
+pub(crate) fn inter_block_attention_fwd(
     hidden: &[f32],
     block_means: &[Vec<f32>],
     attn_res_norm: &[f32],
@@ -1510,7 +1510,7 @@ fn inter_block_attention_fwd(
 /// boundary and for every later boundary, and the reverse loop has already
 /// added the later contributions.
 #[allow(clippy::too_many_arguments)]
-fn inter_block_attention_bwd(
+pub(crate) fn inter_block_attention_bwd(
     hidden: &[f32],             // queries, [seq, hidden]
     block_means: &[Vec<f32>],   // [n][seq, hidden], inputs to the RMSNorm
     normed_reps: &[Vec<f32>],   // [n][seq, hidden]
@@ -1581,7 +1581,7 @@ fn inter_block_attention_bwd(
 /// `mean[t] = (sum_{s <= t} X[s]) / ((t + 1) * divisor)`, therefore
 /// `dX[s] = sum_{t >= s} d_mean[t] / ((t + 1) * divisor)`.
 /// `out` is accumulated (not overwritten) and has shape `[seq, hidden]`.
-fn propagate_mean_grad(d_mean: &[f32], seq: usize, hd: usize, divisor: f32, out: &mut [f32]) {
+pub(crate) fn propagate_mean_grad(d_mean: &[f32], seq: usize, hd: usize, divisor: f32, out: &mut [f32]) {
     let mut suffix = vec![0.0f32; hd];
     for s in (0..seq).rev() {
         let denom = (s + 1) as f32 * divisor;
@@ -1642,7 +1642,7 @@ fn apply_rope_backward(
 /// `probs` is written as `[heads, seq, seq]` with zeros above the diagonal;
 /// `out` is `[seq, q_dim]`.
 #[allow(clippy::too_many_arguments)]
-fn attention_fwd(
+pub(crate) fn attention_fwd(
     q: &[f32],
     k: &[f32],
     v: &[f32],
@@ -1700,7 +1700,7 @@ fn attention_fwd(
 /// Causal attention backward. `d_out` is `[seq, q_dim]`; `dq`, `dk`, `dv` are
 /// overwritten (zeroed inside).
 #[allow(clippy::too_many_arguments)]
-fn attention_bwd(
+pub(crate) fn attention_bwd(
     d_out: &[f32],
     probs: &[f32],
     q: &[f32],

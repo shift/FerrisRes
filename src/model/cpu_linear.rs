@@ -204,6 +204,8 @@ impl CpuRmsNorm {
     pub fn weight(&self) -> &[f32] { &self.weight }
     pub fn weight_mut(&mut self) -> &mut Vec<f32> { &mut self.weight }
     pub fn hidden_dim(&self) -> usize { self.hidden_dim }
+    /// The epsilon the forward pass uses; the backward pass must match it.
+    pub fn eps(&self) -> f32 { self.eps }
 }
 
 #[cfg(test)]
