@@ -3,11 +3,13 @@
 //! Pipeline: acquire (local, git or hf source) -> licence gate -> scan ->
 //! filter -> dedupe -> tokenize -> pack -> shard -> split -> manifest.
 
-use crate::corpus::plan::{classify_split, sha256_hex, Plan, Split, TokenizerRecord};
+use crate::corpus::plan::{
+    classify_split, sha256_hex, Plan, Split, TokenizerRecord, TokenizerSpec,
+};
 use crate::corpus::secret;
 use crate::corpus::stats::Stats;
-use crate::model::tokenizer::SimpleTokenizer;
-use anyhow::{bail, Context, Result};
+use crate::model::tokenizer::{HfTokenizer, SimpleTokenizer};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -208,6 +210,64 @@ struct Doc {
 }
 
 // ---------------------------------------------------------------------------
+// Tokenizer
+// ---------------------------------------------------------------------------
+
+/// The tokenizer a plan selects: the v1 byte tokenizer, or a loaded BPE
+/// `tokenizer.json`.
+enum LoadedTokenizer {
+    Byte(SimpleTokenizer),
+    Bpe(HfTokenizer),
+}
+
+impl LoadedTokenizer {
+    fn encode(&self, text: &str) -> Vec<u32> {
+        match self {
+            LoadedTokenizer::Byte(tokenizer) => tokenizer.encode(text),
+            LoadedTokenizer::Bpe(tokenizer) => tokenizer.encode(text),
+        }
+    }
+}
+
+/// Load the tokenizer named by a validated plan and build its manifest record.
+/// The BPE record's `sha256` is the hash of the file bytes, not of its path.
+fn load_tokenizer(spec: &TokenizerSpec) -> Result<(LoadedTokenizer, TokenizerRecord)> {
+    match spec.kind.as_str() {
+        "byte" => Ok((
+            LoadedTokenizer::Byte(SimpleTokenizer::new()),
+            crate::corpus::plan::tokenizer_record(),
+        )),
+        "bpe" => {
+            let path = spec
+                .path
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .context("plan tokenizer kind 'bpe' requires a path")?;
+            let bytes =
+                std::fs::read(path).with_context(|| format!("cannot read tokenizer {path}"))?;
+            let tokenizer = HfTokenizer::from_tokenizer_json(Path::new(path))
+                .map_err(|err| anyhow!("{err}"))?;
+            let vocab_size = tokenizer.vocab_size();
+            if vocab_size > u16::MAX as usize {
+                bail!(
+                    "tokenizer vocab size {vocab_size} exceeds 65535; shards store token ids as u16"
+                );
+            }
+            let sha256 = sha256_hex(&bytes);
+            let record = TokenizerRecord {
+                kind: "bpe".to_string(),
+                id: format!("ferrisres-bpe-v1-{sha256}"),
+                vocab_size,
+                sha256,
+            };
+            Ok((LoadedTokenizer::Bpe(tokenizer), record))
+        }
+        other => bail!("plan tokenizer kind '{other}' is not supported (expected 'byte' or 'bpe')"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Build
 // ---------------------------------------------------------------------------
 
@@ -215,6 +275,7 @@ struct Doc {
 pub fn build(plan_path: &Path, out: &Path, resume: bool) -> Result<BuildSummary> {
     let (plan_bytes, plan) = Plan::load(plan_path)?;
     let plan_sha256 = sha256_hex(&plan_bytes);
+    let (tokenizer, tokenizer_record) = load_tokenizer(&plan.tokenizer)?;
 
     let manifest_path = out.join("manifest.json");
     if manifest_path.exists() {
@@ -230,6 +291,13 @@ pub fn build(plan_path: &Path, out: &Path, resume: bool) -> Result<BuildSummary>
             .with_context(|| format!("{} is not a valid manifest", manifest_path.display()))?;
         if existing.builder.plan_sha256 != plan_sha256 {
             bail!("cannot resume: plan {} changed since the corpus was built", plan_path.display());
+        }
+        if existing.tokenizer.id != tokenizer_record.id {
+            bail!(
+                "cannot append: output directory tokenizer '{}' differs from plan tokenizer '{}'",
+                existing.tokenizer.id,
+                tokenizer_record.id
+            );
         }
         let verified = crate::corpus::inspect::verify(out).with_context(|| {
             format!("cannot resume: existing corpus at {} failed verification", out.display())
@@ -302,7 +370,6 @@ pub fn build(plan_path: &Path, out: &Path, resume: bool) -> Result<BuildSummary>
             .then_with(|| a.sha256.cmp(&b.sha256))
     });
 
-    let tokenizer = SimpleTokenizer::new();
     let mut docs: Vec<Doc> = Vec::new();
     let mut seen_hashes: BTreeSet<String> = BTreeSet::new();
     let mut drop_reasons: BTreeMap<String, u64> = BTreeMap::new();
@@ -470,7 +537,7 @@ pub fn build(plan_path: &Path, out: &Path, resume: bool) -> Result<BuildSummary>
             seq_len: plan.seq_len,
             seed: plan.seed,
         },
-        tokenizer: crate::corpus::plan::tokenizer_record(),
+        tokenizer: tokenizer_record,
         split: SplitRecord {
             val: plan.split.val,
             heldout: plan.split.heldout,
@@ -628,4 +695,109 @@ fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec_pretty(value).context("cannot serialize JSON")?;
     bytes.push(b'\n');
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn artefact() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("artifacts/frs-tokenizer-32k/0.1.0/tokenizer.json")
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("ferrisres-corpus-bpe-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("create temp root");
+        path
+    }
+
+    fn write_plan(root: &Path, seq_len: usize, tokenizer: serde_json::Value) -> (PathBuf, String) {
+        let source_dir = root.join("source");
+        fs::create_dir_all(&source_dir).expect("create source dir");
+        let source_text = "the quick brown fox jumps over the lazy dog. ".repeat(40);
+        fs::write(source_dir.join("document.txt"), &source_text).expect("write source document");
+        let plan = serde_json::json!({
+            "name": "bpe-tokenizer",
+            "version": "0.1.0",
+            "seq_len": seq_len,
+            "seed": 17,
+            "tokenizer": tokenizer,
+            "sources": [{
+                "id": "fixture",
+                "path": source_dir.to_string_lossy(),
+                "licence": "MIT OR Apache-2.0",
+                "revision": "abc123",
+                "weight": 1.0
+            }],
+            "split": {"val": 0.0, "heldout": 0.0}
+        });
+        let plan_path = root.join("plan.json");
+        fs::write(&plan_path, serde_json::to_vec_pretty(&plan).expect("plan json"))
+            .expect("write plan");
+        (plan_path, source_text)
+    }
+
+    fn read_manifest(out: &Path) -> Manifest {
+        let bytes = fs::read(out.join("manifest.json")).expect("read manifest");
+        serde_json::from_slice(&bytes).expect("parse manifest")
+    }
+
+    #[test]
+    fn corpus_bpe_uses_the_trained_tokenizer() {
+        let root = temp_root("trained");
+        let tokenizer_path = artefact();
+        assert!(tokenizer_path.exists(), "committed 32k artefact is missing");
+        let tokenizer_bytes = fs::read(&tokenizer_path).expect("read 32k artefact");
+        let expected_sha256 = sha256_hex(&tokenizer_bytes);
+
+        let (plan_path, source_text) = write_plan(
+            &root,
+            16,
+            serde_json::json!({"kind": "bpe", "path": tokenizer_path.to_string_lossy()}),
+        );
+
+        let out_one = root.join("out-one");
+        let out_two = root.join("out-two");
+        let first = build(&plan_path, &out_one, false).expect("bpe build");
+        let second = build(&plan_path, &out_two, false).expect("second bpe build");
+
+        let manifest = read_manifest(&out_one);
+        assert_eq!(manifest.tokenizer.kind, "bpe");
+        assert_eq!(manifest.tokenizer.vocab_size, 32768, "manifest vocab_size");
+        assert_eq!(manifest.tokenizer.sha256, expected_sha256, "manifest tokenizer sha256");
+
+        let shard =
+            manifest.shards.iter().find(|shard| shard.tokens > 0).expect("a shard with tokens");
+        let data = fs::read(out_one.join(&shard.file)).expect("read shard");
+        let ids: Vec<u32> = data
+            .chunks_exact(2)
+            .take(manifest.corpus.seq_len)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]) as u32)
+            .collect();
+        let decoded = HfTokenizer::from_tokenizer_json(&tokenizer_path)
+            .expect("reload 32k artefact")
+            .decode(&ids);
+        assert!(!decoded.is_empty(), "first window must decode to text");
+        assert!(
+            source_text.starts_with(&decoded),
+            "first window {:?} is not the source prefix {:?}",
+            decoded,
+            &source_text[..decoded.len().min(source_text.len())]
+        );
+
+        assert_eq!(first.shards, second.shards, "two builds must produce identical shards");
+
+        let (byte_plan, _) = write_plan(&root, 16, serde_json::json!({"kind": "byte"}));
+        let byte_out = root.join("out-byte");
+        build(&byte_plan, &byte_out, false).expect("byte build");
+        let byte_manifest = read_manifest(&byte_out);
+        assert_eq!(byte_manifest.tokenizer.vocab_size, 259, "byte tokenizer keeps 259 ids");
+        assert_eq!(byte_manifest.tokenizer.kind, "byte");
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

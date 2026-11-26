@@ -41,14 +41,32 @@ pub struct Plan {
     pub version: String,
     pub seq_len: usize,
     pub seed: u64,
+    /// `byte` (default) or `bpe` with a `tokenizer.json` path.
+    #[serde(default)]
     pub tokenizer: TokenizerSpec,
     pub sources: Vec<SourceSpec>,
     pub split: SplitSpec,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Which tokenizer turns documents into ids. `byte` is the v1 default; `bpe`
+/// loads a HuggingFace `tokenizer.json` from `path`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TokenizerSpec {
+    #[serde(default = "default_tokenizer_kind")]
     pub kind: String,
+    /// Required for `bpe`, rejected for `byte`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl Default for TokenizerSpec {
+    fn default() -> Self {
+        Self { kind: default_tokenizer_kind(), path: None }
+    }
+}
+
+fn default_tokenizer_kind() -> String {
+    "byte".to_string()
 }
 
 /// Where a source's bytes come from.
@@ -176,11 +194,23 @@ impl Plan {
         if self.seq_len == 0 {
             bail!("plan seq_len must be greater than zero");
         }
-        if self.tokenizer.kind != "byte" {
+        if self.tokenizer.kind != "byte" && self.tokenizer.kind != "bpe" {
             bail!(
-                "plan tokenizer kind '{}' is not supported (v1 supports 'byte')",
+                "plan tokenizer kind '{}' is not supported (expected 'byte' or 'bpe')",
                 self.tokenizer.kind
             );
+        }
+        if self.tokenizer.kind == "bpe" {
+            let path =
+                self.tokenizer.path.as_deref().map(str::trim).filter(|value| !value.is_empty());
+            let Some(path) = path else {
+                bail!("plan tokenizer kind 'bpe' requires a path");
+            };
+            if !Path::new(path).exists() {
+                bail!("plan tokenizer path does not exist: {path}");
+            }
+        } else if self.tokenizer.path.is_some() {
+            bail!("plan tokenizer kind 'byte' takes no path");
         }
         if self.sources.is_empty() {
             bail!("plan has no sources");
