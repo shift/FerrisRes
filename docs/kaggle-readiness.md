@@ -10,9 +10,9 @@ about the target. The smoke must run `--device gpu` and show the T4.
 |---|---|---|---|
 | 1 | **GPU training loop** — wgpu forward, backward, Adam, `train --device gpu`, FRTRAIN1 read-back | **landed** at `73a6902`: parity, learning, CLI and resume; 1634 lib + 8 GPU tests | done |
 | 2 | parity and learning gates: logits/gradients vs f32, loss falls, parameters change | **passed**: logits 1.892e-4, grads ~1e-4, post-step 5e-5, loss 3.557→0.0026 | done |
-| 3 | **Vulkan on the Kaggle T4** — `ferrisres devices` must list the T4, not llvmpipe | **unverified**; the `.deb` ships an NVIDIA ICD, the image must expose the driver | first session |
+| 3 | **Vulkan on the Kaggle T4** — `ferrisres devices` must list the T4, not llvmpipe | **T4 present, ICD missing.** `nvidia-smi` sees 2× T4 (driver 580.178.04); the image has `libvulkan.so.1` and **no** `/usr/share/vulkan/icd.d/`, so the loader has no driver. The notebook now writes `nvidia_icd.json` and exports `VK_DRIVER_FILES`; `devices` under it is not yet observed | next run |
 | 4 | `.deb` with the GPU loop, built on ubuntu:22.04 with `--features vulkan` | **done**: 0.2.5 at `int/gpu-deb` `21aed9c`, 5.7 MiB, sha `db443ac2…`; gate PASS (version, devices, `--device`, CPU smoke, export, infer, glibc 2.34) | agent |
-| 5 | GPU smoke notebook: `nvidia-smi`, `devices` shows T4, `train --device gpu` 20 steps, loss falls, tokens/s recorded | updated; runnable when 0.2.5 is uploaded | — |
+| 5 | GPU smoke notebook: `nvidia-smi`, `devices` shows T4, `train --device gpu` 20 steps, loss falls, tokens/s recorded | **kernel `sectionme/ferrisres-gpu-probe`** pushed; v1 confirmed the T4 and the missing ICD, then stopped | agent |
 | 6 | checkpoint read-back, export, infer from the GPU-trained checkpoint | **done in the loop branch**; the packaged path is after 0.2.5 | agent |
 | 7 | resume from a GPU checkpoint across a 12-hour session | **resume tested** (`total_step=42`); the HF round-trip is in the notebook | operator |
 | 8 | upload the `.deb` as a private Kaggle dataset | operator | you |
@@ -56,6 +56,37 @@ Still needed after the GPU smoke:
 - prefix KV cache and parallel prefill: inference.
 - the harness recall branch: not training.
 - PLE: a separate competition.
+
+## Two facts about the Kaggle image (measured, 2026-11-26)
+
+Both cost a run to learn. Do not re-discover them.
+
+1. **There is no Vulkan ICD manifest.** `libvulkan.so.1` is present;
+   `/usr/share/vulkan/icd.d/` does not exist and there is no `nvidia_icd.json`.
+   A Vulkan loader with no ICD enumerates **zero** adapters, so `devices` would
+   report nothing even with the driver loaded. The fix is local and does not
+   need root pathology: write
+
+   ```json
+   {"file_format_version": "1.0.0",
+    "ICD": {"library_path": "libGLX_nvidia.so.0", "api_version": "1.3.260"}}
+   ```
+
+   to `/kaggle/working/nvidia_icd.json` and export `VK_DRIVER_FILES` **and**
+   `VK_ICD_FILENAMES` before the first wgpu call. Every notebook that trains does
+   this; it is not a packaging change to the `.deb`.
+
+2. **The first run after attaching a dataset mounts nothing.** `kernel-metadata`
+   is correct (`dataset_sources: ["sectionme/ferrisres"]`, confirmed by pulling
+   the kernel metadata back) and the dataset is `ready`, yet the run starts with
+   an empty `/kaggle/input`; a re-push of the identical body mounts it. Relying
+   on a human re-push is not a fix — the notebook discovers the file with
+   `Path('/kaggle/input').rglob(...)` and falls back to
+   `kagglehub.dataset_download('sectionme/ferrisres')`.
+
+The T4 answer is not in doubt any more: 2× Tesla T4, 15,360 MiB each, driver
+580.178.04. What remains is whether `devices` sees them **through wgpu**, which
+is the ICD row above.
 
 ## Risks
 
