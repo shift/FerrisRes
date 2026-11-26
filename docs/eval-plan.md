@@ -120,6 +120,18 @@ built before training, not after.
 | recovery from one empty search result | succeeds or abstains, never repeats the query |
 | success per dollar vs the 30B arm | strictly better |
 
+## 10. Token economics of the AST tools
+
+The claim is tokens per **verified** change, not per call (`token-economics.md`).
+
+| metric | gate |
+|---|---|
+| tokens per verified change, files > 1,000 lines | at least 2x better than text tools |
+| tokens per verified change, files < 200 lines | no worse than text tools |
+| turns to verify under AST | not more than text |
+| accepted change with `has_errors` true | **0** |
+| re-reads after an edit | not more than the text arm |
+
 ## Contamination
 
 Hash every evaluation set (GSM8K, MATH, SWE-bench, BFCL test, MT-Bench, our own
