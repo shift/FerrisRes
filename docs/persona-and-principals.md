@@ -88,3 +88,10 @@ as the Armor gate.
 The child tutor's procedure and its integrity boundary are in
 `learning-theory.md`: hint ladder before answer, no ghostwritten work, a
 parent-visible summary, and curriculum facts supplied by the parent.
+
+## Principal awareness
+
+The model side of the principal is in `principal-awareness.md`: a retrieved block
+(id, role, language, age band, grants summary), a trained adaptation (register,
+scope, escalation), and an enforced boundary (no authority from text, no
+cross-principal memory, no cache shared across principals).

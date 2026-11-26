@@ -196,6 +196,15 @@ share-alike or NC security curricula.
 No real child data, no textbook text, no copyrighted curriculum. Facts of a
 child's curriculum are supplied by the parent and retrieved, not trained.
 
+## 11f. Principal awareness
+
+| id | source | licence | target | filter | status |
+|---|---|---|---:|---|---|
+| `principal-profiles` | synthetic adult/child/operator/guest profiles | CC0 | 1M | no real person; labelled synthetic | planned |
+| `principal-dialogues` | the same request answered per role, contrastive | CC0 | 2M | reviewed; native German for register | planned |
+| `principal-impersonation` | role claims in text, refused | CC0 | 0.5M | authored; no authority from text | planned |
+| `principal-memory-scope` | A's fact, B's question → "not in your scope" | CC0 | 1M | synthetic entities | planned |
+
 ## 12. Held-out evaluation sets
 
 These are never trained. If any of them appears in a training run, that run is

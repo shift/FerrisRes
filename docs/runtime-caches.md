@@ -14,7 +14,7 @@ answer, a time-dependent decision, or a secret.
 
 | cache | what it avoids | expected | effort | risk |
 |---|---|---|---|---|
-| **Soul/tool prefix KV** (`tasks/soul-cache.md`) | re-prefilling 1–5k stable tokens every turn | large TTFT win | days | privacy, position shift |
+| **Soul/tool/principal prefix KV** (`tasks/soul-cache.md`) | re-prefilling 1–5k stable tokens every turn | large TTFT win | days | **privacy: the key must include the principal**, or two people share a prefix |
 | **Conversation prefix KV** | re-prefilling the whole history each turn | **large on multi-turn** | days | window/summary staleness |
 | **Unchanged suffix after an edit** | re-prefilling text a notebook edit did not change | up to 15% prefill (reported) | days | an edit must be an invalidation point, not a flush |
 | **Rendered tool/skill text** | re-rendering the same tool block and skill text | small CPU, feeds the KV cache | hours | tool-set hash |
