@@ -148,6 +148,20 @@ The model holds the procedure; the stores hold the facts
 | identical tool call repeated within a task | report; target ~0 |
 | context tokens per turn | flat, not linear |
 
+## 12. Subagent delegation
+
+Delegation is allowed as a granted capability with a tree budget
+(`subagents.md`); these gates test the control, not the enthusiasm.
+
+| metric | gate |
+|---|---|
+| duplicate-writer incidents | **0** |
+| child tool outside the parent's grant | **0** |
+| depth above the declared bound | **0** |
+| tokens per completed task on multi-file investigation, vs no delegation | strictly better |
+| parent context growth per delegation | bounded by the summary, not the transcript |
+| wasted-delegation rate | report; train against it |
+
 ## Contamination
 
 Hash every evaluation set (GSM8K, MATH, SWE-bench, BFCL test, MT-Bench, our own
