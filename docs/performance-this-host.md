@@ -157,3 +157,34 @@ thousand instructions per useful multiply-add. Every earlier "tok/s" estimate in
 these docs assumed a kernel that converts instructions into MACs at a normal
 rate; this engine's does not, and that gap — not bandwidth, not dispatch — is the
 single largest number in the performance budget.
+
+### The width/sequence wall (measured 2026-11-26)
+
+At the width `frs-s` uses, the sequence length is limited by the device, not by
+memory:
+
+| hidden | seq | batch | outcome |
+|---:|---:|---:|---|
+| 768 | 512 | 1 | **device lost**, 27 s |
+| 768 | 256 | 1 | **device lost**, 38 s |
+| 768 | 128 | 1 | runs: 32 steps in 606 s, **18.9 s/step** |
+| 768 | 512 | 4 | device lost |
+
+A 768-wide, 256-token activation is under a megabyte, so this is not exhaustion:
+it is the signature of a single dispatch running past the kernel watchdog (TDR)
+or writing out of bounds. Either way, **the intended training shape — 768 wide at
+512 tokens — cannot run on the HD 530 today**, and that is a defect to fix, not a
+setting to tune.
+
+Efficiency where it does run: `6 × 75.5M × 128 ≈ 5.8e10` FLOP in 18.9 s is
+**≈3.1 GFLOP/s, about 0.8% of the fp32 peak** — 125× off, and better than the
+0.09% a hidden-64 model achieves only because a larger model amortises the
+per-operation cost.
+
+Two consequences:
+
+- **kernel efficiency dominates everything else on this device** (0.1–0.8% of
+  peak), so SIMD/branchless work and fewer instructions per MAC is the only lever
+  that can move the number by an order of magnitude;
+- the usable learning rate falls as width grows (hidden 64 converged at 1e-4;
+  hidden 768 rose at 1e-4), so learning rate must be tuned per width, not copied.
