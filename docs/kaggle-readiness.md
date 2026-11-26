@@ -159,13 +159,26 @@ Training complete: steps=144 initial_loss=5.763604 final_loss=8.258290
 - the kernel is ERROR only because the probe asserts `final_loss <
   initial_loss`. That assertion is doing its job.
 
-The remaining suspect is the **backward pass or the optimiser update**, and the
-fingerprint is a race rather than a formula: forward identical, loss climbing
-monotonically. This engine has already had two gradient-buffer defects (a 16×16
-shader driven by 32×32 workgroups; grad shaders writing only column 0 while
-overwriting input grads), both fixed and verified on a 24-EU iGPU. A T4 has 40
-SMs, so a missing barrier or a non-atomic add in gradient accumulation is
-invisible there and double-counts on the larger adapter.
+**Resolved 2026-11-26 — and the T4 was innocent.** The roots were the training
+loop, not the kernels:
+
+1. The prebuilt `gpu_train_parity` test ran **on a T4** and passed: every gradient
+   agreed with CPU to ~1e-6, the finite differences matched, the post-step check
+   was 7.3e-7, exit 0. The forward *and* backward paths are correct on that card.
+2. `GpuModel::step_accumulated` scaled `grad_acc` by `1/windows` and then handed
+   Adam `graph.get_node(node).grad()` — the **last window's raw gradient**.
+   Every step over `batch_size > 1` ran at an effective `lr × windows` on a
+   gradient averaged over nothing (fixed in `c5cd360`).
+3. It survived because the only learning test stepped with `windows = 1`, where
+   the two values are identical. The Kaggle probe used batch 4 and diverged; the
+   documented HD 530 figure was the single-window test.
+
+Verified on the HD 530 after the fix: a new 4-window, 100-step test falls
+3.597410 → 0.008073, and the single-window gate still falls 3.557102 → 0.002632.
+
+The earlier hypotheses (cooperative matrices, a parallelism race scaled by SM
+count) were wrong, and the instrument that settled it was a per-tensor CPU-vs-GPU
+gradient dump run on the real hardware, not another reasoning step.
 
 Until that is fixed, "the GPU works" means *enumerates, executes and computes a
 correct forward pass*, not *trains*. No tokens/s figure may be quoted from this run as a

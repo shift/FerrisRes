@@ -5,7 +5,7 @@ one thing that closes it, not a programme.
 
 | # | gap | blocks | closes with | state |
 |---|---|---|---|---|
-| 1 | **T4 backward pass produces rising loss** | every GPU training run at any scale | a per-tensor CPU-vs-GPU gradient comparison on the T4, then the kernel fix | **in progress** |
+| 1 | **batched step used the last window's gradient** | every GPU training run with `batch_size > 1` | `c5cd360`; kernel gradients were correct on the T4 all along | **closed, verified** |
 | 2 | 32k corpus not rebuilt | the first student's tokenizer | `corpus build` with `--tokenizer` (landed, `781f28f`) run on the release plan | ready, CPU only |
 | 3 | corpus is 22.7M tokens, not 300–500M | quality | FineWeb-Edu / FineWeb-2 adapters (parquet converter) | missing |
 | 4 | no teacher distillation artefact | text-aligned KD | top-k dump: 8B bf16 on one T4 with vLLM `prompt_logprobs` | notebook not written |
