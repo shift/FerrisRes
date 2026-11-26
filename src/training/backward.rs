@@ -24,14 +24,32 @@ impl CpuBlockAttnResModel {
     /// Forward pass that stores all activations needed for proper backward.
     /// This is the ONLY forward that should be used during training.
     ///
-    /// Key difference from `forward_with_routing`:
-    /// - Stores pre-attention normed input (for Q/K/V/O LoRA grad)
-    /// - Stores pre-FFN normed input (for expert LoRA grad)
-    /// - Stores per-expert intermediate activations (gate, up, combined — for expert backward)
-    /// - Stores post-attention raw output (before O-LoRA — for O projection LoRA grad)
+    /// # Panics
     ///
-    /// All stored inline during the actual forward — no extra computation.
+    /// When the model has block boundaries and a LoRA manager, the LoRA
+    /// gradient path cannot produce a correct gradient: the inter-block
+    /// summary at position `t` is a prefix sum over `0..=t`, so a parameter
+    /// receives a suffix-sum gradient from every later boundary position, and
+    /// the distillation path uses `d_hidden` directly without any of the
+    /// attention, norm or inter-block Jacobians. The defect is documented in
+    /// `docs/block-attnres-causal.md` and measured by
+    /// [`crate::training::grad_audit::max_rel_error_blocked_lora`]. Callers
+    /// must not train LoRA in a blocked config until it is fixed.
     pub fn forward_train(&self, token_ids: &[u32]) -> TrainForwardOutput {
+        if !self.block_config.boundary_layers.is_empty() && self.lora_manager.is_some() {
+            panic!(
+                "lora_gradient_invalid_with_blocks: forward_train with block boundaries \
+                 and a LoRA manager cannot produce correct gradients; see \
+                 docs/block-attnres-causal.md"
+            );
+        }
+        self.forward_train_impl(token_ids)
+    }
+
+    /// The guarded forward body. `pub(crate)` only so
+    /// [`crate::training::grad_audit`] can measure the gradient defect; every
+    /// other caller must use [`Self::forward_train`].
+    pub(crate) fn forward_train_impl(&self, token_ids: &[u32]) -> TrainForwardOutput {
         let seq = token_ids.len();
         let hd = self.hidden_dim;
         let vs = self.vocab_size;
@@ -70,26 +88,6 @@ impl CpuBlockAttnResModel {
         let mut routing_data = Vec::new();
         let mut activations = Vec::with_capacity(self.num_layers);
         let lora_m = self.lora_manager.as_ref();
-
-        if has_blocks && lora_m.is_some() {
-            // The distillation/LoRA gradient code consumes `LayerActivations`
-            // and uses the per-position `d_hidden` as the gradient for every
-            // projection. That is already an approximation for plain
-            // attention; with causal inter-block attention it is wrong: entry
-            // `e`'s summary at position `t` is a prefix sum over positions
-            // `0..=t`, so a parameter in layer `l` also receives a suffix-sum
-            // gradient from every later boundary position. `forward_train`
-            // records the inter-block output but the gradient path does not
-            // backpropagate it. Gradients produced from this forward in a
-            // blocked config are not trustworthy; see
-            // `docs/block-attnres-causal.md`.
-            tracing::error!(
-                event = "lora_gradient_invalid_with_blocks",
-                "forward_train is running with block boundaries AND a LoRA manager: \
-                 the LoRA gradient path does not backpropagate the causal inter-block \
-                 attention (triangular summary dependency), so its gradients are wrong"
-            );
-        }
 
         let mut per_layer_hidden: Vec<Vec<f32>> = Vec::with_capacity(self.num_layers);
 

@@ -70,7 +70,9 @@ The RoPE cos/sin table is computed in f64 on the host because the driver's
   does not backpropagate the inter-block attention. The causal summaries make
   a parameter in an early layer receive a suffix-sum gradient from every later
   boundary position; the path uses `d_hidden` directly and ignores that term
-  (and the final-norm and attention Jacobians). `forward_train` logs an error
-  when blocks and a LoRA manager are both active, and
-  `tests/lora_gradient_audit.rs` measures the mismatch (max relative error
-  4.89) against a central finite difference.
+  (and the final-norm and attention Jacobians). `forward_train` now **panics**
+  (`lora_gradient_invalid_with_blocks`) when blocks and a LoRA manager are both
+  active. `training::grad_audit::max_rel_error_blocked_lora` measures the
+  mismatch against a central finite difference (currently 4.89), and
+  `examples/grad_audit.rs` prints it as the gate metric
+  `metric=grad_quality value=1 - min(error, 1)`.
