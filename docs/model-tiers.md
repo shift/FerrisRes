@@ -29,7 +29,9 @@ time so a regression can be attributed.
 ## What each tier is for
 
 - **Nano** — router, tool selector, Armor-class scanner, embeddings, and the
-  draft model for speculative decoding. Not a chat model.
+  draft model for speculative decoding. Not a chat model. Any tier can also
+  carry a 768→256 embedding head (`embedding-head.md`); that is an adapter, not
+  a second backbone.
 - **Small** — the first shipping assistant: instant on a Telegram turn, 36 MB,
   fits a Pi 5.
 - **Base** — quality tier for reasoning, longer answers and code.
