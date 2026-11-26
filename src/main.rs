@@ -26,6 +26,16 @@ struct Cli {
 enum Commands {
     Info,
 
+    /// List every GPU adapter the backend enumerates.
+    ///
+    /// The index is the value `WGPU_ADAPTER_INDEX` takes, after sorting by name
+    /// and filtering software adapters (unless `FERRISRES_ALLOW_SOFTWARE=1`).
+    Devices {
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
     Train {
         #[arg(long, default_value_t = 512)]
         hidden_dim: usize,
@@ -256,6 +266,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Info => cmd_info().await,
+        Commands::Devices { json } => cmd_devices(json).await,
         Commands::Train {
             hidden_dim,
             num_blocks,
@@ -342,6 +353,56 @@ async fn cmd_info() -> anyhow::Result<()> {
     info!(event = "max_storage_buffer_mb", "Max storage buffer: {} MB", capability.max_storage_buffer_range / (1024 * 1024));
     info!(event = "max_storage_buffers_stage", "Max storage buffers/stage: {}", capability.max_storage_buffers_per_shader_stage);
     info!(event = "max_bind_groups", "Max bind groups: {}", capability.max_bind_groups);
+
+    Ok(())
+}
+
+async fn cmd_devices(json: bool) -> anyhow::Result<()> {
+    let adapters = ferrisres::compute::pipeline::list_adapters().await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&adapters)?);
+        return Ok(());
+    }
+
+    let name_width = adapters
+        .iter()
+        .map(|a| a.name.chars().count())
+        .max()
+        .unwrap_or(4)
+        .max("name".len());
+
+    println!(
+        "{:<5}  {:<width$}  {:<10}  {:<7}  {:<11}  {:<13}  {:<16}  {}",
+        "index",
+        "name",
+        "kind",
+        "backend",
+        "max_buffer",
+        "max_immediate",
+        "memory",
+        "software",
+        width = name_width
+    );
+    for adapter in &adapters {
+        let memory = match (adapter.dedicated_vram, adapter.shared_memory) {
+            (Some(vram), _) => format!("{} MiB VRAM", vram / (1024 * 1024)),
+            (None, Some(shared)) => format!("shared {} MiB", shared / (1024 * 1024)),
+            (None, None) => "-".to_string(),
+        };
+        println!(
+            "{:<5}  {:<width$}  {:<10}  {:<7}  {:<11}  {:<13}  {:<16}  {}",
+            adapter.index,
+            adapter.name,
+            adapter.kind,
+            adapter.backend,
+            format!("{} MiB", adapter.max_buffer / (1024 * 1024)),
+            adapter.max_immediate,
+            memory,
+            if adapter.software { "yes" } else { "no" },
+            width = name_width
+        );
+    }
 
     Ok(())
 }

@@ -2,6 +2,195 @@ use wgpu::{Adapter, Device, Queue, ShaderModule, ComputePipeline};
 use crate::error::{FerrisResError, Result};
 use crate::device::{DeviceProfile, Capability};
 
+/// The backends `devices` and adapter selection enumerate.
+///
+/// `WgpuCompute::new()` uses the same set for its `HighPerformance` fallback,
+/// so an index printed by `ferrisres devices` always refers to the same list
+/// a worker sees.
+pub fn device_backends() -> wgpu::Backends {
+    wgpu::Backends::VULKAN
+        | wgpu::Backends::METAL
+        | wgpu::Backends::DX12
+        | wgpu::Backends::GL
+}
+
+fn new_instance() -> wgpu::Instance {
+    wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: device_backends(),
+        flags: wgpu::InstanceFlags::default(),
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        backend_options: wgpu::BackendOptions::default(),
+        display: None,
+    })
+}
+
+/// One row of `ferrisres devices`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdapterListing {
+    /// Position after sorting by name; this is what `WGPU_ADAPTER_INDEX` takes.
+    pub index: usize,
+    pub name: String,
+    /// Discrete / Integrated / Virtual / Cpu / Other.
+    pub kind: String,
+    pub backend: String,
+    pub max_buffer: u64,
+    pub max_immediate: u32,
+    /// `DeviceType::Cpu`; skipped by selection unless `FERRISRES_ALLOW_SOFTWARE=1`.
+    pub software: bool,
+    /// Dedicated VRAM when sysfs reports it for this PCI bus.
+    pub dedicated_vram: Option<u64>,
+    /// Host RAM shared with the adapter (integrated or software adapters).
+    pub shared_memory: Option<u64>,
+}
+
+fn kind_label(kind: wgpu::DeviceType) -> &'static str {
+    match kind {
+        wgpu::DeviceType::DiscreteGpu => "Discrete",
+        wgpu::DeviceType::IntegratedGpu => "Integrated",
+        wgpu::DeviceType::VirtualGpu => "Virtual",
+        wgpu::DeviceType::Cpu => "Cpu",
+        wgpu::DeviceType::Other => "Other",
+    }
+}
+
+fn read_u64(path: &str) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Dedicated VRAM from sysfs, looked up by the PCI bus id Vulkan reports.
+fn dedicated_vram_bytes(info: &wgpu::AdapterInfo) -> Option<u64> {
+    if info.device_pci_bus_id.is_empty() {
+        return None;
+    }
+    read_u64(&format!(
+        "/sys/bus/pci/devices/{}/mem_info_vram_total",
+        info.device_pci_bus_id
+    ))
+}
+
+/// Total host RAM, from `/proc/meminfo` (`MemTotal` is in kB).
+fn host_memory_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: u64 = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    Some(kb * 1024)
+}
+
+/// Deterministic order for adapters: name, then PCI bus id, then backend.
+///
+/// Two identical T4s share a name, so the bus id is the tie-breaker that keeps
+/// index 0 and index 1 from swapping between runs. Pure, so it is unit-tested
+/// without a GPU.
+pub(crate) fn sort_order(names: &[String], bus_ids: &[String], backends: &[String]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..names.len()).collect();
+    order.sort_by(|&a, &b| {
+        names[a]
+            .cmp(&names[b])
+            .then_with(|| bus_ids.get(a).cmp(&bus_ids.get(b)))
+            .then_with(|| backends.get(a).cmp(&backends.get(b)))
+    });
+    order
+}
+
+fn sorted_adapters(adapters: Vec<Adapter>) -> Vec<Adapter> {
+    let infos: Vec<wgpu::AdapterInfo> = adapters.iter().map(|a| a.get_info()).collect();
+    let names: Vec<String> = infos.iter().map(|i| i.name.clone()).collect();
+    let bus_ids: Vec<String> = infos.iter().map(|i| i.device_pci_bus_id.clone()).collect();
+    let backends: Vec<String> = infos.iter().map(|i| format!("{:?}", i.backend)).collect();
+    let order = sort_order(&names, &bus_ids, &backends);
+    let mut slots: Vec<Option<Adapter>> = adapters.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .filter_map(|i| slots[i].take())
+        .collect()
+}
+
+/// Enumerate every adapter on the configured backends, sorted by name.
+pub async fn list_adapters() -> Result<Vec<AdapterListing>> {
+    let instance = new_instance();
+    let adapters = sorted_adapters(instance.enumerate_adapters(device_backends()).await);
+    let host_memory = host_memory_bytes();
+
+    Ok(adapters
+        .into_iter()
+        .enumerate()
+        .map(|(index, adapter)| {
+            let info = adapter.get_info();
+            let limits = adapter.limits();
+            let software = info.device_type == wgpu::DeviceType::Cpu;
+            AdapterListing {
+                index,
+                name: info.name.clone(),
+                kind: kind_label(info.device_type).to_string(),
+                backend: format!("{:?}", info.backend).to_lowercase(),
+                max_buffer: limits.max_buffer_size,
+                max_immediate: limits.max_immediate_size,
+                software,
+                dedicated_vram: dedicated_vram_bytes(&info),
+                shared_memory: if info.device_type == wgpu::DeviceType::DiscreteGpu {
+                    None
+                } else {
+                    host_memory
+                },
+            }
+        })
+        .collect())
+}
+
+/// Choose an adapter index from a name-sorted list.
+///
+/// `requested` counts positions *after* software filtering, matching
+/// `WGPU_ADAPTER_INDEX`. Names and kinds must already be in sorted order; the
+/// returned value indexes that same slice. The error names the usable count
+/// and every usable adapter so an out-of-range launch is diagnosable from the
+/// log alone.
+pub fn pick_adapter(
+    names: &[String],
+    kinds: &[wgpu::DeviceType],
+    requested: usize,
+    allow_software: bool,
+) -> Result<usize> {
+    let usable: Vec<usize> = names
+        .iter()
+        .zip(kinds.iter())
+        .enumerate()
+        .filter(|(_, (_, kind))| allow_software || **kind != wgpu::DeviceType::Cpu)
+        .map(|(i, _)| i)
+        .collect();
+
+    if let Some(&index) = usable.get(requested) {
+        return Ok(index);
+    }
+
+    let listed = if usable.is_empty() {
+        "none".to_string()
+    } else {
+        usable
+            .iter()
+            .map(|&i| names[i].as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Err(FerrisResError::Device(format!(
+        "WGPU_ADAPTER_INDEX={} is out of range: {} usable adapter(s) after software filtering: [{}]",
+        requested,
+        usable.len(),
+        listed
+    )))
+}
+
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
+    )
+}
+
 /// Runtime compute parameters optimized for detected hardware
 #[derive(Debug, Clone)]
 pub struct ComputeParams {
@@ -53,22 +242,47 @@ pub(crate) fn device_limits(adapter: &wgpu::Limits, features: wgpu::Features) ->
 
 impl WgpuCompute {
     pub async fn new() -> Result<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12,
-            flags: wgpu::InstanceFlags::default(),
-            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-            backend_options: wgpu::BackendOptions::default(),
-            display: None,
-        });
+        let instance = new_instance();
 
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: None,
-            })
-            .await
-            .map_err(|e| FerrisResError::Device(format!("Failed to find adapter: {}", e)))?;
+        // `WGPU_ADAPTER_INDEX` selects a specific adapter (one worker per GPU).
+        // Without it, keep the historical HighPerformance request.
+        let adapter = match std::env::var("WGPU_ADAPTER_INDEX") {
+            Ok(raw) => {
+                let requested = raw.trim().parse::<usize>().map_err(|_| {
+                    FerrisResError::Device(format!(
+                        "WGPU_ADAPTER_INDEX must be a non-negative integer, got {:?}",
+                        raw
+                    ))
+                })?;
+                let adapters =
+                    sorted_adapters(instance.enumerate_adapters(device_backends()).await);
+                let names: Vec<String> = adapters.iter().map(|a| a.get_info().name).collect();
+                let kinds: Vec<wgpu::DeviceType> =
+                    adapters.iter().map(|a| a.get_info().device_type).collect();
+                let index = pick_adapter(
+                    &names,
+                    &kinds,
+                    requested,
+                    env_flag("FERRISRES_ALLOW_SOFTWARE"),
+                )?;
+                adapters.into_iter().nth(index).ok_or_else(|| {
+                    FerrisResError::Device(format!(
+                        "WGPU_ADAPTER_INDEX={} resolved to {} but the adapter list changed",
+                        requested, index
+                    ))
+                })?
+            }
+            Err(_) => instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                })
+                .await
+                .map_err(|e| {
+                    FerrisResError::Device(format!("Failed to find adapter: {}", e))
+                })?,
+        };
 
         let required_features = if adapter.features().contains(wgpu::Features::IMMEDIATES) {
             wgpu::Features::IMMEDIATES
@@ -207,7 +421,8 @@ impl WgpuCompute {
 
 #[cfg(test)]
 mod tests {
-    use super::device_limits;
+    use super::{device_limits, pick_adapter, sort_order};
+    use wgpu::DeviceType;
 
     /// The regression this module exists for: `Limits::default()` reports no
     /// immediate space, so a device that enables `IMMEDIATES` on top of it
@@ -249,5 +464,99 @@ mod tests {
         };
         let limits = device_limits(&adapter, wgpu::Features::IMMEDIATES);
         assert!(limits.max_immediate_size >= 4);
+    }
+
+    fn strs(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn selects_each_of_two_gpus_by_index() {
+        let names = strs(&["NVIDIA T4", "NVIDIA T4"]);
+        let kinds = [DeviceType::DiscreteGpu, DeviceType::DiscreteGpu];
+        assert_eq!(pick_adapter(&names, &kinds, 0, false).unwrap(), 0);
+        assert_eq!(pick_adapter(&names, &kinds, 1, false).unwrap(), 1);
+    }
+
+    #[test]
+    fn software_adapter_is_skipped_by_default() {
+        let names = strs(&["GPU A", "llvmpipe", "GPU B"]);
+        let kinds = [
+            DeviceType::DiscreteGpu,
+            DeviceType::Cpu,
+            DeviceType::DiscreteGpu,
+        ];
+        // The second *usable* adapter is GPU B, not llvmpipe.
+        assert_eq!(pick_adapter(&names, &kinds, 1, false).unwrap(), 2);
+        assert_eq!(pick_adapter(&names, &kinds, 0, false).unwrap(), 0);
+    }
+
+    #[test]
+    fn allow_software_includes_the_cpu_adapter() {
+        let names = strs(&["GPU A", "llvmpipe", "GPU B"]);
+        let kinds = [
+            DeviceType::DiscreteGpu,
+            DeviceType::Cpu,
+            DeviceType::DiscreteGpu,
+        ];
+        assert_eq!(pick_adapter(&names, &kinds, 1, true).unwrap(), 1);
+    }
+
+    #[test]
+    fn out_of_range_names_the_count_and_adapters() {
+        let names = strs(&["GPU A", "llvmpipe", "GPU B"]);
+        let kinds = [
+            DeviceType::DiscreteGpu,
+            DeviceType::Cpu,
+            DeviceType::DiscreteGpu,
+        ];
+        let err = pick_adapter(&names, &kinds, 2, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("2 usable adapter"), "missing count: {msg}");
+        assert!(msg.contains("GPU A") && msg.contains("GPU B"), "missing names: {msg}");
+        assert!(!msg.contains("llvmpipe"), "software must not be listed: {msg}");
+    }
+
+    /// Exercises `ferrisres devices` on this host with the Intel ICD:
+    ///
+    /// ```text
+    /// VK_ICD_FILENAMES=.../intel_icd.x86_64.json \
+    ///   cargo test --lib devices_lists_this_hosts_intel_adapter -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a Vulkan ICD; run manually with VK_ICD_FILENAMES set"]
+    fn devices_lists_this_hosts_intel_adapter() {
+        let adapters = pollster::block_on(super::list_adapters()).expect("enumerate adapters");
+        for adapter in &adapters {
+            eprintln!(
+                "#{} {} [{} {}] max_buffer={} max_immediate={} software={}",
+                adapter.index,
+                adapter.name,
+                adapter.kind,
+                adapter.backend,
+                adapter.max_buffer,
+                adapter.max_immediate,
+                adapter.software
+            );
+        }
+        assert!(!adapters.is_empty(), "no adapter enumerated");
+        assert!(
+            adapters.iter().any(|a| a.name.contains("Intel")),
+            "expected the Intel HD 530; got {:?}",
+            adapters.iter().map(|a| &a.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ordering_is_stable_and_ties_break_on_bus_id() {
+        let names = strs(&["GPU B", "GPU A", "GPU A"]);
+        let bus_ids = strs(&["0000:02:00.0", "0000:03:00.0", "0000:01:00.0"]);
+        let backends = strs(&["Vulkan", "Vulkan", "Vulkan"]);
+        let order = sort_order(&names, &bus_ids, &backends);
+        // Name first; identical names order by PCI bus id, deterministically.
+        assert_eq!(order, vec![2, 1, 0]);
+        for _ in 0..8 {
+            assert_eq!(sort_order(&names, &bus_ids, &backends), order);
+        }
     }
 }
