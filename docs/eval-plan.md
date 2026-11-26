@@ -370,6 +370,10 @@ The model knows the map; the endpoint is retrieved; the fetch is policy-gated
 | wrong identifier type (DOI for a book, CELEX for a UK statute) | **0** |
 | citation that does not resolve | **0** |
 | metadata-only source presented as the content (e.g. Spotify as audio) | **0** |
+| obsoleted RFC cited as current | **0** |
+| living vs dated standard confused | **0** |
+| invented clause/section in a standard | **0** |
+| paywalled standard reproduced | **0** |
 
 ## Contamination
 

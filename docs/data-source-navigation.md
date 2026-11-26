@@ -37,13 +37,47 @@ Unpaywall for an open copy" can look it up and cite it.
 | **chemistry / materials** | PubChem, ChEMBL, Materials Project, COD | CID, ChEMBL id, mp-id | API |
 | **finance / economics** | SEC EDGAR, ECB, Bundesbank, World Bank; broker APIs only under their terms | CIK, series id | API, bulk |
 | **legal** | EUR-Lex, CURIA, gesetze-im-internet, legislation.gov.uk, CourtListener, WorldLII | CELEX/ELI, ECLI, §/section | API, bulk |
-| **standards** | W3C, IETF RFCs, NIST, ISO/IEC (paywalled) | RFC, W3C shortname, ISO number | web/API, purchase |
+| **standards** | IETF RFCs/BCP/STD, W3C TR, WHATWG, ISO/IEC, IEEE, ECMA, ITU-T, NIST, IANA, OASIS, Unicode, 3GPP/ETSI | RFC number, W3C shortname + date, ISO/IEC number:year, IEEE number-year, ECMA number edition, NIST SP/FIPS rev., registry+value | web/API, some purchase |
 | **web archives** | Wayback Machine, Common Crawl, arquivo.pt | timestamp URL, WARC path | API, bulk |
 | **models** | Hugging Face Hub, Ollama library, vendor releases | repo id, commit | API |
 
 The registry — not this table — is the runtime source. Each entry records:
 source, data type, canonical identifier, access method, auth, licence/ToS, rate
 limit, verification, citation form, last checked.
+
+## Standards bodies and versioning
+
+A standard is not a web page. The failure mode is a citation that is real,
+plausible and **the wrong version** — an obsoleted RFC, a W3C Working Draft
+quoted as a Recommendation, or an ISO clause copied from a paywalled PDF.
+
+| body | where | versioning rule | access |
+|---|---|---|---|
+| **IETF** | `rfc-editor.org/rfc/rfcNNNN`, `datatracker.ietf.org` | an RFC number is **immutable**; `obsoletes`/`updates` and errata say what changed; drafts expire and are not normative | free |
+| **IETF BCP/STD** | same, subseries numbers | a BCP number can point at a newer RFC set | free |
+| **W3C** | `w3.org/TR/<shortname>` | dated REC/CR/PR/WD vs an Editor's Draft vs a **Living Standard**; cite the dated version and check errata | free |
+| **WHATWG** | `whatwg.org` | living standard only; cite the commit/date, not a "version" | free |
+| **ISO/IEC** | iso.org, national bodies (DIN, BSI, ANSI) | edition + year + amendments/corrigenda; national adoption may differ | **paywalled** |
+| **IEEE** | ieee.org (802.x, 1003.1) | number + year; amendments are separate documents | **paywalled** |
+| **ECMA** | ecma-international.org (ECMA-262) | edition + year; TC39 proposals are stages, not standards | free |
+| **ITU-T** | itu.int (X.509, …) | Recommendation number + version/date | free |
+| **NIST** | csrc.nist.gov (SP 800-x, FIPS) | revision number is part of the citation (`SP 800-53 Rev. 5`) | free |
+| **IANA** | iana.org/registries | registry + value; the registry is the authority, not a blog | free |
+| **OASIS** | oasis-open.org (SAML, ODF) | version + errata | free |
+| **Unicode** | unicode.org (UAX/UTS) | version (`Unicode 16.0`, `UAX #15`) | free |
+| **3GPP / ETSI** | 3gpp.org, etsi.org | release + spec number; ETSI publishes adopted versions | free/registration |
+
+**Rules for a standards answer**
+
+1. Name the body and the series, then the exact document.
+2. Say whether it is immutable (RFC), dated (W3C REC), living (WHATWG), or an
+   edition with amendments (ISO/IEC).
+3. Check `obsoleted-by` / `updates` / errata before calling it current.
+4. Cite the section from the document's own table of contents; never invent a
+   clause number.
+5. For a paywalled standard, cite the standard and its scope/abstract; do not
+   reproduce the clause.
+6. Never present a draft, a stage proposal or a blog summary as the standard.
 
 ## Identifier literacy
 
@@ -57,6 +91,9 @@ limit, verification, citation form, last checked.
 | case (EU) | ECLI | CURIA |
 | law (DE) | § + Gesetz, BGBl | gesetze-im-internet |
 | law (UK) | statute + section, SI number | legislation.gov.uk |
+| standard (IETF) | RFC number, BCP/STD | rfc-editor.org, datatracker |
+| standard (W3C) | shortname + dated version | w3.org/TR |
+| standard (ISO/IEC) | number:year (+ amendment) | iso.org / national body |
 | music release | MBID, ISRC | MusicBrainz |
 | place | OSM id, GeoNames id | osm.org, geonames.org |
 | person/org | ORCID, ROR | orcid.org, ror.org |
@@ -119,6 +156,10 @@ identifier systems, procedure, licence families, ethics.
 | citation that does not resolve | **0** |
 | fetch without approval where the policy requires it | **0** |
 | metadata-only claim (e.g. Spotify) presented as the audio | **0** |
+| obsoleted RFC cited as current without a note | **0** |
+| living standard cited as a dated Recommendation (or the reverse) | **0** |
+| invented clause or section number | **0** |
+| paywalled standard reproduced beyond its scope/abstract | **0** |
 
 ## Honest limits
 
