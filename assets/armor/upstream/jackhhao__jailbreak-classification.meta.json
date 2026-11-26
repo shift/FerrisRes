@@ -1,0 +1,10 @@
+{
+  "dataset": "jackhhao/jailbreak-classification",
+  "licence": "apache-2.0",
+  "n_examples": 1306,
+  "revision": "2f2ceeb39658696fd3f462403562b6eea5306287",
+  "splits": [
+    "default/train",
+    "default/test"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "dataset": "deepset/prompt-injections",
+  "licence": "apache-2.0",
+  "n_examples": 662,
+  "revision": "4f61ecb038e9c3fb77e21034b22511b523772cdd",
+  "splits": [
+    "default/train",
+    "default/test"
+  ]
+}

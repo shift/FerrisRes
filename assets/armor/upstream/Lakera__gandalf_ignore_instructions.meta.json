@@ -1,0 +1,11 @@
+{
+  "dataset": "Lakera/gandalf_ignore_instructions",
+  "licence": "mit",
+  "n_examples": 1000,
+  "revision": "04737b65e90a6794ec227012e4a255a7def6344b",
+  "splits": [
+    "default/train",
+    "default/validation",
+    "default/test"
+  ]
+}
