@@ -2,6 +2,7 @@ pub mod error;
 pub mod device;
 pub mod tensor;
 pub mod compute;
+pub mod multi_gpu;
 pub mod model;
 pub mod inference;
 pub mod training;
