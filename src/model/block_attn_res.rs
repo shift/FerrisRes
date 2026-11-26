@@ -10,6 +10,7 @@ use crate::compute::kernels::rope::RopeOp;
 use crate::compute::kernels::flash_decode::FlashDecodeOp;
 use crate::compute::kernels::causal_mask::CausalMaskOp;
 use crate::compute::kernels::prefill_attn::PrefillAttnOp;
+use crate::compute::kernels::inter_block::InterBlockAttentionOp;
 use crate::model::config::BlockAttnResConfig;
 use crate::model::linear::Linear;
 use crate::model::moe_linear::MoELinear;
@@ -188,6 +189,7 @@ pub struct BlockAttnResLayer {
     causal_mask: CausalMaskOp,
     flash_decode: FlashDecodeOp,
     prefill_attn: PrefillAttnOp,
+    inter_block_attn: InterBlockAttentionOp,
 
     device: Arc<Device>,
     queue: Arc<Queue>,
@@ -305,6 +307,7 @@ impl BlockAttnResLayer {
         let causal_mask = CausalMaskOp::new(&device)?;
         let flash_decode = FlashDecodeOp::new(&device, &queue)?;
         let prefill_attn = PrefillAttnOp::new(&device)?;
+        let inter_block_attn = InterBlockAttentionOp::new(&device, &queue)?;
 
         tracing::info!(
             "BlockAttnResLayer {} created: heads={} kv_heads={} head_dim={}",
@@ -360,6 +363,7 @@ impl BlockAttnResLayer {
             causal_mask,
             flash_decode,
             prefill_attn,
+            inter_block_attn,
             device,
             queue,
         })
@@ -619,19 +623,25 @@ impl BlockAttnResLayer {
             self.ff_gate.as_ref().unwrap().forward(encoder, &ff_normed, &ff_gate_buf, batch_size)?;
             self.ff_up.as_ref().unwrap().forward(encoder, &ff_normed, &ff_up_buf, batch_size)?;
 
-            // Activation: act(up)
+            // Activation: act(up). Use a separate buffer: a read-only and a
+            // read-write binding of the same buffer in one dispatch is invalid.
+            let ff_act = GpuBuffer::new(
+                &self.device,
+                ff_up_buf.size() as usize,
+                Some("intra_ff_act"),
+            )?;
             if self.use_gelu {
                 self.elementwise.dispatch_gelu(
-                    encoder, &ff_up_buf, &ff_up_buf, batch_size * intermediate_dim,
+                    encoder, &ff_up_buf, &ff_act, batch_size * intermediate_dim,
                 )?;
             } else {
                 self.elementwise.dispatch_relu(
-                    encoder, &ff_up_buf, &ff_up_buf, batch_size * intermediate_dim,
+                    encoder, &ff_up_buf, &ff_act, batch_size * intermediate_dim,
                 )?;
             }
-            // Gated: gate * act(up)
+            // Gated: gate * act(up), written back into ff_up_buf (not read here).
             self.elementwise.dispatch_mul(
-                encoder, &ff_gate_buf, &ff_up_buf, &ff_up_buf, batch_size * intermediate_dim,
+                encoder, &ff_gate_buf, &ff_act, &ff_up_buf, batch_size * intermediate_dim,
             )?;
 
             let ff_out = GpuBuffer::new(
@@ -950,12 +960,13 @@ impl BlockAttnResLayer {
             self.ff_gate.as_ref().unwrap().forward(encoder, &ff_normed, &ff_gate, 1u32)?;
             self.ff_up.as_ref().unwrap().forward(encoder, &ff_normed, &ff_up, 1u32)?;
 
+            let ff_act = GpuBuffer::new(&self.device, self.intermediate_dim * f32_size, Some("decode_direct_ff_act"))?;
             if self.use_gelu {
-                self.elementwise.dispatch_gelu(encoder, &ff_up, &ff_up, intermediate_dim)?;
+                self.elementwise.dispatch_gelu(encoder, &ff_up, &ff_act, intermediate_dim)?;
             } else {
-                self.elementwise.dispatch_relu(encoder, &ff_up, &ff_up, intermediate_dim)?;
+                self.elementwise.dispatch_relu(encoder, &ff_up, &ff_act, intermediate_dim)?;
             }
-            self.elementwise.dispatch_mul(encoder, &ff_gate, &ff_up, &ff_up, intermediate_dim)?;
+            self.elementwise.dispatch_mul(encoder, &ff_gate, &ff_act, &ff_up, intermediate_dim)?;
 
             let ff_out = GpuBuffer::new(&self.device, hidden_dim * f32_size, Some("decode_direct_ff_out"))?;
             self.ff_down.as_ref().unwrap().forward(encoder, &ff_up, &ff_out, 1u32)?;
@@ -1132,12 +1143,17 @@ impl BlockAttnResLayer {
             self.ff_gate.as_ref().unwrap().forward(encoder, &ff_normed, &ff_gate, seq_len)?;
             self.ff_up.as_ref().unwrap().forward(encoder, &ff_normed, &ff_up, seq_len)?;
 
+            let ff_act = GpuBuffer::new(
+                &self.device,
+                seq_len as usize * self.intermediate_dim * f32_size,
+                Some("prefill_ff_act"),
+            )?;
             if self.use_gelu {
-                self.elementwise.dispatch_gelu(encoder, &ff_up, &ff_up, seq_len * intermediate_dim)?;
+                self.elementwise.dispatch_gelu(encoder, &ff_up, &ff_act, seq_len * intermediate_dim)?;
             } else {
-                self.elementwise.dispatch_relu(encoder, &ff_up, &ff_up, seq_len * intermediate_dim)?;
+                self.elementwise.dispatch_relu(encoder, &ff_up, &ff_act, seq_len * intermediate_dim)?;
             }
-            self.elementwise.dispatch_mul(encoder, &ff_gate, &ff_up, &ff_up, seq_len * intermediate_dim)?;
+            self.elementwise.dispatch_mul(encoder, &ff_gate, &ff_act, &ff_up, seq_len * intermediate_dim)?;
 
             let ff_out = GpuBuffer::new(
                 &self.device, seq_len as usize * hidden_dim * f32_size, Some("prefill_ff_out"),
@@ -1223,26 +1239,36 @@ impl BlockAttnResLayer {
         Ok(())
     }
 
+    /// Causal inter-block attention.
+    ///
+    /// `block_reps` holds `[num_entries, batch, hidden]` per-position causal
+    /// means (built by [`CausalPrefixOp`] in the model forward). `query` is the
+    /// current block output, `[batch, hidden]`, one row per position. Each
+    /// position attends only to its own summary row, so no position can see a
+    /// later token.
     pub fn forward_inter_block(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         block_reps: &GpuBuffer,
-        partial_sum: &GpuBuffer,
+        query: &GpuBuffer,
         attn_output: &GpuBuffer,
-        num_blocks: u32,
+        num_entries: u32,
         batch_size: u32,
     ) -> Result<()> {
         tracing::debug!(
-            "BlockAttnResLayer::forward_inter_block layer={} num_blocks={} batch={}",
-            self.layer_number, num_blocks, batch_size
+            "BlockAttnResLayer::forward_inter_block layer={} num_entries={} batch={}",
+            self.layer_number, num_entries, batch_size
         );
 
         let hidden_dim = self.hidden_dim as u32;
-        let total_entries = num_blocks + 1;
+        if num_entries == 0 || batch_size == 0 {
+            return Ok(());
+        }
 
+        // Norm each (entry, position) row with attn_res_norm.
         let normed_keys = GpuBuffer::new(
             &self.device,
-            total_entries as usize * self.hidden_dim * std::mem::size_of::<f32>(),
+            num_entries as usize * batch_size as usize * self.hidden_dim * std::mem::size_of::<f32>(),
             Some("inter_normed_keys"),
         )?;
         self.attn_res_norm.dispatch(
@@ -1251,51 +1277,20 @@ impl BlockAttnResLayer {
             encoder,
             block_reps,
             &normed_keys,
-            total_entries,
+            num_entries * batch_size,
             hidden_dim,
         )?;
 
-        let scale_factor = 1.0f32 / (self.hidden_dim as f32).sqrt();
-
-        let scores = GpuBuffer::new(
-            &self.device,
-            batch_size as usize * total_entries as usize * std::mem::size_of::<f32>(),
-            Some("inter_scores"),
-        )?;
-
-        self.matmul.dispatch(
+        let scale = 1.0f32 / (self.hidden_dim as f32).sqrt();
+        self.inter_block_attn.dispatch(
             encoder,
-            partial_sum,
-            &normed_keys,
-            &scores,
-            batch_size,
-            hidden_dim,
-            total_entries,
-        )?;
-
-        self.elementwise.dispatch_scale(
-            encoder,
-            &scores,
-            &scores,
-            scale_factor,
-            batch_size * total_entries,
-        )?;
-
-        let softmax_out = GpuBuffer::new(
-            &self.device,
-            batch_size as usize * total_entries as usize * std::mem::size_of::<f32>(),
-            Some("inter_softmax"),
-        )?;
-        self.softmax.dispatch(encoder, &scores, &softmax_out, batch_size, total_entries)?;
-
-        self.matmul.dispatch(
-            encoder,
-            &softmax_out,
+            query,
             &normed_keys,
             attn_output,
             batch_size,
-            total_entries,
+            num_entries,
             hidden_dim,
+            scale,
         )?;
 
         tracing::debug!(

@@ -104,11 +104,18 @@ impl LayerKVCache {
 pub struct ModelKVCache {
     /// Per-layer caches.
     pub layers: Vec<LayerKVCache>,
-    /// Cached block representations for inter-block attention.
+    /// Causal running sums for inter-block attention.
+    ///
+    /// `block_reps[0]` is the sum of the initial embeddings over every processed
+    /// position. `block_reps[i + 1]` is the sum over every processed position of
+    /// all layer outputs in block `i`. The causal mean for entry `e` at the
+    /// current position is `block_reps[e] / (block_token_count * divisor)`,
+    /// where `divisor` is 1 for the embedding entry and `layers_per_block` for
+    /// a block entry. See the module docs of
+    /// [`crate::model::cpu_block_attn_res`] for the exact rule.
     pub block_reps: Vec<Vec<f32>>,
-    /// Partial sum accumulator for current block.
-    pub partial_sum: Vec<f32>,
-    /// Current block token count (for averaging).
+    /// Number of positions processed so far (the prefix length used by the
+    /// causal means above).
     pub block_token_count: usize,
     /// Shared KV mapping: layer_idx → source_layer_idx.
     /// For KV-shared layers, we point to the source layer's cache.
@@ -142,7 +149,6 @@ impl ModelKVCache {
         Self {
             layers,
             block_reps: Vec::new(),
-            partial_sum: vec![0.0f32; hidden_dim],
             block_token_count: 0,
             shared_kv_sources: std::collections::HashMap::new(),
             ple_prefix: None,
@@ -173,7 +179,6 @@ impl ModelKVCache {
             layer.clear();
         }
         self.block_reps.clear();
-        self.partial_sum = vec![0.0f32; self.hidden_dim];
         self.block_token_count = 0;
         self.ple_prefix = None;
         self.cached_token_ids.clear();

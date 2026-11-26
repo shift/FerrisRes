@@ -264,10 +264,11 @@ impl TwoPhaseInference {
             Some("block_scratch"),
         )?;
 
+        let partial_sum_bytes = batch_size as usize * hidden_dim * std::mem::size_of::<f32>();
         let partial_sum = GpuBuffer::zeros(
             &self.device,
             &self.queue,
-            hidden_dim * std::mem::size_of::<f32>(),
+            partial_sum_bytes,
             Some("block_partial_sum"),
         )?;
 
@@ -275,8 +276,7 @@ impl TwoPhaseInference {
             label: Some(&format!("Forward Block {}", block_idx)),
         });
 
-        let partial_sum_size = hidden_dim * std::mem::size_of::<f32>();
-        encoder.clear_buffer(partial_sum.buffer(), 0, Some(partial_sum_size as u64));
+        encoder.clear_buffer(partial_sum.buffer(), 0, Some(partial_sum_bytes as u64));
 
         self.elementwise.dispatch_copy(
             &mut encoder,
