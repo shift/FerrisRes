@@ -1,6 +1,7 @@
 # Kaggle GPU .deb and probe
 
-Status: **blocked on `feat/gpu-train-loop`.** Base: `int/kaggle-deb` + that branch.
+Status: **0.2.5 built and gated at `int/gpu-deb` `21aed9c`; the T4 probe is
+the remaining step.** Base: `int/kaggle-deb` + `feat/gpu-train-loop`.
 
 ## Behaviour (one)
 

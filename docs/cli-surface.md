@@ -24,7 +24,7 @@ released when it is in a tagged `.deb`. The Rust API reference is separate
 | `--seq-len` (128), `--vocab` (259), `--seed` (42) | `feat/train-cli` | byte tokenizer until the 32k one lands |
 | `--checkpoint-every`, `--output`, `--resume`, `--log-every` | `feat/train-cli` | `FRTRAIN1` checkpoints |
 | `--lora-rank` | `feat/train-cli` | **rejected**: the block+LoRA path is the open defect |
-| `--device gpu` | in progress | `feat/gpu-train-loop`; default is CPU |
+| `--device <cpu\|gpu>` | in 0.2.5 (`int/gpu-deb` `21aed9c`) | default CPU; GPU picks the adapter via `WGPU_ADAPTER_INDEX` |
 | `--rank`, `--world-size`, `--exchange-dir`, `--exchange-every` | `int/train-multi-gpu` | window sharding, init identity, exchange, resume refusal; CPU path only |
 
 ## Distillation
