@@ -14,16 +14,17 @@ corpus is permissive; the research corpus adds the overrides.
 | FineWeb-2 `deu` sample | ODC-By | German |
 | public-domain long text | per source | 8k windows |
 
-## Research corpus (same + overrides)
+## Private test corpus (same + overrides)
 
 | source | licence | condition |
 |---|---|---|
-| xLAM function calling | NC reported | **research only**; not commercial, not released |
-| Dolly 15k | CC-BY-SA-3.0 | **research only**; share-alike may reach the weights |
-| CulturaX `de` | gated terms | **research only**; confirm the card permits training at all |
+| xLAM function calling | NC reported | **private test only**; non-commercial, not distributed |
+| Dolly 15k | CC-BY-SA-3.0 | **private test only**; share-alike matters on distribution |
+| CulturaX `de` | gated terms | **private test only**; if the card forbids training, exclude it |
 
-The research corpus is a **separate plan and output directory**. A row from it
-never enters the release shards; the manifest records the split.
+The private test corpus is a **separate plan and output directory**. A row from
+it never enters the release shards; the manifest records the split, and the build
+is not distributed or served.
 
 ## Steps
 

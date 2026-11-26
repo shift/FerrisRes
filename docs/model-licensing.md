@@ -80,15 +80,19 @@ weight redistribution.
 ## Override: the research corpus (2026-11-26)
 
 Decision: include xLAM (NC), Dolly (CC-BY-SA) and CulturaX (gated) in a
-**research corpus** to measure whether they improve quality. Consequences,
-recorded rather than waived:
+**private test corpus** to measure whether they improve quality. The scope is
+internal evaluation only. Consequences, recorded rather than waived:
 
-- the resulting weights are **research-only**: not deployed, not sold, not
-  redistributed, and not used to serve third parties;
-- an internal commercial evaluation of NC data is still outside the NC grant in
-  the conservative reading; treat it as non-commercial research;
-- share-alike may reach the derived weights; the research artefact inherits the
-  question and is not released;
+- the weights are **private-test only**: not deployed, not sold, not
+  redistributed, not served to third parties, and not used in a commercial
+  offering;
+- NC: an internal evaluation by a commercial company is a grey area; the
+  conservative reading is that it is outside the NC grant, so keep the build
+  private, non-commercial and short-lived;
+- Dolly share-alike matters on **distribution** of a derivative; the private
+  build is not distributed, and any release is retrained;
+- CulturaX: read the gated card first; if it forbids training, it is excluded
+  even from the private build;
 - a model cannot unlearn the data; a release is **retrained** on the permissive
   corpus, not filtered.
 

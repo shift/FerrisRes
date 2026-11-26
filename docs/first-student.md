@@ -1,8 +1,10 @@
 # First student
 
-Status: **decision, 2026-11-26.** The first student is the **shipping model**, not
-a pipeline proof: `frs-s-0.1.0-beta`, 111M, 32k tokenizer, 8k context, ternary
-experts, top-1 MoE, MQA, 3-bit KV — shaped for **this machine**.
+Status: **private test build, 2026-11-26.** The first student is a private,
+hardware-shaped `frs-s` (111M, 32k tokenizer, 8k context, ternary experts, top-1
+MoE, MQA, 3-bit KV) for **testing on this machine**. It is not a release, not
+distributed, and not served to third parties. The shipping gates below are the
+graduation path if it proves itself.
 
 ## Why this shape
 
@@ -37,14 +39,17 @@ the first student trains the plain config that is verified.
 
 | corpus | contents | use |
 |---|---|---|
-| **release** | permissive only (MIT/Apache/BSD/CC0/CC-BY/ODC-By) | ships as `frs-s-0.1.0-beta` |
-| **research** | release + xLAM (NC), Dolly (SA), CulturaX (gated) | a comparison run only; **not deployed, not redistributed** |
+| **release** | permissive only (MIT/Apache/BSD/CC0/CC-BY/ODC-By) | the path to any distribution |
+| **private test** | release + xLAM (NC), Dolly (SA), CulturaX (gated) | this build; **not deployed, not distributed, not served** |
 
-The research corpus exists to answer "does the extra data improve quality?" The
-shipping model cannot use it: NC and share-alike data do not become compatible
-with an Apache-2.0 weight release because the run was internal, and a model
-cannot unlearn them. If the research result is compelling, the release model is
-**retrained** on the release corpus, not filtered.
+The private-test corpus exists to answer "does the extra data improve quality?"
+A distributed model cannot use it: NC and share-alike data do not become
+compatible with an Apache-2.0 weight release because the run was internal, and a
+model cannot unlearn them. If the result is compelling, the release model is
+**retrained** on the permissive corpus, not filtered.
+
+**CulturaX caveat:** if its card forbids training at all, it is excluded even
+from the private build. A gated licence is permission, not a formality.
 
 ## Gates for "shipping"
 

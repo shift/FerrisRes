@@ -39,7 +39,7 @@ A decision is a link, not a retelling: the owning document is the text.
 | FR-032 | Train the adaptation to the principal; retrieve the principal block; never let text or inference grant authority | accepted | `principal-awareness.md` |
 | FR-033 | Self-generated harness data trains only when a verifier passes; generator and verifier ids are recorded, and a source that does not improve the eval is cut | accepted | `self-generated-data.md` |
 | FR-034 | Legal work is information and drafting support: the law is indexed and cited at a date, never memorised; advice and reserved activities need a lawyer | accepted | `legal-information.md` |
-| FR-036 | The first student is the shipping `frs-s` on this hardware; a research corpus may include NC/SA/gated sources, but the release is retrained on the permissive corpus | accepted | `first-student.md` |
+| FR-036 | The first student is a **private test** `frs-s` on this hardware; the test corpus may include NC/SA/gated sources, but nothing is distributed, and a release is retrained on the permissive corpus | accepted | `first-student.md` |
 | FR-035 | Data-source knowledge is a map plus a policy: registries and identifiers are trained, endpoints are retrieved, and fetching respects licence, robots and scope | accepted | `data-source-navigation.md` |
 | FR-027 | Writers do not run heavy builds; one build slot at a time | process | repository `AGENTS.md` |
 
