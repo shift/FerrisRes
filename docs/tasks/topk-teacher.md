@@ -15,8 +15,8 @@ Plain `transformers`, one forward pass per 1024-token window, on one Kaggle T4.
 | fact | value |
 |---|---|
 | teacher in the smoke | `Qwen/Qwen3-4B`, fp16 (Turing has no bf16), `sdpa` |
-| measured throughput | **≈1,100 teacher tokens/s** on one T4 |
-| projection for 22.7M tokens | **≈5.7 h** — one 9 h session, no margin |
+| measured throughput | **927.9 teacher tokens/s** on one T4 (200,508 tokens in 216 s) |
+| projection for 22.7M tokens | **≈6.8 h** — one 9 h session, effectively no margin |
 | alignment | `logits[i-1]` predicts token `i`; the record at `i` carries it |
 | corpus decode | byte *b* is **id b+3**; ids 0–2 are `<unk>/<eos>/<pad>` |
 
@@ -39,7 +39,7 @@ Plain `transformers`, one forward pass per 1024-token window, on one Kaggle T4.
 
 The smoke proves format, not scale. Two levers, in this order:
 
-1. **batch 4–8 windows per forward**: 3–5×, one parameter, one process → ~1.5 h;
+1. **batch 4–8 windows per forward**: 3–5×, one parameter, one process → ~1.7 h;
 2. **both T4s, data parallel** (4B per card, shard ranges split): ~2×.
 
 8B fp16 is 16 GB and does not fit one T4; it needs both, and the post that
