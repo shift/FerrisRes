@@ -41,6 +41,11 @@ def status(slug):
 
 def push(template, slug, sets, title):
     src = Path(template)
+    lint = subprocess.run([sys.executable, str(Path(__file__).with_name("nb_lint.py")),
+                           str(src), "--no-datasets"], capture_output=True, text=True)
+    if lint.returncode != 0:
+        print(lint.stdout.strip() or lint.stderr.strip())
+        raise SystemExit("refusing to push: lint failed")
     meta = json.loads((src / "kernel-metadata.json").read_text())
     nb_file = meta["code_file"]
     text = (src / nb_file).read_text()
