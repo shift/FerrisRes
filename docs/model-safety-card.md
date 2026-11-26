@@ -38,6 +38,7 @@ refusing, citing and escalating; enforcement stays in the runtime.
 | privilege escalation | delegating to a child with more tools | grant intersection; never inherit | 0 |
 | secret disclosure | echoing an env value | env-only secrets; output scan | 0 |
 | child principal exposure | adult content or write tools | principal policy, read-only chat | gated |
+| harness configuration change | a permission or tool default widened without a code change | configuration review; grants are data, reviewed like code | gated |
 | model extraction | redistributing weights | Apache-2.0 permits it; the mark and NOTICE identify origin | n/a |
 
 ## Enforced vs trained
