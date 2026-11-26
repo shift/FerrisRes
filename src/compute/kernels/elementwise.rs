@@ -4,42 +4,43 @@ use crate::compute::GpuBuffer;
 use crate::error::Result;
 
 const ELEMENTWISE_WGSL: &str = r#"
+struct EW { param: u32, grid_x: u32, _a: u32, _b: u32 }
 @group(0) @binding(0) var<storage, read> ew_a: array<f32>;
 @group(0) @binding(1) var<storage, read> ew_b: array<f32>;
 @group(0) @binding(2) var<storage, read_write> ew_c: array<f32>;
-@group(0) @binding(3) var<uniform> ew_param: u32;
+@group(0) @binding(3) var<uniform> ew_param: EW;
 
 @compute @workgroup_size(256)
-fn add_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn add_main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wid.y * ew_param.grid_x + wid.x) * 256u + lid.x;
     let a_val = ew_a[idx];
-    let b_val = select(ew_b[idx], ew_b[idx % ew_param], ew_param > 0u);
+    let b_val = select(ew_b[idx], ew_b[idx % ew_param.param], ew_param.param > 0u);
     ew_c[idx] = a_val + b_val;
 }
 
 @compute @workgroup_size(256)
-fn scale_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    let s = bitcast<f32>(ew_param);
+fn scale_main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wid.y * ew_param.grid_x + wid.x) * 256u + lid.x;
+    let s = bitcast<f32>(ew_param.param);
     ew_c[idx] = ew_a[idx] * s;
 }
 
 @compute @workgroup_size(256)
-fn copy_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn copy_main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wid.y * ew_param.grid_x + wid.x) * 256u + lid.x;
     ew_c[idx] = ew_a[idx];
 }
 
 @compute @workgroup_size(256)
-fn relu_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn relu_main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wid.y * ew_param.grid_x + wid.x) * 256u + lid.x;
     let val = ew_a[idx];
     ew_c[idx] = select(0.0, val, val > 0.0);
 }
 
 @compute @workgroup_size(256)
-fn gelu_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn gelu_main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wid.y * ew_param.grid_x + wid.x) * 256u + lid.x;
     let val = ew_a[idx];
     // GELU tanh approximation
     let sqrt_2_over_pi = 0.7978845608028654;
@@ -49,11 +50,27 @@ fn gelu_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 @compute @workgroup_size(256)
-fn mul_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn mul_main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wid.y * ew_param.grid_x + wid.x) * 256u + lid.x;
     ew_c[idx] = ew_a[idx] * ew_b[idx];
 }
 "#;
+
+/// The WebGPU spec caps every dispatch dimension at 65,535 workgroups. A
+/// parameter gradient (the 32k head is 25.2M floats) exceeds that in one
+/// dimension, so workgroup counts are folded over a 2D grid and the shader
+/// flattens them again with `grid_x`.
+const MAX_WORKGROUPS: u32 = 65_535;
+
+fn grid(groups: u32) -> (u32, u32) {
+    let gx = groups.min(MAX_WORKGROUPS);
+    let gy = if groups == 0 {
+        0
+    } else {
+        (groups + MAX_WORKGROUPS - 1) / MAX_WORKGROUPS
+    };
+    (gx, gy)
+}
 
 pub struct ElementWiseOp {
     add_pipeline: wgpu::ComputePipeline,
@@ -167,7 +184,7 @@ impl ElementWiseOp {
 
         let copy_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ElementWise Copy Bind Group Layout"),
-            entries: &[read_entry.clone(), rw_entry.clone()],
+            entries: &[read_entry.clone(), rw_entry.clone(), uniform_entry.clone()],
         });
 
         let copy_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -187,7 +204,7 @@ impl ElementWiseOp {
 
         let relu_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ElementWise ReLU Bind Group Layout"),
-            entries: &[read_entry.clone(), rw_entry.clone()],
+            entries: &[read_entry.clone(), rw_entry.clone(), uniform_entry.clone()],
         });
 
         let relu_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -208,7 +225,7 @@ impl ElementWiseOp {
         // GELU pipeline uses same BGL as ReLU (a + c bindings)
         let gelu_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ElementWise GELU BGL"),
-            entries: &[read_entry.clone(), rw_entry.clone()],
+            entries: &[read_entry.clone(), rw_entry.clone(), uniform_entry.clone()],
         });
 
         let gelu_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -229,7 +246,7 @@ impl ElementWiseOp {
         // Multiply pipeline uses a + b + c bindings (same as add)
         let mul_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ElementWise Mul BGL"),
-            entries: &[read_entry.clone(), read_entry_b.clone(), rw_entry.clone()],
+            entries: &[read_entry.clone(), read_entry_b.clone(), rw_entry.clone(), uniform_entry.clone()],
         });
 
         let mul_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -267,6 +284,27 @@ impl ElementWiseOp {
         }
     }
 
+    /// Uniform params shared by every elementwise entry point: the op's own
+    /// scalar (`param`) and the fast grid dimension the shader uses to flatten
+    /// the 2D dispatch back into one element index.
+    fn params(&self, param: u32, grid_x: u32, label: &str) -> wgpu::Buffer {
+        let data = [
+            param.to_le_bytes(),
+            grid_x.to_le_bytes(),
+            0u32.to_le_bytes(),
+            0u32.to_le_bytes(),
+        ]
+        .concat();
+        let buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some(label),
+            size: 16,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&buffer, 0, &data);
+        buffer
+    }
+
     pub fn dispatch_add(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -283,6 +321,9 @@ impl ElementWiseOp {
                 Some("ew_add_tmp"),
             )?;
             self.dispatch_add_impl(encoder, a, b, &tmp, numel)?;
+            let workgroup_count = (numel + 255) / 256;
+            let (gx, gy) = grid(workgroup_count);
+            let params_buffer = self.params(0, gx, "ElementWise Add Copy Params");
             let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("ElementWise Add Copy Pass"),
                 timestamp_writes: None,
@@ -294,10 +335,11 @@ impl ElementWiseOp {
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: tmp.buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 2, resource: c.buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: params_buffer.as_entire_binding() },
                 ],
             });
             cp.set_bind_group(0, &bg, &[]);
-            cp.dispatch_workgroups((numel + 255) / 256, 1, 1);
+            cp.dispatch_workgroups(gx, gy, 1);
             drop(cp);
             return Ok(());
         }
@@ -325,19 +367,14 @@ impl ElementWiseOp {
         stride: u32,
     ) -> Result<()> {
         let workgroup_count = (numel + 255) / 256;
+        let (gx, gy) = grid(workgroup_count);
 
         tracing::debug!(
-            "ElementWiseOp::dispatch_add numel={} stride={} workgroups={}",
-            numel, stride, workgroup_count
+            "ElementWiseOp::dispatch_add numel={} stride={} workgroups={}x{}",
+            numel, stride, gx, gy
         );
 
-        let params_buffer = self.device.create_buffer(&BufferDescriptor {
-            label: Some("ElementWise Add Params"),
-            size: 4,
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue.write_buffer(&params_buffer, 0, &stride.to_le_bytes());
+        let params_buffer = self.params(stride, gx, "ElementWise Add Params");
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ElementWise Add Bind Group"),
@@ -369,7 +406,7 @@ impl ElementWiseOp {
 
         pass.set_pipeline(&self.add_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(workgroup_count, 1, 1);
+        pass.dispatch_workgroups(gx, gy, 1);
 
         drop(pass);
 
@@ -392,6 +429,9 @@ impl ElementWiseOp {
                 Some("ew_scale_tmp"),
             )?;
             self.dispatch_scale_impl(encoder, a, &tmp, scale, numel)?;
+            let workgroup_count = (numel + 255) / 256;
+            let (gx, gy) = grid(workgroup_count);
+            let params_buffer = self.params(0, gx, "ElementWise Scale Copy Params");
             let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("ElementWise Scale Copy Pass"),
                 timestamp_writes: None,
@@ -403,10 +443,11 @@ impl ElementWiseOp {
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: tmp.buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 2, resource: c.buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: params_buffer.as_entire_binding() },
                 ],
             });
             cp.set_bind_group(0, &bg, &[]);
-            cp.dispatch_workgroups((numel + 255) / 256, 1, 1);
+            cp.dispatch_workgroups(gx, gy, 1);
             drop(cp);
             return Ok(());
         }
@@ -422,19 +463,14 @@ impl ElementWiseOp {
         numel: u32,
     ) -> Result<()> {
         let workgroup_count = (numel + 255) / 256;
+        let (gx, gy) = grid(workgroup_count);
 
         tracing::debug!(
-            "ElementWiseOp::dispatch_scale numel={} scale={} workgroups={}",
-            numel, scale, workgroup_count
+            "ElementWiseOp::dispatch_scale numel={} scale={} workgroups={}x{}",
+            numel, scale, gx, gy
         );
 
-        let params_buffer = self.device.create_buffer(&BufferDescriptor {
-            label: Some("ElementWise Scale Params"),
-            size: 4,
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue.write_buffer(&params_buffer, 0, &scale.to_le_bytes());
+        let params_buffer = self.params(scale.to_bits(), gx, "ElementWise Scale Params");
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ElementWise Scale Bind Group"),
@@ -462,7 +498,7 @@ impl ElementWiseOp {
 
         pass.set_pipeline(&self.scale_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(workgroup_count, 1, 1);
+        pass.dispatch_workgroups(gx, gy, 1);
 
         drop(pass);
 
@@ -477,12 +513,14 @@ impl ElementWiseOp {
         numel: u32,
     ) -> Result<()> {
         let workgroup_count = (numel + 255) / 256;
+        let (gx, gy) = grid(workgroup_count);
 
         tracing::debug!(
-            "ElementWiseOp::dispatch_copy numel={} workgroups={}",
-            numel, workgroup_count
+            "ElementWiseOp::dispatch_copy numel={} workgroups={}x{}",
+            numel, gx, gy
         );
 
+        let params_buffer = self.params(0, gx, "ElementWise Copy Params");
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ElementWise Copy Bind Group"),
             layout: &self.copy_bind_group_layout,
@@ -495,6 +533,10 @@ impl ElementWiseOp {
                     binding: 2,
                     resource: c.buffer().as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -505,7 +547,7 @@ impl ElementWiseOp {
 
         pass.set_pipeline(&self.copy_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(workgroup_count, 1, 1);
+        pass.dispatch_workgroups(gx, gy, 1);
 
         drop(pass);
 
@@ -520,10 +562,11 @@ impl ElementWiseOp {
         numel: u32,
     ) -> Result<()> {
         let workgroup_count = (numel + 255) / 256;
+        let (gx, gy) = grid(workgroup_count);
 
         tracing::debug!(
-            "ElementWiseOp::dispatch_relu numel={} workgroups={}",
-            numel, workgroup_count
+            "ElementWiseOp::dispatch_relu numel={} workgroups={}x{}",
+            numel, gx, gy
         );
 
         // wgpu forbids binding the same buffer as both read-only and read-write
@@ -536,6 +579,7 @@ impl ElementWiseOp {
                 Some("ew_relu_tmp"),
             )?;
             self.dispatch_relu_impl(encoder, a, &tmp, numel)?;
+            let params_buffer = self.params(0, gx, "ElementWise ReLU Copy Params");
             let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("ElementWise ReLU Copy Pass"),
                 timestamp_writes: None,
@@ -547,10 +591,11 @@ impl ElementWiseOp {
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: tmp.buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 2, resource: c.buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: params_buffer.as_entire_binding() },
                 ],
             });
             cp.set_bind_group(0, &bg, &[]);
-            cp.dispatch_workgroups(workgroup_count, 1, 1);
+            cp.dispatch_workgroups(gx, gy, 1);
             drop(cp);
             return Ok(());
         }
@@ -565,6 +610,8 @@ impl ElementWiseOp {
         numel: u32,
     ) -> Result<()> {
         let workgroup_count = (numel + 255) / 256;
+        let (gx, gy) = grid(workgroup_count);
+        let params_buffer = self.params(0, gx, "ElementWise ReLU Params");
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ElementWise ReLU Bind Group"),
             layout: &self.relu_bind_group_layout,
@@ -577,6 +624,10 @@ impl ElementWiseOp {
                     binding: 2,
                     resource: c.buffer().as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -587,7 +638,7 @@ impl ElementWiseOp {
 
         pass.set_pipeline(&self.relu_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(workgroup_count, 1, 1);
+        pass.dispatch_workgroups(gx, gy, 1);
 
         drop(pass);
 
@@ -603,6 +654,8 @@ impl ElementWiseOp {
         numel: u32,
     ) -> Result<()> {
         let workgroup_count = (numel + 255) / 256;
+        let (gx, gy) = grid(workgroup_count);
+        let params_buffer = self.params(0, gx, "ElementWise GELU Params");
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ElementWise GELU Bind Group"),
             layout: &self.gelu_bind_group_layout,
@@ -615,6 +668,10 @@ impl ElementWiseOp {
                     binding: 2,
                     resource: c.buffer().as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -625,7 +682,7 @@ impl ElementWiseOp {
 
         pass.set_pipeline(&self.gelu_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(workgroup_count, 1, 1);
+        pass.dispatch_workgroups(gx, gy, 1);
 
         drop(pass);
 
@@ -642,6 +699,8 @@ impl ElementWiseOp {
         numel: u32,
     ) -> Result<()> {
         let workgroup_count = (numel + 255) / 256;
+        let (gx, gy) = grid(workgroup_count);
+        let params_buffer = self.params(0, gx, "ElementWise Mul Params");
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ElementWise Mul Bind Group"),
             layout: &self.mul_bind_group_layout,
@@ -658,6 +717,10 @@ impl ElementWiseOp {
                     binding: 2,
                     resource: c.buffer().as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -668,7 +731,7 @@ impl ElementWiseOp {
 
         pass.set_pipeline(&self.mul_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(workgroup_count, 1, 1);
+        pass.dispatch_workgroups(gx, gy, 1);
 
         drop(pass);
 

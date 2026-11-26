@@ -19,6 +19,7 @@ use crate::error::Result;
 
 struct Kernel {
     pipeline: ComputePipeline,
+    label: &'static str,
     layout: BindGroupLayout,
     /// Number of storage bindings; the uniform params buffer, when present,
     /// always takes the next binding.
@@ -27,7 +28,7 @@ struct Kernel {
 
 fn kernel(
     device: &Device,
-    label: &str,
+    label: &'static str,
     wgsl: &str,
     entry: &str,
     storage: &[bool],
@@ -86,6 +87,7 @@ fn kernel(
 
     Kernel {
         pipeline,
+        label,
         layout,
         storage: storage.len(),
     }
@@ -97,6 +99,24 @@ fn groups(n: u32, size: u32) -> u32 {
     } else {
         (n + size - 1) / size
     }
+}
+
+/// The WebGPU spec caps every dispatch dimension at 65,535 workgroups. A
+/// vocabulary x hidden tensor (the 32k head gradient is 25.2M elements) needs
+/// more than that in the fast dimension alone, so the flat workgroup count is
+/// folded into a 2D grid and each shader flattens it again with `grid_x`.
+const MAX_WORKGROUPS: u32 = 65_535;
+
+/// Split a flat workgroup count over a 2D grid. `gx` is the fast dimension and
+/// must be passed to the shader in its params; `gy` is the slow dimension.
+fn grid(groups: u32) -> (u32, u32) {
+    let gx = groups.min(MAX_WORKGROUPS);
+    let gy = if groups == 0 {
+        0
+    } else {
+        (groups + MAX_WORKGROUPS - 1) / MAX_WORKGROUPS
+    };
+    (gx, gy)
 }
 
 // ---------------------------------------------------------------------------
@@ -183,42 +203,42 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) row
 "#;
 
 const MUL_BCAST_FWD: &str = r#"
-struct P { numel: u32, cols: u32, rows: u32, _pad: u32 }
+struct P { numel: u32, cols: u32, rows: u32, _pad: u32, grid_x: u32, _pad2: u32, _pad3: u32, _pad4: u32 }
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read> w: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
 @group(0) @binding(3) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let i = (wid.y * p.grid_x + wid.x) * 256u + lid.x;
     if (i >= p.numel) { return; }
     out[i] = a[i] * w[i % p.cols];
 }
 "#;
 
 const MUL_BCAST_GRAD_A: &str = r#"
-struct P { numel: u32, cols: u32, rows: u32, _pad: u32 }
+struct P { numel: u32, cols: u32, rows: u32, _pad: u32, grid_x: u32, _pad2: u32, _pad3: u32, _pad4: u32 }
 @group(0) @binding(0) var<storage, read> dout: array<f32>;
 @group(0) @binding(1) var<storage, read> w: array<f32>;
 @group(0) @binding(2) var<storage, read_write> da: array<f32>;
 @group(0) @binding(3) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let i = (wid.y * p.grid_x + wid.x) * 256u + lid.x;
     if (i >= p.numel) { return; }
     da[i] = da[i] + dout[i] * w[i % p.cols];
 }
 "#;
 
 const MUL_BCAST_GRAD_W: &str = r#"
-struct P { numel: u32, cols: u32, rows: u32, _pad: u32 }
+struct P { numel: u32, cols: u32, rows: u32, _pad: u32, grid_x: u32, _pad2: u32, _pad3: u32, _pad4: u32 }
 @group(0) @binding(0) var<storage, read> dout: array<f32>;
 @group(0) @binding(1) var<storage, read> a: array<f32>;
 @group(0) @binding(2) var<storage, read_write> dw: array<f32>;
 @group(0) @binding(3) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let c = gid.x;
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let c = (wid.y * p.grid_x + wid.x) * 256u + lid.x;
     if (c >= p.cols) { return; }
     var s = 0.0;
     for (var r = 0u; r < p.rows; r = r + 1u) {
@@ -229,14 +249,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 const SILU_MUL_FWD: &str = r#"
-struct P { numel: u32, _a: u32, _b: u32, _c: u32 }
+struct P { numel: u32, _a: u32, _b: u32, _c: u32, grid_x: u32, _d: u32, _e: u32, _f: u32 }
 @group(0) @binding(0) var<storage, read> gate: array<f32>;
 @group(0) @binding(1) var<storage, read> up: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
 @group(0) @binding(3) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let i = (wid.y * p.grid_x + wid.x) * 256u + lid.x;
     if (i >= p.numel) { return; }
     let g = gate[i];
     out[i] = (g / (1.0 + exp(-g))) * up[i];
@@ -244,7 +264,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 const SILU_MUL_BWD: &str = r#"
-struct P { numel: u32, _a: u32, _b: u32, _c: u32 }
+struct P { numel: u32, _a: u32, _b: u32, _c: u32, grid_x: u32, _d: u32, _e: u32, _f: u32 }
 @group(0) @binding(0) var<storage, read> gate: array<f32>;
 @group(0) @binding(1) var<storage, read> up: array<f32>;
 @group(0) @binding(2) var<storage, read> dout: array<f32>;
@@ -252,8 +272,8 @@ struct P { numel: u32, _a: u32, _b: u32, _c: u32 }
 @group(0) @binding(4) var<storage, read_write> dup: array<f32>;
 @group(0) @binding(5) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let i = (wid.y * p.grid_x + wid.x) * 256u + lid.x;
     if (i >= p.numel) { return; }
     let g = gate[i];
     let s = 1.0 / (1.0 + exp(-g));
@@ -265,15 +285,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 const ROPE_FWD: &str = r#"
-struct P { seq: u32, heads: u32, head_dim: u32, offset: u32, theta: f32, _a: f32, _b: f32, _c: f32 }
+struct P { seq: u32, heads: u32, head_dim: u32, offset: u32, theta: f32, grid_x: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> out: array<f32>;
 @group(0) @binding(2) var<uniform> p: P;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let half = p.head_dim / 2u;
     let total = p.seq * p.heads * half;
-    let i = gid.x;
+    let i = (wid.y * p.grid_x + wid.x) * 64u + lid.x;
     if (i >= total) { return; }
     let d = i % half;
     let rest = i / half;
@@ -292,15 +312,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 const ROPE_BWD: &str = r#"
-struct P { seq: u32, heads: u32, head_dim: u32, offset: u32, theta: f32, _a: f32, _b: f32, _c: f32 }
+struct P { seq: u32, heads: u32, head_dim: u32, offset: u32, theta: f32, grid_x: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<storage, read> dx: array<f32>;
 @group(0) @binding(1) var<storage, read_write> dout: array<f32>;
 @group(0) @binding(2) var<uniform> p: P;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let half = p.head_dim / 2u;
     let total = p.seq * p.heads * half;
-    let i = gid.x;
+    let i = (wid.y * p.grid_x + wid.x) * 64u + lid.x;
     if (i >= total) { return; }
     let d = i % half;
     let rest = i / half;
@@ -319,14 +339,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 const GQA_EXPAND_FWD: &str = r#"
-struct P { seq: u32, heads: u32, kv_heads: u32, head_dim: u32 }
+struct P { seq: u32, heads: u32, kv_heads: u32, head_dim: u32, grid_x: u32, _a: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<storage, read> kv: array<f32>;
 @group(0) @binding(1) var<storage, read_write> out: array<f32>;
 @group(0) @binding(2) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let total = p.seq * p.heads * p.head_dim;
-    let i = gid.x;
+    let i = (wid.y * p.grid_x + wid.x) * 256u + lid.x;
     if (i >= total) { return; }
     let d = i % p.head_dim;
     let rest = i / p.head_dim;
@@ -339,14 +359,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 const GQA_EXPAND_BWD: &str = r#"
-struct P { seq: u32, heads: u32, kv_heads: u32, head_dim: u32 }
+struct P { seq: u32, heads: u32, kv_heads: u32, head_dim: u32, grid_x: u32, _a: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<storage, read> dout: array<f32>;
 @group(0) @binding(1) var<storage, read_write> dkv: array<f32>;
 @group(0) @binding(2) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let total = p.seq * p.kv_heads * p.head_dim;
-    let i = gid.x;
+    let i = (wid.y * p.grid_x + wid.x) * 256u + lid.x;
     if (i >= total) { return; }
     let d = i % p.head_dim;
     let rest = i / p.head_dim;
@@ -516,15 +536,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 const EMBEDDING_FWD: &str = r#"
-struct P { seq: u32, vocab: u32, hidden: u32, _pad: u32 }
+struct P { seq: u32, vocab: u32, hidden: u32, _pad: u32, grid_x: u32, _pad2: u32, _pad3: u32, _pad4: u32 }
 @group(0) @binding(0) var<storage, read> ids: array<u32>;
 @group(0) @binding(1) var<storage, read> table: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
 @group(0) @binding(3) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let total = p.seq * p.hidden;
-    let i = gid.x;
+    let i = (wid.y * p.grid_x + wid.x) * 256u + lid.x;
     if (i >= total) { return; }
     let d = i % p.hidden;
     let t = i / p.hidden;
@@ -533,15 +553,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 const EMBEDDING_BWD: &str = r#"
-struct P { seq: u32, vocab: u32, hidden: u32, _pad: u32 }
+struct P { seq: u32, vocab: u32, hidden: u32, _pad: u32, grid_x: u32, _pad2: u32, _pad3: u32, _pad4: u32 }
 @group(0) @binding(0) var<storage, read> ids: array<u32>;
 @group(0) @binding(1) var<storage, read> dout: array<f32>;
 @group(0) @binding(2) var<storage, read_write> dtable: array<f32>;
 @group(0) @binding(3) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let total = p.vocab * p.hidden;
-    let i = gid.x;
+    let i = (wid.y * p.grid_x + wid.x) * 256u + lid.x;
     if (i >= total) { return; }
     let v = i / p.hidden;
     let d = i % p.hidden;
@@ -554,35 +574,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 const LAYER_SCALE_FWD: &str = r#"
-struct P { numel: u32, _a: u32, _b: u32, _c: u32 }
+struct P { numel: u32, _a: u32, _b: u32, _c: u32, grid_x: u32, _d: u32, _e: u32, _f: u32 }
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> scalar: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
 @group(0) @binding(3) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let i = (wid.y * p.grid_x + wid.x) * 256u + lid.x;
     if (i >= p.numel) { return; }
     out[i] = x[i] * scalar[0];
 }
 "#;
 
 const LAYER_SCALE_BWD_X: &str = r#"
-struct P { numel: u32, _a: u32, _b: u32, _c: u32 }
+struct P { numel: u32, _a: u32, _b: u32, _c: u32, grid_x: u32, _d: u32, _e: u32, _f: u32 }
 @group(0) @binding(0) var<storage, read> dout: array<f32>;
 @group(0) @binding(1) var<storage, read> scalar: array<f32>;
 @group(0) @binding(2) var<storage, read_write> dx: array<f32>;
 @group(0) @binding(3) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let i = (wid.y * p.grid_x + wid.x) * 256u + lid.x;
     if (i >= p.numel) { return; }
     dx[i] = dx[i] + dout[i] * scalar[0];
 }
 "#;
 
 const LAYER_SCALE_BWD_S: &str = r#"
-struct P { numel: u32, _a: u32, _b: u32, _c: u32 }
+struct P { numel: u32, _a: u32, _b: u32, _c: u32, grid_x: u32, _d: u32, _e: u32, _f: u32 }
 @group(0) @binding(0) var<storage, read> dout: array<f32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> dscalar: array<f32>;
@@ -684,9 +704,20 @@ impl TrainOps {
         encoder: &mut wgpu::CommandEncoder,
         buffers: &[&GpuBuffer],
         params: &[u8],
+        elements: u32,
         workgroups: (u32, u32, u32),
     ) -> Result<()> {
         assert_eq!(buffers.len(), kernel.storage);
+        assert!(
+            workgroups.0 <= MAX_WORKGROUPS
+                && workgroups.1 <= MAX_WORKGROUPS
+                && workgroups.2 <= MAX_WORKGROUPS,
+            "kernel '{}': {} elements dispatch workgroups {:?}, but every dimension is capped at {}",
+            kernel.label,
+            elements,
+            workgroups,
+            MAX_WORKGROUPS,
+        );
         let params_buf = self.params(params);
         let mut entries: Vec<wgpu::BindGroupEntry> = buffers
             .iter()
@@ -726,7 +757,7 @@ impl TrainOps {
         eps: f32,
     ) -> Result<()> {
         let p = params_rms(dim, rows, eps);
-        self.dispatch(&self.rmsnorm_fwd, enc, &[x, y], &p, (rows, 1, 1))
+        self.dispatch(&self.rmsnorm_fwd, enc, &[x, y], &p, rows * dim, (rows, 1, 1))
     }
 
     pub fn rmsnorm_backward(
@@ -740,7 +771,7 @@ impl TrainOps {
         eps: f32,
     ) -> Result<()> {
         let p = params_rms(dim, rows, eps);
-        self.dispatch(&self.rmsnorm_bwd, enc, &[dy, x, dx], &p, (rows, 1, 1))
+        self.dispatch(&self.rmsnorm_bwd, enc, &[dy, x, dx], &p, rows * dim, (rows, 1, 1))
     }
 
     pub fn mul_broadcast_forward(
@@ -752,8 +783,11 @@ impl TrainOps {
         rows: u32,
         cols: u32,
     ) -> Result<()> {
-        let p = params_mul(rows * cols, cols, rows);
-        self.dispatch(&self.mul_bcast_fwd, enc, &[a, w, out], &p, (groups(rows * cols, 256), 1, 1))
+        let numel = rows * cols;
+        let g = groups(numel, 256);
+        let (gx, gy) = grid(g);
+        let p = params_mul(numel, cols, rows, gx);
+        self.dispatch(&self.mul_bcast_fwd, enc, &[a, w, out], &p, numel, (gx, gy, 1))
     }
 
     pub fn mul_broadcast_backward(
@@ -767,9 +801,15 @@ impl TrainOps {
         rows: u32,
         cols: u32,
     ) -> Result<()> {
-        let p = params_mul(rows * cols, cols, rows);
-        self.dispatch(&self.mul_bcast_grad_a, enc, &[dout, w, da], &p, (groups(rows * cols, 256), 1, 1))?;
-        self.dispatch(&self.mul_bcast_grad_w, enc, &[dout, a, dw], &p, (groups(cols, 256), 1, 1))
+        let numel = rows * cols;
+        let g_a = groups(numel, 256);
+        let (gx_a, gy_a) = grid(g_a);
+        let p_a = params_mul(numel, cols, rows, gx_a);
+        self.dispatch(&self.mul_bcast_grad_a, enc, &[dout, w, da], &p_a, numel, (gx_a, gy_a, 1))?;
+        let g_w = groups(cols, 256);
+        let (gx_w, gy_w) = grid(g_w);
+        let p_w = params_mul(numel, cols, rows, gx_w);
+        self.dispatch(&self.mul_bcast_grad_w, enc, &[dout, a, dw], &p_w, cols, (gx_w, gy_w, 1))
     }
 
     pub fn silu_mul_forward(
@@ -780,8 +820,10 @@ impl TrainOps {
         out: &GpuBuffer,
         numel: u32,
     ) -> Result<()> {
-        let p = params_n(numel);
-        self.dispatch(&self.silu_mul_fwd, enc, &[gate, up, out], &p, (groups(numel, 256), 1, 1))
+        let g = groups(numel, 256);
+        let (gx, gy) = grid(g);
+        let p = params_n(numel, gx);
+        self.dispatch(&self.silu_mul_fwd, enc, &[gate, up, out], &p, numel, (gx, gy, 1))
     }
 
     pub fn silu_mul_backward(
@@ -794,13 +836,16 @@ impl TrainOps {
         dup: &GpuBuffer,
         numel: u32,
     ) -> Result<()> {
-        let p = params_n(numel);
+        let g = groups(numel, 256);
+        let (gx, gy) = grid(g);
+        let p = params_n(numel, gx);
         self.dispatch(
             &self.silu_mul_bwd,
             enc,
             &[gate, up, dout, dgate, dup],
             &p,
-            (groups(numel, 256), 1, 1),
+            numel,
+            (gx, gy, 1),
         )
     }
 
@@ -815,9 +860,11 @@ impl TrainOps {
         theta: f32,
         offset: u32,
     ) -> Result<()> {
-        let p = params_rope(seq, heads, head_dim, theta, offset);
         let total = seq * heads * (head_dim / 2);
-        self.dispatch(&self.rope_fwd, enc, &[x, out], &p, (groups(total, 64), 1, 1))
+        let g = groups(total, 64);
+        let (gx, gy) = grid(g);
+        let p = params_rope(seq, heads, head_dim, theta, offset, gx);
+        self.dispatch(&self.rope_fwd, enc, &[x, out], &p, total, (gx, gy, 1))
     }
 
     pub fn rope_backward(
@@ -831,9 +878,11 @@ impl TrainOps {
         theta: f32,
         offset: u32,
     ) -> Result<()> {
-        let p = params_rope(seq, heads, head_dim, theta, offset);
         let total = seq * heads * (head_dim / 2);
-        self.dispatch(&self.rope_bwd, enc, &[dx, dout], &p, (groups(total, 64), 1, 1))
+        let g = groups(total, 64);
+        let (gx, gy) = grid(g);
+        let p = params_rope(seq, heads, head_dim, theta, offset, gx);
+        self.dispatch(&self.rope_bwd, enc, &[dx, dout], &p, total, (gx, gy, 1))
     }
 
     pub fn gqa_expand_forward(
@@ -846,9 +895,11 @@ impl TrainOps {
         kv_heads: u32,
         head_dim: u32,
     ) -> Result<()> {
-        let p = params_gqa(seq, heads, kv_heads, head_dim);
         let total = seq * heads * head_dim;
-        self.dispatch(&self.gqa_fwd, enc, &[kv, out], &p, (groups(total, 256), 1, 1))
+        let g = groups(total, 256);
+        let (gx, gy) = grid(g);
+        let p = params_gqa(seq, heads, kv_heads, head_dim, gx);
+        self.dispatch(&self.gqa_fwd, enc, &[kv, out], &p, total, (gx, gy, 1))
     }
 
     pub fn gqa_expand_backward(
@@ -861,9 +912,11 @@ impl TrainOps {
         kv_heads: u32,
         head_dim: u32,
     ) -> Result<()> {
-        let p = params_gqa(seq, heads, kv_heads, head_dim);
         let total = seq * kv_heads * head_dim;
-        self.dispatch(&self.gqa_bwd, enc, &[dout, dkv], &p, (groups(total, 256), 1, 1))
+        let g = groups(total, 256);
+        let (gx, gy) = grid(g);
+        let p = params_gqa(seq, heads, kv_heads, head_dim, gx);
+        self.dispatch(&self.gqa_bwd, enc, &[dout, dkv], &p, total, (gx, gy, 1))
     }
 
     pub fn attention_forward(
@@ -879,7 +932,8 @@ impl TrainOps {
         scale: f32,
     ) -> Result<()> {
         let p = params_attn(seq, heads, head_dim, scale);
-        self.dispatch(&self.attention_fwd, enc, &[q, k, v, out], &p, (seq, heads, 1))
+        let elements = seq * heads * head_dim;
+        self.dispatch(&self.attention_fwd, enc, &[q, k, v, out], &p, elements, (seq, heads, 1))
     }
 
     /// Backward over pre-expanded K/V. `probs` and `ds` are scratch buffers of
@@ -902,8 +956,9 @@ impl TrainOps {
         scale: f32,
     ) -> Result<()> {
         let p = params_attn(seq, heads, head_dim, scale);
-        self.dispatch(&self.attention_bwd_a, enc, &[dout, q, k, v, dq, probs, ds], &p, (seq, heads, 1))?;
-        self.dispatch(&self.attention_bwd_b, enc, &[q, dout, probs, ds, dk, dv], &p, (seq, heads, 1))
+        let elements = seq * heads * head_dim;
+        self.dispatch(&self.attention_bwd_a, enc, &[dout, q, k, v, dq, probs, ds], &p, elements, (seq, heads, 1))?;
+        self.dispatch(&self.attention_bwd_b, enc, &[q, dout, probs, ds, dk, dv], &p, elements, (seq, heads, 1))
     }
 
     pub fn embedding_forward(
@@ -916,9 +971,11 @@ impl TrainOps {
         vocab: u32,
         hidden: u32,
     ) -> Result<()> {
-        let p = params_emb(seq, vocab, hidden);
         let total = seq * hidden;
-        self.dispatch(&self.embedding_fwd, enc, &[ids, table, out], &p, (groups(total, 256), 1, 1))
+        let g = groups(total, 256);
+        let (gx, gy) = grid(g);
+        let p = params_emb(seq, vocab, hidden, gx);
+        self.dispatch(&self.embedding_fwd, enc, &[ids, table, out], &p, total, (gx, gy, 1))
     }
 
     pub fn embedding_backward(
@@ -931,9 +988,11 @@ impl TrainOps {
         vocab: u32,
         hidden: u32,
     ) -> Result<()> {
-        let p = params_emb(seq, vocab, hidden);
         let total = vocab * hidden;
-        self.dispatch(&self.embedding_bwd, enc, &[ids, dout, dtable], &p, (groups(total, 256), 1, 1))
+        let g = groups(total, 256);
+        let (gx, gy) = grid(g);
+        let p = params_emb(seq, vocab, hidden, gx);
+        self.dispatch(&self.embedding_bwd, enc, &[ids, dout, dtable], &p, total, (gx, gy, 1))
     }
 
     pub fn layer_scale_forward(
@@ -944,8 +1003,10 @@ impl TrainOps {
         out: &GpuBuffer,
         numel: u32,
     ) -> Result<()> {
-        let p = params_n(numel);
-        self.dispatch(&self.layer_scale_fwd, enc, &[x, scalar, out], &p, (groups(numel, 256), 1, 1))
+        let g = groups(numel, 256);
+        let (gx, gy) = grid(g);
+        let p = params_n(numel, gx);
+        self.dispatch(&self.layer_scale_fwd, enc, &[x, scalar, out], &p, numel, (gx, gy, 1))
     }
 
     pub fn layer_scale_backward(
@@ -958,9 +1019,12 @@ impl TrainOps {
         dscalar: &GpuBuffer,
         numel: u32,
     ) -> Result<()> {
-        let p = params_n(numel);
-        self.dispatch(&self.layer_scale_bwd_x, enc, &[dout, scalar, dx], &p, (groups(numel, 256), 1, 1))?;
-        self.dispatch(&self.layer_scale_bwd_s, enc, &[dout, x, dscalar], &p, (1, 1, 1))
+        let g = groups(numel, 256);
+        let (gx, gy) = grid(g);
+        let p = params_n(numel, gx);
+        self.dispatch(&self.layer_scale_bwd_x, enc, &[dout, scalar, dx], &p, numel, (gx, gy, 1))?;
+        let p_s = params_n(numel, 1);
+        self.dispatch(&self.layer_scale_bwd_s, enc, &[dout, x, dscalar], &p_s, numel, (1, 1, 1))
     }
 }
 
@@ -974,46 +1038,65 @@ fn params_rms(dim: u32, rows: u32, eps: f32) -> Vec<u8> {
     .concat()
 }
 
-fn params_mul(numel: u32, cols: u32, rows: u32) -> Vec<u8> {
+fn params_mul(numel: u32, cols: u32, rows: u32, grid_x: u32) -> Vec<u8> {
     [
         numel.to_le_bytes(),
         cols.to_le_bytes(),
         rows.to_le_bytes(),
         0u32.to_le_bytes(),
+        grid_x.to_le_bytes(),
+        0u32.to_le_bytes(),
+        0u32.to_le_bytes(),
+        0u32.to_le_bytes(),
     ]
     .concat()
 }
 
-fn params_n(numel: u32) -> Vec<u8> {
+fn params_n(numel: u32, grid_x: u32) -> Vec<u8> {
     [
         numel.to_le_bytes(),
         0u32.to_le_bytes(),
         0u32.to_le_bytes(),
         0u32.to_le_bytes(),
+        grid_x.to_le_bytes(),
+        0u32.to_le_bytes(),
+        0u32.to_le_bytes(),
+        0u32.to_le_bytes(),
     ]
     .concat()
 }
 
-fn params_rope(seq: u32, heads: u32, head_dim: u32, theta: f32, offset: u32) -> Vec<u8> {
+fn params_rope(
+    seq: u32,
+    heads: u32,
+    head_dim: u32,
+    theta: f32,
+    offset: u32,
+    grid_x: u32,
+) -> Vec<u8> {
     [
         seq.to_le_bytes(),
         heads.to_le_bytes(),
         head_dim.to_le_bytes(),
         offset.to_le_bytes(),
         theta.to_le_bytes(),
-        0u32.to_le_bytes(),
+        grid_x.to_le_bytes(),
         0u32.to_le_bytes(),
         0u32.to_le_bytes(),
     ]
     .concat()
 }
 
-fn params_gqa(seq: u32, heads: u32, kv_heads: u32, head_dim: u32) -> Vec<u8> {
+fn params_gqa(seq: u32, heads: u32, kv_heads: u32, head_dim: u32, grid_x: u32) -> Vec<u8> {
     [
         seq.to_le_bytes(),
         heads.to_le_bytes(),
         kv_heads.to_le_bytes(),
         head_dim.to_le_bytes(),
+        grid_x.to_le_bytes(),
+        0u32.to_le_bytes(),
+        0u32.to_le_bytes(),
+        0u32.to_le_bytes(),
     ]
     .concat()
 }
@@ -1028,12 +1111,49 @@ fn params_attn(seq: u32, heads: u32, head_dim: u32, scale: f32) -> Vec<u8> {
     .concat()
 }
 
-fn params_emb(seq: u32, vocab: u32, hidden: u32) -> Vec<u8> {
+fn params_emb(seq: u32, vocab: u32, hidden: u32, grid_x: u32) -> Vec<u8> {
     [
         seq.to_le_bytes(),
         vocab.to_le_bytes(),
         hidden.to_le_bytes(),
         0u32.to_le_bytes(),
+        grid_x.to_le_bytes(),
+        0u32.to_le_bytes(),
+        0u32.to_le_bytes(),
+        0u32.to_le_bytes(),
     ]
     .concat()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{grid, MAX_WORKGROUPS};
+
+    #[test]
+    fn grid_arithmetic_covers_every_element() {
+        let cases = [
+            1u32,
+            256,
+            MAX_WORKGROUPS * 256 - 1,
+            MAX_WORKGROUPS * 256,
+            MAX_WORKGROUPS * 256 + 1,
+            25_165_824,
+        ];
+        for numel in cases {
+            let g = (numel + 255) / 256;
+            let (gx, gy) = grid(g);
+            assert!(
+                gx <= MAX_WORKGROUPS,
+                "numel {numel}: gx {gx} exceeds the spec limit"
+            );
+            assert!(
+                gy <= MAX_WORKGROUPS,
+                "numel {numel}: gy {gy} exceeds the spec limit"
+            );
+            assert!(
+                gx as u64 * gy as u64 * 256 >= numel as u64,
+                "numel {numel}: grid {gx}x{gy}x256 covers less than the tensor"
+            );
+        }
+    }
 }
