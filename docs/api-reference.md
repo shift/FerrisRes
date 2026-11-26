@@ -1,5 +1,9 @@
 # FerrisRes API Reference
 
+> The **CLI** surface — commands, flags and which branch has them — is in
+> `cli-surface.md`. This file is the Rust module/API reference and predates the
+> training, worker and teacher commands.
+
 > **Version 0.2.2** — API is unstable and may change before 1.0.0.
 
 ## Module Stability Tiers
