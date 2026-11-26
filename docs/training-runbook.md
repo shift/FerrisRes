@@ -62,6 +62,20 @@ checkpoint by loading it, not by its size.
   refusal**; do not edit the checkpoint to get past it.
 - `epochs` is the number of passes *from the resume point*, not the original run.
 
+## Retention (mandatory)
+
+Every SFT or KD run mixes an **out-of-domain replay set** of the initial
+checkpoint's own answers (about 15% of each update) with a KL term toward those
+answers. Without it, factual fine-tuning has been measured to lose ~35 points of
+general ability and to halve answer length; with it, the loss fell from 28.1 to
+2.4 points (`research/hf-papers-2026-11-25-agentic.md`). The run is refused if
+the replay set is in-domain or absent, and the general-ability gate in
+`eval-plan.md` §17 must pass.
+
+Distillation is split: text-aligned KD for language (`text-aligned-kd.md`),
+action-only or CoT-proxy trajectory SFT for tool behaviour. Do not train on the
+teacher's chain of thought.
+
 ## What is not implemented yet
 
 - GPU training (`--device gpu`): the wgpu loop is in progress.

@@ -40,6 +40,16 @@ between calls.
 7. **Workflow conformance** — follow the state grammar and the grants; a
    long-running agent that leaves the workflow is not long-running, it is lost.
 
+## Compaction is trained, not prompted
+
+The 2026-11-25 RECAP result makes the summary a training target: the objective
+is to preserve the behaviour induced by the original history, measured as the KL
+between next actions under the full and the compacted context, with a
+distortion-based reward for the summary and self-distillation for the actions
+that follow (`research/hf-papers-2026-11-25-agentic.md`). Until that training
+runs, evaluate every compaction with the same divergence: a summary that changes
+the next action is a bad summary, however readable it is.
+
 ## Data
 
 | source | shape | rule |

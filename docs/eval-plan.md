@@ -219,6 +219,22 @@ Distilling a 151k-vocab teacher into a 32k student (`text-aligned-kd.md`).
 | KD share of the loss | reported; < 10% means it is SFT |
 | coverage per language (English/Rust/Nix/German) | reported; < 30% uses SeqKD for that slice |
 
+## 17. Retention, compaction and commitment
+
+Four 2026-11-25 results add gates we did not have
+(`research/hf-papers-2026-11-25-agentic.md`).
+
+| metric | gate |
+|---|---|
+| **general-ability regression after any fine-tune** (instruction-following, reasoning, coding) | no more than 2 points below the initial checkpoint |
+| answer length after fine-tuning | within 25% of the initial model's median |
+| **behaviour distortion of a compaction** (KL between next actions under full and compacted context) | reported; a summary that changes the next action is a bad summary |
+| **commits with insufficient evidence** (an open question remains, the model answers) | **0** on the held-out long-horizon set |
+| fine-tune without an out-of-domain replay set and KL term | refused by the training gate |
+
+Every SFT/KD run carries a replay corpus from the initial checkpoint and a KL
+term toward it; the gate is the same as the one that protects general ability.
+
 ## Contamination
 
 Hash every evaluation set (GSM8K, MATH, SWE-bench, BFCL test, MT-Bench, our own

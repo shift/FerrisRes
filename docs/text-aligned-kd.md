@@ -130,6 +130,15 @@ the repeated teacher passes are cheaper than the storage; usually they are not.
 4. **No distillation for the small tier** — if 2 and 3 both lose to SFT at equal
    compute, say so and ship SFT.
 
+## What this does not teach
+
+Token-level KD teaches *language*, not *agent behaviour*. For long-horizon tool
+use, distil from the teacher's **actions alone** (empty reasoning block) with a
+KL replay term toward the initial model, optionally with short CoT-proxies
+outside the think block; the student reasons in its own style at inference
+(`research/hf-papers-2026-11-25-agentic.md`). Use both: KD for text, trajectory
+SFT for the policy.
+
 ## What this does not solve
 
 - The teacher's own bias: a wrong top-k is a wrong target, however well aligned.
