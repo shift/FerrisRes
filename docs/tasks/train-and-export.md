@@ -91,3 +91,28 @@ Only then does a Kaggle run make sense.
 - Multi-GPU training: single process, one adapter.
 - A GPU training path: the f32 trainer is CPU; a GPU path is a later port with
   the same tests as the oracle.
+
+## What blocks the first smoke (2026-11-26)
+
+Measured against `main` at `ff98a05`; the branches named are not merged.
+
+| blocker | evidence | unblocks it |
+|---|---|---|
+| **`train` does not learn** | `cmd_train` allocates zeroed logits and targets, runs `CrossEntropyLoss::compute`, reads the value back, and never calls backward or `optimizer.step`; the LoRA merge callback returns `None` | wire `f32_trainer` as specified above |
+| **The only real path, `distill`, is blocked in the target config** | Block AttnRes with `boundary_layers` non-empty + LoRA has a 4.89 relative gradient error; `fix/gpu-interblock-generator` turns it into a panic | the suffix-sum and Jacobian rewrite |
+| **Vocabulary mismatch** | the teacher is Qwen3 at 151k; Nano/Small are specified at 32k; distillation maps logits into the student vocab | a 151k student for the smoke, or a projection layer, or SFT instead of distillation for the small tiers |
+| **No data pipeline** | `train` reads one text file with a 259-token byte tokenizer; there is no tokenise/shard command, no packing, no data offset; every source-index row is still `planned` | a small licensed slice + the loader in `dataset-formats` |
+| **No resume or export for `train`** | `distill` has `--resume`, `--checkpoint-every`, `--converge`; `train` has none, and there is no export command | the checkpoint section above |
+| **The Kaggle notebook stops on the guard** | `distill_smoke.ipynb` reaches the blocked config | a non-blocked config, or the gradient fix |
+| **Branch split** | Qwen teacher configs are on `feat/teacher-benchmark`; the guard is on `fix/gpu-interblock-generator`; GPU selection on `feat/gpu-selection` | one integration branch |
+
+**Shortest route to a Kaggle smoke without the gradient rewrite:** use
+`distill` (it has resume and checkpoints) with a config that has **no boundary
+layers** — the guard's condition is blocks *and* LoRA — and a student whose vocab
+matches the teacher, on a small licensed slice at 128–512 tokens. The assertion
+is that loss falls and a held-out sample improves. That proves the pipeline and
+the Kaggle path; it is not the tiered model, and the 32k-vocab Small still needs
+the projection or the gradient fix.
+
+Not blocking the smoke: multi-GPU phase 2 (one T4 is enough at this size), Armor
+(a separate model), the `.deb`, and host load (Kaggle is another machine).
