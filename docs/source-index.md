@@ -151,6 +151,19 @@ security configuration.
 | `safety-jailbreak` | 40 golden + 30 benign-hard | ours | pin | ours | 1M | held-out split separate | planned |
 | `safety-pii` | deterministic PII patterns | ours | pin | ours | 1M | synthetic only | planned |
 
+## 11b. Secure development and vulnerability finding
+
+| id | source | licence | target | filter | status |
+|---|---|---|---:|---|---|
+| `sec-theory` | authored principle notes: trust boundaries, least privilege, fail-closed, CWE classes | CC0 | 3M | original summaries; cite, do not copy CC-BY-SA curricula | planned |
+| `sec-snippets` | synthetic vulnerable snippets + a checker + a fixed version | CC0 | 2M | one defect each; the check must fail before and pass after | planned |
+| `sec-fixes` | OSS fixes from permissive repos, with commit and CVE id | per-repo MIT/Apache | 2M | no exploit code; patch only | planned |
+| `sec-tools` | code → scanner output → triage → reproduction | ours | 1M | scanner version recorded; no secrets | planned |
+| `sec-incidents` | redacted incidents: failure → cause → fix → verification | internal | 1M | derived, never raw logs | planned |
+
+Excluded: exploit payloads, malware, live targets, advisory text as memory,
+share-alike or NC security curricula.
+
 ## 12. Held-out evaluation sets
 
 These are never trained. If any of them appears in a training run, that run is
