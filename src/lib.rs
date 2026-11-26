@@ -7,6 +7,7 @@ pub mod inference;
 pub mod training;
 pub mod autodiff;
 pub mod corpus;
+pub mod tokenizer;
 
 pub use error::{FerrisResError, Result};
 pub use device::{DeviceProfile, Capability};
