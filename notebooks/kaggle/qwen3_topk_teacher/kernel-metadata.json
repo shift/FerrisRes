@@ -1,0 +1,14 @@
+{
+  "id": "sectionme/ferrisres-topk-teacher",
+  "title": "FerrisRes top-k teacher logits",
+  "code_file": "qwen3_topk_teacher.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": true,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": []
+}
