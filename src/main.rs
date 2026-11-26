@@ -80,6 +80,10 @@ enum Commands {
         /// Not supported by the f32 reference trainer; rejected when set.
         #[arg(long)]
         lora_rank: Option<usize>,
+        /// Training device: `cpu` (the f32 reference) or `gpu` (wgpu graph).
+        /// `WGPU_ADAPTER_INDEX` selects the adapter for `gpu`.
+        #[arg(long, default_value = "cpu")]
+        device: String,
     },
 
     /// Run inference on a prompt using a Block AttnRes model.
@@ -296,11 +300,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Train {
             hidden_dim, num_blocks, block_size, epochs, batch_size,
             learning_rate, data, data_format, chat_template, seq_len, vocab,
-            seed, checkpoint_every, output, resume, log_every, lora_rank,
+            seed, checkpoint_every, output, resume, log_every, lora_rank, device,
         } => cmd_train(
             hidden_dim, num_blocks, block_size, epochs, batch_size,
             learning_rate, data, data_format, chat_template, seq_len, vocab,
-            seed, checkpoint_every, output, resume, log_every, lora_rank,
+            seed, checkpoint_every, output, resume, log_every, lora_rank, device,
         ).await,
         Commands::Infer {
             model_path, config, config_path, model_format, tokenizer,
@@ -376,9 +380,10 @@ async fn cmd_train(
     resume: Option<String>,
     log_every: u64,
     lora_rank: Option<usize>,
+    device: String,
 ) -> anyhow::Result<()> {
     use ferrisres::training::f32_trainer::F32Config;
-    use ferrisres::training::train_loop::{run, TrainOptions};
+    use ferrisres::training::train_loop::TrainOptions;
 
     if let Some(rank) = lora_rank {
         anyhow::bail!(
@@ -461,7 +466,11 @@ async fn cmd_train(
         log_every,
     };
 
-    let report = run(&options, &tokens)?;
+    let report = match device.as_str() {
+        "cpu" => ferrisres::training::train_loop::run(&options, &tokens)?,
+        "gpu" => ferrisres::training::gpu_train_loop::run(&options, &tokens).await?,
+        other => anyhow::bail!("--device must be `cpu` or `gpu`, got {:?}", other),
+    };
 
     info!(
         event = "training_summary_steps_lr",

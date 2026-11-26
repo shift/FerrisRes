@@ -194,7 +194,7 @@ pub fn run(options: &TrainOptions, tokens: &[u32]) -> Result<TrainReport> {
     Ok(report)
 }
 
-fn validate(options: &TrainOptions, tokens: &[u32]) -> Result<()> {
+pub(crate) fn validate(options: &TrainOptions, tokens: &[u32]) -> Result<()> {
     if options.seq_len == 0 || options.seq_len > options.config.max_seq {
         return Err(FerrisResError::Shape(format!(
             "seq_len {} must be in 1..={} (the model's max_seq)",
@@ -253,7 +253,7 @@ fn params_fingerprint(model: &F32Model) -> u64 {
 // checkpointing for the wgpu model, so it does not fit this CPU trainer; the
 // parameter layout below is the same stable one `F32Model::tensors` exposes.
 
-fn save_checkpoint(path: &Path, model: &F32Model, adam: &Adam, step: u64) -> Result<()> {
+pub(crate) fn save_checkpoint(path: &Path, model: &F32Model, adam: &Adam, step: u64) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -288,7 +288,7 @@ fn save_checkpoint(path: &Path, model: &F32Model, adam: &Adam, step: u64) -> Res
     Ok(())
 }
 
-fn load_checkpoint(path: &Path) -> Result<(F32Model, Adam, u64)> {
+pub(crate) fn load_checkpoint(path: &Path) -> Result<(F32Model, Adam, u64)> {
     let file = File::open(path)?;
     let mut r = BufReader::new(file);
 

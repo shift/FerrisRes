@@ -16,6 +16,7 @@ pub mod bit_moe;
 pub mod f32_trainer;
 pub mod train_loop;
 pub mod gpu_trainer;
+pub mod gpu_train_loop;
 
 pub use optimizer::{SgdOptimizer, AdamOptimizer, CrossEntropyLoss, WeightOptimizer, OptimizerHint, optimizer_for_profile};
 pub use dataset::{
