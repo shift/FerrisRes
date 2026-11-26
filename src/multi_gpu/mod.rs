@@ -10,11 +10,13 @@
 
 pub mod checkpoint;
 pub mod error;
+pub mod exchange;
 pub mod identity;
 pub mod shard;
 
 pub use checkpoint::{check_resume_world_size, RunParallelism};
 pub use error::MultiGpuError;
+pub use exchange::{WeightExchange, DEFAULT_EXCHANGE_TIMEOUT};
 pub use identity::{verify_identity, InitIdentity};
 pub use shard::ShardPlan;
 
