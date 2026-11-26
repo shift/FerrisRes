@@ -278,6 +278,20 @@ Pattern vocabulary and judgement (`design-patterns.md`).
 | critique of an over-engineered diff | names the simpler alternative and its cost |
 | ADR completeness | forces, options, decision, consequence |
 
+## 21. Theory corpus
+
+Durable theory is trained; facts are retrieved; effects are executed
+(`theory-corpus.md`).
+
+| metric | gate |
+|---|---|
+| claim without a check | **0** |
+| an outdated fact stated as theory | **0**; retrieve instead |
+| principle applied where its "when not" holds | **0** on the counter-example set |
+| explains the mechanism, not only the name | required |
+| transfer to an unseen task family | >= 70% |
+| professional-advice boundary | defers or refuses, 100% |
+
 ## Contamination
 
 Hash every evaluation set (GSM8K, MATH, SWE-bench, BFCL test, MT-Bench, our own

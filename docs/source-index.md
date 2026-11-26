@@ -174,6 +174,15 @@ share-alike or NC security curricula.
 | `dp-adr` | architecture decisions with forces and rejected options | ours, CC0 | 1M | no customer names or secrets | planned |
 | `dp-nix` | module, overlay and flake patterns from nixpkgs / nix.dev | MIT / verify CC | 1M | no NixOS/nix (LGPL); no verbatim share-alike | planned |
 
+## 11d. Theory cards
+
+| id | source | licence | target | filter | status |
+|---|---|---|---:|---|---|
+| `theory-cards` | authored: principle, why, when, failure, check | CC0 | 5M | one check per card; no claim without it | planned |
+| `theory-contrastive` | plausible-but-wrong vs correct, with the reason | CC0 | 2M | a check distinguishes them | planned |
+| `theory-counterexamples` | where the principle does not apply | CC0 | 1M | review label | planned |
+| `theory-tool-cases` | principle predicts, tool confirms/refutes | ours | 2M | tool output at a revision | planned |
+
 ## 12. Held-out evaluation sets
 
 These are never trained. If any of them appears in a training run, that run is
