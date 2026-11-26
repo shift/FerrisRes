@@ -27,7 +27,7 @@ HF parquet --(Kaggle notebook: stream, filter, sample)--> *.txt shards
 | German web | `HuggingFaceFW/fineweb-2` config `deu` | ODC-By | same | ~50M tok |
 | Code | `bigcode/the-stack-dedup`, licence-filtered | per-file, filter to MIT/Apache/BSD | select where the file licence is permissive; keep `content` | ~100M tok |
 | Instruction SFT | `HuggingFaceTB/smoltalk` | Apache-2.0 | render each conversation through our chat template into jsonl, then text | ~75M tok |
-| Tool use | **generate** from our own tool schemas | ours (CC0) | teacher calls our tools against a sandbox; record request/response pairs | ~60M tok |
+| Tool use | **generate** from our own tool schemas | ours (CC0) | teacher calls our tools against a sandbox; see `tasks/synthetic-tool-traces.md` | ~60M tok |
 | Math / reasoning | `AI-MO/NuminaMath-CoT` | Apache-2.0 | `problem` + `solution` as text | ~25M tok |
 | Long documents | Project Gutenberg, more titles | public domain | already have the adapter; fetch a larger slice | ~15M tok |
 | Soul / persona | **authored + generated** | ours (CC0) | 30 authored souls + 500 synthetic × 5–10 tasks, answered by the teacher | ~5M tok |
