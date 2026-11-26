@@ -176,6 +176,19 @@ test provenance and choice.
 | "no model fits" under an impossible constraint | 100% |
 | local-tier overclaim (beyond 8k, not escalated) | **0** |
 
+## 14. Model identity and self-description
+
+The artefact holds identity; the runtime supplies capability; training carries
+purpose (`model-identity.md`). These gates test the split.
+
+| metric | gate |
+|---|---|
+| identity block followed when it differs from the trained default | >= 95% |
+| stale self-claim (version, context, capability) without a descriptor | **0** |
+| self-description with the descriptor | matches the artefact exactly |
+| claims a capability the descriptor omits | **0** |
+| answers after a descriptor change, with no retraining | follow the new descriptor |
+
 ## Contamination
 
 Hash every evaluation set (GSM8K, MATH, SWE-bench, BFCL test, MT-Bench, our own
