@@ -132,6 +132,34 @@ Both cost a run to learn. Do not re-discover them.
    `Path('/kaggle/input').rglob(...)` and falls back to
    `kagglehub.dataset_download('sectionme/ferrisres')`.
 
+### First T4 measurement (run 7, 2026-11-26)
+
+The engine ran on a T4 for the first time. It is reachable and it executes, but
+it does **not** learn:
+
+```
+selected adapter 0 Tesla T4
+step 144/144 loss=8.258290
+Training complete: steps=144 initial_loss=5.763604 final_loss=8.258290
+```
+
+- **144 steps executed** on adapter 0 (`Tesla T4`, vulkan, Discrete);
+- **loss rose** 5.764 → 8.258. The identical config on the HD 530 fell
+  3.557 → 0.0026, so this is a T4-path defect, not a bad corpus or a bad
+  learning rate;
+- **~1.6 s/step** derived from the log timestamps (~228 s for 144 steps of
+  4×128 tokens, ≈320 tok/s). The HD 530 did the same config at ~0.16 s/step, so
+  the T4 is **~10× slower per step** at this size: dispatch-bound, not
+  bandwidth-bound, and the cooperative-matrix path the driver advertises
+  ("Found 6 cooperative matrix configurations") is a prime suspect;
+- the kernel is ERROR only because the probe asserts `final_loss <
+  initial_loss`. That assertion is doing its job.
+
+Until the divergence is explained, "the GPU works" means *enumerates and
+executes*, not *trains*. No tokens/s figure may be quoted from this run as a
+performance expectation: the workload is a 64-hidden toy, and it is slower than
+the iGPU.
+
 The T4 is reachable. Run 4 measured `Tesla T4`, backend `vulkan`, kind
 `Discrete`, `software: false`, twice — index 0 and index 1 — after the in-session
 install above. What remains unmeasured is **speed**: no FerrisRes step has run on
