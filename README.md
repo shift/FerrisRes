@@ -687,8 +687,11 @@ The project is not yet open for external contributions while core development is
 
 ## License
 
-FerrisRes is dual-licensed:
+FerrisRes is free and open-source software under the **GNU Affero General
+Public License v3.0 or later** (AGPL-3.0-or-later). There is no commercial
+edition and no separate commercial licence. See [`LICENSE`](LICENSE) for the
+full terms.
 
-**AGPL-3.0-or-later** for free and open-source use. See [`LICENSE`](LICENSE) for the full terms.
-
-**Commercial license** for use in proprietary or commercial products. Contact: shift+licensing@someone.section.me
+The model weights are a separate artefact under **Apache-2.0**, with a NOTICE
+naming the teachers and corpora. Running the model requires no licence key,
+entitlement or network call.
