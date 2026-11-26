@@ -217,7 +217,7 @@ impl CpuBlockAttnResLayer {
         let normed = self.attn_norm.forward(hidden);
 
         // Q projection + per-head norm + RoPE
-        let mut q = self.q_proj.forward(&normed, seq);
+        let mut q = self.q_proj.forward_batch(&normed, seq);
         q = crate::model::gemma_mapper::per_head_rms_norm(&q, self.q_norm.weight(), seq, nh, head_d);
         apply_rope(&mut q, seq, nh, head_d, 0, self.rope_theta, self.partial_rotary_factor);
 
@@ -229,8 +229,8 @@ impl CpuBlockAttnResLayer {
             }
             None => {
                 // Normal layer — compute own K/V
-                let mut k = self.k_proj.forward(&normed, seq);
-                let v_raw = self.v_proj.forward(&normed, seq);
+                let mut k = self.k_proj.forward_batch(&normed, seq);
+                let v_raw = self.v_proj.forward_batch(&normed, seq);
 
                 // Per-head K/V norms
                 k = crate::model::gemma_mapper::per_head_rms_norm(&k, self.k_norm.weight(), seq, nkv, head_d);
@@ -337,7 +337,9 @@ impl CpuBlockAttnResLayer {
             if routing_collector.is_some() || lora_manager.is_some() {
                 moe.forward_with_routing(&normed2, seq, routing_collector, layer_idx, lora_manager).0
             } else {
-                moe.forward(&normed2, seq)
+                // Prefill batches each expert's tokens onto the parallel
+                // kernel; seq == 1 stays on the serial path.
+                moe.forward_prefill(&normed2, seq)
             }
         } else {
             self.cpu_ffn(&normed2, seq)
@@ -358,7 +360,7 @@ impl CpuBlockAttnResLayer {
             {
                 let ple_dim = ple_slice.len() / seq;
                 // Gate: hidden → ple_dim with GELU
-                let gate_out = gate.forward(hidden, seq);
+                let gate_out = gate.forward_batch(hidden, seq);
                 let gate_gelu: Vec<f32> = gate_out.iter().map(|&x| gelu_tanh(x)).collect();
 
                 // Gated input: gate * ple_slice (element-wise)
@@ -368,7 +370,7 @@ impl CpuBlockAttnResLayer {
                 }
 
                 // Project back: [seq, ple_dim] → [seq, hd]
-                let proj_out = proj.forward(&gated, seq);
+                let proj_out = proj.forward_batch(&gated, seq);
 
                 // Post norm and add residual
                 let ple_final = norm.forward(&proj_out);
@@ -518,6 +520,53 @@ impl CpuBlockAttnResLayer {
         let mut attn_out = vec![0.0f32; q_len * q_dim];
         assert!(kv_len >= q_len, "kv_len {} < q_len {}", kv_len, q_len);
 
+        if q_len > 1 {
+            // Prefill: one query row per task. Each row writes a contiguous
+            // slice of `attn_out`, and the per-row arithmetic is identical to
+            // the serial loop below, so this is bit-identical. The score
+            // buffer is allocated once per worker thread instead of once per
+            // (head, query) — the serial loop allocated `q_len * num_heads`
+            // short-lived vectors per layer.
+            use rayon::prelude::*;
+            attn_out
+                .par_chunks_mut(q_dim)
+                .enumerate()
+                .for_each_init(
+                    || vec![0.0f32; q_len],
+                    |scores, (t, out_row)| {
+                        let q_pos = kv_len - q_len + t;
+                        for h in 0..num_heads {
+                            let kv_h = h / heads_per_kv;
+                            let scores = &mut scores[..=q_pos];
+                            let mut max_score = f32::NEG_INFINITY;
+                            for (s, score) in scores.iter_mut().enumerate() {
+                                let mut dot = 0.0f32;
+                                for d in 0..head_dim {
+                                    dot += q[t * q_dim + h * head_dim + d]
+                                        * k[s * kv_dim + kv_h * head_dim + d];
+                                }
+                                *score = dot * scale;
+                                if *score > max_score { max_score = *score; }
+                            }
+                            let mut sum_exp = 0.0f32;
+                            for score in scores.iter_mut() {
+                                *score = (*score - max_score).exp();
+                                sum_exp += *score;
+                            }
+                            for score in scores.iter_mut() { *score /= sum_exp; }
+                            for d in 0..head_dim {
+                                let mut sum = 0.0f32;
+                                for (s, &score) in scores.iter().enumerate() {
+                                    sum += score * v[s * kv_dim + kv_h * head_dim + d];
+                                }
+                                out_row[h * head_dim + d] = sum;
+                            }
+                        }
+                    },
+                );
+            return attn_out;
+        }
+
         for h in 0..num_heads {
             let kv_h = h / heads_per_kv;
             for t in 0..q_len {
@@ -572,7 +621,7 @@ impl CpuBlockAttnResLayer {
         let attn_out = self.cpu_attention_cached(
             q, k, v, q_len, kv_len, num_heads, num_kv_heads, head_dim, q_dim, kv_dim,
         );
-        self.out_proj.forward(&attn_out, q_len)
+        self.out_proj.forward_batch(&attn_out, q_len)
     }
 
     /// CPU attention with packed parallel O projection (for decode path).
@@ -605,19 +654,19 @@ impl CpuBlockAttnResLayer {
         if let (Some(gate), Some(up), Some(down)) =
             (&self.ffn_gate, &self.ffn_up, &self.ffn_down)
         {
-            let gated = gate.forward(input, seq);
+            let gated = gate.forward_batch(input, seq);
             let gated: Vec<f32> = if self.use_gelu {
                 gated.iter().map(|&x| gelu_tanh(x)).collect()
             } else {
                 // SwiGLU: silu(x) = x / (1 + exp(-x))
                 gated.iter().map(|&x| x / (1.0 + (-x).exp())).collect()
             };
-            let upped = up.forward(input, seq);
+            let upped = up.forward_batch(input, seq);
             let mut combined = vec![0.0; seq * id];
             for i in 0..combined.len() {
                 combined[i] = gated[i] * upped[i];
             }
-            down.forward(&combined, seq)
+            down.forward_batch(&combined, seq)
         } else {
             vec![0.0; seq * hd]
         }
@@ -627,6 +676,24 @@ impl CpuBlockAttnResLayer {
 // ---------------------------------------------------------------------------
 // CpuBlockAttnResModel — full model with PLE pre-computation and KV sharing
 // ---------------------------------------------------------------------------
+
+/// Per-stage wall time of one prefill, filled by
+/// [`CpuBlockAttnResModel::forward_prefill_profiled`].
+///
+/// The stages partition the prefill: embedding lookup, PLE precomputation,
+/// per-layer attention (norm, Q/K/V, scores, softmax, value, O projection),
+/// per-layer FFN/MoE, inter-block attention, KV-cache appends, and the final
+/// norm + LM head.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PrefillProfile {
+    pub embedding: std::time::Duration,
+    pub ple: std::time::Duration,
+    pub attention: std::time::Duration,
+    pub ffn: std::time::Duration,
+    pub inter_block: std::time::Duration,
+    pub kv_cache: std::time::Duration,
+    pub lm_head: std::time::Duration,
+}
 
 /// Full BlockAttnRes model that runs on CPU with all Gemma 4 features.
 /// Manages layers, PLE pre-computation, KV sharing, embedding, and LM head.
@@ -795,6 +862,39 @@ impl CpuBlockAttnResModel {
         token_ids: &[u32],
         cache: &mut crate::inference::student_kv_cache::ModelKVCache,
     ) -> Vec<f32> {
+        self.forward_prefill_impl(token_ids, cache, None)
+    }
+
+    /// Same as [`Self::forward_prefill`], and reports where the time went.
+    ///
+    /// The timers only wrap existing calls; they do not change the computation.
+    pub fn forward_prefill_profiled(
+        &self,
+        token_ids: &[u32],
+        cache: &mut crate::inference::student_kv_cache::ModelKVCache,
+    ) -> (Vec<f32>, PrefillProfile) {
+        let mut profile = PrefillProfile::default();
+        let logits = self.forward_prefill_impl(token_ids, cache, Some(&mut profile));
+        (logits, profile)
+    }
+
+    fn forward_prefill_impl(
+        &self,
+        token_ids: &[u32],
+        cache: &mut crate::inference::student_kv_cache::ModelKVCache,
+        mut profile: Option<&mut PrefillProfile>,
+    ) -> Vec<f32> {
+        macro_rules! timed {
+            ($stage:ident, $body:block) => {{
+                let started = std::time::Instant::now();
+                let value = $body;
+                if let Some(p) = profile.as_deref_mut() {
+                    p.$stage += started.elapsed();
+                }
+                value
+            }};
+        }
+
         let seq = token_ids.len();
         let hd = self.hidden_dim;
         let vs = self.vocab_size;
@@ -803,22 +903,28 @@ impl CpuBlockAttnResModel {
         cache.cached_token_ids = token_ids.to_vec();
 
         // 1. Embedding
-        let mut hidden = vec![0.0f32; seq * hd];
-        for (t, &tid) in token_ids.iter().enumerate() {
-            let id = tid as usize;
-            if id * hd + hd <= self.embed_tokens.len() {
-                for d in 0..hd {
-                    hidden[t * hd + d] = self.embed_tokens[id * hd + d];
+        let mut hidden = timed!(embedding, {
+            let mut hidden = vec![0.0f32; seq * hd];
+            for (t, &tid) in token_ids.iter().enumerate() {
+                let id = tid as usize;
+                if id * hd + hd <= self.embed_tokens.len() {
+                    for d in 0..hd {
+                        hidden[t * hd + d] = self.embed_tokens[id * hd + d];
+                    }
                 }
             }
-        }
-        let scale = (hd as f32).sqrt();
-        for h in hidden.iter_mut() { *h *= scale; }
+            let scale = (hd as f32).sqrt();
+            for h in hidden.iter_mut() { *h *= scale; }
+            hidden
+        });
 
         // 2. Pre-compute PLE
         let ple_dim = self.hidden_size_per_layer_input;
-        let ple_precomputed = self.precompute_ple(&hidden, token_ids, seq, hd, ple_dim);
-        cache.ple_prefix = ple_precomputed.clone();
+        let ple_precomputed = timed!(ple, {
+            let ple_precomputed = self.precompute_ple(&hidden, token_ids, seq, hd, ple_dim);
+            cache.ple_prefix = ple_precomputed.clone();
+            ple_precomputed
+        });
 
         // 3. Per-layer forward, caching K/V
         let first_shared_layer = self.num_layers.saturating_sub(self.num_kv_shared_layers);
@@ -859,19 +965,26 @@ impl CpuBlockAttnResModel {
                 } else { (None, false) }
             } else { (None, true) };
 
-            let (k_states, v_states) = layer.forward_full(
-                &mut hidden,
-                ple_slice.as_ref().map(|s| s.as_slice()),
-                kv,
-            );
+            // `forward_full` is `forward` (attention) + `forward_ffn`; call them
+            // separately so the profile can attribute the attention and FFN
+            // stages. The result is identical: `forward_full` delegates to the
+            // same two calls when no LoRA manager is active.
+            let (k_states, v_states) = timed!(attention, {
+                layer.forward(&mut hidden, ple_slice.as_ref().map(|s| s.as_slice()), kv)
+            });
+            timed!(ffn, {
+                layer.forward_ffn(&mut hidden, ple_slice.as_ref().map(|s| s.as_slice()))
+            });
 
-            // Cache K/V for this layer
-            if should_store && !k_states.is_empty() {
-                shared_kv.insert(layer_idx, (k_states.clone(), v_states.clone()));
-                cache.layers[layer_idx].append_batch(&k_states, &v_states, seq);
-            } else if !should_store && !k_states.is_empty() {
-                // Shared KV layer — still cache for reference
-                cache.layers[layer_idx].append_batch(&k_states, &v_states, seq);
+            // Cache K/V for this layer. Move the buffers into `shared_kv` (no
+            // per-layer clone); the cache append borrows them first.
+            if !k_states.is_empty() {
+                timed!(kv_cache, {
+                    cache.layers[layer_idx].append_batch(&k_states, &v_states, seq);
+                });
+                if should_store {
+                    shared_kv.insert(layer_idx, (k_states, v_states));
+                }
             }
 
             if has_blocks {
@@ -879,11 +992,13 @@ impl CpuBlockAttnResModel {
                 add_layer_prefix(&mut prefix_sums[bi + 1], &hidden, seq, hd);
 
                 if self.is_block_boundary(layer_idx) {
-                    let means = prefix_means(&prefix_sums, bi + 1, seq, hd, lpb);
-                    let inter_out = self.inter_block_attention(&hidden, &means, seq);
-                    for i in 0..seq * hd {
-                        hidden[i] += inter_out[i];
-                    }
+                    timed!(inter_block, {
+                        let means = prefix_means(&prefix_sums, bi + 1, seq, hd, lpb);
+                        let inter_out = self.inter_block_attention(&hidden, &means, seq);
+                        for i in 0..seq * hd {
+                            hidden[i] += inter_out[i];
+                        }
+                    });
                 }
             }
         }
@@ -897,11 +1012,14 @@ impl CpuBlockAttnResModel {
         }
 
         // 4. Final norm + LM head
-        hidden = rms_norm(&hidden, &self.final_norm, hd, 1e-6);
-        let mut logits = matmul(&hidden, &self.lm_head, seq, hd, vs);
-        if let Some(cap) = self.final_logit_softcapping {
-            for l in logits.iter_mut() { *l = (*l / cap).tanh() * cap; }
-        }
+        let logits = timed!(lm_head, {
+            let normed = rms_norm(&hidden, &self.final_norm, hd, 1e-6);
+            let mut logits = matmul(&normed, &self.lm_head, seq, hd, vs);
+            if let Some(cap) = self.final_logit_softcapping {
+                for l in logits.iter_mut() { *l = (*l / cap).tanh() * cap; }
+            }
+            logits
+        });
         logits
     }
 
@@ -3388,5 +3506,93 @@ impl GpuVramCache {
         }
 
         Ok(GpuVramCache { layers, total_vram_bytes: total_bytes })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reference implementation of the serial attention loop, kept in the test
+    /// so the parallel prefill path is checked against the arithmetic it
+    /// replaced rather than against itself.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_reference(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        q_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        q_dim: usize,
+        kv_dim: usize,
+    ) -> Vec<f32> {
+        let heads_per_kv = num_heads / num_kv_heads;
+        let mut out = vec![0.0f32; q_len * q_dim];
+        for h in 0..num_heads {
+            let kv_h = h / heads_per_kv;
+            for t in 0..q_len {
+                let q_pos = kv_len - q_len + t;
+                let mut scores = vec![0.0f32; q_pos + 1];
+                let mut max_score = f32::NEG_INFINITY;
+                for s in 0..=q_pos {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[t * q_dim + h * head_dim + d]
+                            * k[s * kv_dim + kv_h * head_dim + d];
+                    }
+                    scores[s] = dot;
+                    if scores[s] > max_score { max_score = scores[s]; }
+                }
+                let mut sum_exp = 0.0f32;
+                for s in 0..=q_pos {
+                    scores[s] = (scores[s] - max_score).exp();
+                    sum_exp += scores[s];
+                }
+                for s in 0..=q_pos { scores[s] /= sum_exp; }
+                for d in 0..head_dim {
+                    let mut sum = 0.0f32;
+                    for s in 0..=q_pos {
+                        sum += scores[s] * v[s * kv_dim + kv_h * head_dim + d];
+                    }
+                    out[t * q_dim + h * head_dim + d] = sum;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn prefill_attention_matches_serial_reference() {
+        let (heads, kv_heads, head_dim) = (8usize, 2usize, 4usize);
+        let q_dim = heads * head_dim;
+        let kv_dim = kv_heads * head_dim;
+        let (q_len, kv_len) = (6usize, 6usize);
+
+        let mut seed = 0x51EE_D001u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        };
+        let q: Vec<f32> = (0..q_len * q_dim).map(|_| next()).collect();
+        let k: Vec<f32> = (0..kv_len * kv_dim).map(|_| next()).collect();
+        let v: Vec<f32> = (0..kv_len * kv_dim).map(|_| next()).collect();
+
+        let layer = CpuBlockAttnResLayer::new(16, heads, kv_heads, head_dim, 16);
+        let parallel = layer.cpu_attention_cached(
+            &q, &k, &v, q_len, kv_len, heads, kv_heads, head_dim, q_dim, kv_dim,
+        );
+        let reference = attention_reference(
+            &q, &k, &v, q_len, kv_len, heads, kv_heads, head_dim, q_dim, kv_dim,
+        );
+
+        assert_eq!(parallel.len(), reference.len());
+        let mut worst = 0.0f32;
+        for (&a, &b) in parallel.iter().zip(&reference) {
+            worst = worst.max((a - b).abs());
+        }
+        assert_eq!(worst, 0.0, "parallel attention differs from the serial loop by {worst}");
     }
 }

@@ -111,6 +111,21 @@ impl CpuLinear {
         output
     }
 
+    /// Batch/prefill projection: parallel over rows when there is more than one
+    /// row, serial otherwise.
+    ///
+    /// Both kernels perform the same per-row accumulation, so the result is
+    /// bit-identical to [`Self::forward`]; only the schedule differs. This is
+    /// the dispatch prefill should use — `seq == 1` (decode) is left on the
+    /// serial path.
+    pub fn forward_batch(&self, input: &[f32], seq: usize) -> Vec<f32> {
+        if seq > 1 {
+            self.forward_parallel(input, seq)
+        } else {
+            self.forward(input, seq)
+        }
+    }
+
     /// Packed parallel forward — 4× less memory bandwidth than unpacked.
     /// Fastest path for decode (seq=1) on memory-bound systems.
     pub fn forward_packed_parallel(&self, input: &[f32], seq: usize) -> Vec<f32> {
@@ -240,5 +255,27 @@ mod tests {
         assert_eq!(output.len(), 2);
         // Row 0: [-1,0,1] · [1,0,-1] = -1*1 + 0*0 + 1*(-1) = -2, × scale 0.5 = -1.0
         assert!((output[0] - (-1.0)).abs() < 1e-5, "got {}", output[0]);
+    }
+
+    /// The prefill dispatch must leave one-row (decode) calls on `forward`, and
+    /// a batch must reproduce the per-row serial results exactly.
+    #[test]
+    fn forward_batch_matches_forward() {
+        let weight: Vec<f32> = (0..24 * 12).map(|i| ((i * 37) % 7) as f32 - 3.0).collect();
+        let linear = CpuLinear::from_weight(weight, 12, 24);
+        let input: Vec<f32> = (0..5 * 12).map(|i| (i as f32 * 0.37).sin()).collect();
+
+        let one = linear.forward(&input[..12], 1);
+        assert_eq!(linear.forward_batch(&input[..12], 1), one);
+
+        let batched = linear.forward_batch(&input, 5);
+        for row in 0..5 {
+            let serial = linear.forward(&input[row * 12..(row + 1) * 12], 1);
+            assert_eq!(
+                &batched[row * 24..(row + 1) * 24],
+                &serial[..],
+                "row {row} differs between batch and serial"
+            );
+        }
     }
 }
