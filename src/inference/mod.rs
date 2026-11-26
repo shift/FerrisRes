@@ -29,6 +29,7 @@ pub mod block_draft;
 pub mod concept_memory;
 pub mod pdf_ingestion;
 pub mod student_kv_cache;
+pub mod prefix_kv_cache;
 pub mod acp;
 pub mod tts_stream;
 pub mod vla;
