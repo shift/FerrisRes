@@ -133,6 +133,8 @@ verified it.
 
 | gap | effect |
 |---|---|
+| no **drop log** | a model-driven drop moves the decision into a sampling step; record the reason, turn and time or the first bug is "it forgot the schema from turn 3" (see `research/hf-papers-2026-11-26.md`) |
+| no **management-token accounting** | the calls spent managing context must be counted, or a tight-budget comparison flatters itself |
 | no non-destructive **session notebook** | compaction is the only structured state and it replaces history; the model cannot keep a fact without keeping the whole turn |
 | `docs_search`/`docs_read`/`cli_help` designed, not built | the "look it up for this version" path is missing |
 | no retention eval | the metrics above have no runner |

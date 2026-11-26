@@ -23,7 +23,7 @@ always be the neglected one.
 | **instant** | Small (or Nano for a draft) | direct answer, no visible plan | no reasoning scratchpad, <= 1 tool call, no verification step | claim something was verified |
 | **balanced** (default) | Small, then Base on a signal | short plan when the task needs it | <= 4 tool calls, verify code claims | silently escalate without saying so |
 | **deliberate** | Base/Large, or a hosted model if configured | plan → act → check → answer; scratchpad trimmed | tool and step budget, verification required for factual/code claims | pretend the local tier did it |
-| **auto** | decided per request | routes on task features | inherits the chosen mode's budget | hide which mode was chosen |
+| **auto** | decided per request | routes on **uncertainty and domain shift**, not task length (evidence: `research/hf-papers-2026-11-26.md`) | inherits the chosen mode's budget | hide which mode was chosen |
 
 `auto` is the product default. The user can force a mode; the runtime reports
 which one answered and whether it escalated.
