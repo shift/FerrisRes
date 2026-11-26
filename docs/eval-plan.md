@@ -189,6 +189,21 @@ purpose (`model-identity.md`). These gates test the split.
 | claims a capability the descriptor omits | **0** |
 | answers after a descriptor change, with no retraining | follow the new descriptor |
 
+## 15. Response modes
+
+A mode is behaviour plus routing plus budget, not two checkpoints
+(`response-modes.md`).
+
+| metric | gate |
+|---|---|
+| instant overclaim ("I ran the test") | **0** |
+| hidden escalation (larger tier answered, unreported) | **0** |
+| deliberate answers a code/factual question without a check | **0** |
+| forced mode honoured | 100% |
+| auto-mode choice on a labelled set | >= 85% |
+| deliberate accuracy over instant on tasks that need it | must improve, else cut the mode |
+| p95 TTFT and total per mode | within the target table |
+
 ## Contamination
 
 Hash every evaluation set (GSM8K, MATH, SWE-bench, BFCL test, MT-Bench, our own
