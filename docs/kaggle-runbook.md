@@ -14,6 +14,11 @@ the procedure that keeps a 12-hour session from costing a week.
 | CPU sessions | no weekly quota — use them for data preparation |
 | internet | requires phone verification |
 
+## Readiness
+
+The two-stage checklist — what the CPU smoke needs versus what a real run needs —
+is `kaggle-readiness.md`.
+
 ## Prerequisites
 
 1. The **`.deb` from `int/train-deb` @ `51b750a`** (version 0.2.3), which
