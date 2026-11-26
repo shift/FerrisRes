@@ -1,5 +1,8 @@
 # Evaluation plan
 
+The runner, record format and CI hook are in `eval-runner.md`; a metric here
+without a record there is not evidence.
+
 Status: **designed.** No model has been evaluated. This is the fixed suite that
 decides whether one ships, so that "it looks better" is never the argument.
 

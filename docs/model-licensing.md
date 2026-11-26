@@ -51,7 +51,8 @@ with the weights names:
   fact that the weights are distilled rather than the teacher's own.
 
 The third-party register is `provenance-register.md`; the card template is
-`model-card-template.md`.
+`model-card-template.md`; the release order and sign-off are in
+`release-runbook.md`.
 
 A teacher whose licence is not compatible (a custom or non-commercial licence)
 cannot be used for an open-weight release, whatever the quality gain. Gemma 1–3
