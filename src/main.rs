@@ -283,6 +283,12 @@ enum Commands {
         #[arg(long)]
         concepts_path: Option<String>,
     },
+
+    /// Build, verify, inspect, or sample a reproducible token corpus.
+    Corpus {
+        #[command(subcommand)]
+        command: ferrisres::corpus::CorpusCommand,
+    },
 }
 
 #[tokio::main]
@@ -328,6 +334,7 @@ async fn main() -> anyhow::Result<()> {
             model_path, config, model_format, tokenizer,
             host, port, model_name, armor, cognitive, concepts_path,
         } => cmd_serve(model_path, config, model_format, tokenizer, host, port, model_name, armor, cognitive, concepts_path).await,
+        Commands::Corpus { command } => ferrisres::corpus::run(command),
     }
 }
 
