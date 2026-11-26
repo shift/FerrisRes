@@ -31,6 +31,25 @@ one thing that closes it, not a programme.
    a number, not a result.
 5. **#7–#10** after the first checkpoint exists.
 
+## What the first real sessions actually uncovered (2026-11-26)
+
+Four defects, each hidden behind the one before it. None was a performance
+problem; all four had to be fixed before a step of real training could run.
+
+| # | defect | discovered by | status |
+|---|---|---|---|
+| a | `step_accumulated` used the last window's raw gradient | reading the loop after a CPU reference fell and the GPU rose | fixed `c5cd360` |
+| b | 32k vocabulary exceeded 65,535 dispatch groups (98,304) | the first real session panicking in `gpu_train_backward` | fixed `fa74d2f`, verified on lavapipe |
+| c | GPU diverges at `3e-3` where the CPU converges; falls at `1e-4` | LR sweep, same data and seed | **open** — effective step larger than the CPU's |
+| d | 768 wide at 256 tokens loses the iGPU device | seq bisect: 160 runs, 192 dies, superlinear | **open** — untiled attention past the watchdog |
+
+Two consequences worth keeping:
+
+- **the cheap check that found (a) and (c) was a CPU reference run**, not more
+  reasoning about kernels. Every GPU claim in this repository should have one;
+- **the first real session was worth more than a week of inference**: it named
+  (b) in fifteen seconds, and no amount of reading `gpu_ops.rs` had found it.
+
 ## The CPU ceiling the prefill work exposed
 
 `perf/parallel-prefill` measured the parallel ternary kernel at **0.88–0.96
