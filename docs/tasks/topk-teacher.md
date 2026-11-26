@@ -60,3 +60,24 @@ reported 0.0%/2.2% and failed — the bug was in the checker, which assumed
 `record i == token i`. The dump starts at token 1 by design (`logits[i-1]`
 predicts `i`) and stores each token's byte offset precisely so a consumer never
 has to assume; the checker now locates records by that offset.
+
+
+## Published (2026-11-27)
+
+The real dump is a **Kaggle dataset**, verified by downloading its manifest back:
+
+| | |
+|---|---|
+| dataset | `sectionme/qwen3-4b-topk-ferrisres-release` (private) |
+| contents | `topk-teacher/topk/part-00000.bin … part-01326.bin` + `manifest.json`; Kaggle extracts the uploaded archive, so the parts are directly readable |
+| manifest | teacher `Qwen/Qwen3-4B`, k=32, **5,426,265 records**, window 1024, batch 4 |
+| archive sha256 | `27871009456d42a010a2f6d6daffd989082790a725434bb5dd65d7b59a9f0c6f` (1,411,665,920 bytes) |
+| alignment | **83.0%** top-1 at its own offset, 0.8% at k+1 (`verify_topk.py`, 4,092 records) |
+| consume at | `/kaggle/input/qwen3-4b-topk-ferrisres-release/topk-teacher/topk/*.bin` |
+
+Manifest as downloaded from the dataset: `parts` lists 1,327 entries, first
+`part-00000.bin`, last `part-01326.bin` — so the upload is complete rather than a
+prefix, which is the failure mode a directory of 1,327 small files invites.
+
+**Naming rule:** teacher first, corpus second. A future 8B dump is
+`qwen3-8b-topk-ferrisres-release` and sorts beside this one.
