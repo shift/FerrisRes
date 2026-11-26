@@ -135,16 +135,36 @@ verified it.
 |---|---|
 | no **drop log** | a model-driven drop moves the decision into a sampling step; record the reason, turn and time or the first bug is "it forgot the schema from turn 3" (see `research/hf-papers-2026-11-26.md`) |
 | no **management-token accounting** | the calls spent managing context must be counted, or a tight-budget comparison flatters itself |
-| no non-destructive **session notebook** | compaction is the only structured state and it replaces history; the model cannot keep a fact without keeping the whole turn |
+| ~~no non-destructive **session notebook**~~ | **implemented** at `9742bbdd`; the remaining gaps are the drop log, management-token accounting, the retention eval and the training data |
 | `docs_search`/`docs_read`/`cli_help` designed, not built | the "look it up for this version" path is missing |
 | no retention eval | the metrics above have no runner |
 | evidence tools are not wired into the default chat workflow | recall exists but the model is not offered it |
 | no training data for recall/citation policy | the behaviour is untaught |
 
-The notebook is the smallest useful addition: a typed, bounded, in-context store
-(`goal`, `decision`, `fact`, `evidence`, `open_question`) that the model writes
-and reads without destroying history. It is also the natural training target for
-retention, because every write is a labelled decision about what mattered.
+The notebook was the smallest useful addition: a typed, bounded, in-context
+store (`goal`, `decision`, `fact`, `evidence`, `open_question`) that the model
+writes and reads without destroying history. It is now implemented, and it
+remains the natural training target for retention, because every write is a
+labelled decision about what mattered.
+
+## Implementation (harness)
+
+`agentic-loop` `feat/recall-notebook` @ `9742bbdd` (on `645e1043`):
+
+- typed notebook with `write`/`read`/`recall`/`resolve`/`drop`, a bounded render,
+  and persistence in `WorkflowSession.variables`; the runner intercepts the call;
+- the step's `Tools:` grant is required; read-only discovery through
+  `tool_search` also reaches it; writes still need the explicit grant;
+- `assistant`, `worktree_fix`, `diagnose` and `task_review` grant it;
+- tests: `agentic-core` notebook **12 passed**, workflow discovery **1**, tools-core
+  notebook tool **3**; `agentic-loop-bin` checks clean.
+
+**Not verified:** no full scripted turn loop or Telegram run exercised the tool;
+a discovered tool absent from the offered schema may be rejected by a provider;
+notebook persistence no-ops if `variables` is a non-object scalar. A pre-existing
+test, `only_listed_workflows_are_exempt_from_execution`, fails on `origin/main`
+with four stale exemptions (`consensus-review`, `home_adult`, `home_child`,
+`web_research`); this branch does not touch them.
 
 ## Falsification
 
