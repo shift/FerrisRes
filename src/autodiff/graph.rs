@@ -53,6 +53,66 @@ pub enum NodeKind {
         hidden_dim: u32,
         block_size: u32,
     },
+    /// Per-row RMSNorm without a learned weight, over `rows` contiguous vectors
+    /// of width `dim`. The weighted form is this op followed by
+    /// `MulBroadcast`, so the weight gets a gradient of its own.
+    RmsNormNoScale {
+        rows: u32,
+        dim: u32,
+        eps: f32,
+    },
+    /// `out[r, c] = a[r, c] * weight[c]`, with `weight` of length `cols`.
+    /// Used for the learned RMSNorm scale and nothing else.
+    MulBroadcast {
+        rows: u32,
+        cols: u32,
+    },
+    /// SwiGLU activation: `out = silu(gate) * up`.
+    SiluMul {
+        numel: u32,
+    },
+    /// Rotary position embedding, half-split layout:
+    /// pairs `(d, d + head_dim/2)` rotate by `pos * theta^(-2d/head_dim)`.
+    Rope {
+        seq: u32,
+        heads: u32,
+        head_dim: u32,
+        theta: f32,
+        offset: u32,
+    },
+    /// Expand grouped-query KV (`num_kv_heads < num_heads`) by repeating each
+    /// KV head for its query group. Backward sums over the group.
+    GqaExpand {
+        seq: u32,
+        heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+    },
+    /// Causal multi-head attention over pre-expanded K/V.
+    ///
+    /// The causal mask is folded into the softmax as an additive bias, so
+    /// masked positions get probability zero and their gradient is zero by
+    /// construction. Scaling is a parameter because the reference model uses
+    /// `scale = 1` (its per-head Q/K RMSNorm fixes the score scale).
+    Attention {
+        seq: u32,
+        heads: u32,
+        head_dim: u32,
+        scale: f32,
+    },
+    /// Embedding lookup with the table as an input, so the scatter-add
+    /// backward accumulates into the table's gradient.
+    EmbeddingGather {
+        vocab: u32,
+        hidden: u32,
+    },
+    /// `out = x * scalar`, with `scalar` a one-element input. Backward gives
+    /// the scalar `sum(dout * x)`; the reference model's `layer_scalar` is a
+    /// trainable parameter, not a constant.
+    LayerScale {
+        numel: u32,
+    },
+
     Parameter {
         name: String,
         numel: usize,
@@ -515,6 +575,173 @@ impl ComputationGraph {
         Ok(id)
     }
 
+    /// Shared recorder for ops whose gradient buffers are all shaped like the
+    /// output. Input gradients live on the input nodes already.
+    fn record_op(
+        &mut self,
+        op: NodeKind,
+        inputs: Vec<NodeId>,
+        output_buf: GpuBuffer,
+    ) -> Result<NodeId> {
+        let id = self.alloc_id();
+        let grad = GpuBuffer::zeros(
+            &self.device,
+            &self.queue,
+            output_buf.size(),
+            Some("grad_op"),
+        )?;
+        self.nodes.insert(id, Node {
+            id,
+            kind: op.clone(),
+            buf: output_buf,
+            grad,
+            is_leaf: false,
+            requires_grad: true,
+        });
+        self.tape.push(TapeEntry {
+            op,
+            inputs,
+            output_id: id,
+        });
+        Ok(id)
+    }
+
+    pub fn record_rmsnorm_no_scale(
+        &mut self,
+        input_id: NodeId,
+        output_buf: GpuBuffer,
+        rows: u32,
+        dim: u32,
+        eps: f32,
+    ) -> Result<NodeId> {
+        self.record_op(
+            NodeKind::RmsNormNoScale { rows, dim, eps },
+            vec![input_id],
+            output_buf,
+        )
+    }
+
+    pub fn record_mul_broadcast(
+        &mut self,
+        input_id: NodeId,
+        weight_id: NodeId,
+        output_buf: GpuBuffer,
+        rows: u32,
+        cols: u32,
+    ) -> Result<NodeId> {
+        self.record_op(
+            NodeKind::MulBroadcast { rows, cols },
+            vec![input_id, weight_id],
+            output_buf,
+        )
+    }
+
+    pub fn record_silu_mul(
+        &mut self,
+        gate_id: NodeId,
+        up_id: NodeId,
+        output_buf: GpuBuffer,
+        numel: u32,
+    ) -> Result<NodeId> {
+        self.record_op(NodeKind::SiluMul { numel }, vec![gate_id, up_id], output_buf)
+    }
+
+    pub fn record_rope(
+        &mut self,
+        input_id: NodeId,
+        output_buf: GpuBuffer,
+        seq: u32,
+        heads: u32,
+        head_dim: u32,
+        theta: f32,
+        offset: u32,
+    ) -> Result<NodeId> {
+        self.record_op(
+            NodeKind::Rope {
+                seq,
+                heads,
+                head_dim,
+                theta,
+                offset,
+            },
+            vec![input_id],
+            output_buf,
+        )
+    }
+
+    pub fn record_gqa_expand(
+        &mut self,
+        input_id: NodeId,
+        output_buf: GpuBuffer,
+        seq: u32,
+        heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+    ) -> Result<NodeId> {
+        self.record_op(
+            NodeKind::GqaExpand {
+                seq,
+                heads,
+                kv_heads,
+                head_dim,
+            },
+            vec![input_id],
+            output_buf,
+        )
+    }
+
+    pub fn record_attention(
+        &mut self,
+        q_id: NodeId,
+        k_id: NodeId,
+        v_id: NodeId,
+        output_buf: GpuBuffer,
+        seq: u32,
+        heads: u32,
+        head_dim: u32,
+        scale: f32,
+    ) -> Result<NodeId> {
+        self.record_op(
+            NodeKind::Attention {
+                seq,
+                heads,
+                head_dim,
+                scale,
+            },
+            vec![q_id, k_id, v_id],
+            output_buf,
+        )
+    }
+
+    pub fn record_embedding_gather(
+        &mut self,
+        token_ids_id: NodeId,
+        weight_id: NodeId,
+        output_buf: GpuBuffer,
+        vocab: u32,
+        hidden: u32,
+    ) -> Result<NodeId> {
+        self.record_op(
+            NodeKind::EmbeddingGather { vocab, hidden },
+            vec![token_ids_id, weight_id],
+            output_buf,
+        )
+    }
+
+    pub fn record_layer_scale(
+        &mut self,
+        input_id: NodeId,
+        scalar_id: NodeId,
+        output_buf: GpuBuffer,
+        numel: u32,
+    ) -> Result<NodeId> {
+        self.record_op(
+            NodeKind::LayerScale { numel },
+            vec![input_id, scalar_id],
+            output_buf,
+        )
+    }
+
     pub fn tape(&self) -> &[TapeEntry] {
         &self.tape
     }
@@ -540,6 +767,14 @@ impl ComputationGraph {
         self.tape.clear();
         self.nodes.clear();
         self.next_id = 0;
+    }
+
+    /// Drop one step's activations and inputs, keeping parameter nodes and
+    /// their gradient buffers. A training step calls this before recording a
+    /// new forward pass, so weights (and Adam state keyed by node id) survive.
+    pub fn clear_activations(&mut self) {
+        self.tape.clear();
+        self.nodes.retain(|_, node| matches!(node.kind, NodeKind::Parameter { .. }));
     }
 
     pub fn zero_all_grads(&self, encoder: &mut wgpu::CommandEncoder) -> Result<()> {
