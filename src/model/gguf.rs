@@ -818,6 +818,48 @@ impl GgufFile {
         })
     }
 
+    /// Get a metadata value as f32.
+    ///
+    /// Integer metadata is accepted too, because converters disagree about
+    /// whether e.g. `rope.freq_base` is stored as F32 or U32.
+    pub fn metadata_f32(&self, key: &str) -> Option<f32> {
+        self.metadata.get(key).and_then(|v| match v {
+            GgufValue::Float32(n) => Some(*n),
+            GgufValue::Float64(n) => Some(*n as f32),
+            GgufValue::UInt32(n) => Some(*n as f32),
+            GgufValue::Int32(n) => Some(*n as f32),
+            GgufValue::UInt64(n) => Some(*n as f32),
+            GgufValue::Int64(n) => Some(*n as f32),
+            _ => None,
+        })
+    }
+
+    /// Get a metadata value as usize, accepting any integer width.
+    pub fn metadata_usize(&self, key: &str) -> Option<usize> {
+        self.metadata.get(key).and_then(|v| match v {
+            GgufValue::UInt8(n) => Some(*n as usize),
+            GgufValue::Int8(n) => Some(*n as usize),
+            GgufValue::UInt16(n) => Some(*n as usize),
+            GgufValue::Int16(n) => Some(*n as usize),
+            GgufValue::UInt32(n) => Some(*n as usize),
+            GgufValue::Int32(n) => Some(*n as usize),
+            GgufValue::UInt64(n) => Some(*n as usize),
+            GgufValue::Int64(n) => Some(*n as usize),
+            _ => None,
+        })
+    }
+
+    /// Vocabulary size from the tokenizer token list.
+    ///
+    /// Some GGUFs omit `<arch>.vocab_size`; the tokenizer array is the
+    /// authoritative fallback (and agrees with `token_embd` for Qwen3).
+    pub fn tokenizer_vocab_size(&self) -> Option<usize> {
+        match self.metadata.get("tokenizer.ggml.tokens") {
+            Some(GgufValue::Array(tokens)) if !tokens.is_empty() => Some(tokens.len()),
+            _ => None,
+        }
+    }
+
     /// Get the model architecture name (e.g., "llama", "mistral").
     pub fn architecture(&self) -> &str {
         self.metadata_string("general.architecture").unwrap_or("unknown")
@@ -1015,6 +1057,41 @@ impl GgufFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_metadata_helpers_for_teacher_spec() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "qwen3.block_count".to_string(),
+            GgufValue::UInt32(28),
+        );
+        metadata.insert(
+            "qwen3.rope.freq_base".to_string(),
+            GgufValue::Float32(1_000_000.0),
+        );
+        metadata.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            GgufValue::Array(vec![
+                GgufValue::String("a".into()),
+                GgufValue::String("b".into()),
+                GgufValue::String("c".into()),
+            ]),
+        );
+        let gguf = GgufFile {
+            version: 3,
+            tensor_count: 0,
+            metadata,
+            tensor_infos: std::collections::HashMap::new(),
+            data_offset: 0,
+            alignment: 32,
+            path: std::path::PathBuf::from("test.gguf"),
+        };
+        assert_eq!(gguf.metadata_usize("qwen3.block_count"), Some(28));
+        assert_eq!(gguf.metadata_f32("qwen3.rope.freq_base"), Some(1_000_000.0));
+        assert_eq!(gguf.tokenizer_vocab_size(), Some(3));
+        assert_eq!(gguf.metadata_usize("missing"), None);
+        assert_eq!(gguf.metadata_f32("missing"), None);
+    }
 
     #[test]
     fn test_ggml_type_from_u32() {

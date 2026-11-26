@@ -199,7 +199,7 @@ cargo run -- distill \
   --resume my_distilled_model.checkpoint.bin \
   --steps 2000
 
-# Non-Gemma models (LLaMA, Mistral, Phi, Qwen)
+# Non-Gemma dense models (LLaMA, Mistral, Phi, Qwen)
 cargo run -- distill \
   --model-path ./llama-3.1-8b.safetensors \
   --config llama3-8b \
@@ -209,6 +209,25 @@ cargo run -- distill \
   --model-path ./mistral-7b.gguf \
   --config mistral-7b \
   --model-format gguf
+
+# Fast CPU/iGPU smoke test: Qwen3 0.6B (dense, uniform attention)
+# This proves mapping, block grouping, distillation and evaluate end to end.
+# It is not a quality teacher; see "Teacher families" below.
+cargo run -- distill \
+  --model-path ./Qwen3-0.6B.Q4_K_M.gguf \
+  --config qwen3-0.6b \
+  --model-format gguf \
+  --steps 20 \
+  --seq-len 256 \
+  --data training_data.txt \
+  --output qwen3_smoke
+
+# The matching evaluation path accepts the same GGUF and config name.
+cargo run -- evaluate \
+  --model-path ./Qwen3-0.6B.Q4_K_M.gguf \
+  --config qwen3-0.6b \
+  --model-format gguf \
+  --text "the quick brown fox"
 ```
 
 ### 3. Monitor Progress
@@ -271,11 +290,12 @@ Required:
 
 Options:
   --config <CONFIG>       Model config [default: e2b]
-                          Gemma:    e2b, e4b, 12b, 27b, 27b-mm
+                          Gemma:    e2b, e4b, 12b, 27b, 27b-mm, 26b-a4b, 31b
                           LLaMA:    llama3-8b, llama3-70b
-                          Mistral:  mistral-7b, mixtral-8x7b
+                          Mistral:  mistral-7b
                           Phi:      phi3-mini
-                          Qwen:     qwen2-7b
+                          Qwen:     qwen2-7b, qwen3-1.7b, qwen3-0.6b
+                          Unsupported MoE (kept for compatibility): mixtral-8x7b
   --model-format <FMT>    File format: safetensors or gguf [default: safetensors]
   --seq-len <N>           Training sequence length [default: 512]
   --steps <N>             Number of distillation steps [default: 1000]
@@ -313,6 +333,8 @@ Usage: ferrisres evaluate --model-path <PATH> --text <TEXT>
 
 Options:
   --config <CONFIG>       Model config [default: e2b]
+                          Same names as `distill`, including qwen3-1.7b and qwen3-0.6b.
+  --model-format <FMT>    File format: safetensors or gguf [default: safetensors]
 ```
 
 ### `info`
@@ -771,17 +793,99 @@ lm_head.weight                                         # [vocab × hidden]
 
 **Other supported architectures:**
 
-| Model | `--config` | hidden | layers | params | Notes |
-|:------|:----------|:-------|:-------|:-------|:------|
-| LLaMA 3.1 8B | `llama3-8b` | 4096 | 32 | ~8B | Dense |
-| LLaMA 3.1 70B | `llama3-70b` | 8192 | 80 | ~70B | Dense |
-| Mistral 7B | `mistral-7b` | 4096 | 32 | ~7B | Dense |
-| Mixtral 8x7B | `mixtral-8x7b` | 4096 | 32 | ~47B | 8 experts |
-| Phi-3 Mini | `phi3-mini` | 3072 | 32 | ~3.8B | Dense |
-| Qwen 2.5 7B | `qwen2-7b` | 3584 | 28 | ~7B | Dense |
+| Model | `--config` | hidden | layers | heads / KV | head_dim | intermediate | vocab | Notes |
+|:------|:----------|:-------|:-------|:-----------|:---------|:-------------|:------|:------|
+| LLaMA 3.1 8B | `llama3-8b` | 4096 | 32 | 32 / 32 | 128 | 14336 | 128256 | Dense, uniform |
+| LLaMA 3.1 70B | `llama3-70b` | 8192 | 80 | 64 / 64 | 128 | 28672 | 128256 | Dense, uniform |
+| Mistral 7B | `mistral-7b` | 4096 | 32 | 32 / 32 | 128 | 14336 | 32768 | Dense, uniform |
+| Phi-3 Mini | `phi3-mini` | 3072 | 32 | 32 / 32 | 96 | 8192 | 32064 | Dense, uniform |
+| Qwen 2.5 7B | `qwen2-7b` | 3584 | 28 | 28 / 28 | 128 | 18944 | 152064 | Dense, uniform |
+| Qwen3 1.7B | `qwen3-1.7b` | 2048 | 28 | 16 / 8 | 128 | 6144 | 151936 | Dense, uniform, CPU/iGPU |
+| Qwen3 0.6B | `qwen3-0.6b` | 1024 | 28 | 16 / 8 | 128 | 3072 | 151936 | Dense, uniform, smoke test |
+| Mixtral 8x7B | `mixtral-8x7b` | 4096 | 32 | 32 / 32 | 128 | 14336 | 32000 | **Unsupported** MoE (see below) |
 
-All models use the same RMSNorm + GQA + SwiGLU architecture and are
-compatible with both safetensors and GGUF loading.
+Qwen3 numbers are from the Qwen3-1.7B `config.json` and from the
+`Qwen3-0.6B.Q4_K_M.gguf` metadata (`qwen3.block_count=28`,
+`qwen3.embedding_length=1024`, `qwen3.attention.head_count=16`,
+`qwen3.attention.head_count_kv=8`, `qwen3.attention.key_length=128`,
+`qwen3.feed_forward_length=3072`, `qwen3.context_length=40960`,
+`tokenizer.ggml.tokens` length 151936, `qwen3.rope.freq_base=1000000`).
+
+### Teacher families
+
+A teacher is described by a `TeacherSpec`: architecture name, hidden size,
+layer count, Q/KV heads, head dimension, intermediate size, optional expert
+routing, vocabulary, maximum positions, attention pattern, RoPE theta, norm
+and activation. `--config` names one; with `--model-format gguf` the same
+fields are also read from the file's metadata and compared, so a config string
+cannot silently disagree with the checkpoint. Dense teachers are checked
+strictly. Gemma keeps its preset for fields GGUF metadata cannot express
+(Per-Layer Embeddings, logit softcap, KV sharing) and only logs a mismatch.
+
+**Maps directly to Block AttnRes**
+
+* `q_proj`, `k_proj`, `v_proj`, `o_proj` (GQA is preserved; `num_kv_heads`
+  is carried through).
+* Dense MLP `gate_proj` / `up_proj` / `down_proj` (SwiGLU, GeGLU).
+* RMSNorm weights, token embeddings, final norm and LM head.
+* Per-layer RoPE theta and head dimension, for teachers whose layers differ.
+
+Dense teachers use `AttentionPattern::Uniform`: every layer maps as an
+intra-block layer and no local/global alternation is assumed. Layer blocks are
+formed by splitting `num_layers` into `num_blocks` contiguous groups as evenly
+as possible. The remainder goes to the first blocks: `base = num_layers /
+num_blocks`, `rem = num_layers % num_blocks`, the first `rem` blocks get
+`base + 1` layers and the rest get `base`. For example 24/7 →
+`[4,4,4,3,3,3,3]`, 32/7 → `[5,5,5,5,4,4,4]`, 35/7 → `[5,5,5,5,5,5,5]`,
+16/4 → `[4,4,4,4]`, 28/7 → `[4,4,4,4,4,4,4]`, 28/4 → `[7,7,7,7]`. More
+blocks than layers is clamped to one layer per block. `num_blocks` is a
+config value, not derived from the layer count; the preset default is 7 and
+`TeacherSpec::with_num_blocks` overrides it.
+
+**Gemma-specific (not generalised)**
+
+* The sliding-window / full-attention alternation. `SlidingGlobal` keeps the
+  teacher's own full-attention layers as block boundaries; this is exactly
+  the list the Gemma path used before `TeacherSpec` existed.
+* Per-Layer Embeddings (`hidden_size_per_layer_input`), final logit
+  softcapping, partial rotary on full-attention layers, and KV-sharing layers.
+* The MoE-128 tensor layout (`expert_gate`/`expert_up`/`expert_down` plus a
+  router). Gemma's MoE layers are preserved exactly.
+
+**Unsupported**
+
+* MoE teachers other than Gemma, including Mixtral. Their expert tensor
+  layout and router semantics are not the Gemma layout, so the mapping would
+  be wrong. `--config mixtral-8x7b` still parses for compatibility, but
+  `distill` refuses it with an error.
+* Up/down-only (non-gated) MLPs, such as GPT-NeoX, are shape-compatible only:
+  the mapper reuses `up` as the gate branch and records `Activation::Gelu`.
+  The two real matrices are preserved, but the student's gated activation is
+  not value-exact.
+* LayerNorm teachers are not value-exact either: the student normalises with
+  RMSNorm, so only the weights and shapes carry over.
+* Dense teachers keep the Gemma block order (post-attention norm before the
+  residual). Llama/Qwen blocks that have only a pre-FFN norm are mapped by
+  shape, not value-for-value. The smoke-test teacher is for pipeline
+  validation, not for a numerically faithful student.
+* Qwen3's per-head Q/K RMSNorm is loaded by the GGUF path. The Gemma
+  safetensors builder leaves those two norms at identity, so prefer GGUF for
+  Qwen3.
+
+**Vocabulary constraint**
+
+The student's embedding table and LM head follow the teacher's vocabulary
+size. A `--config` whose `vocab_size` does not match the checkpoint will
+produce a wrongly sized embedding; for GGUF dense teachers this is caught
+before any weights load. Use the matching `--config` (or the teacher's own
+`config.json` via `--config-path` where supported) rather than guessing.
+
+**`qwen3-0.6b` is a smoke-test teacher**
+
+`qwen3-0.6b` exists to prove the pipeline end to end quickly — mapping, block
+grouping, distillation steps and `evaluate` — not to produce a useful student.
+A 0.6B teacher caps the quality of the student it can produce, so do not ship
+a model distilled from it.
 
 ---
 
@@ -802,10 +906,11 @@ compatible with both safetensors and GGUF loading.
 ## FAQ
 
 **Q: Can I use this with non-Gemma models (LLaMA, Mistral)?**
-A: Yes! The pipeline now supports LLaMA 3, Mistral, Mixtral, Phi-3, and
-Qwen 2 out of the box. Use `--config llama3-8b`, `--config mistral-7b`,
-`--config phi3-mini`, or `--config qwen2-7b`. All share the same
-RMSNorm + GQA + SwiGLU architecture.
+A: Yes for dense teachers. Use `--config llama3-8b`, `--config mistral-7b`,
+`--config phi3-mini`, `--config qwen2-7b`, `--config qwen3-1.7b` or
+`--config qwen3-0.6b`. These share RMSNorm + GQA + SwiGLU and map through the
+same dense path. MoE teachers other than Gemma (Mixtral) are not supported;
+see "Teacher families".
 
 **Q: Can I use GGUF files instead of safetensors?**
 A: Yes. Use `--model-format gguf` and point to any GGUF file. The loader

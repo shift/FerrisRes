@@ -3043,7 +3043,7 @@ pub fn gemma4_to_block_attnres(teacher: &MappedGemma4Model) -> CpuBlockAttnResMo
                     Some(CpuLinear::from_weight(up_proj.clone(), hd, layer_inter_dim)),
                     Some(CpuLinear::from_weight(down_proj.clone(), layer_inter_dim, hd)),
                     None,
-                    true, // Gemma 4 dense FFN uses GeLU
+                    config.use_gelu,
                 )
             }
             Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs } => {
@@ -3052,11 +3052,11 @@ pub fn gemma4_to_block_attnres(teacher: &MappedGemma4Model) -> CpuBlockAttnResMo
                 moe_layer.expert_gate = expert_gates.iter().map(|g| crate::model::cpu_moe::TernaryExpert::from_fp32(g, layer_inter_dim, hd)).collect();
                 moe_layer.expert_up = expert_ups.iter().map(|u| crate::model::cpu_moe::TernaryExpert::from_fp32(u, layer_inter_dim, hd)).collect();
                 moe_layer.expert_down = expert_downs.iter().map(|d| crate::model::cpu_moe::TernaryExpert::from_fp32(d, hd, layer_inter_dim)).collect();
-                moe_layer.use_gelu = true; // Gemma 4
+                moe_layer.use_gelu = config.use_gelu;
                 (
                     None, None, None,
                     Some(moe_layer),
-                    true,
+                    config.use_gelu,
                 )
             }
         };
@@ -3114,6 +3114,13 @@ pub fn gemma4_to_block_attnres(teacher: &MappedGemma4Model) -> CpuBlockAttnResMo
     // LM head: stored as [hd, vs] in gemma_mapper (transposed for matmul)
     let lm_head = teacher.lm_head.clone();
 
+    // Block-MoE-Res structure: the teacher's own full-attention layers
+    // (Gemma) or the uniform layer split (dense). The old code hardcoded
+    // E2B's 7 × 5 boundaries here for every model.
+    let boundary_layers = config.block_summary_injection_points();
+    let num_blocks = boundary_layers.len().max(1);
+    let layers_per_block = (config.num_layers + num_blocks - 1) / num_blocks;
+
     CpuBlockAttnResModel {
         layers,
         embed_tokens: teacher.embed_tokens.clone(),
@@ -3131,11 +3138,10 @@ pub fn gemma4_to_block_attnres(teacher: &MappedGemma4Model) -> CpuBlockAttnResMo
         hidden_size_per_layer_input: config.hidden_size_per_layer_input.unwrap_or(0),
         num_kv_shared_layers: config.num_kv_shared_layers,
 
-        // Block-MoE-Res structure: 7 blocks × 5 layers for E2B
         block_config: BlockConfig {
-            num_blocks: 7,
-            layers_per_block: 5,
-            boundary_layers: vec![4, 9, 14, 19, 24, 29, 34], // full attention layers
+            num_blocks,
+            layers_per_block,
+            boundary_layers,
             attn_res_proj: vec![0.0f32; hd * hd], // identity init [hd, hd]
             attn_res_norm: vec![1.0f32; hd],       // norm weights = 1.0 (identity)
         },

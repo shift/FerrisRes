@@ -520,6 +520,14 @@ pub struct Gemma4Config {
     pub sliding_window: usize,
     /// Which layers use MoE (alternating pattern).
     pub moe_layers: Vec<usize>,
+    /// Layer indices that end a Block AttnRes block (Block Summary injection).
+    /// Empty = fall back to `moe_layers` (the Gemma 4 full-attention layers).
+    /// Dense teachers populate this with a uniform split instead, because
+    /// `moe_layers` must stay empty for the dense FFN loader.
+    pub block_boundaries: Vec<usize>,
+    /// FFN activation: `true` = GeGLU (Gemma 4), `false` = SwiGLU
+    /// (Llama/Mistral/Qwen/Phi). The student's dense FFN is gated either way.
+    pub use_gelu: bool,
     /// Per-layer embedding dimension (Gemma 4 PLE). 0 = disabled.
     pub hidden_size_per_layer_input: Option<usize>,
     /// Final logit softcapping value (Gemma 4). None = disabled.
@@ -620,6 +628,8 @@ impl Gemma4Config {
             max_position_embeddings: max_pos,
             sliding_window,
             moe_layers,
+            block_boundaries: vec![],
+            use_gelu: true,
             hidden_size_per_layer_input,
             final_logit_softcapping,
             layer_types,
@@ -680,6 +690,10 @@ impl Gemma4Config {
             sliding_window: 512,
             // Gemma 4 E2B is all-dense (no MoE)
             moe_layers: vec![],
+            // full_attention at [4, 9, 14, 19, 24, 29, 34]; these were
+            // hardcoded in gemma4_to_block_attnres before TeacherSpec.
+            block_boundaries: vec![4, 9, 14, 19, 24, 29, 34],
+            use_gelu: true,
             // Per-Layer Embeddings: 256 dims (from config.json)
             hidden_size_per_layer_input: Some(256),
             // Logit softcapping at 30.0
@@ -712,6 +726,8 @@ impl Gemma4Config {
             sliding_window: 512,
             // Block Summary injection at full_attention layers
             moe_layers: vec![5, 11, 17, 23, 29, 35, 41],
+            block_boundaries: vec![],
+            use_gelu: true,
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
             layer_types: vec![],
@@ -740,6 +756,8 @@ impl Gemma4Config {
             max_position_embeddings: 131072,
             sliding_window: 1024,
             moe_layers: (1..48).step_by(2).collect(), // Placeholder
+            block_boundaries: vec![],
+            use_gelu: true,
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
             layer_types: vec![],
@@ -768,6 +786,8 @@ impl Gemma4Config {
             max_position_embeddings: 262144,
             sliding_window: 1024,
             moe_layers: (1..60).step_by(2).collect(), // Placeholder
+            block_boundaries: vec![],
+            use_gelu: true,
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
             layer_types: vec![],
@@ -805,6 +825,8 @@ impl Gemma4Config {
             sliding_window: 1024,
             // Block Summary injection at full_attention layers
             moe_layers: vec![5, 11, 17, 23, 29],
+            block_boundaries: vec![],
+            use_gelu: true,
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
             layer_types: vec![],
@@ -835,6 +857,8 @@ impl Gemma4Config {
             sliding_window: 1024,
             // Block Summary injection at full_attention layers
             moe_layers: vec![5, 11, 17, 23, 29, 35, 41, 47, 53, 59],
+            block_boundaries: vec![],
+            use_gelu: true,
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
             layer_types: vec![],
@@ -861,6 +885,8 @@ impl Gemma4Config {
             max_position_embeddings: 131072,
             sliding_window: 8192,
             moe_layers: vec![],
+            block_boundaries: vec![],
+            use_gelu: false,
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
             layer_types: vec![],
@@ -887,6 +913,8 @@ impl Gemma4Config {
             max_position_embeddings: 131072,
             sliding_window: 8192,
             moe_layers: vec![],
+            block_boundaries: vec![],
+            use_gelu: false,
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
             layer_types: vec![],
@@ -913,6 +941,8 @@ impl Gemma4Config {
             max_position_embeddings: 32768,
             sliding_window: 4096,
             moe_layers: vec![],
+            block_boundaries: vec![],
+            use_gelu: false,
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
             layer_types: vec![],
@@ -939,6 +969,8 @@ impl Gemma4Config {
             max_position_embeddings: 32768,
             sliding_window: 4096,
             moe_layers: (0..32).step_by(2).collect(),
+            block_boundaries: vec![],
+            use_gelu: false,
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
             layer_types: vec![],
@@ -965,6 +997,8 @@ impl Gemma4Config {
             max_position_embeddings: 131072,
             sliding_window: 4096,
             moe_layers: vec![],
+            block_boundaries: vec![],
+            use_gelu: false,
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
             layer_types: vec![],
@@ -991,6 +1025,8 @@ impl Gemma4Config {
             max_position_embeddings: 131072,
             sliding_window: 4096,
             moe_layers: vec![],
+            block_boundaries: vec![],
+            use_gelu: false,
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
             layer_types: vec![],
@@ -998,6 +1034,83 @@ impl Gemma4Config {
             rope_theta_sliding: 10000.0,
             rope_theta_full: 1000000.0,
             partial_rotary_factor_full: 0.25,
+            num_kv_shared_layers: 0,
+        }
+    }
+
+    /// Qwen3 1.7B (dense, uniform full attention, no experts).
+    ///
+    /// Source: `Qwen/Qwen3-1.7B` `config.json` and the Qwen3-1.7B GGUF
+    /// metadata (verified 2026-11-25): `hidden_size=2048`,
+    /// `num_hidden_layers=28`, 16 Q / 8 KV heads, `head_dim=128`,
+    /// `intermediate_size=6144`, `vocab_size=151936`,
+    /// `max_position_embeddings=40960`, `rope_theta=1000000`, SwiGLU.
+    ///
+    /// This is the CPU/iGPU-sized teacher: ~1.7B parameters, no expert
+    /// routing, and every layer attends over the full context.
+    pub fn qwen3_1_7b() -> Self {
+        Self {
+            hidden_dim: 2048,
+            num_layers: 28,
+            num_heads: 16,
+            num_kv_heads: 8,
+            head_dim: 128,
+            intermediate_dim: 6144,
+            num_experts: 1,
+            top_k: 1,
+            vocab_size: 151936,
+            max_position_embeddings: 40960,
+            // No sliding window; 4096 is only the token block size used by
+            // Block Summary. See `TeacherSpec::block_size`.
+            sliding_window: 4096,
+            moe_layers: vec![],
+            block_boundaries: vec![],
+            use_gelu: false,
+            hidden_size_per_layer_input: None,
+            final_logit_softcapping: None,
+            layer_types: vec![],
+            global_head_dim: 128,
+            rope_theta_sliding: 1_000_000.0,
+            rope_theta_full: 1_000_000.0,
+            partial_rotary_factor_full: 1.0,
+            num_kv_shared_layers: 0,
+        }
+    }
+
+    /// Qwen3 0.6B (dense, uniform full attention, no experts).
+    ///
+    /// Numbers read from `Qwen3-0.6B.Q4_K_M.gguf` metadata (verified
+    /// 2026-11-25): `qwen3.block_count=28`, `qwen3.embedding_length=1024`,
+    /// `qwen3.attention.head_count=16`, `qwen3.attention.head_count_kv=8`,
+    /// `qwen3.attention.key_length=128`, `qwen3.feed_forward_length=3072`,
+    /// `qwen3.context_length=40960`,
+    /// `tokenizer.ggml.tokens` length 151936, `qwen3.rope.freq_base=1000000`.
+    ///
+    /// This teacher exists to prove the pipeline end to end quickly. It is
+    /// not a quality teacher: a 0.6B teacher caps the student it can produce.
+    pub fn qwen3_0_6b() -> Self {
+        Self {
+            hidden_dim: 1024,
+            num_layers: 28,
+            num_heads: 16,
+            num_kv_heads: 8,
+            head_dim: 128,
+            intermediate_dim: 3072,
+            num_experts: 1,
+            top_k: 1,
+            vocab_size: 151936,
+            max_position_embeddings: 40960,
+            sliding_window: 4096,
+            moe_layers: vec![],
+            block_boundaries: vec![],
+            use_gelu: false,
+            hidden_size_per_layer_input: None,
+            final_logit_softcapping: None,
+            layer_types: vec![],
+            global_head_dim: 128,
+            rope_theta_sliding: 1_000_000.0,
+            rope_theta_full: 1_000_000.0,
+            partial_rotary_factor_full: 1.0,
             num_kv_shared_layers: 0,
         }
     }
@@ -1027,10 +1140,673 @@ impl Gemma4Config {
 
     /// Identify which layers need Block Summary injection.
     /// These are the global attention layers that become inter-block attention.
+    /// Dense teachers supply a uniform split in `block_boundaries`; Gemma
+    /// falls back to its full-attention layers, exactly as before.
     pub fn block_summary_injection_points(&self) -> Vec<usize> {
-        // Inject after every sliding window block
-        // In Gemma 4: global attention layers (every other layer)
-        self.moe_layers.clone()
+        if self.block_boundaries.is_empty() {
+            self.moe_layers.clone()
+        } else {
+            self.block_boundaries.clone()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Teacher specification — architecture-agnostic description of a teacher
+// ---------------------------------------------------------------------------
+
+/// How attention is arranged across the teacher's layers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttentionPattern {
+    /// Every layer attends over the full context (Llama, Mistral, Qwen, Phi).
+    Uniform,
+    /// Sliding-window layers with periodic full-attention layers (Gemma 4).
+    SlidingGlobal { window: usize },
+    /// Explicit per-layer mix, e.g. from `config.json` `layer_types`.
+    Hybrid,
+}
+
+/// Expert routing description. `None` means a dense FFN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpertSpec {
+    pub count: usize,
+    pub top_k: usize,
+}
+
+/// Normalization used by the teacher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormKind {
+    RmsNorm,
+    LayerNorm,
+}
+
+/// FFN activation used by the teacher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activation {
+    /// SwiGLU: `silu(gate(x)) * up(x)` (Llama, Mistral, Qwen, Phi-3).
+    SwiGlu,
+    /// GeGLU: `gelu(gate(x)) * up(x)` (Gemma).
+    GeGlu,
+    /// Non-gated GELU MLP: `down(gelu(up(x)))` (GPT-NeoX style).
+    Gelu,
+}
+
+impl Activation {
+    /// Best-effort activation for a GGUF architecture name.
+    pub fn for_arch(arch: &str) -> Self {
+        if arch.starts_with("gemma") {
+            Self::GeGlu
+        } else if arch.starts_with("gpt") || arch.starts_with("falcon") || arch == "mpt" {
+            Self::Gelu
+        } else {
+            Self::SwiGlu
+        }
+    }
+}
+
+/// Gemma-4-only parameters with no dense-teacher equivalent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GemmaExtras {
+    pub global_head_dim: usize,
+    pub rope_theta_sliding: f64,
+    pub rope_theta_full: f64,
+    pub partial_rotary_factor_full: f32,
+    pub hidden_size_per_layer_input: Option<usize>,
+    pub final_logit_softcapping: Option<f32>,
+    pub num_kv_shared_layers: usize,
+}
+
+/// Architecture-agnostic description of a distillation teacher.
+///
+/// This is the single place that decides what a `--config` name means and how
+/// the teacher's layers are grouped into Block AttnRes blocks. The Gemma 4
+/// path is reconstructed exactly (`Gemma4Config` is still the weight layout);
+/// dense teachers use [`AttentionPattern::Uniform`] and carry no expert
+/// routing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TeacherSpec {
+    /// GGUF architecture name (`gemma4`, `llama`, `mistral`, `qwen2`, `qwen3`,
+    /// `phi3`, `mixtral`).
+    pub arch: String,
+    pub hidden_dim: usize,
+    pub num_layers: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_dim: usize,
+    /// `None` for dense teachers.
+    pub experts: Option<ExpertSpec>,
+    pub vocab_size: usize,
+    pub max_position_embeddings: usize,
+    pub attention: AttentionPattern,
+    pub rope_theta: f64,
+    pub norm: NormKind,
+    pub activation: Activation,
+    /// Token block size for Block Summary (not the layer grouping size).
+    pub block_size: usize,
+    /// Number of layer blocks to build for a `Uniform` teacher. Kept as a
+    /// config value; the default is 7.
+    pub num_blocks: usize,
+    /// Layers that use the MoE FFN in the loader (`Gemma4Config::moe_layers`).
+    pub moe_layers: Vec<usize>,
+    /// Layers that use full (global) attention. Empty for `Uniform` teachers.
+    pub full_attention_layers: Vec<usize>,
+    /// Per-layer attention types from `config.json`, if the teacher supplied
+    /// them. Empty means "infer from `attention`".
+    pub layer_types: Vec<String>,
+    /// Present only for Gemma 4 teachers.
+    pub gemma: Option<GemmaExtras>,
+}
+
+impl TeacherSpec {
+    /// Resolve a `--config` name into a teacher specification.
+    ///
+    /// The name is the only disambiguator: the dense names
+    /// (`llama3-*`, `mistral-7b`, `phi3-mini`, `qwen2-7b`, `qwen3-*`) never
+    /// carry experts, and `mixtral-8x7b` is the only non-Gemma MoE name.
+    pub fn from_config_name(name: &str) -> Result<Self, String> {
+        let (config, arch) = match name {
+            "e2b" => (Gemma4Config::gemma4_e2b(), "gemma4"),
+            "e4b" => (Gemma4Config::gemma4_e4b(), "gemma4"),
+            "12b" => (Gemma4Config::gemma4_12b(), "gemma4"),
+            "27b" => (Gemma4Config::gemma4_27b(), "gemma4"),
+            "27b-mm" => (Gemma4Config::gemma4_27b_mm(), "gemma4"),
+            "26b-a4b" => (Gemma4Config::gemma4_26b_a4b(), "gemma4"),
+            "31b" => (Gemma4Config::gemma4_31b(), "gemma4"),
+            "llama3-8b" => (Gemma4Config::llama3_8b(), "llama"),
+            "llama3-70b" => (Gemma4Config::llama3_70b(), "llama"),
+            "mistral-7b" => (Gemma4Config::mistral_7b(), "mistral"),
+            "mixtral-8x7b" => (Gemma4Config::mixtral_8x7b(), "mixtral"),
+            "phi3-mini" => (Gemma4Config::phi3_mini(), "phi3"),
+            "qwen2-7b" => (Gemma4Config::qwen2_7b(), "qwen2"),
+            "qwen3-1.7b" => (Gemma4Config::qwen3_1_7b(), "qwen3"),
+            "qwen3-0.6b" => (Gemma4Config::qwen3_0_6b(), "qwen3"),
+            other => {
+                return Err(format!(
+                    "Unknown model config: '{}'. Valid: e2b, e4b, 12b, 27b, 27b-mm, \
+                     26b-a4b, 31b, llama3-8b, llama3-70b, mistral-7b, mixtral-8x7b, \
+                     phi3-mini, qwen2-7b, qwen3-1.7b, qwen3-0.6b",
+                    other
+                ))
+            }
+        };
+        Ok(Self::from_gemma4_config(&config, arch))
+    }
+
+    /// Build a spec from one of the `Gemma4Config` presets.
+    ///
+    /// `arch` is the GGUF architecture name; it decides whether the attention
+    /// pattern is Gemma-style or uniform.
+    pub fn from_gemma4_config(config: &Gemma4Config, arch: &str) -> Self {
+        let attention = if !config.layer_types.is_empty() {
+            AttentionPattern::Hybrid
+        } else if arch.starts_with("gemma") {
+            AttentionPattern::SlidingGlobal {
+                window: config.sliding_window,
+            }
+        } else {
+            AttentionPattern::Uniform
+        };
+
+        let experts = if config.num_experts > 1 {
+            Some(ExpertSpec {
+                count: config.num_experts,
+                top_k: config.top_k,
+            })
+        } else {
+            None
+        };
+
+        let num_blocks = match attention {
+            AttentionPattern::Uniform => 7,
+            _ => config.moe_layers.len().max(1),
+        };
+
+        // Explicit per-layer types win over the preset's boundary list.
+        let full_attention_layers = if !config.layer_types.is_empty() {
+            config
+                .layer_types
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.as_str() == "full_attention")
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            config.block_summary_injection_points()
+        };
+        let num_blocks = if full_attention_layers.is_empty() {
+            num_blocks
+        } else {
+            full_attention_layers.len()
+        };
+
+        let gemma = if arch.starts_with("gemma") {
+            Some(GemmaExtras {
+                global_head_dim: config.global_head_dim,
+                rope_theta_sliding: config.rope_theta_sliding,
+                rope_theta_full: config.rope_theta_full,
+                partial_rotary_factor_full: config.partial_rotary_factor_full,
+                hidden_size_per_layer_input: config.hidden_size_per_layer_input,
+                final_logit_softcapping: config.final_logit_softcapping,
+                num_kv_shared_layers: config.num_kv_shared_layers,
+            })
+        } else {
+            None
+        };
+
+        Self {
+            arch: arch.to_string(),
+            hidden_dim: config.hidden_dim,
+            num_layers: config.num_layers,
+            num_heads: config.num_heads,
+            num_kv_heads: config.num_kv_heads,
+            head_dim: config.head_dim,
+            intermediate_dim: config.intermediate_dim,
+            experts,
+            vocab_size: config.vocab_size,
+            max_position_embeddings: config.max_position_embeddings,
+            attention,
+            rope_theta: config.rope_theta_sliding,
+            norm: NormKind::RmsNorm,
+            activation: Activation::for_arch(arch),
+            block_size: config.sliding_window,
+            num_blocks,
+            moe_layers: config.moe_layers.clone(),
+            full_attention_layers,
+            layer_types: config.layer_types.clone(),
+            gemma,
+        }
+    }
+
+    /// Reconstruct the `Gemma4Config` used by the weight loader.
+    ///
+    /// For Gemma this is an exact round-trip of the preset (including the
+    /// per-layer PLE, softcap and RoPE settings). For a dense teacher it sets
+    /// `num_experts = 1` and leaves `moe_layers` empty, so no expert path is
+    /// ever taken.
+    pub fn to_gemma4_config(&self) -> Gemma4Config {
+        let (global_head_dim, rope_sliding, rope_full, partial_rotary, ple, softcap, kv_shared) =
+            match &self.gemma {
+                Some(g) => (
+                    g.global_head_dim,
+                    g.rope_theta_sliding,
+                    g.rope_theta_full,
+                    g.partial_rotary_factor_full,
+                    g.hidden_size_per_layer_input,
+                    g.final_logit_softcapping,
+                    g.num_kv_shared_layers,
+                ),
+                None => (
+                    self.head_dim,
+                    self.rope_theta,
+                    self.rope_theta,
+                    1.0,
+                    None,
+                    None,
+                    0,
+                ),
+            };
+
+        Gemma4Config {
+            hidden_dim: self.hidden_dim,
+            num_layers: self.num_layers,
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            intermediate_dim: self.intermediate_dim,
+            num_experts: self.experts.map(|e| e.count).unwrap_or(1),
+            top_k: self.experts.map(|e| e.top_k).unwrap_or(1),
+            vocab_size: self.vocab_size,
+            max_position_embeddings: self.max_position_embeddings,
+            sliding_window: match &self.attention {
+                AttentionPattern::SlidingGlobal { window } => *window,
+                _ => self.block_size,
+            },
+            moe_layers: self.moe_layers.clone(),
+            // Gemma keeps the historical fallback to `moe_layers`; dense
+            // teachers carry an explicit uniform split here because their
+            // `moe_layers` must stay empty for the FFN loader.
+            block_boundaries: if self.is_gemma() {
+                self.full_attention_layers.clone()
+            } else {
+                self.block_boundaries()
+            },
+            use_gelu: !matches!(self.activation, Activation::SwiGlu),
+            hidden_size_per_layer_input: ple,
+            final_logit_softcapping: softcap,
+            layer_types: self.layer_types.clone(),
+            global_head_dim,
+            rope_theta_sliding: rope_sliding,
+            rope_theta_full: rope_full,
+            partial_rotary_factor_full: partial_rotary,
+            num_kv_shared_layers: kv_shared,
+        }
+    }
+
+    pub fn is_gemma(&self) -> bool {
+        self.arch.starts_with("gemma")
+    }
+
+    /// MoE teachers other than Gemma are not mapped: their expert tensor
+    /// layout is not the Gemma layout, and the student has no expert path
+    /// that matches it.
+    pub fn supports_distillation(&self) -> bool {
+        self.is_gemma() || self.experts.is_none()
+    }
+
+    /// True if `layer_idx` is a full-attention (block-boundary) layer.
+    ///
+    /// Uniform teachers have no global layers, so this is always false; no
+    /// local/global alternation is assumed.
+    pub fn is_global_layer(&self, layer_idx: usize) -> bool {
+        match self.attention {
+            AttentionPattern::Uniform => false,
+            AttentionPattern::SlidingGlobal { .. } | AttentionPattern::Hybrid => {
+                self.full_attention_layers.contains(&layer_idx)
+            }
+        }
+    }
+
+    /// Block boundaries (0-based index of the last layer in each block) for
+    /// this teacher.
+    ///
+    /// * `SlidingGlobal` keeps the teacher's own full-attention layers, which
+    ///   is exactly what the Gemma path used before this abstraction.
+    /// * `Hybrid` uses the supplied full-attention layers, or falls back to
+    ///   uniform grouping if none were supplied.
+    /// * `Uniform` splits `num_layers` into `num_blocks` blocks (see
+    ///   [`uniform_layer_counts`] for the rounding rule).
+    pub fn block_boundaries(&self) -> Vec<usize> {
+        self.block_boundaries_for(self.num_blocks)
+    }
+
+    /// Same as [`Self::block_boundaries`] with an explicit block count.
+    pub fn block_boundaries_for(&self, num_blocks: usize) -> Vec<usize> {
+        match self.attention {
+            AttentionPattern::SlidingGlobal { .. } => self.full_attention_layers.clone(),
+            AttentionPattern::Hybrid => {
+                if self.full_attention_layers.is_empty() {
+                    uniform_boundaries(self.num_layers, num_blocks)
+                } else {
+                    self.full_attention_layers.clone()
+                }
+            }
+            AttentionPattern::Uniform => uniform_boundaries(self.num_layers, num_blocks),
+        }
+    }
+
+    /// Override the configured number of blocks (the default is 7).
+    ///
+    /// This does not change a `SlidingGlobal` teacher's own boundaries; it
+    /// only affects `Uniform` and boundary-less `Hybrid` teachers.
+    pub fn with_num_blocks(mut self, num_blocks: usize) -> Self {
+        self.num_blocks = num_blocks.max(1);
+        self
+    }
+
+    /// Create one identity-initialized Block Summary layer per boundary.
+    pub fn create_block_summary_layers(&self) -> Vec<BlockSummaryLayer> {
+        self.block_boundaries()
+            .iter()
+            .map(|_| BlockSummaryLayer::new_identity(self.hidden_dim, self.block_size))
+            .collect()
+    }
+
+    /// Map one layer's attention weights. Dense teachers never take a global
+    /// branch; the shape metadata comes from this spec, not from an
+    /// alternation assumption.
+    pub fn map_attention_weights(
+        &self,
+        q_weight: &[f32],
+        k_weight: &[f32],
+        v_weight: &[f32],
+        o_weight: &[f32],
+        layer_idx: usize,
+    ) -> MappedAttentionWeights {
+        MappedAttentionWeights {
+            q_proj: q_weight.to_vec(),
+            k_proj: k_weight.to_vec(),
+            v_proj: v_weight.to_vec(),
+            o_proj: o_weight.to_vec(),
+            is_global: self.is_global_layer(layer_idx),
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            hidden_dim: self.hidden_dim,
+        }
+    }
+
+    /// Map a dense MLP to the Block AttnRes MLP.
+    ///
+    /// `gate` is `None` for up/down-only teachers (GPT-NeoX style). The
+    /// Block AttnRes MLP is gated, so such a teacher is shape-compatible but
+    /// not value-exact: [`MappedDenseMlp::to_ffn_weights`] reuses `up` as the
+    /// gate branch and marks the activation as [`Activation::Gelu`].
+    pub fn map_dense_mlp(
+        &self,
+        gate: Option<&[f32]>,
+        up: &[f32],
+        down: &[f32],
+        _layer_idx: usize,
+    ) -> MappedDenseMlp {
+        let gated = gate.is_some();
+        MappedDenseMlp {
+            gate_proj: gate.map(|g| g.to_vec()),
+            up_proj: up.to_vec(),
+            down_proj: down.to_vec(),
+            hidden_dim: self.hidden_dim,
+            intermediate_dim: self.intermediate_dim,
+            activation: if gated { self.activation } else { Activation::Gelu },
+            gated,
+        }
+    }
+
+    /// Read a spec from GGUF metadata.
+    ///
+    /// Uses the standard `{arch}.*` keys plus the existing `GgufFile` shape
+    /// helpers. Missing keys fall back to shapes inferred from tensor
+    /// metadata, so a config name can be checked against the file.
+    pub fn from_gguf(gguf: &crate::model::gguf::GgufFile) -> Result<Self, String> {
+        let arch = gguf.architecture().to_string();
+        let arch_key = arch.clone();
+        let key = |suffix: &str| format!("{}.{}", arch_key, suffix);
+
+        let num_layers = gguf
+            .metadata_usize(&key("block_count"))
+            .or_else(|| {
+                let n = gguf.infer_num_layers();
+                if n > 0 { Some(n) } else { None }
+            })
+            .ok_or_else(|| format!("GGUF '{}' has no block_count", arch))?;
+
+        let hidden_dim = gguf
+            .metadata_usize(&key("embedding_length"))
+            .or_else(|| gguf.infer_hidden_dim())
+            .ok_or_else(|| format!("GGUF '{}' has no embedding_length", arch))?;
+
+        let num_heads = gguf
+            .metadata_usize(&key("attention.head_count"))
+            .unwrap_or_else(|| (hidden_dim / 128).max(1));
+        let num_kv_heads = gguf
+            .metadata_usize(&key("attention.head_count_kv"))
+            .unwrap_or(num_heads);
+        let head_dim = gguf
+            .metadata_usize(&key("attention.key_length"))
+            .unwrap_or_else(|| hidden_dim / num_heads.max(1));
+
+        let intermediate_dim = gguf
+            .metadata_usize(&key("feed_forward_length"))
+            .unwrap_or(hidden_dim * 4);
+
+        let vocab_size = gguf
+            .metadata_usize(&key("vocab_size"))
+            .or_else(|| gguf.tokenizer_vocab_size())
+            .or_else(|| gguf.infer_vocab_size())
+            .ok_or_else(|| format!("GGUF '{}' has no vocabulary size", arch))?;
+
+        let max_position_embeddings = gguf
+            .metadata_usize(&key("context_length"))
+            .unwrap_or(0);
+
+        let experts = gguf
+            .metadata_usize(&key("expert_count"))
+            .filter(|&n| n > 0)
+            .map(|count| ExpertSpec {
+                count,
+                top_k: gguf.metadata_usize(&key("expert_used_count")).unwrap_or(1),
+            });
+
+        let attention = if arch.starts_with("gemma") {
+            AttentionPattern::SlidingGlobal {
+                window: gguf.metadata_usize(&key("attention.sliding_window")).unwrap_or(0),
+            }
+        } else {
+            AttentionPattern::Uniform
+        };
+
+        let norm = if gguf.metadata.contains_key(&key("attention.layer_norm_rms_epsilon")) {
+            NormKind::RmsNorm
+        } else {
+            NormKind::LayerNorm
+        };
+
+        let block_size = match attention {
+            AttentionPattern::SlidingGlobal { window } if window > 0 => window,
+            _ => 4096,
+        };
+
+        let num_blocks = match attention {
+            AttentionPattern::Uniform => 7,
+            _ => 1,
+        };
+
+        Ok(Self {
+            arch,
+            hidden_dim,
+            num_layers,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            intermediate_dim,
+            experts,
+            vocab_size,
+            max_position_embeddings,
+            attention,
+            rope_theta: gguf
+                .metadata_f32(&key("rope.freq_base"))
+                .map(|v| v as f64)
+                .unwrap_or(10_000.0),
+            norm,
+            activation: Activation::for_arch(gguf.architecture()),
+            block_size,
+            num_blocks,
+            moe_layers: Vec::new(),
+            full_attention_layers: Vec::new(),
+            layer_types: Vec::new(),
+            gemma: None,
+        })
+    }
+
+    /// Check this config-name spec against GGUF metadata.
+    ///
+    /// * `strict = true` (dense teachers): any disagreement in architecture,
+    ///   hidden size, layer count, heads, head_dim, intermediate size, vocab
+    ///   or expert count is an error, and the file's values are returned.
+    /// * `strict = false` (Gemma 4): Gemma's PLE/softcap/KV-sharing settings
+    ///   are not in GGUF metadata, so the preset is kept and a mismatch is
+    ///   logged instead. This keeps the Gemma path byte-for-byte as it was.
+    pub fn reconcile_with_gguf(
+        &self,
+        gguf: &crate::model::gguf::GgufFile,
+        strict: bool,
+    ) -> Result<Self, String> {
+        let file = match Self::from_gguf(gguf) {
+            Ok(spec) => spec,
+            Err(e) if !strict => {
+                tracing::warn!(event = "gguf_spec_unavailable", error = %e,
+                    "Could not derive a teacher spec from GGUF metadata; keeping --config");
+                return Ok(self.clone());
+            }
+            Err(e) => return Err(e),
+        };
+
+        let mut mismatches = Vec::new();
+        if self.arch != file.arch {
+            mismatches.push(format!("arch: config={} file={}", self.arch, file.arch));
+        }
+        fn check(m: &mut Vec<String>, name: &str, a: usize, b: usize) {
+            if a != b {
+                m.push(format!("{}: config={} file={}", name, a, b));
+            }
+        }
+        check(&mut mismatches, "hidden_dim", self.hidden_dim, file.hidden_dim);
+        check(&mut mismatches, "num_layers", self.num_layers, file.num_layers);
+        check(&mut mismatches, "num_heads", self.num_heads, file.num_heads);
+        check(&mut mismatches, "num_kv_heads", self.num_kv_heads, file.num_kv_heads);
+        check(&mut mismatches, "head_dim", self.head_dim, file.head_dim);
+        check(&mut mismatches, "intermediate_dim", self.intermediate_dim, file.intermediate_dim);
+        check(&mut mismatches, "vocab_size", self.vocab_size, file.vocab_size);
+        if self.experts != file.experts {
+            mismatches.push(format!(
+                "experts: config={:?} file={:?}",
+                self.experts, file.experts
+            ));
+        }
+
+        if mismatches.is_empty() {
+            // Gemma keeps its preset exactly: PLE, softcap, KV sharing and the
+            // full-attention layer list are not expressible in GGUF metadata.
+            if self.is_gemma() {
+                return Ok(self.clone());
+            }
+            return Ok(file);
+        }
+
+        if strict {
+            return Err(format!(
+                "--config disagrees with GGUF metadata: {}",
+                mismatches.join("; ")
+            ));
+        }
+
+        tracing::warn!(
+            event = "config_gguf_mismatch",
+            mismatches = %mismatches.join("; "),
+            "Keeping --config for Gemma-specific fields; GGUF metadata differs"
+        );
+        Ok(self.clone())
+    }
+}
+
+/// Split `num_layers` into `num_blocks` contiguous blocks as evenly as
+/// possible.
+///
+/// Rounding rule: `base = num_layers / num_blocks`, `rem = num_layers %
+/// num_blocks`; the first `rem` blocks receive `base + 1` layers and the rest
+/// receive `base`. `num_blocks` is clamped to `[1, num_layers]`, so a request
+/// for more blocks than layers yields one layer per block (and no empty
+/// blocks). Examples:
+///
+/// * 24 / 7 → `[4, 4, 4, 3, 3, 3, 3]`
+/// * 32 / 7 → `[5, 5, 5, 5, 4, 4, 4]`
+/// * 35 / 7 → `[5, 5, 5, 5, 5, 5, 5]`
+/// * 16 / 4 → `[4, 4, 4, 4]`
+/// * 28 / 7 → `[4, 4, 4, 4, 4, 4, 4]`
+/// * 28 / 4 → `[7, 7, 7, 7]`
+pub fn uniform_layer_counts(num_layers: usize, num_blocks: usize) -> Vec<usize> {
+    if num_layers == 0 {
+        return Vec::new();
+    }
+    let blocks = num_blocks.max(1).min(num_layers);
+    let base = num_layers / blocks;
+    let rem = num_layers % blocks;
+    (0..blocks)
+        .map(|i| if i < rem { base + 1 } else { base })
+        .collect()
+}
+
+/// Block boundaries (0-based index of the last layer in each block) for a
+/// uniform split. See [`uniform_layer_counts`] for the rounding rule.
+pub fn uniform_boundaries(num_layers: usize, num_blocks: usize) -> Vec<usize> {
+    let mut acc = 0usize;
+    uniform_layer_counts(num_layers, num_blocks)
+        .into_iter()
+        .map(|count| {
+            acc += count;
+            acc - 1
+        })
+        .collect()
+}
+
+/// A dense MLP mapped into Block AttnRes form.
+#[derive(Debug, Clone)]
+pub struct MappedDenseMlp {
+    /// Gate projection, or `None` for an up/down-only teacher.
+    pub gate_proj: Option<Vec<f32>>,
+    pub up_proj: Vec<f32>,
+    pub down_proj: Vec<f32>,
+    pub hidden_dim: usize,
+    pub intermediate_dim: usize,
+    pub activation: Activation,
+    /// True when the teacher supplied a gate projection.
+    pub gated: bool,
+}
+
+impl MappedDenseMlp {
+    /// Convert to the loader's dense FFN representation.
+    ///
+    /// For a non-gated teacher the `up` projection is reused as the gate
+    /// branch so the student can run at all; this preserves shapes and both
+    /// real matrices but not the teacher's exact activation.
+    pub fn to_ffn_weights(&self) -> Gemma4FfnWeights {
+        Gemma4FfnWeights::Dense {
+            gate_proj: self
+                .gate_proj
+                .clone()
+                .unwrap_or_else(|| self.up_proj.clone()),
+            up_proj: self.up_proj.clone(),
+            down_proj: self.down_proj.clone(),
+        }
     }
 }
 
@@ -2444,10 +3220,14 @@ impl Gemma4Teacher {
             // Pre-FFN RMSNorm
             let normed2 = rms_norm(&hidden, &layer.pre_ffn_norm, hd, 1e-6);
 
-            // FFN: GeLU(gate(x)) * up(x), NOT SwiGLU
+            // FFN: GeGLU for Gemma 4, SwiGLU for Llama/Mistral/Qwen/Phi.
             let ffn_out = match &layer.ffn {
                 Gemma4FfnWeights::Dense { gate_proj, up_proj, down_proj } => {
-                    self.dense_ffn_gelu(&normed2, gate_proj, up_proj, down_proj, hd, layer_inter_dim)
+                    if config.use_gelu {
+                        self.dense_ffn_gelu(&normed2, gate_proj, up_proj, down_proj, hd, layer_inter_dim)
+                    } else {
+                        self.dense_ffn(&normed2, gate_proj, up_proj, down_proj, hd, layer_inter_dim)
+                    }
                 }
                 Gemma4FfnWeights::Moe { router, expert_gates, expert_ups, expert_downs } => {
                     self.moe_ffn(&normed2, router, expert_gates, expert_ups, expert_downs,
@@ -3046,6 +3826,7 @@ impl Gemma4Student {
         for h in hidden.iter_mut() { *h *= scale; }
 
         // 2. Per-layer transformer with Block Summary injection
+        let injection_points = config.block_summary_injection_points();
         let mut summary_idx = 0;
         for (layer_idx, layer) in self.model.layers.iter().enumerate() {
             let residual = hidden.clone();
@@ -3059,9 +3840,10 @@ impl Gemma4Student {
             }
 
             // === Block Summary Injection ===
-            // At injection points (MoE/global attention layers),
-            // compress the accumulated hidden states into a block summary
-            if config.moe_layers.contains(&layer_idx) {
+            // At injection points (Gemma full-attention layers, or the uniform
+            // layer split for a dense teacher), compress the accumulated
+            // hidden states into a block summary.
+            if injection_points.contains(&layer_idx) {
                 if summary_idx < self.block_summaries.len() {
                     let bs = &self.block_summaries[summary_idx];
                     // Feed current hidden as block tokens to Block Summary
@@ -3137,6 +3919,7 @@ impl Gemma4Student {
         for h in hidden.iter_mut() { *h *= scale; }
         layer_states.push(hidden.clone());
 
+        let injection_points = config.block_summary_injection_points();
         let mut summary_idx = 0;
         for (layer_idx, layer) in self.model.layers.iter().enumerate() {
             let residual = hidden.clone();
@@ -3145,7 +3928,7 @@ impl Gemma4Student {
             for i in 0..hidden.len() { hidden[i] = residual[i] + attn_out[i]; }
 
             // Block Summary injection
-            if config.moe_layers.contains(&layer_idx) {
+            if injection_points.contains(&layer_idx) {
                 if summary_idx < self.block_summaries.len() {
                     let bs = &self.block_summaries[summary_idx];
                     let block_tokens = hidden.clone();
@@ -5445,6 +6228,344 @@ mod tests {
         assert_eq!(config.moe_layers, vec![5, 11, 17, 23, 29, 35, 41, 47, 53, 59]);
     }
 
+    // -----------------------------------------------------------------------
+    // TeacherSpec / dense teacher tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_teacher_spec_from_each_config_name() {
+        struct Case {
+            name: &'static str,
+            layers: usize,
+            heads: usize,
+            experts: Option<(usize, usize)>,
+            gemma: bool,
+        }
+        let cases = [
+            Case { name: "e2b", layers: 35, heads: 8, experts: None, gemma: true },
+            Case { name: "e4b", layers: 42, heads: 8, experts: None, gemma: true },
+            Case { name: "12b", layers: 48, heads: 32, experts: Some((128, 2)), gemma: true },
+            Case { name: "27b", layers: 60, heads: 36, experts: Some((128, 2)), gemma: true },
+            Case { name: "27b-mm", layers: 35, heads: 8, experts: None, gemma: true },
+            Case { name: "26b-a4b", layers: 30, heads: 16, experts: Some((128, 8)), gemma: true },
+            Case { name: "31b", layers: 60, heads: 32, experts: None, gemma: true },
+            Case { name: "llama3-8b", layers: 32, heads: 32, experts: None, gemma: false },
+            Case { name: "llama3-70b", layers: 80, heads: 64, experts: None, gemma: false },
+            Case { name: "mistral-7b", layers: 32, heads: 32, experts: None, gemma: false },
+            Case { name: "mixtral-8x7b", layers: 32, heads: 32, experts: Some((8, 2)), gemma: false },
+            Case { name: "phi3-mini", layers: 32, heads: 32, experts: None, gemma: false },
+            Case { name: "qwen2-7b", layers: 28, heads: 28, experts: None, gemma: false },
+            Case { name: "qwen3-1.7b", layers: 28, heads: 16, experts: None, gemma: false },
+            Case { name: "qwen3-0.6b", layers: 28, heads: 16, experts: None, gemma: false },
+        ];
+
+        for case in cases {
+            let spec = TeacherSpec::from_config_name(case.name)
+                .unwrap_or_else(|e| panic!("{}: {}", case.name, e));
+            assert_eq!(spec.num_layers, case.layers, "{} layers", case.name);
+            assert_eq!(spec.num_heads, case.heads, "{} heads", case.name);
+            assert_eq!(
+                spec.experts.map(|e| (e.count, e.top_k)),
+                case.experts,
+                "{} experts",
+                case.name
+            );
+            assert_eq!(spec.is_gemma(), case.gemma, "{} gemma", case.name);
+            if case.gemma {
+                assert!(
+                    matches!(spec.attention, AttentionPattern::SlidingGlobal { .. }),
+                    "{} should keep the Gemma sliding/global pattern",
+                    case.name
+                );
+            } else {
+                assert_eq!(
+                    spec.attention,
+                    AttentionPattern::Uniform,
+                    "{} should be uniform",
+                    case.name
+                );
+                assert!(
+                    spec.supports_distillation() == case.experts.is_none(),
+                    "{} support flag",
+                    case.name
+                );
+            }
+        }
+
+        assert!(TeacherSpec::from_config_name("does-not-exist").is_err());
+    }
+
+    #[test]
+    fn test_teacher_spec_qwen3_1_7b_fields() {
+        let spec = TeacherSpec::from_config_name("qwen3-1.7b").unwrap();
+        // Source: Qwen/Qwen3-1.7B config.json + Qwen3-1.7B GGUF metadata.
+        assert_eq!(spec.arch, "qwen3");
+        assert_eq!(spec.hidden_dim, 2048);
+        assert_eq!(spec.num_layers, 28);
+        assert_eq!(spec.num_heads, 16);
+        assert_eq!(spec.num_kv_heads, 8);
+        assert_eq!(spec.head_dim, 128);
+        assert_eq!(spec.intermediate_dim, 6144);
+        assert_eq!(spec.vocab_size, 151936);
+        assert_eq!(spec.max_position_embeddings, 40960);
+        assert!(spec.experts.is_none());
+        assert_eq!(spec.attention, AttentionPattern::Uniform);
+        assert_eq!(spec.norm, NormKind::RmsNorm);
+        assert_eq!(spec.activation, Activation::SwiGlu);
+        assert_eq!(spec.rope_theta, 1_000_000.0);
+        assert!(spec.supports_distillation());
+    }
+
+    #[test]
+    fn test_teacher_spec_qwen3_0_6b_fields() {
+        let spec = TeacherSpec::from_config_name("qwen3-0.6b").unwrap();
+        // Source: Qwen3-0.6B.Q4_K_M.gguf metadata (qwen3.* keys), read
+        // 2026-11-25. See Gemma4Config::qwen3_0_6b.
+        assert_eq!(spec.arch, "qwen3");
+        assert_eq!(spec.hidden_dim, 1024);
+        assert_eq!(spec.num_layers, 28);
+        assert_eq!(spec.num_heads, 16);
+        assert_eq!(spec.num_kv_heads, 8);
+        assert_eq!(spec.head_dim, 128);
+        assert_eq!(spec.intermediate_dim, 3072);
+        assert_eq!(spec.vocab_size, 151936);
+        assert_eq!(spec.max_position_embeddings, 40960);
+        assert!(spec.experts.is_none());
+        assert_eq!(spec.attention, AttentionPattern::Uniform);
+        assert!(spec.supports_distillation());
+    }
+
+    #[test]
+    fn test_uniform_grouping_rounding_rule() {
+        // Remainder goes to the first `rem` blocks.
+        assert_eq!(uniform_layer_counts(24, 7), vec![4, 4, 4, 3, 3, 3, 3]);
+        assert_eq!(uniform_layer_counts(32, 7), vec![5, 5, 5, 5, 4, 4, 4]);
+        assert_eq!(uniform_layer_counts(35, 7), vec![5, 5, 5, 5, 5, 5, 5]);
+        assert_eq!(uniform_layer_counts(16, 4), vec![4, 4, 4, 4]);
+        assert_eq!(uniform_layer_counts(28, 7), vec![4, 4, 4, 4, 4, 4, 4]);
+        assert_eq!(uniform_layer_counts(28, 4), vec![7, 7, 7, 7]);
+
+        // Boundaries are the 0-based last layer of each block.
+        assert_eq!(uniform_boundaries(24, 7), vec![3, 7, 11, 14, 17, 20, 23]);
+        assert_eq!(uniform_boundaries(32, 7), vec![4, 9, 14, 19, 23, 27, 31]);
+        assert_eq!(uniform_boundaries(35, 7), vec![4, 9, 14, 19, 24, 29, 34]);
+        assert_eq!(uniform_boundaries(16, 4), vec![3, 7, 11, 15]);
+        assert_eq!(uniform_boundaries(28, 7), vec![3, 7, 11, 15, 19, 23, 27]);
+        assert_eq!(uniform_boundaries(28, 4), vec![6, 13, 20, 27]);
+
+        // More blocks than layers is clamped to one layer per block.
+        assert_eq!(uniform_layer_counts(3, 7), vec![1, 1, 1]);
+        assert_eq!(uniform_boundaries(3, 7), vec![0, 1, 2]);
+        assert!(uniform_layer_counts(0, 7).is_empty());
+    }
+
+    #[test]
+    fn test_teacher_block_boundaries() {
+        let qwen = TeacherSpec::from_config_name("qwen3-1.7b").unwrap();
+        assert_eq!(qwen.block_boundaries_for(7), uniform_boundaries(28, 7));
+        assert_eq!(qwen.block_boundaries_for(4), uniform_boundaries(28, 4));
+        assert_eq!(qwen.block_boundaries().len(), 7);
+        assert_eq!(
+            qwen.clone().with_num_blocks(4).block_boundaries(),
+            uniform_boundaries(28, 4)
+        );
+
+        let qwen_small = TeacherSpec::from_config_name("qwen3-0.6b").unwrap();
+        assert_eq!(qwen_small.block_boundaries_for(7).len(), 7);
+        assert_eq!(qwen_small.block_boundaries_for(4).len(), 4);
+        assert_eq!(qwen_small.create_block_summary_layers().len(), 7);
+
+        // Gemma keeps its own full-attention layers, exactly as before.
+        let e4b = TeacherSpec::from_config_name("e4b").unwrap();
+        assert_eq!(
+            e4b.block_boundaries(),
+            Gemma4Config::gemma4_e4b().block_summary_injection_points()
+        );
+        assert_eq!(e4b.block_boundaries(), vec![5, 11, 17, 23, 29, 35, 41]);
+        let e2b = TeacherSpec::from_config_name("e2b").unwrap();
+        // E2B's full-attention layers are not in its `moe_layers` list (it is
+        // dense); they are the list the old gemma4_to_block_attnres hardcoded.
+        assert_eq!(e2b.block_boundaries(), vec![4, 9, 14, 19, 24, 29, 34]);
+        assert_eq!(e2b.block_boundaries(), Gemma4Config::gemma4_e2b().block_summary_injection_points());
+    }
+
+    #[test]
+    fn test_gemma_spec_round_trips_to_gemma4_config() {
+        for name in ["e2b", "e4b", "12b", "27b", "27b-mm", "26b-a4b", "31b"] {
+            let original = match name {
+                "e2b" => Gemma4Config::gemma4_e2b(),
+                "e4b" => Gemma4Config::gemma4_e4b(),
+                "12b" => Gemma4Config::gemma4_12b(),
+                "27b" => Gemma4Config::gemma4_27b(),
+                "27b-mm" => Gemma4Config::gemma4_27b_mm(),
+                "26b-a4b" => Gemma4Config::gemma4_26b_a4b(),
+                "31b" => Gemma4Config::gemma4_31b(),
+                _ => unreachable!(),
+            };
+            let round = TeacherSpec::from_config_name(name).unwrap().to_gemma4_config();
+            assert_eq!(round.hidden_dim, original.hidden_dim, "{} hidden", name);
+            assert_eq!(round.num_layers, original.num_layers, "{} layers", name);
+            assert_eq!(round.num_heads, original.num_heads, "{} heads", name);
+            assert_eq!(round.num_kv_heads, original.num_kv_heads, "{} kv", name);
+            assert_eq!(round.head_dim, original.head_dim, "{} head_dim", name);
+            assert_eq!(round.intermediate_dim, original.intermediate_dim, "{} inter", name);
+            assert_eq!(round.num_experts, original.num_experts, "{} experts", name);
+            assert_eq!(round.top_k, original.top_k, "{} top_k", name);
+            assert_eq!(round.vocab_size, original.vocab_size, "{} vocab", name);
+            assert_eq!(round.max_position_embeddings, original.max_position_embeddings, "{} max_pos", name);
+            assert_eq!(round.sliding_window, original.sliding_window, "{} window", name);
+            assert_eq!(round.moe_layers, original.moe_layers, "{} moe_layers", name);
+            assert_eq!(round.layer_types, original.layer_types, "{} layer_types", name);
+            assert_eq!(round.global_head_dim, original.global_head_dim, "{} global_head_dim", name);
+            assert_eq!(round.rope_theta_sliding, original.rope_theta_sliding, "{} rope_sliding", name);
+            assert_eq!(round.rope_theta_full, original.rope_theta_full, "{} rope_full", name);
+            assert_eq!(round.partial_rotary_factor_full, original.partial_rotary_factor_full, "{} rotary", name);
+            assert_eq!(round.hidden_size_per_layer_input, original.hidden_size_per_layer_input, "{} ple", name);
+            assert_eq!(round.final_logit_softcapping, original.final_logit_softcapping, "{} softcap", name);
+            assert_eq!(round.num_kv_shared_layers, original.num_kv_shared_layers, "{} kv_shared", name);
+            assert_eq!(round.use_gelu, original.use_gelu, "{} use_gelu", name);
+            assert_eq!(round.block_summary_injection_points(), original.block_summary_injection_points(), "{} boundaries", name);
+        }
+    }
+
+    #[test]
+    fn test_dense_teacher_attention_and_mlp_mapping_shapes() {
+        // qwen3-0.6b is dense and uniform: no expert path is ever taken.
+        let spec = TeacherSpec::from_config_name("qwen3-0.6b").unwrap();
+        let hd = spec.hidden_dim;
+        let h = spec.num_heads * spec.head_dim;
+        let kv = spec.num_kv_heads * spec.head_dim;
+        let inter = spec.intermediate_dim;
+
+        let q = vec![0.0f32; h * hd];
+        let k = vec![0.0f32; kv * hd];
+        let v = vec![0.0f32; kv * hd];
+        let o = vec![0.0f32; hd * h];
+        let attn = spec.map_attention_weights(&q, &k, &v, &o, 0);
+        assert_eq!(attn.q_proj.len(), h * hd);
+        assert_eq!(attn.k_proj.len(), kv * hd);
+        assert_eq!(attn.v_proj.len(), kv * hd);
+        assert_eq!(attn.o_proj.len(), hd * h);
+        assert_eq!(attn.num_heads, 16);
+        assert_eq!(attn.num_kv_heads, 8);
+        assert_eq!(attn.head_dim, 128);
+        assert!(!attn.is_global);
+        for layer in 0..spec.num_layers {
+            assert!(!spec.is_global_layer(layer));
+        }
+
+        let gate = vec![0.0f32; inter * hd];
+        let up = vec![0.0f32; inter * hd];
+        let down = vec![0.0f32; hd * inter];
+        let mlp = spec.map_dense_mlp(Some(&gate), &up, &down, 0);
+        assert!(mlp.gated);
+        assert_eq!(mlp.gate_proj.as_ref().unwrap().len(), inter * hd);
+        assert_eq!(mlp.up_proj.len(), inter * hd);
+        assert_eq!(mlp.down_proj.len(), hd * inter);
+        assert_eq!(mlp.activation, Activation::SwiGlu);
+        match mlp.to_ffn_weights() {
+            Gemma4FfnWeights::Dense { gate_proj, up_proj, down_proj } => {
+                assert_eq!(gate_proj.len(), inter * hd);
+                assert_eq!(up_proj.len(), inter * hd);
+                assert_eq!(down_proj.len(), hd * inter);
+            }
+            Gemma4FfnWeights::Moe { .. } => panic!("dense teacher must not map to MoE"),
+        }
+
+        // The loader config has no experts and no MoE layers.
+        let config = spec.to_gemma4_config();
+        assert_eq!(config.num_experts, 1);
+        assert!(config.moe_layers.is_empty());
+        assert!(!config.use_gelu, "Qwen3 dense FFN is SwiGLU");
+        // Dense block grouping is carried separately from moe_layers.
+        assert_eq!(
+            config.block_summary_injection_points(),
+            uniform_boundaries(28, 7)
+        );
+    }
+
+    #[test]
+    fn test_dense_mlp_up_down_only_is_shape_compatible() {
+        let spec = TeacherSpec {
+            hidden_dim: 8,
+            num_layers: 2,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 4,
+            intermediate_dim: 16,
+            ..TeacherSpec::from_config_name("qwen3-0.6b").unwrap()
+        };
+        let up = vec![1.0f32; 16 * 8];
+        let down = vec![2.0f32; 8 * 16];
+        let mlp = spec.map_dense_mlp(None, &up, &down, 0);
+        assert!(!mlp.gated);
+        assert!(mlp.gate_proj.is_none());
+        assert_eq!(mlp.activation, Activation::Gelu);
+        match mlp.to_ffn_weights() {
+            Gemma4FfnWeights::Dense { gate_proj, up_proj, .. } => {
+                // Shape-compatible approximation: up is reused as the gate.
+                assert_eq!(gate_proj, up_proj);
+                assert_eq!(gate_proj.len(), 16 * 8);
+            }
+            Gemma4FfnWeights::Moe { .. } => panic!("dense teacher must not map to MoE"),
+        }
+    }
+
+    #[test]
+    fn test_teacher_spec_from_gguf_and_reconcile() {
+        use crate::model::gguf::{GgufFile, GgufValue};
+        use std::collections::HashMap;
+
+        let mut metadata = HashMap::new();
+        let mut put = |k: &str, v: GgufValue| { metadata.insert(k.to_string(), v); };
+        put("general.architecture", GgufValue::String("qwen3".into()));
+        put("qwen3.block_count", GgufValue::UInt32(28));
+        put("qwen3.embedding_length", GgufValue::UInt32(1024));
+        put("qwen3.attention.head_count", GgufValue::UInt32(16));
+        put("qwen3.attention.head_count_kv", GgufValue::UInt32(8));
+        put("qwen3.attention.key_length", GgufValue::UInt32(128));
+        put("qwen3.feed_forward_length", GgufValue::UInt32(3072));
+        put("qwen3.context_length", GgufValue::UInt32(40960));
+        put("qwen3.vocab_size", GgufValue::UInt32(151936));
+        put("qwen3.rope.freq_base", GgufValue::Float32(1_000_000.0));
+        put("qwen3.attention.layer_norm_rms_epsilon", GgufValue::Float32(1e-6));
+
+        let gguf = GgufFile {
+            version: 3,
+            tensor_count: 0,
+            metadata,
+            tensor_infos: HashMap::new(),
+            data_offset: 0,
+            alignment: 32,
+            path: std::path::PathBuf::from("Qwen3-0.6B.Q4_K_M.gguf"),
+        };
+
+        let file_spec = TeacherSpec::from_gguf(&gguf).unwrap();
+        assert_eq!(file_spec.arch, "qwen3");
+        assert_eq!(file_spec.hidden_dim, 1024);
+        assert_eq!(file_spec.num_layers, 28);
+        assert_eq!(file_spec.num_heads, 16);
+        assert_eq!(file_spec.num_kv_heads, 8);
+        assert_eq!(file_spec.head_dim, 128);
+        assert_eq!(file_spec.intermediate_dim, 3072);
+        assert_eq!(file_spec.vocab_size, 151936);
+        assert_eq!(file_spec.max_position_embeddings, 40960);
+        assert_eq!(file_spec.attention, AttentionPattern::Uniform);
+        assert_eq!(file_spec.norm, NormKind::RmsNorm);
+        assert_eq!(file_spec.activation, Activation::SwiGlu);
+        assert!(file_spec.experts.is_none());
+
+        // The matching --config name is accepted and returns the file values.
+        let name_spec = TeacherSpec::from_config_name("qwen3-0.6b").unwrap();
+        let reconciled = name_spec.reconcile_with_gguf(&gguf, true).unwrap();
+        assert_eq!(reconciled.hidden_dim, 1024);
+
+        // A different size under the same arch is rejected, not silently used.
+        let wrong = TeacherSpec::from_config_name("qwen3-1.7b").unwrap();
+        let err = wrong.reconcile_with_gguf(&gguf, true).unwrap_err();
+        assert!(err.contains("hidden_dim"), "unexpected error: {}", err);
+    }
+
     #[test]
     fn test_gemma4_e2b_to_block_attnres() {
         let gemma = Gemma4Config::gemma4_e2b();
@@ -6001,6 +7122,8 @@ mod tests {
             max_position_embeddings: 256,
             sliding_window: 32,
             moe_layers: vec![], // Dense only
+            block_boundaries: vec![],
+            use_gelu: true,
         hidden_size_per_layer_input: None,
         final_logit_softcapping: None,
             layer_types: vec![],
