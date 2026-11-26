@@ -25,7 +25,7 @@ the family and the intended use, not a legal opinion.
 |---|---|---|---|
 | English web, filtered | pretrain | FineWeb-Edu, DCLM-baseline, Dolma 3, Common Pile | ODC-By / CC-BY / permissive — attribute |
 | German web | pretrain | FineWeb-2 `de`, CulturaX `de`, GermanWeb | ODC-By / gated terms — verify per card |
-| Code | pretrain + SFT | The Stack v2 permissive subset, StarCoderData | per-file licences; keep identifiers and honour opt-outs |
+| Code | pretrain + SFT | The Stack v2 permissive subset; **Rust** (crates.io, rust-lang repos, our own); **Nix** (nixpkgs, permissive flakes) | per-file licences; MIT/Apache/BSD only; no secrets, no generated/vendored files |
 | Instruction / chat | SFT | OASST1 (Apache-2.0), Dolly (CC-BY-SA), SmolTalk/Tulu, OpenHermes | prefer Apache/MIT/CC-BY; avoid NC |
 | German instruction | SFT | Multi-SFT (permissively licensed, DE included), translated OASST1 | verify per card |
 | Tool use | SFT | Glaive function-calling, xLAM, ToolBench, BFCL train split | verify per card; exclude the BFCL test split |
@@ -60,7 +60,8 @@ reported once.
 | 5% | math and reasoning |
 | 3% | long documents (public domain, documentation) |
 
-Domain match beats volume for a 0.6B. A model trained on 2B well-chosen tokens
+The full list with token targets — including Rust at 2x and Nix — is
+`corpus-manifest.md`. Domain match beats volume for a 0.6B. A model trained on 2B well-chosen tokens
 beats one trained on 10B random tokens at this size, and the tool-use share is
 what makes it useful in this harness.
 
