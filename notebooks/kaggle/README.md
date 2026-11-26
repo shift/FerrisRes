@@ -5,15 +5,16 @@ Two notebooks, and only one is runnable today.
 | notebook | state | what it does |
 |---|---|---|
 | `teacher_benchmark.ipynb` | **runnable now** | installs the `.deb`, lists adapters, measures teacher **prefill tokens/s** at 512/2048 tokens for Qwen3-0.6B Q8/Q4, prints `hours_per_10M` |
+| `train_smoke.ipynb` | **runnable once the `.deb` includes `feat/train-cli`** | installs, trains a synthetic byte-tokenized corpus, asserts loss falls and a parameter changed, then resumes and reports the restored step |
 | `distill_smoke.ipynb` | **prepared, blocked** | installs, runs a 10-step distill smoke, and **stops loudly** on `lora_gradient_invalid_with_blocks`; the long run is behind `RUN_LONG = False` |
 
 ## Prerequisites
 
 1. **A `.deb` with the current subcommands.** The GitHub release does not have
-   `devices`, `benchmark teacher` or the `qwen3-0.6b` preset yet. Build from the
-   branch (`int/ferris-main` + the teacher-bench and gpu-selection branches),
-   run `packaging/build-deb.sh`, and attach the result as a private Kaggle
-   dataset at `/kaggle/input/ferrisres-deb/`.
+   `devices`, `benchmark teacher`, the `qwen3-0.6b` preset or the real `train`
+   loop yet. Build from the branch (`int/ferris-main` + `feat/train-cli` +
+   teacher-bench and gpu-selection), run `packaging/build-deb.sh`, and attach
+   the result as a private Kaggle dataset at `/kaggle/input/ferrisres-deb/`.
 2. **GPU T4 ×2** and internet enabled.
 3. **Secrets** — the Kaggle API token is a secret, never a notebook cell:
    use **Add-ons → Secrets** and read it with `kaggle_secrets.UserSecretsClient`.
@@ -24,10 +25,12 @@ Two notebooks, and only one is runnable today.
 
 ## Order
 
-1. `teacher_benchmark` — pick the teacher by `hours_per_10M` on this runtime.
-2. Fix the LoRA gradient; rebuild the `.deb`.
-3. `distill_smoke` — 10 steps, then flip `RUN_LONG`.
-4. `evaluate` + `benchmark` on a quiet machine.
+1. `train_smoke` — prove the loop learns, checkpoints and resumes; record the
+   wall clock. This needs no teacher and no corpus licence.
+2. `teacher_benchmark` — pick the teacher by `hours_per_10M` on this runtime.
+3. Fix the LoRA gradient; rebuild the `.deb`.
+4. `distill_smoke` — 10 steps, then flip `RUN_LONG`.
+5. `evaluate` + `benchmark` on a quiet machine.
 
 ## Two GPUs
 
