@@ -74,6 +74,31 @@ examples are authored and parent-reviewed; no real minor data is used. See
 `persona-and-principals.md`; the soul field, synthetic souls and violation pairs
 are in `soul-training.md`.
 
+## Context budget
+
+The prompt is soul + tool definitions + memory/retrieval + conversation + the
+user turn; the output is the answer or the tool call. Measure the token counts
+from agentic-loop runs and use the **p95**, not a guess:
+
+| part | typical | cap |
+|---|---|---|
+| soul | 100–300 (child), <1k (operator) | 1k |
+| tool definitions | 1–4k | select the top-k; never the full registry |
+| memory / retrieval | 1–4k | top-k chunks |
+| conversation | 1–8k | summarise beyond the window |
+| output | 0.5–2k | — |
+
+**Decision: train the first student at 8k.** 4k is smaller than the p95 input
+once tools and retrieval are included; 32k from scratch costs roughly 1.7x the
+training compute of 8k (about 220 vs 130 GPU-hours for 0.6B x 2B on a T4) for a
+capability the product may not need. If the p95 exceeds 8k, cut the input —
+top-k tools, a retrieval cap, a history summary — rather than raise the window.
+
+Long context is an extension, not a default: train at 8k, then a short YaRN
+continued phase to 32k if the evals show a need; 64k only with a measured use.
+Include long documents and multi-turn conversations so the 8k window is used,
+not padded.
+
 ## Contamination
 
 Hash every evaluation set (GSM8K, MATH, SWE-bench, BFCL test, MT-Bench, our own

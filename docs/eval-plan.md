@@ -50,10 +50,10 @@ reverse means the model does.
 
 | context | metric | gate |
 |---|---|---|
-| 4k / 16k / 32k / 64k | recall on a needle-in-haystack set and a document-QA set | recall at 32k ≥ 80%; report the curve |
-| 64k | throughput | report tok/s; the model must not fall below half its 8k rate |
+| 8k / 16k / 32k | recall on a needle-in-haystack set and a document-QA set | recall at 32k ≥ 80%; report the curve |
+| 32k | throughput | report tok/s; the model must not fall below half its 8k rate |
 
-A model trained at 4k and declared at 32k without an extension phase will fail
+A model trained at 8k and declared at 32k without an extension phase will fail
 this, which is the point.
 
 ## 5. Throughput

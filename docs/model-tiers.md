@@ -45,9 +45,10 @@ Large.
 
 Hybrid attention: sliding window 1024 with 1–4 global visits. KV with MQA and
 3-bit is small (0.9–10.6 MB at 32k across the tiers), so context is limited by
-**compute**, not memory: Base is ~36 tok/s at 32k and ~26 at 64k. Training at
-2k–4k and extending with YaRN is the plan; claiming 32k without the extension
-phase would be a number the model cannot use.
+**compute**, not memory: Base is ~36 tok/s at 32k and ~26 at 64k. The first
+student trains at **8k** (soul + tools + retrieval + conversation at the p95);
+32k needs a short YaRN extension phase, and 64k only a measured need. Claiming
+32k without the extension would be a number the model cannot use.
 
 ## Target hardware (calculated)
 
