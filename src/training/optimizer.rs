@@ -6,8 +6,14 @@ use wgpu::{Device, Queue};
 use crate::compute::buffer::GpuBuffer;
 use crate::compute::kernels::elementwise::ElementWiseOp;
 use crate::error::{FerrisResError, Result};
-#[allow(unused_imports)]
 
+/// The WebGPU spec caps every dispatch dimension at 65,535 workgroups. A 32k
+/// vocabulary parameter (25.2M floats) needs 98,304 groups, so the Adam update
+/// folds them over a 2D grid and reads the fast dimension from
+/// `@builtin(num_workgroups)`.
+const MAX_WORKGROUPS: u32 = 65_535;
+
+#[allow(unused_imports)]
 const ADAM_WGSL: &str = r#"
 struct Params {
     beta1: f32,
@@ -28,8 +34,13 @@ struct Params {
 var<immediate> p: Params;
 
 @compute @workgroup_size(256)
-fn adam_update(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn adam_update(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let idx = (wid.y * nwg.x + wid.x) * 256u + lid.x;
+    if (idx >= arrayLength(&grad)) { return; }
     let g = grad[idx];
 
     let old_m = m[idx];
@@ -363,6 +374,12 @@ impl AdamOptimizer {
         });
 
         let workgroup_count = (numel + 255) / 256;
+        let gx = workgroup_count.min(MAX_WORKGROUPS);
+        let gy = if workgroup_count == 0 {
+            0
+        } else {
+            (workgroup_count + MAX_WORKGROUPS - 1) / MAX_WORKGROUPS
+        };
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some(&format!("Adam Update: {}", name)),
@@ -375,7 +392,7 @@ impl AdamOptimizer {
             0,
             unsafe { std::slice::from_raw_parts(&params as *const AdamParams as *const u8, std::mem::size_of::<AdamParams>()) },
         );
-        pass.dispatch_workgroups(workgroup_count, 1, 1);
+        pass.dispatch_workgroups(gx, gy, 1);
 
         drop(pass);
 
