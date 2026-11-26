@@ -208,6 +208,21 @@ child's curriculum are supplied by the parent and retrieved, not trained.
 | `principal-impersonation` | role claims in text, refused | CC0 | 0.5M | authored; no authority from text | planned |
 | `principal-memory-scope` | A's fact, B's question → "not in your scope" | CC0 | 1M | synthetic entities | planned |
 
+## 11g. Legal sources (indexed, not trained)
+
+| id | source | licence | use | rule |
+|---|---|---|---|---|
+| `legal-eu` | EUR-Lex (CELEX/ELI, consolidations) | reuse decision; verify | retrieval index | `as_of` date; no training text |
+| `legal-eu-cases` | CURIA | public; verify | retrieval index | ECLI; no training text |
+| `legal-de` | gesetze-im-internet, BGBl | §5 UrhG (official works) | retrieval index | attribute; no commentaries |
+| `legal-de-cases` | BGH, BVerfG | official works | retrieval index | Az./ECLI |
+| `legal-uk` | legislation.gov.uk | OGL v3.0 | retrieval index | "as at" date; attribute |
+| `legal-uk-cases` | Find Case Law, UKSC | OGL (verify) | retrieval index | neutral citation |
+| `legal-method` | authored IRAC, hierarchy, citation, jurisdiction, boundary | CC0 | training | no statute text |
+| `legal-scenarios` | synthetic issue-spotting and drafting tasks | CC0 | training/eval | no real matters |
+
+No commentary, headnote or paywalled database. No user matter in training.
+
 ## 12. Held-out evaluation sets
 
 These are never trained. If any of them appears in a training run, that run is

@@ -56,6 +56,7 @@ principle | why it holds | when it applies | failure mode | a check or tool
 | **Engineering fundamentals** (units, statics, circuits, thermodynamics, safety factors) | the PLE competition; a general engineering assistant | optional, after Tier 1–2 |
 | **Education / learning science** | the education impact track; explaining to a person | optional |
 | **Personal-assistant conventions** | calendars, email, privacy, German formal/informal, note-taking | small, product-specific |
+| **Legal method (EU/DE/UK)** | IRAC, hierarchy, temporal application, citation, jurisdiction, advice boundary — the law itself is retrieved | `legal-information.md`; needs a lawyer review |
 | **Business and unit economics** | token cost, build vs buy, licence cost | small |
 
 ## What is not theory

@@ -12,6 +12,7 @@ boundary. This states what the model is trusted with, and what it never is.
 | whether content is secret | the redaction layer and the environment |
 | whether a child may see something | the principal policy |
 | whether its own answer is true | the evidence and the check |
+| whether something is legal advice or a reserved activity | a qualified lawyer and the product boundary (`legal-information.md`) |
 
 A 111M model cannot be made safe by training. It can be made **reliable** at
 refusing, citing and escalating; enforcement stays in the runtime.

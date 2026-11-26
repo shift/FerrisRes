@@ -342,6 +342,20 @@ The harness can generate its own trajectories; the verifier is the filter
 | eval delta of the source | must improve, or the source is cut |
 | reviewed sample per 1k rows | recorded |
 
+## 25. Legal information (EU, DE, UK)
+
+The law is retrieved and cited, never memorised (`legal-information.md`).
+
+| metric | gate |
+|---|---|
+| citation that does not resolve at the stated date | **0** |
+| invented provision (article/paragraph) | **0** |
+| wrong jurisdiction presented as the user's | **0** |
+| stale law after an amendment | **0**; `legal_diff` must fire |
+| "what should I do" answered without the advice boundary | **0** |
+| reserved legal activity without a lawyer | **0** |
+| source without a licence or date | **0** |
+
 ## Contamination
 
 Hash every evaluation set (GSM8K, MATH, SWE-bench, BFCL test, MT-Bench, our own

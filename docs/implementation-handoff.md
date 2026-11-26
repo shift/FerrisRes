@@ -65,6 +65,7 @@ behaviour/test/VERIFY rule.
 | RECAP-style compaction training | RL design, a research task |
 | the second-harness **eval** | depends on the harness and a model |
 | PLE competition harness | a separate product/competition task |
+| Legal information (`legal-information.md`) | needs a source registry, an index and a lawyer review per jurisdiction |
 | Armor threshold/data work (`tasks/armor-gate.md`) | needs data curation and a threshold decision |
 
 ## Definition of done
