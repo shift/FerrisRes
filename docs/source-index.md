@@ -54,7 +54,7 @@ notes:         secrets, gating, share-alike, NC, known defects
 | id | source | licence | revision | access | target | filter | status |
 |---|---|---|---|---|---|---|---|
 | `de-fineweb2` | FineWeb-2 `deu_Latn` | ODC-By | pin | `hf:HuggingFaceFW/fineweb-2` | 150M | lang=de, dedupe | planned |
-| `de-culturax` | CulturaX `de` | gated; verify card | pin | `hf:uonlp/CulturaX` | 50M | gated terms accepted, dedupe | planned |
+| `de-culturax` | CulturaX `de` | gated; verify card | pin | `hf:uonlp/CulturaX` | 50M | **research corpus only**; confirm the card permits training | research |
 | `de-news` | German news/instruction subset | per card | pin | hf | 20M | licence per subset | planned |
 | `de-authored` | authored German templates | CC0 | ours | ours | 20M | reviewed | planned |
 
@@ -84,7 +84,7 @@ Nix training data teaches code, not the AST edit path.
 | id | source | licence | revision | access | target | filter | status |
 |---|---|---|---|---|---|---|---|
 | `sft-oasst1` | OASST1 | Apache-2.0 | pin | `hf:OpenAssistant/oasst1` | 40M | dedupe, tree flatten with provenance | planned |
-| `sft-dolly` | Dolly 15k | CC-BY-SA-3.0 | pin | `hf:databricks/databricks-dolly-15k` | 0 | **excluded for the open-weight release** (share-alike reaches the weights) | excluded |
+| `sft-dolly` | Dolly 15k | CC-BY-SA-3.0 | pin | `hf:databricks/databricks-dolly-15k` | 10M | **research corpus only**; never a release shard | research |
 | `sft-smoltalk` | SmolTalk | Apache-2.0 (verify card) | pin | `hf:HuggingFaceTB/smoltalk` | 50M | dedupe | planned |
 | `sft-tulu3` | Tulu 3 SFT mixture | mixture; verify per subset | pin | `hf:allenai/tulu-3-sft-mixture` | 30M | licence per subset; some subsets may be excluded | planned |
 | `sft-de` | German multi-SFT | per card | pin | hf | 30M | lang=de | planned |
@@ -94,7 +94,7 @@ Nix training data teaches code, not the AST edit path.
 | id | source | licence | revision | access | target | filter | status |
 |---|---|---|---|---|---|---|---|
 | `tool-bfcl` | BFCL train split | Apache-2.0 | pin | `hf:gorilla-llm/...` | 30M | dedupe against eval split | planned |
-| `tool-xlam` | xLAM function calling | **NC reported** | pin | hf | 0 | **excluded**: an open, commercially usable model cannot be built on NC data | excluded |
+| `tool-xlam` | xLAM function calling | **NC reported** | pin | hf | 20M | **research corpus only**; non-commercial, not released | research |
 | `tool-glaive` | Glaive function calling v2 | Apache-2.0 | pin | `hf:glaiveai/...` | 20M | strip synthetic dialogues that invent tools | planned |
 | `tool-registry` | MCP catalogue + OpenAPI specs | per server/repo | pin | mixed | 5M | ids and schemas only; no secrets in examples | planned |
 | `tool-traces` | reviewed run records | internal | redacted | ours | 40M | derived, never raw; consent recorded | planned |

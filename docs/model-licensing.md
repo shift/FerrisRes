@@ -77,6 +77,24 @@ excluded if its NC report is confirmed, and Dolly is excluded unless the
 share-alike decision is taken. CulturaX is excluded if its gated terms forbid
 weight redistribution.
 
+## Override: the research corpus (2026-11-26)
+
+Decision: include xLAM (NC), Dolly (CC-BY-SA) and CulturaX (gated) in a
+**research corpus** to measure whether they improve quality. Consequences,
+recorded rather than waived:
+
+- the resulting weights are **research-only**: not deployed, not sold, not
+  redistributed, and not used to serve third parties;
+- an internal commercial evaluation of NC data is still outside the NC grant in
+  the conservative reading; treat it as non-commercial research;
+- share-alike may reach the derived weights; the research artefact inherits the
+  question and is not released;
+- a model cannot unlearn the data; a release is **retrained** on the permissive
+  corpus, not filtered.
+
+The release corpus remains permissive (`source-index.md`), and the release model
+is `frs-s-0.1.0-beta` from that corpus. The two corpora and outputs are separate.
+
 ## Generated data from hosted providers
 
 Free hosted access makes data generation cheap, and that is real. It does not
