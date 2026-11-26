@@ -10,8 +10,14 @@ teacher beside the student requires both in one graph, which means porting the
 engine to XLA. Capturing **top-k** logits breaks that dependency: the student
 reads a static artefact, and the teacher never has to run again.
 
-The TPU is the right device for this one job: ~123 TFLOP/s bf16 against a T4's
-~65, and the job is a pure forward pass with no training state.
+The TPU is the right device for this one job: a pure forward pass with no
+training state. Kaggle provisions `machine_shape: TpuV5E8` for `enable_tpu: true`
+(measured from the pushed kernel's metadata, 2026-11-26), not the v3-8 that the
+docs elsewhere assume.
+
+Detect it through XLA, never through `/dev`: a Kaggle TPU VM exposes no
+`/dev/accel*` and sets no `TPU_NAME`, so `xm.xla_device_hw(xm.xla_device())`
+returning `TPU` is the only check that works.
 
 ## The artefact
 
