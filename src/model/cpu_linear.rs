@@ -113,7 +113,15 @@ impl CpuLinear {
 
     /// Packed parallel forward — 4× less memory bandwidth than unpacked.
     /// Fastest path for decode (seq=1) on memory-bound systems.
+    ///
+    /// The packed kernel decodes one activation row against 2-bit weights and
+    /// assumes a row stride of `in_features / 4` bytes. Any other shape — more
+    /// than one token, or a width that is not a multiple of 4 — falls back to
+    /// the unpacked parallel kernel rather than computing a wrong result.
     pub fn forward_packed_parallel(&self, input: &[f32], seq: usize) -> Vec<f32> {
+        if seq != 1 || self.in_features % 4 != 0 {
+            return self.forward_parallel(input, seq);
+        }
         let mut output = crate::model::ternary::ternary_matmul_packed_parallel(
             &self.packed, self.scale, input,
             self.out_features, self.in_features, seq,
@@ -240,5 +248,80 @@ mod tests {
         assert_eq!(output.len(), 2);
         // Row 0: [-1,0,1] · [1,0,-1] = -1*1 + 0*0 + 1*(-1) = -2, × scale 0.5 = -1.0
         assert!((output[0] - (-1.0)).abs() < 1e-5, "got {}", output[0]);
+    }
+
+    /// Regression: the packed decode kernel assumes a row stride of
+    /// `in_features / 4` bytes and a single activation row. It used to be
+    /// called unconditionally, so a width that is not a multiple of 4 read
+    /// the wrong bytes (silently, or out of bounds for wider matrices) and
+    /// `seq > 1` produced only the first token. `forward_packed_parallel`
+    /// must fall back to the unpacked path for both shapes.
+    #[test]
+    fn test_forward_packed_parallel_falls_back_for_unsupported_shapes() {
+        // in_features = 6 is not a multiple of 4. With out_features = 2 the
+        // unguarded packed kernel stays in bounds and returns wrong values;
+        // with out_features = 5 it runs off the end of the packed buffer.
+        for out_features in [2usize, 5] {
+            let in_features = 6;
+            let ternary: Vec<i8> = (0..in_features * out_features)
+                .map(|i| ((i * 7 + 3) % 3) as i8 - 1)
+                .collect();
+            let linear = CpuLinear::from_ternary(ternary, 0.5, in_features, out_features);
+            let input: Vec<f32> = (0..in_features)
+                .map(|i| (i as f32 * 0.7).sin())
+                .collect();
+
+            let expected = linear.forward(&input, 1);
+            let got = linear.forward_packed_parallel(&input, 1);
+            assert_eq!(
+                got, expected,
+                "unaligned width {} -> {} did not fall back to the unpacked path",
+                in_features, out_features
+            );
+        }
+
+        // seq > 1: the packed kernel is decode-only and ignores the sequence
+        // dimension, so it must fall back rather than return one token.
+        let in_features = 8;
+        let out_features = 3;
+        let ternary: Vec<i8> = (0..in_features * out_features)
+            .map(|i| ((i * 5 + 1) % 3) as i8 - 1)
+            .collect();
+        let linear = CpuLinear::from_ternary(ternary, 0.25, in_features, out_features);
+        let input: Vec<f32> = (0..3 * in_features)
+            .map(|i| (i as f32 * 0.3).cos())
+            .collect();
+
+        let expected = linear.forward_parallel(&input, 3);
+        let got = linear.forward_packed_parallel(&input, 3);
+        assert_eq!(got.len(), 3 * out_features, "seq > 1 must return every token");
+        assert_eq!(
+            got, expected,
+            "seq = 3 did not fall back to the unpacked parallel path"
+        );
+    }
+
+    /// The packed path must still be taken (and stay numerically equivalent)
+    /// for the shape it is designed for: `seq == 1`, `in_features % 4 == 0`.
+    #[test]
+    fn test_forward_packed_parallel_still_used_for_decode_shape() {
+        let in_features = 64;
+        let out_features = 8;
+        let ternary: Vec<i8> = (0..in_features * out_features)
+            .map(|i| ((i * 11 + 2) % 3) as i8 - 1)
+            .collect();
+        let linear = CpuLinear::from_ternary(ternary, 0.125, in_features, out_features);
+        let input: Vec<f32> = (0..in_features).map(|i| (i as f32 * 0.11).sin()).collect();
+
+        let packed = linear.forward_packed_parallel(&input, 1);
+        let unpacked = linear.forward(&input, 1);
+        assert_eq!(packed.len(), out_features);
+        for (i, (p, u)) in packed.iter().zip(unpacked.iter()).enumerate() {
+            assert!(
+                (p - u).abs() <= 1e-5,
+                "packed decode differs from unpacked at {}: {} vs {}",
+                i, p, u
+            );
+        }
     }
 }

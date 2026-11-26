@@ -28,6 +28,27 @@ use crate::model::cpu_moe::CpuMoELayer;
 use crate::model::gemma_mapper::{matmul, rms_norm, apply_rope, apply_rope_gqa, gelu_tanh};
 use crate::model::gemma_mapper::{MappedGemma4Model, Gemma4FfnWeights};
 
+/// One linear projection on the CPU inference path (attention q/k/v/o, the
+/// dense FFN gate/up/down, and the PLE gate/projection).
+///
+/// Decode (`seq == 1`) reads the 2-bit packed weights, which is a quarter of
+/// the memory traffic and the whole point of the packed representation.
+/// Prefill (`seq > 1`) uses the unpacked parallel kernel, which splits the
+/// sequence positions across threads.
+///
+/// Both kernels compute the same arithmetic. The unpacked one is bit-identical
+/// to the previous serial kernel; the packed one sums in eight lanes, so a
+/// decode projection and a prefill projection of the same vector can differ in
+/// the last few bits (~1e-6 relative). No model semantics depend on that.
+#[inline]
+fn projection(linear: &CpuLinear, input: &[f32], seq: usize) -> Vec<f32> {
+    if seq == 1 {
+        linear.forward_packed_parallel(input, seq)
+    } else {
+        linear.forward_parallel(input, seq)
+    }
+}
+
 /// Stored activations from a forward pass, used for proper backward.
 ///
 /// Rather than storing ALL intermediate tensors (which would be ~4GB for 35 layers),
@@ -217,7 +238,7 @@ impl CpuBlockAttnResLayer {
         let normed = self.attn_norm.forward(hidden);
 
         // Q projection + per-head norm + RoPE
-        let mut q = self.q_proj.forward(&normed, seq);
+        let mut q = projection(&self.q_proj, &normed, seq);
         q = crate::model::gemma_mapper::per_head_rms_norm(&q, self.q_norm.weight(), seq, nh, head_d);
         apply_rope(&mut q, seq, nh, head_d, 0, self.rope_theta, self.partial_rotary_factor);
 
@@ -229,8 +250,8 @@ impl CpuBlockAttnResLayer {
             }
             None => {
                 // Normal layer — compute own K/V
-                let mut k = self.k_proj.forward(&normed, seq);
-                let v_raw = self.v_proj.forward(&normed, seq);
+                let mut k = projection(&self.k_proj, &normed, seq);
+                let v_raw = projection(&self.v_proj, &normed, seq);
 
                 // Per-head K/V norms
                 k = crate::model::gemma_mapper::per_head_rms_norm(&k, self.k_norm.weight(), seq, nkv, head_d);
@@ -297,11 +318,11 @@ impl CpuBlockAttnResLayer {
                 (&self.ple_input_gate, &self.ple_projection, &self.ple_post_norm)
             {
                 let ple_dim = ple_slice.len() / seq;
-                let gate_out = gate.forward_packed_parallel(hidden, seq);
+                let gate_out = projection(gate, hidden, seq);
                 let gate_gelu: Vec<f32> = gate_out.iter().map(|&x| crate::model::gemma_mapper::gelu_tanh(x)).collect();
                 let mut gated = vec![0.0f32; seq * ple_dim];
                 for i in 0..seq * ple_dim { gated[i] = gate_gelu[i] * ple_slice[i]; }
-                let proj_out = proj.forward_packed_parallel(&gated, seq);
+                let proj_out = projection(proj, &gated, seq);
                 let ple_final = norm.forward(&proj_out);
                 for i in 0..hidden.len() { hidden[i] += ple_final[i]; }
             }
@@ -358,7 +379,7 @@ impl CpuBlockAttnResLayer {
             {
                 let ple_dim = ple_slice.len() / seq;
                 // Gate: hidden → ple_dim with GELU
-                let gate_out = gate.forward(hidden, seq);
+                let gate_out = projection(gate, hidden, seq);
                 let gate_gelu: Vec<f32> = gate_out.iter().map(|&x| gelu_tanh(x)).collect();
 
                 // Gated input: gate * ple_slice (element-wise)
@@ -368,7 +389,7 @@ impl CpuBlockAttnResLayer {
                 }
 
                 // Project back: [seq, ple_dim] → [seq, hd]
-                let proj_out = proj.forward(&gated, seq);
+                let proj_out = projection(proj, &gated, seq);
 
                 // Post norm and add residual
                 let ple_final = norm.forward(&proj_out);
@@ -427,7 +448,7 @@ impl CpuBlockAttnResLayer {
         let normed = self.attn_norm.forward(hidden);
 
         // Q projection + LoRA
-        let mut q = self.q_proj.forward(&normed, seq);
+        let mut q = projection(&self.q_proj, &normed, seq);
         if let Some(lora_out) = lora_m.forward(layer_idx, "q_proj", &normed, seq) {
             for (i, v) in lora_out.iter().enumerate() { q[i] += v; }
         }
@@ -438,11 +459,11 @@ impl CpuBlockAttnResLayer {
         let (k, v, should_share) = match shared_kv {
             Some((sk, sv)) => (sk.to_vec(), sv.to_vec(), false),
             None => {
-                let mut k = self.k_proj.forward(&normed, seq);
+                let mut k = projection(&self.k_proj, &normed, seq);
                 if let Some(lora_out) = lora_m.forward(layer_idx, "k_proj", &normed, seq) {
                     for (i, l) in lora_out.iter().enumerate() { k[i] += l; }
                 }
-                let mut v_raw = self.v_proj.forward(&normed, seq);
+                let mut v_raw = projection(&self.v_proj, &normed, seq);
                 if let Some(lora_out) = lora_m.forward(layer_idx, "v_proj", &normed, seq) {
                     for (i, l) in lora_out.iter().enumerate() { v_raw[i] += l; }
                 }
@@ -458,7 +479,7 @@ impl CpuBlockAttnResLayer {
         // Raw attention output (before out_proj) — LoRA needs the same input as the base weight
         let attn_raw = self.cpu_attention_raw(&q, &k, &v, seq, nh, nkv, head_d, q_dim, kv_dim);
         // Apply out_proj + LoRA on O projection
-        let mut attn_out = self.out_proj.forward(&attn_raw, seq);
+        let mut attn_out = projection(&self.out_proj, &attn_raw, seq);
         if let Some(lora_out) = lora_m.forward(layer_idx, "o_proj", &attn_raw, seq) {
             for (i, l) in lora_out.iter().enumerate() { attn_out[i] += l; }
         }
@@ -572,7 +593,7 @@ impl CpuBlockAttnResLayer {
         let attn_out = self.cpu_attention_cached(
             q, k, v, q_len, kv_len, num_heads, num_kv_heads, head_dim, q_dim, kv_dim,
         );
-        self.out_proj.forward(&attn_out, q_len)
+        projection(&self.out_proj, &attn_out, q_len)
     }
 
     /// CPU attention with packed parallel O projection (for decode path).
@@ -605,19 +626,19 @@ impl CpuBlockAttnResLayer {
         if let (Some(gate), Some(up), Some(down)) =
             (&self.ffn_gate, &self.ffn_up, &self.ffn_down)
         {
-            let gated = gate.forward(input, seq);
+            let gated = projection(gate, input, seq);
             let gated: Vec<f32> = if self.use_gelu {
                 gated.iter().map(|&x| gelu_tanh(x)).collect()
             } else {
                 // SwiGLU: silu(x) = x / (1 + exp(-x))
                 gated.iter().map(|&x| x / (1.0 + (-x).exp())).collect()
             };
-            let upped = up.forward(input, seq);
+            let upped = projection(up, input, seq);
             let mut combined = vec![0.0; seq * id];
             for i in 0..combined.len() {
                 combined[i] = gated[i] * upped[i];
             }
-            down.forward(&combined, seq)
+            projection(down, &combined, seq)
         } else {
             vec![0.0; seq * hd]
         }
