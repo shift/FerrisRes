@@ -1,6 +1,6 @@
 # Top-k teacher logits: the route that works
 
-Status: **smoke produced artefact, 2026-11-26.** Supersedes
+Status: **format verified 2026-11-26; real dump running.** Supersedes
 `tpu-topk-teacher.md` (TPU, six failures) and the vLLM variant (one failure).
 
 Notebook: `notebooks/kaggle/qwen3_topk_vllm/qwen3_topk_vllm.ipynb` on
@@ -45,9 +45,18 @@ The smoke proves format, not scale. Two levers, in this order:
 8B fp16 is 16 GB and does not fit one T4; it needs both, and the post that
 prompted this thread measured tensor-parallel over PCIe working.
 
-## Gate before scaling
+## Gate: passed
 
-`tools/verify_topk.py <dir> <train-shard>` must pass, and its alignment line must
-show `top-1 == token[i]` ahead of `token[i+1]`. A dump that is one position off is
-worse than no dump: the student would learn a shifted distribution and every
-training number afterwards would be suspect.
+```
+structure ok: 49 parts, 50127 records, k=8
+alignment over 1023 records:
+  top-1 == token[k]   79.4%
+  top-1 == token[k+1]  1.0%
+  top-1 == token[k-1]  0.5%
+```
+
+79.4% at its own offset against 1% either side settles it. The first checker run
+reported 0.0%/2.2% and failed — the bug was in the checker, which assumed
+`record i == token i`. The dump starts at token 1 by design (`logits[i-1]`
+predicts `i`) and stores each token's byte offset precisely so a consumer never
+has to assume; the checker now locates records by that offset.
