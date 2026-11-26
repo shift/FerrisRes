@@ -1,0 +1,15 @@
+{
+  "id": "sectionme/ferrisres-tpu-qwen",
+  "title": "FerrisRes tpu qwen",
+  "code_file": "tpu_qwen.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_tpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "rahim3/qwen38-tpu-env-v5e8"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

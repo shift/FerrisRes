@@ -59,11 +59,17 @@ def lint_datasets(meta, check):
     for slug in meta.get("dataset_sources", []):
         if not check:
             continue
-        r = subprocess.run(["kaggle", "datasets", "status", slug], capture_output=True, text=True)
-        if "ready" not in r.stdout:
-            err(f"dataset {slug}: not ready or not found ({r.stdout.strip()[:60]}{r.stderr.strip()[:60]})")
-        else:
+        # `datasets status` is owner-only and 404s on a public dataset someone else
+        # owns, which is not the same as "missing". The file listing works for any.
+        st = subprocess.run(["kaggle", "datasets", "status", slug], capture_output=True, text=True)
+        if "ready" in st.stdout:
             warn(f"dataset {slug}: ready (the first run after attaching may still mount nothing)")
+            continue
+        files = subprocess.run(["kaggle", "datasets", "files", "-d", slug], capture_output=True, text=True)
+        if files.returncode != 0 or "name" not in files.stdout:
+            err(f"dataset {slug}: not reachable ({files.stderr.strip()[:80]})")
+        else:
+            warn(f"dataset {slug}: public, not owned; attachment is still required")
 
 
 def lint_placeholders(src, meta_text):
