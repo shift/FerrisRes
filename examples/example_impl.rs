@@ -158,3 +158,12 @@ impl BlockAttnResLayer {
         partial_block
     }
 }
+
+// This file is illustrative: it sketches the block-attention-residual forward
+// pass against a mock tensor and has no runnable behaviour. Cargo still requires
+// an entry point for anything under `examples/`, and without one the whole
+// `cargo test -p ferrisres` target set failed to compile — a gate nobody could
+// pass. The real implementation is `src/model/block_attn_res.rs`.
+fn main() {
+    println!("example_impl is illustrative only; see src/model/block_attn_res.rs");
+}
