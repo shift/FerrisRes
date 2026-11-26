@@ -70,18 +70,28 @@ Hash every evaluation set (GSM8K, MATH, SWE-bench, BFCL test, MT-Bench, our own
 evals) and remove any training example whose normalised text matches. Record the
 hash list with the run so the check is reproducible.
 
-## Teacher choice
+## Teacher choice — decided: Qwen3
 
-| teacher | vocab | embedding at hidden 1024 | licence |
-|---|---:|---:|---|
-| Qwen3-0.6B / 1.7B | 151,936 | 156M | Apache-2.0 |
-| Gemma 4 E2B | 262,144 | 268M | Apache-2.0 |
+**Decision (2026-11-26): Qwen3-1.7B for Base, Qwen3-0.6B for the smoke run.**
+Gemma 4 E2B stays as the fallback, because it is the path proven on a Colab T4.
 
-Both are permissive, so licence no longer decides. **Vocabulary does:** Gemma's
-262k head is a quarter of a 1B student, while Qwen's 151k is 15%. The Gemma path
-is the one proven on a Colab T4; Qwen is the better first student for size and
-decode speed. A 64k pruned vocabulary is the third option and needs its own
-embedding training.
+| teacher | vocab | embedding at hidden 1024 | licence | role |
+|---|---:|---:|---|---|
+| **Qwen3-1.7B** | 151,936 | 156M | Apache-2.0 | Base teacher |
+| **Qwen3-0.6B** | 151,936 | 156M | Apache-2.0 | smoke teacher, fastest end-to-end proof |
+| Gemma 4 E2B | 262,144 | 268M | Apache-2.0 | fallback; proven notebook path |
+
+Both families are permissive, so licence did not decide. **Vocabulary did:**
+Gemma's 262k head is a quarter of a 1B student, while Qwen's 151k is 15%, and
+the head is already the largest single read per token. Qwen is also faster to
+iterate, which matters more than the last point of quality before the pipeline
+is proven.
+
+Consequence: **the first distillation still waits on the LoRA gradient fix.**
+The student is Block AttnRes, and `forward_train` with blocks plus a LoRA
+manager now panics rather than training wrong. The teacher decision unblocks
+the data and the presets, not the defective gradient path. A 64k pruned
+vocabulary remains a later experiment.
 
 ## Tokenizer and vocabulary
 
