@@ -274,3 +274,9 @@ customer document.
 - **Quality.** A licence-clean row can still be a bad row; the eval gates decide.
 - **Contamination.** The held-out sets must be checked against every fetched
   source, not assumed disjoint.
+
+## Getting the missing sources in
+
+The route for each missing source — convert outside the engine, land plain text
+in a Kaggle dataset, let the builder read it as a `local` source — is in
+`data-acquisition.md`.
