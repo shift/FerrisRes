@@ -11,6 +11,9 @@ use ferrisres::model::gemma_mapper::{
     DistillationCheckpoint, load_gemma4_model_gguf,
 };
 use ferrisres::model::tokenizer::HfTokenizer;
+use ferrisres::training::dataset::{
+    load_dataset_with, ChatTemplate, DataFormat, DatasetOptions,
+};
 
 #[derive(Parser)]
 #[command(name = "ferrisres", about = "Block AttnRes runtime for SLM/LLM training and inference")]
@@ -143,6 +146,25 @@ enum Commands {
         /// Path to training data (text file, one doc per line).
         #[arg(long)]
         data: Option<String>,
+        /// Training-data format: `auto` (choose by file extension), `text`
+        /// (the whole file is one example) or `jsonl` (one JSON object per
+        /// line, either `{"text": ...}` or `{"messages": [...]}`).
+        /// zstd input is refused; decompress it with `zstd -dc` first.
+        #[arg(long, default_value = "auto")]
+        data_format: DataFormat,
+        /// Chat template used to render structured examples: `gemma`
+        /// (`<start_of_turn>` turns), `qwen` (`<|im_start|>` ChatML), `lfm`
+        /// (`<|startoftext|>` plus ChatML) or `plain` (`role: content` lines).
+        /// `text` examples are never re-rendered, so a `.txt` corpus is
+        /// unaffected by this flag.
+        #[arg(long, default_value = "gemma")]
+        chat_template: ChatTemplate,
+        /// Refuse to run when any example is missing `source`, `licence` or
+        /// `redacted`; the error names the line number and the missing field.
+        /// Without this flag missing fields are counted and reported once at
+        /// the end.
+        #[arg(long)]
+        require_provenance: bool,
         /// Output path for distilled model.
         #[arg(long, default_value = "distilled_model.bin")]
         output: String,
@@ -260,8 +282,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Distill {
             model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every,
             resume, model_format, tokenizer, checkpoint_every, converge, converge_patience,
+            data_format, chat_template, require_provenance,
             armor: _, armor_config: _,
-        } => cmd_distill(model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every, resume, model_format, tokenizer, checkpoint_every, converge, converge_patience).await,
+        } => cmd_distill(model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every, resume, model_format, tokenizer, checkpoint_every, converge, converge_patience, data_format, chat_template, require_provenance).await,
         Commands::Evaluate {
             model_path, config, text,
         } => cmd_evaluate(model_path, config, text).await,
@@ -1213,6 +1236,9 @@ async fn cmd_distill(
     checkpoint_every: usize,
     converge_threshold: f64,
     converge_patience: usize,
+    data_format: DataFormat,
+    chat_template: ChatTemplate,
+    require_provenance: bool,
     // use_gpu removed — now determined by DispatchPlan from model size + device capabilities
 ) -> anyhow::Result<()> {
     info!(event = "ferrisres_gemma_4_block_attnres_distillation", "=== FerrisRes Gemma 4 → Block AttnRes Distillation ===");
@@ -1317,17 +1343,60 @@ async fn cmd_distill(
 
     let token_ids = if let Some(ref dp) = data_path {
         info!(event = "loading_training_data_from", "Loading training data from: {}", dp);
-        let text = std::fs::read_to_string(dp)
-            .map_err(|e| anyhow::anyhow!("Failed to read data: {}", e))?;
-        if let Some(ref tok) = hf_tokenizer {
-            let ids = tok.encode_raw(&text);
-            info!(event = "tokenized_to_tokens_using_provided_tokenizer", "Tokenized to {} tokens using provided tokenizer", ids.len());
-            ids
-        } else {
-            let ids: Vec<u32> = text.bytes().map(|b| b as u32).collect();
-            info!(event = "loaded_byte_level_tokens_from_training", "Loaded {} byte-level tokens from training data", ids.len());
-            ids
+        let path = std::path::Path::new(dp);
+        let resolved_format = data_format
+            .resolve(path)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let options = DatasetOptions { require_provenance };
+        let mut examples = load_dataset_with(path, data_format, &options)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        let mut ids: Vec<u32> = Vec::new();
+        let mut example_count: u64 = 0;
+        let mut rendered_tokens: u64 = 0;
+
+        while let Some(example) = examples.next() {
+            let example = example.map_err(|e| anyhow::anyhow!("{}", e))?;
+            let rendered = example.render(chat_template);
+            let encoded: Vec<u32> = match hf_tokenizer {
+                Some(ref tok) => tok.encode_raw(&rendered),
+                None => rendered.bytes().map(|b| b as u32).collect(),
+            };
+            example_count += 1;
+            rendered_tokens += encoded.len() as u64;
+            ids.extend_from_slice(&encoded);
         }
+
+        info!(
+            event = "dataset_loaded",
+            examples = example_count,
+            rendered_tokens = rendered_tokens,
+            format = resolved_format.as_str(),
+            template = chat_template.as_str(),
+            "Loaded {} example(s) from {} and rendered {} token(s)",
+            example_count,
+            resolved_format.as_str(),
+            rendered_tokens
+        );
+
+        if let Some(report) = examples.stats().provenance_summary() {
+            let stats = examples.stats();
+            warn!(
+                event = "dataset_missing_provenance",
+                source = stats.missing_source,
+                licence = stats.missing_licence,
+                redacted = stats.missing_redacted,
+                "{}",
+                report
+            );
+        }
+
+        if hf_tokenizer.is_some() {
+            info!(event = "tokenized_to_tokens_using_provided_tokenizer", "Tokenized to {} tokens using provided tokenizer", ids.len());
+        } else {
+            info!(event = "loaded_byte_level_tokens_from_training", "Loaded {} byte-level tokens from training data", ids.len());
+        }
+        ids
     } else {
         info!(event = "no_training_data_provided_using_synthetic", "No training data provided, using synthetic tokens");
         (0..10000).map(|i| i % config.vocab_size as u32).collect()

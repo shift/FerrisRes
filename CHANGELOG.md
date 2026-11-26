@@ -11,6 +11,12 @@ Pre-1.0 minor versions may contain breaking changes.
 ## [Unreleased]
 
 ### Added
+- Structured training datasets for `ferrisres distill`: `--data` now accepts
+  JSONL (`{"text": ...}` or `{"messages": [...]}` with optional `tools` and
+  `reasoning`), streams examples instead of reading the whole file, renders them
+  with `--chat-template gemma|qwen|lfm|plain`, and reports or enforces
+  `source`/`licence`/`redacted` provenance with `--require-provenance`
+  (`src/training/dataset.rs`, `docs/dataset-formats.md`)
 - `FusedPatchEmbedOp` — Implicit GEMM fused patch embedding WGSL kernel; eliminates the
   explicit `im2col` intermediate buffer (~59 MB at 224×224 RGB) by computing patch pixels
   on-the-fly inside a tiled 16×16 workgroup shader (`compute/kernels/fused_patch_embed.rs`)

@@ -281,7 +281,10 @@ Options:
   --steps <N>             Number of distillation steps [default: 1000]
   --lr <RATE>             Learning rate [default: 0.0001]
   --temperature <T>       KL divergence temperature [default: 2.0]
-  --data <PATH>           Training text file (plain text)
+  --data <PATH>           Training data: plain text or JSONL (see docs/dataset-formats.md)
+  --data-format <FMT>     auto | text | jsonl [default: auto]
+  --chat-template <T>     gemma | qwen | lfm | plain [default: gemma]
+  --require-provenance    Refuse examples missing source/licence/redacted
   --tokenizer <PATH>      Path to tokenizer.json (HuggingFace format)
   --output <PATH>         Output prefix [default: distilled_model]
   --log-every <N>         Log every N steps [default: 1]
@@ -292,6 +295,16 @@ Options:
   --converge-patience <N> Steps with no improvement before stopping [default: 50]
   se GPU for matmul acceleration
 ```
+
+### Training data formats
+
+`--data` accepts raw text (`.txt`, the whole file is one example) and JSONL
+(`.jsonl`, one object per line) with either `{"text": ...}` or
+`{"messages": [...]}`. Structured examples can carry `tools` and `reasoning`,
+and every example can carry `source`, `licence` and `redacted` provenance.
+`--chat-template` renders messages with the Gemma, Qwen, LFM or plain template
+before tokenisation. See [dataset-formats.md](dataset-formats.md) for the full
+shapes, the rendered special tokens, and the streaming and provenance rules.
 
 ### `evaluate`
 
