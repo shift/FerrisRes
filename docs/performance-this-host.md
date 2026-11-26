@@ -20,10 +20,21 @@ Two conclusions, both measured rather than assumed:
    still a floor — the counter rose with the load rather than plateauing at 8.
    Decode figures computed at 6.3 are pessimistic by ~65%: Small is ~291 tok/s
    rather than ~163, Base ~78 rather than ~49.
-2. **GPU training here is memory-bound, not dispatch-bound.** Bandwidth is at the
-   ceiling while the EUs sit at 30%. So more threads or wider SIMD buy almost
-   nothing on this host, and cutting bytes buys up to ~3.3× before compute takes
-   over: f16 activations ≈ 2×, f16 plus fused elementwise ops ≈ 3×.
+2. **GPU training here has two regimes, and the shape picks which.** An earlier
+   reading of 30% EU at 7.8–10 GiB/s was taken to mean "memory-bound"; a later
+   one contradicts it: **Render/3D ~97% with reads at only 1.8–2.8 GB/s and
+   writes 0.76 GB/s.** At that point the EUs are the wall and memory is half idle.
+
+   | regime | EU | IMC reads | limited by | lever |
+   |---|---:|---|---|---|
+   | small shapes | ~30% | ~8–10 GB/s | dispatch and per-op traffic | fewer launches, f16 buffers |
+   | large shapes | **~97%** | ~2 GB/s | **execution units** | SIMD, branchless kernels, fewer instructions per MAC |
+
+   The shapes that matter (512–768 wide) are in the second regime, so **kernel
+   efficiency is the lever on this host**, which is the same 40× gap the prefill
+   work measured (ternary kernel at 0.9 GFLOP/s against 36 GFLOP/s for an fp32
+   GEMM on the same shape). f16 is secondary: it halves bytes that this regime is
+   not short of.
 
 This is also why the T4 result (326 tok/s, dispatch-bound) and this host cannot be
 compared directly: the two are limited by different things.
