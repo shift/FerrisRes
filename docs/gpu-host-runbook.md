@@ -1,9 +1,10 @@
 # GPU host runbook
 
-Status: **runbook, 2026-11-26. Prepared, not executed on a rented GPU.** The
-Kaggle T4 is closed (`docs/kaggle-readiness.md`). This procedure tests one
-rented host that is expected to mount the NVIDIA graphics stack, and records
-the answer in under an hour.
+Status: **runbook, 2026-11-26. Prepared, not executed on a rented GPU.** It is
+the fallback, not the first choice: the Kaggle T4 works once the graphics
+userspace is installed in the session, which run 4 measured
+(`docs/kaggle-readiness.md`). Use this procedure for a host that will not let you
+install that package, or when you want a second host for comparison.
 
 The purpose is one question: **does the engine enumerate a hardware adapter on
 this host, and can it train on it?** A "no" is an answer. Do not fall back to
@@ -89,8 +90,28 @@ well; on Kaggle the package was installed, its ICD file was present, and
 `devices` still reported llvmpipe because the named library was absent
 (measured, run 2).
 
-The three conditions are properties of the host image. They are not repaired
-from inside the job. If any check fails, go to section 4.
+Conditions 2 and 3 **can** be repaired from inside the job when the image's
+Ubuntu release and the running driver share a major version. Measured on Kaggle
+run 4:
+
+```bash
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  -o Dpkg::Options::="--force-overwrite" \
+  -o Dpkg::Options::="--force-confold" \
+  libnvidia-gl-580-server
+```
+
+`--force-overwrite` is required: the package ships
+`15_nvidia_gbm.json`, owned by `libnvidia-egl-gbm1`, and dpkg aborts without the
+flag. Use the `-server` name; plain `libnvidia-gl-580` exited 0 and shipped no
+`libGLX_nvidia.so`. Condition 1 cannot be repaired in the job — it changes what
+the runtime mounts — but it does not have to be, because a library installed
+into the image is reachable through the `/dev/nvidia*` nodes the runtime already
+passes through. After run 4, `devices` listed two `Tesla T4`, `vulkan`,
+`Discrete`, `software: false`.
+
+If the install leaves no library, go to section 4.
 
 ## 2. The probe
 
@@ -135,9 +156,11 @@ export VK_DRIVER_FILES=/tmp/nvidia_icd.json
 export VK_ICD_FILENAMES=/tmp/nvidia_icd.json
 ```
 
-This repairs a missing manifest. It cannot repair a missing library. On Kaggle,
-the manifest was written and `devices` still reported
-`llvmpipe (LLVM 20.1.2)`, backend `gl`, `software: true` (measured, run 2).
+This repairs a missing manifest. It cannot repair a missing library: on Kaggle
+run 2 the manifest was written and `devices` still reported
+`llvmpipe (LLVM 20.1.2)`, backend `gl`, `software: true`. On run 4 the library
+came first (section 1) and the adapter appeared. Install the library, then the
+manifest if the package did not ship one.
 
 ### Step 3 — enumerate adapters
 
@@ -249,10 +272,18 @@ instance.
 
 ## 4. If the host also lacks graphics capabilities
 
-Stop. Do not install driver packages inside the job. On Kaggle,
-`libnvidia-gl-580` installed with exit 0 and left no library, and
-`libnvidia-gl-580-server` conflicted with `libnvidia-egl-gbm1` (measured, run 3).
-That is a host image decision, not a job step.
+Only after the in-session install in section 1 has been tried and has left no
+`libGLX_nvidia.so.0`. Then stop; the image is not going to provide it.
+
+Two failures to recognise rather than repeat (measured on Kaggle run 3):
+
+- `libnvidia-gl-580` (no `-server`) exits 0 and ships no `libGLX_nvidia.so` in
+  that image;
+- `libnvidia-gl-580-server` aborts on a file owned by `libnvidia-egl-gbm1` unless
+  dpkg is given `--force-overwrite`.
+
+Neither of those is a reason to stop by itself; run 4 passed both by forcing the
+overwrite.
 
 Keep this evidence:
 
