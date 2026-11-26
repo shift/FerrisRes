@@ -35,13 +35,21 @@ enum Commands {
         json: bool,
     },
 
-    /// Launch one worker process per GPU adapter.
+    /// Launch one worker process per rank.
     ///
-    /// Refuses when fewer usable adapters exist than `--world-size`. Each child
-    /// gets `WGPU_ADAPTER_INDEX=i` and `--rank i --world-size N` appended.
+    /// The default path takes one GPU adapter per rank, refuses when fewer
+    /// usable adapters exist than `--world-size`, sets `WGPU_ADAPTER_INDEX=i`
+    /// and appends `--rank i --world-size N`. With `--cpu` there is no adapter
+    /// enumeration or `WGPU_ADAPTER_INDEX`; the children coordinate through
+    /// their own `--exchange-dir`, which is the f32 trainer's path.
     Workers {
         #[arg(long, default_value_t = 1)]
         world_size: usize,
+        /// CPU ranks: no adapter enumeration, no `WGPU_ADAPTER_INDEX` per rank.
+        /// This is the path the f32 trainer uses; the children coordinate
+        /// through `--exchange-dir`, not a GPU.
+        #[arg(long)]
+        cpu: bool,
         /// Include software (CPU) adapters; off by default.
         #[arg(long)]
         allow_software: bool,
@@ -58,6 +66,12 @@ enum Commands {
     /// One step is next-token prediction over a `--seq-len` window. Because the
     /// reference forward has no batch axis, `--batch-size` windows are averaged
     /// into one Adam step. Checkpoints are written to `--output`.
+    ///
+    /// With `--world-size N`, the run shards training *windows*: every rank
+    /// runs the same global optimizer steps and owns one disjoint window per
+    /// step, so the union covers the corpus exactly as often as one process
+    /// would. Parameters are averaged through `--exchange-dir`. This is the
+    /// f32 CPU trainer; it never uses a GPU.
     Train {
         #[arg(long, default_value_t = 512)]
         hidden_dim: usize,
@@ -102,6 +116,19 @@ enum Commands {
         /// Restore model and Adam state, then train `--epochs` more epochs.
         #[arg(long)]
         resume: Option<String>,
+        /// This process's rank for `--world-size > 1`.
+        #[arg(long, default_value_t = 0)]
+        rank: usize,
+        /// Number of cooperating processes. One keeps the unsharded schedule.
+        #[arg(long, default_value_t = 1)]
+        world_size: usize,
+        /// Shared directory for weight exchange and per-rank evidence.
+        /// Required when `--world-size > 1`.
+        #[arg(long)]
+        exchange_dir: Option<String>,
+        /// Average parameters every N optimizer steps (last step included).
+        #[arg(long, default_value_t = 5)]
+        exchange_every: u64,
         /// Log one loss line every N steps. Zero logs only first and last.
         #[arg(long, default_value_t = 1)]
         log_every: u64,
@@ -324,11 +351,13 @@ async fn main() -> anyhow::Result<()> {
         Commands::Devices { json } => cmd_devices(json).await,
         Commands::Workers {
             world_size,
+            cpu,
             allow_software,
             evidence_dir,
             command,
         } => {
             ferrisres::multi_gpu::launcher::run_workers(
+                cpu,
                 world_size,
                 allow_software,
                 evidence_dir,
@@ -341,11 +370,13 @@ async fn main() -> anyhow::Result<()> {
         Commands::Train {
             hidden_dim, num_blocks, block_size, epochs, batch_size,
             learning_rate, data, data_format, chat_template, seq_len, vocab,
-            seed, checkpoint_every, output, resume, log_every, lora_rank,
+            seed, checkpoint_every, output, resume, rank, world_size,
+            exchange_dir, exchange_every, log_every, lora_rank,
         } => cmd_train(
             hidden_dim, num_blocks, block_size, epochs, batch_size,
             learning_rate, data, data_format, chat_template, seq_len, vocab,
-            seed, checkpoint_every, output, resume, log_every, lora_rank,
+            seed, checkpoint_every, output, resume, rank, world_size,
+            exchange_dir, exchange_every, log_every, lora_rank,
         ).await,
         Commands::Infer {
             model_path, config, config_path, model_format, tokenizer,
@@ -411,45 +442,7 @@ async fn cmd_devices(json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let name_width = adapters
-        .iter()
-        .map(|a| a.name.chars().count())
-        .max()
-        .unwrap_or(4)
-        .max("name".len());
-
-    println!(
-        "{:<5}  {:<width$}  {:<10}  {:<7}  {:<11}  {:<13}  {:<16}  {}",
-        "index",
-        "name",
-        "kind",
-        "backend",
-        "max_buffer",
-        "max_immediate",
-        "memory",
-        "software",
-        width = name_width
-    );
-    for adapter in &adapters {
-        let memory = match (adapter.dedicated_vram, adapter.shared_memory) {
-            (Some(vram), _) => format!("{} MiB VRAM", vram / (1024 * 1024)),
-            (None, Some(shared)) => format!("shared {} MiB", shared / (1024 * 1024)),
-            (None, None) => "-".to_string(),
-        };
-        println!(
-            "{:<5}  {:<width$}  {:<10}  {:<7}  {:<11}  {:<13}  {:<16}  {}",
-            adapter.index,
-            adapter.name,
-            adapter.kind,
-            adapter.backend,
-            format!("{} MiB", adapter.max_buffer / (1024 * 1024)),
-            adapter.max_immediate,
-            memory,
-            if adapter.software { "yes" } else { "no" },
-            width = name_width
-        );
-    }
-
+    print!("{}", ferrisres::compute::pipeline::format_adapter_table(&adapters));
     Ok(())
 }
 
@@ -469,6 +462,10 @@ async fn cmd_train(
     checkpoint_every: u64,
     output: String,
     resume: Option<String>,
+    rank: usize,
+    world_size: usize,
+    exchange_dir: Option<String>,
+    exchange_every: u64,
     log_every: u64,
     lora_rank: Option<usize>,
 ) -> anyhow::Result<()> {
@@ -554,6 +551,10 @@ async fn cmd_train(
         output: std::path::PathBuf::from(&output),
         resume: resume.map(std::path::PathBuf::from),
         log_every,
+        rank,
+        world_size,
+        exchange_dir: exchange_dir.map(std::path::PathBuf::from),
+        exchange_every,
     };
 
     let report = run(&options, &tokens)?;

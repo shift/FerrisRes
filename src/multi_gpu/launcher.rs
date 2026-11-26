@@ -10,7 +10,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -28,6 +28,9 @@ pub struct AdapterSlot {
     /// It is not necessarily [`AdapterListing::index`].
     pub selector: usize,
     pub name: String,
+    /// PCI bus id, when the backend exposed one. Two cards of the same model
+    /// share `name`, so this is what tells their evidence apart.
+    pub bus_id: Option<String>,
 }
 
 /// The adapters a launch may use, in the same order `WGPU_ADAPTER_INDEX`
@@ -40,6 +43,22 @@ pub fn usable_adapters(listings: &[AdapterListing], allow_software: bool) -> Vec
         .map(|(selector, adapter)| AdapterSlot {
             selector,
             name: adapter.name.clone(),
+            bus_id: adapter.bus_id.clone(),
+        })
+        .collect()
+}
+
+/// The synthetic slots a `workers --cpu` run uses.
+///
+/// There is no GPU per rank on the f32 path, so no adapter is enumerated and
+/// no `WGPU_ADAPTER_INDEX` is exported. The slot exists only so the launcher's
+/// capacity check, evidence and report keep one shape for both paths.
+pub fn cpu_adapters(world_size: usize) -> Vec<AdapterSlot> {
+    (0..world_size)
+        .map(|rank| AdapterSlot {
+            selector: rank,
+            name: "cpu".to_string(),
+            bus_id: None,
         })
         .collect()
 }
@@ -78,6 +97,9 @@ pub struct LaunchOptions {
     /// `None` means no launcher-side deadline; the barrier in each worker and
     /// the training budget are the real limits. Set one for scripted runs.
     pub child_timeout: Option<Duration>,
+    /// Export `WGPU_ADAPTER_INDEX`. False on the CPU path, where no child may
+    /// be pointed at an adapter it does not have.
+    pub export_adapter_index: bool,
 }
 
 impl LaunchOptions {
@@ -85,11 +107,17 @@ impl LaunchOptions {
         Self {
             evidence_dir: evidence_dir.into(),
             child_timeout: None,
+            export_adapter_index: true,
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.child_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_adapter_index(mut self, export: bool) -> Self {
+        self.export_adapter_index = export;
         self
     }
 }
@@ -101,6 +129,8 @@ pub struct WorkerEvidence {
     /// Position among usable adapters; `WGPU_ADAPTER_INDEX` for this child.
     pub adapter_index: usize,
     pub adapter_name: String,
+    /// PCI bus id of the adapter this rank took, when one was available.
+    pub adapter_bus_id: Option<String>,
     pub world_size: usize,
     /// Exit code; `None` when the process was signalled or never started.
     pub exit_status: Option<i32>,
@@ -164,6 +194,17 @@ pub fn launch(
         source,
     })?;
 
+    // One id for the whole launch scopes the init-identity reference file, so
+    // a reused exchange directory cannot feed a rank a previous run's hash.
+    let run_id = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0)
+    );
+
     let mut children: Vec<ChildSlot> = Vec::with_capacity(world_size);
     for (rank, adapter) in adapters.iter().take(world_size).enumerate() {
         let mut command = Command::new(program);
@@ -173,12 +214,15 @@ pub fn launch(
             .arg(rank.to_string())
             .arg("--world-size")
             .arg(world_size.to_string())
-            .env("WGPU_ADAPTER_INDEX", adapter.selector.to_string())
+            .env("FERRISRES_RUN_ID", &run_id)
             .env("FERRISRES_RANK", rank.to_string())
             .env("FERRISRES_WORLD_SIZE", world_size.to_string())
             .env("FERRISRES_EVIDENCE_DIR", dir)
             .env("FERRISRES_TOKENS_FILE", tokens_path(dir, rank))
             .stdin(Stdio::null());
+        if options.export_adapter_index {
+            command.env("WGPU_ADAPTER_INDEX", adapter.selector.to_string());
+        }
         // A worker gets its own process group so that a launcher-side terminate
         // also reaches a shell script's grandchildren, not only the shell.
         #[cfg(unix)]
@@ -291,6 +335,7 @@ pub fn launch(
 /// Prints one line per rank on success and returns the report; every refusal
 /// travels up as the named error so `main` exits non-zero.
 pub async fn run_workers(
+    cpu: bool,
     world_size: usize,
     allow_software: bool,
     evidence_dir: Option<String>,
@@ -299,10 +344,16 @@ pub async fn run_workers(
     if command.is_empty() {
         return Err(MultiGpuError::EmptyCommand);
     }
-    let listings = list_adapters()
-        .await
-        .map_err(|err| MultiGpuError::Enumeration(err.to_string()))?;
-    let adapters = usable_adapters(&listings, allow_software);
+    let (adapters, export_adapter_index) = if cpu {
+        // No GPU is involved on this path, so enumerating adapters (and
+        // needing a Vulkan ICD) would refuse a run the host can perform.
+        (cpu_adapters(world_size), false)
+    } else {
+        let listings = list_adapters()
+            .await
+            .map_err(|err| MultiGpuError::Enumeration(err.to_string()))?;
+        (usable_adapters(&listings, allow_software), true)
+    };
     check_capacity(world_size, &adapters)?;
 
     let dir = evidence_dir.map(PathBuf::from).unwrap_or_else(|| {
@@ -314,7 +365,7 @@ pub async fn run_workers(
         world_size,
         &program,
         &args,
-        &LaunchOptions::new(&dir),
+        &LaunchOptions::new(&dir).with_adapter_index(export_adapter_index),
     )?;
 
     for worker in &report.workers {
@@ -322,12 +373,14 @@ pub async fn run_workers(
             .tokens_per_second
             .map(|value| format!("{value:.2}"))
             .unwrap_or_else(|| "-".to_string());
+        let bus = worker.adapter_bus_id.as_deref().unwrap_or("-");
         println!(
-            "rank {}/{} adapter {} ({}) exit {} elapsed {} ms tokens/s {}",
+            "rank {}/{} adapter {} ({}, bus {}) exit {} elapsed {} ms tokens/s {}",
             worker.rank,
             worker.world_size,
             worker.adapter_index,
             worker.adapter_name,
+            bus,
             worker
                 .exit_status
                 .map(|code| code.to_string())
@@ -373,6 +426,7 @@ fn build_report(
                 rank: slot.rank,
                 adapter_index: slot.adapter.selector,
                 adapter_name: slot.adapter.name.clone(),
+                adapter_bus_id: slot.adapter.bus_id.clone(),
                 world_size,
                 exit_status,
                 success,
@@ -492,6 +546,7 @@ mod tests {
         AdapterSlot {
             selector,
             name: name.to_string(),
+            bus_id: None,
         }
     }
 
@@ -506,6 +561,7 @@ mod tests {
             software,
             dedicated_vram: None,
             shared_memory: None,
+            bus_id: None,
         }
     }
 
@@ -637,6 +693,54 @@ mod tests {
         for worker in &report.workers {
             assert_eq!(worker.tokens_per_second, Some(123.5));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cpu_mode_spawns_children_without_an_adapter_index() {
+        let temp = TempDir::new("cpu");
+        let adapters = super::cpu_adapters(2);
+        let script = r#"echo "${WGPU_ADAPTER_INDEX:-none} $1 $3" > "$FERRISRES_EVIDENCE_DIR/seen-$1.txt""#;
+        let args = [OsString::from("-c"), OsString::from(script)];
+        let options = LaunchOptions::new(temp.path()).with_adapter_index(false);
+
+        let report = launch(&adapters, 2, OsStr::new("/bin/sh"), &args, &options)
+            .expect("launch two cpu ranks");
+
+        assert_eq!(report.workers.len(), 2);
+        for worker in &report.workers {
+            assert_eq!(worker.adapter_name, "cpu");
+            assert_eq!(worker.adapter_bus_id, None);
+        }
+        for rank in 0..2 {
+            let seen = fs::read_to_string(temp.path().join(format!("seen-{rank}.txt"))).unwrap();
+            assert_eq!(seen.trim(), format!("none {rank} 2"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bus_id_is_carried_from_the_listing_into_the_evidence() {
+        let temp = TempDir::new("bus");
+        let mut a = listing(0, "NVIDIA T4", false);
+        a.bus_id = Some("0000:3b:00.0".to_string());
+        let mut b = listing(1, "NVIDIA T4", false);
+        b.bus_id = Some("0000:5e:00.0".to_string());
+        let adapters = usable_adapters(&[a, b], false);
+        assert_eq!(adapters[0].name, adapters[1].name);
+        assert_eq!(adapters[0].bus_id.as_deref(), Some("0000:3b:00.0"));
+        assert_eq!(adapters[1].bus_id.as_deref(), Some("0000:5e:00.0"));
+
+        let args = [OsString::from("-c"), OsString::from("true")];
+        let report = launch(&adapters, 2, OsStr::new("/bin/sh"), &args, &LaunchOptions::new(temp.path()))
+            .unwrap();
+        assert_eq!(report.worker(0).unwrap().adapter_bus_id.as_deref(), Some("0000:3b:00.0"));
+        assert_eq!(report.worker(1).unwrap().adapter_bus_id.as_deref(), Some("0000:5e:00.0"));
+
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(temp.path().join("rank-1.json")).unwrap())
+                .unwrap();
+        assert_eq!(written["adapter_bus_id"], serde_json::json!("0000:5e:00.0"));
     }
 
     #[cfg(unix)]

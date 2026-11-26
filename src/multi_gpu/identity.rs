@@ -6,11 +6,17 @@
 //! weights later: averaging ranks that began from different checkpoints
 //! produces a model that never existed.
 
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
 use crate::multi_gpu::error::MultiGpuError;
 use crate::multi_gpu::fnv1a;
 
 /// The `(seed, parameter hash)` pair a rank reports before its first step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InitIdentity {
     pub seed: u64,
     pub param_hash: u64,
@@ -87,6 +93,101 @@ pub fn verify_identity(
     })
 }
 
+/// The file rank 0 publishes and every rank compares itself against.
+///
+/// `run_id` scopes the file to one launch (the launcher passes
+/// `FERRISRES_RUN_ID`). Without it the name includes the seed and the starting
+/// step, so a fresh run and a resumed run never read each other's reference.
+/// A stale file is therefore either impossible (fresh directory) or identical
+/// in content (same seed, same start, same parameters).
+pub fn identity_path(dir: &Path, run_id: Option<&str>, seed: u64, start_step: u64) -> PathBuf {
+    let name = match run_id {
+        Some(id) => {
+            let safe: String = id
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            format!("init-identity-{safe}.json")
+        }
+        None => format!("init-identity-s{start_step}-seed{seed}.json"),
+    };
+    dir.join(name)
+}
+
+/// Publish the run's reference identity, atomically.
+///
+/// Called by rank 0 before any rank proceeds. The rename keeps a waiting rank
+/// from reading half a JSON document.
+pub fn publish_reference(
+    dir: &Path,
+    identity: &InitIdentity,
+    run_id: Option<&str>,
+    start_step: u64,
+) -> Result<PathBuf, MultiGpuError> {
+    fs::create_dir_all(dir).map_err(|source| MultiGpuError::Io {
+        path: dir.display().to_string(),
+        source,
+    })?;
+    let path = identity_path(dir, run_id, identity.seed, start_step);
+    let temp = dir.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("identity.json"),
+        std::process::id()
+    ));
+    let bytes =
+        serde_json::to_vec(identity).map_err(|err| MultiGpuError::Json(err.to_string()))?;
+    fs::write(&temp, &bytes).map_err(|source| MultiGpuError::Io {
+        path: temp.display().to_string(),
+        source,
+    })?;
+    fs::rename(&temp, &path).map_err(|source| MultiGpuError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(path)
+}
+
+/// Wait for the reference identity to appear, then return it.
+///
+/// A missing file is reported as a timeout that names it; it never blocks
+/// forever. A partially written file is not possible because the writer
+/// renames, but a malformed file is still refused rather than guessed at.
+pub fn await_reference(
+    dir: &Path,
+    run_id: Option<&str>,
+    seed: u64,
+    start_step: u64,
+    timeout: Duration,
+) -> Result<InitIdentity, MultiGpuError> {
+    let path = identity_path(dir, run_id, seed, start_step);
+    let started = Instant::now();
+    loop {
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let identity: InitIdentity = serde_json::from_slice(&bytes)
+                    .map_err(|err| MultiGpuError::Json(err.to_string()))?;
+                return Ok(identity);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(MultiGpuError::Io {
+                    path: path.display().to_string(),
+                    source,
+                })
+            }
+        }
+        if started.elapsed() >= timeout {
+            return Err(MultiGpuError::IdentityTimeout {
+                path: path.display().to_string(),
+                waited_ms: started.elapsed().as_millis(),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{verify_identity, InitIdentity};
@@ -141,6 +242,50 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("seed"), "must name the field: {text}");
         assert!(text.contains("rank 0"), "must name the rank: {text}");
+    }
+
+    #[test]
+    fn a_published_reference_is_read_back_verbatim() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrisres-init-identity-{}-publish",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let reference = InitIdentity::from_params(42, &params(1.0));
+        let path = super::publish_reference(&dir, &reference, Some("run-7"), 0).unwrap();
+        assert!(path.is_file());
+
+        let read = super::await_reference(
+            &dir,
+            Some("run-7"),
+            42,
+            0,
+            std::time::Duration::from_millis(100),
+        )
+        .unwrap();
+        assert_eq!(read, reference);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_reference_times_out_with_its_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrisres-init-identity-{}-missing",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = super::await_reference(
+            &dir,
+            Some("run-8"),
+            1,
+            0,
+            std::time::Duration::from_millis(20),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("init-identity-run-8.json"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

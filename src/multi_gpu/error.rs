@@ -38,6 +38,9 @@ pub enum MultiGpuError {
     #[error("weight average for step {step} did not appear within {waited_ms} ms")]
     AverageTimeout { step: u64, waited_ms: u128 },
 
+    #[error("reference init identity {path} did not appear within {waited_ms} ms")]
+    IdentityTimeout { path: String, waited_ms: u128 },
+
     #[error("weight averaging is rank 0's job; this process is rank {rank}")]
     NotCoordinator { rank: usize },
 

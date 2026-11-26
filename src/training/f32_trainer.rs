@@ -75,6 +75,7 @@
 // Configuration
 // ---------------------------------------------------------------------------
 
+use crate::error::{FerrisResError, Result};
 use crate::model::cpu_block_attn_res::{
     add_layer_prefix, block_index_of_layer, embedding_prefix, prefix_means,
 };
@@ -425,6 +426,41 @@ impl F32Model {
     pub fn set_tensor_elem(&mut self, tensor: usize, index: usize, value: f32) {
         let mut tensors = self.tensors_mut();
         tensors[tensor].1[index] = value;
+    }
+
+    /// Concatenate every parameter in [`Self::tensors`] order.
+    ///
+    /// This is the payload of one weight-exchange round, so it is the only
+    /// place that has to agree with [`Self::set_flat_params`].
+    pub fn flat_params(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.param_count());
+        for (_, values) in self.tensors() {
+            out.extend_from_slice(values);
+        }
+        out
+    }
+
+    /// Replace every parameter from a flat vector in [`Self::tensors`] order.
+    ///
+    /// Used to install the averaged parameters after an exchange. The length
+    /// check happens before any write, so a malformed weight file cannot leave
+    /// the model half-updated.
+    pub fn set_flat_params(&mut self, values: &[f32]) -> Result<()> {
+        let expected = self.param_count();
+        if values.len() != expected {
+            return Err(FerrisResError::Shape(format!(
+                "flat parameter vector has {} elements, model expects {}",
+                values.len(),
+                expected
+            )));
+        }
+        let mut offset = 0usize;
+        for (_, tensor) in self.tensors_mut() {
+            let end = offset + tensor.len();
+            tensor.copy_from_slice(&values[offset..end]);
+            offset = end;
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2472,6 +2508,25 @@ mod tests {
             first,
             last
         );
+    }
+
+    #[test]
+    fn flat_parameters_round_trip_and_refuse_a_wrong_length() {
+        let model = F32Model::new_random(tiny_config(2, 1), 3);
+        let flat = model.flat_params();
+        assert_eq!(flat.len(), model.param_count());
+
+        let mut other = F32Model::new_random(tiny_config(2, 1), 4);
+        assert_ne!(other.flat_params(), flat);
+        other.set_flat_params(&flat).expect("install flat parameters");
+        assert_eq!(other.flat_params(), flat);
+        assert_eq!(
+            other.tensors().iter().map(|(_, t)| t.len()).sum::<usize>(),
+            flat.len()
+        );
+
+        let err = other.set_flat_params(&flat[..flat.len() - 1]).unwrap_err();
+        assert!(err.to_string().contains("model expects"), "{err}");
     }
 
     #[test]

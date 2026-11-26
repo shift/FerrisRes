@@ -49,6 +49,10 @@ fn options(epochs: u32, output: PathBuf) -> TrainOptions {
         output,
         resume: None,
         log_every: 0,
+        rank: 0,
+        world_size: 1,
+        exchange_dir: None,
+        exchange_every: 5,
     }
 }
 

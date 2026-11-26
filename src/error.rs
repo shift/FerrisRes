@@ -33,4 +33,12 @@ impl From<String> for FerrisResError {
     }
 }
 
+impl From<crate::multi_gpu::MultiGpuError> for FerrisResError {
+    fn from(e: crate::multi_gpu::MultiGpuError) -> Self {
+        // The multi-GPU layer's messages already name the rank, step and field;
+        // keep them verbatim so a refusal survives the conversion.
+        FerrisResError::Unsupported(format!("multi-gpu: {e}"))
+    }
+}
+
 pub type Result<T> = std::result::Result<T, FerrisResError>;

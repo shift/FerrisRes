@@ -41,6 +41,10 @@ pub struct AdapterListing {
     pub dedicated_vram: Option<u64>,
     /// Host RAM shared with the adapter (integrated or software adapters).
     pub shared_memory: Option<u64>,
+    /// PCI bus id from sysfs/Vulkan when the backend exposes one
+    /// (for example `0000:3b:00.0`). Two identical cards share a name, so this
+    /// is the only field that identifies which one a rank took.
+    pub bus_id: Option<String>,
 }
 
 fn kind_label(kind: wgpu::DeviceType) -> &'static str {
@@ -137,9 +141,70 @@ pub async fn list_adapters() -> Result<Vec<AdapterListing>> {
                 } else {
                     host_memory
                 },
+                bus_id: if info.device_pci_bus_id.trim().is_empty() {
+                    None
+                } else {
+                    Some(info.device_pci_bus_id.trim().to_string())
+                },
             }
         })
         .collect())
+}
+
+/// Render the `ferrisres devices` table.
+///
+/// Kept out of `main` so the column set (including the PCI bus id) is testable
+/// without a GPU.
+pub fn format_adapter_table(adapters: &[AdapterListing]) -> String {
+    let name_width = adapters
+        .iter()
+        .map(|a| a.name.chars().count())
+        .max()
+        .unwrap_or(4)
+        .max("name".len());
+    let bus_width = adapters
+        .iter()
+        .map(|a| a.bus_id.as_deref().unwrap_or("-").chars().count())
+        .max()
+        .unwrap_or(6)
+        .max("bus_id".len());
+
+    let mut out = format!(
+        "{:<5}  {:<width$}  {:<bus$}  {:<10}  {:<7}  {:<11}  {:<13}  {:<16}  {}\n",
+        "index",
+        "name",
+        "bus_id",
+        "kind",
+        "backend",
+        "max_buffer",
+        "max_immediate",
+        "memory",
+        "software",
+        width = name_width,
+        bus = bus_width
+    );
+    for adapter in adapters {
+        let memory = match (adapter.dedicated_vram, adapter.shared_memory) {
+            (Some(vram), _) => format!("{} MiB VRAM", vram / (1024 * 1024)),
+            (None, Some(shared)) => format!("shared {} MiB", shared / (1024 * 1024)),
+            (None, None) => "-".to_string(),
+        };
+        out.push_str(&format!(
+            "{:<5}  {:<width$}  {:<bus$}  {:<10}  {:<7}  {:<11}  {:<13}  {:<16}  {}\n",
+            adapter.index,
+            adapter.name,
+            adapter.bus_id.as_deref().unwrap_or("-"),
+            adapter.kind,
+            adapter.backend,
+            format!("{} MiB", adapter.max_buffer / (1024 * 1024)),
+            adapter.max_immediate,
+            memory,
+            if adapter.software { "yes" } else { "no" },
+            width = name_width,
+            bus = bus_width
+        ));
+    }
+    out
 }
 
 /// Choose an adapter index from a name-sorted list.
@@ -545,6 +610,44 @@ mod tests {
             "expected the Intel HD 530; got {:?}",
             adapters.iter().map(|a| &a.name).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn the_devices_table_and_json_expose_the_bus_id() {
+        let adapters = vec![
+            super::AdapterListing {
+                index: 0,
+                name: "NVIDIA T4".to_string(),
+                kind: "Discrete".to_string(),
+                backend: "vulkan".to_string(),
+                max_buffer: 1024,
+                max_immediate: 128,
+                software: false,
+                dedicated_vram: Some(16 * 1024 * 1024),
+                shared_memory: None,
+                bus_id: Some("0000:3b:00.0".to_string()),
+            },
+            super::AdapterListing {
+                index: 1,
+                name: "NVIDIA T4".to_string(),
+                kind: "Discrete".to_string(),
+                backend: "vulkan".to_string(),
+                max_buffer: 1024,
+                max_immediate: 128,
+                software: false,
+                dedicated_vram: Some(16 * 1024 * 1024),
+                shared_memory: None,
+                bus_id: Some("0000:5e:00.0".to_string()),
+            },
+        ];
+        let table = super::format_adapter_table(&adapters);
+        assert!(table.contains("bus_id"), "{table}");
+        assert!(table.contains("0000:3b:00.0"), "{table}");
+        assert!(table.contains("0000:5e:00.0"), "{table}");
+
+        let json = serde_json::to_value(&adapters).unwrap();
+        assert_eq!(json[0]["bus_id"], serde_json::json!("0000:3b:00.0"));
+        assert_eq!(json[1]["bus_id"], serde_json::json!("0000:5e:00.0"));
     }
 
     #[test]
