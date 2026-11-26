@@ -666,18 +666,20 @@ impl GpuModel {
         let GpuModel {
             adam,
             weights,
-            graph,
-            param_nodes,
             param_order,
+            grad_acc,
             ..
         } = self;
+        // The step must use the **accumulated, scaled** gradient. Reading
+        // `graph.get_node(node).grad()` here takes only the last window's raw
+        // gradient and discards the other windows and the 1/windows scale, which
+        // makes an effective learning rate of lr * windows. That diverges for any
+        // batch size above 1 while a single-window run looks perfect.
         let items: Vec<(&str, &GpuBuffer, &GpuBuffer, u32)> = param_order
             .iter()
             .map(|name| {
-                let node = param_nodes[name];
-                let grad = graph.get_node(node).unwrap().grad();
                 let numel = (weights[name].size() / std::mem::size_of::<f32>()) as u32;
-                (name.as_str(), &weights[name], grad, numel)
+                (name.as_str(), &weights[name], &grad_acc[name], numel)
             })
             .collect();
         adam.step_all(&mut enc, &items)?;
