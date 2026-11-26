@@ -1,6 +1,8 @@
 # Corpus builder
 
-Status: **specification, 2026-11-26.** `dataset-formats.md` defines what a sample
+Status: **v1 implemented at `b3a9a89`** (local files, determinism, licence gate,
+secret scan, exact dedupe, u16 shards, split, manifest, verify/stats/sample; 6
+tests). The fetchers, near-dedupe and the 32k tokenizer remain. Specification: `dataset-formats.md` defines what a sample
 looks like; this defines how licensed sources become reproducible tokenized
 shards. No builder exists yet; every row in `source-index.md` is still `planned`.
 
