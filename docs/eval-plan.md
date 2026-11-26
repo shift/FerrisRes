@@ -235,6 +235,21 @@ Four 2026-11-25 results add gates we did not have
 Every SFT/KD run carries a replay corpus from the initial checkpoint and a KL
 term toward it; the gate is the same as the one that protects general ability.
 
+## 18. Model + harness pair
+
+A result is about a pair, not a model (`research/hf-papers-harness.md`). Harness
+choice alone has been measured to change tokens per solved task by up to 40×.
+
+| metric | gate |
+|---|---|
+| harness id and version, token and latency budget in a record | required; a result without them is invalid |
+| per-task tokens and wall clock | reported with the pass rate |
+| **execution-alignment failures** (ignored tool result, claim without evidence, workspace-state mismatch, contract not met) | taxonomy recorded; zero ignored-tool-result on the harness suite |
+| a harness configuration change | reviewed like a code change |
+
+The failure taxonomy is the point: a correct answer from a trace that ignored a
+tool result is not a pass.
+
 ## Contamination
 
 Hash every evaluation set (GSM8K, MATH, SWE-bench, BFCL test, MT-Bench, our own

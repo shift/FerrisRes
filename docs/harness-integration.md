@@ -31,6 +31,8 @@ Integration is a protocol, not a tone. Three things make it real:
 | **Memory protocol** | entity types, ids, dedupe, retrieve before deriving | memory operations from runs | correct type/id; no duplicate entity |
 | **Surface formatting** | Telegram length, markdown, keyboards, no wall of text | surface examples and run outputs | format/length validity |
 | **Self-routing** | when the task exceeds this tier's context, tools or quality, escalate | routing outcomes, tier descriptors | route choice on a labelled set |
+| **Harness activation and faithful following** | a tool, skill or memory exists in the harness; the model must call it and follow it, not re-derive it | activation traces, skills, memories | call rate; following rate; a weak model that activates but ignores is the failure |
+| **Residual distillation** | the harness already supplies state and tools; the student only needs what the teacher adds beyond it | harness-aware preference pairs, validated against the trace | no preference pair contradicting the harness record |
 | **Report discipline** | verified / implemented / designed, counts not percentages | review reports and the feature register | unsupported claims counted |
 | **Documentation grounding** | the user asks about a command, flag, error or ADP operation; a memorised answer drifts | `cli_help`, installed docs, doc-QA pairs (`tasks/versioned-docs-tool.md`) | citation present; no invented flag/operation; stale-doc question → retrieve or refuse |
 
