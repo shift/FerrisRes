@@ -99,7 +99,8 @@ tokens it saved.
 
 ## Release checklist
 
-Before a weights release, all of these are true and recorded:
+Before a weights release, all of these are true and recorded. Artefact names
+follow `naming.md`; a name is a label and the hash is the identity.
 
 1. weights hash, parameter count, architecture, tokenizer hash;
 2. `NOTICE` with teachers and corpora, each with its licence;

@@ -60,7 +60,7 @@ Every number below is calculated from bandwidth and geometry, as in
 | `frs-s-draft` | 20–30M draft for speculative decoding | all | latency, not quality |
 | `frs-b-hybrid` | 598M, hybrid sliding+global, 32k | Strix | long context without quadratic prefill |
 | `frs-l-moe` | 1–3B, 16 experts top-2, NF4, MLA | Spark | capacity at low active bytes |
-| `frs-s-bf16` | the same Small, bf16 weights and training | 2× T4 | the f32 path wastes the T4; this is the training shape |
+| `frs-s` in **bf16** | the same shape, bf16 weights and training (not a new id: precision is an artefact property) | 2× T4 | the f32 path wastes the T4; this is the training shape |
 
 ## What each profile should not do
 

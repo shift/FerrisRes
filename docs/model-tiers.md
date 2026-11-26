@@ -20,7 +20,8 @@ Large.
 
 ## Other points in the space
 
-The four tiers fix one shape. The alternatives — GQA instead of MQA, a code
+Ids and versions follow `naming.md`: `frs-n`, `frs-s`, `frs-b`, `frs-l`, with
+variants and specialist roles as separate ids. The four tiers fix one shape. The alternatives — GQA instead of MQA, a code
 tokenizer at 32k, hybrid sliding+global attention, bf16 on a T4, a larger MoE on
 a unified-memory box — are in `hardware-shapes.md`, each changing one lever at a
 time so a regression can be attributed.
