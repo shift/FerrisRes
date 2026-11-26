@@ -1,6 +1,8 @@
 # Corpus manifest
 
-Status: **plan with target token counts, 2B total.** Counts are targets, not
+Status: **plan with target token counts, 2B total.** The per-source records —
+licence, revision, access, filter, status — are in `source-index.md`; this file
+is the shape, that one is the lookup. Counts are targets, not
 measurements; every entry needs a licence, a revision and a hash before it is
 used. This is the complete list the data plan referred to.
 

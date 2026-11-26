@@ -61,7 +61,8 @@ reported once.
 | 3% | long documents (public domain, documentation) |
 
 The full list with token targets — including Rust at 2x and Nix — is
-`corpus-manifest.md`. Domain match beats volume for a 0.6B. A model trained on 2B well-chosen tokens
+`corpus-manifest.md`; the per-source licence and status records are in
+`source-index.md`. Domain match beats volume for a 0.6B. A model trained on 2B well-chosen tokens
 beats one trained on 10B random tokens at this size, and the tool-use share is
 what makes it useful in this harness.
 
