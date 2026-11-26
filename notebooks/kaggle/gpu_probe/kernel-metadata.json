@@ -1,0 +1,15 @@
+{
+  "id": "sectionme/ferrisres-gpu-probe",
+  "title": "FerrisRes GPU probe",
+  "code_file": "gpu_probe.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "sectionme/ferrisres"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}
