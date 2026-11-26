@@ -132,6 +132,22 @@ The claim is tokens per **verified** change, not per call (`token-economics.md`)
 | accepted change with `has_errors` true | **0** |
 | re-reads after an edit | not more than the text arm |
 
+## 11. Reasoning and retention
+
+The model holds the procedure; the stores hold the facts
+(`reasoning-and-retention.md`). These gates test the policy, not the weights.
+
+| metric | gate |
+|---|---|
+| fact introduced at turn k, recalled at k+20 | >= 95% |
+| facts needed later present after compaction | >= 95% |
+| goal after three compactions contradicts the original | **0** |
+| recalled fact used without a revision check | **0** |
+| factual claim without a span/entity/path | **0** |
+| absent fact guessed instead of refused | **0** |
+| identical tool call repeated within a task | report; target ~0 |
+| context tokens per turn | flat, not linear |
+
 ## Contamination
 
 Hash every evaluation set (GSM8K, MATH, SWE-bench, BFCL test, MT-Bench, our own
