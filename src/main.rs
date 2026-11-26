@@ -23,6 +23,42 @@ struct Cli {
     command: Commands,
 }
 
+/// Modes of the `benchmark` command. No mode keeps the GPU kernel benchmark.
+#[derive(Subcommand)]
+enum BenchmarkMode {
+    /// Measure teacher prefill throughput (teacher-forcing forward, CPU).
+    ///
+    /// This is the selection metric for distillation: tokens/s over the
+    /// training window. It loads the teacher only; it never samples and never
+    /// touches the student or a KV cache.
+    Teacher {
+        /// Path to teacher weights (GGUF or safetensors).
+        #[arg(long)]
+        model_path: String,
+        /// Model config preset: qwen3-0.6b, qwen3-1.7b, e2b, e4b, ...
+        #[arg(long, default_value = "e2b")]
+        config: String,
+        /// Model file format: gguf or safetensors.
+        #[arg(long, default_value = "gguf")]
+        model_format: String,
+        /// Path to tokenizer.json. Without it, token ids are deterministic.
+        #[arg(long)]
+        tokenizer: Option<String>,
+        /// Number of tokens in the timed forward pass (the training window).
+        #[arg(long, default_value_t = 512)]
+        seq_len: usize,
+        /// Number of timed passes. The median is reported.
+        #[arg(long, default_value_t = 3)]
+        iterations: usize,
+        /// Number of untimed passes before timing.
+        #[arg(long, default_value_t = 1)]
+        warmup: usize,
+        /// Print a JSON record after the metric line.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum Commands {
     Info,
@@ -120,6 +156,9 @@ enum Commands {
     /// CPU model — ternary kernels, decode/prefill and per-layer attention and
     /// FFN timings — run `cargo bench --bench ternary_kernels`.
     Benchmark {
+        /// Optional mode. With no mode, run the GPU kernel microbenchmark.
+        #[command(subcommand)]
+        mode: Option<BenchmarkMode>,
         /// Accepted for compatibility; unused by this GPU benchmark.
         #[arg(long, default_value_t = 512)]
         hidden_dim: usize,
@@ -287,11 +326,30 @@ async fn main() -> anyhow::Result<()> {
             student, moe_experts, lora_path,
         } => cmd_infer(model_path, config, config_path, model_format, tokenizer, hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale, image, armor, cognitive, concepts_path, persist_kv, kv_path, student, moe_experts, lora_path).await,
         Commands::Benchmark {
+            mode,
             hidden_dim,
             num_blocks,
             block_size,
             iterations,
-        } => cmd_benchmark(hidden_dim, num_blocks, block_size, iterations).await,
+        } => match mode {
+            Some(BenchmarkMode::Teacher {
+                model_path,
+                config,
+                model_format,
+                tokenizer,
+                seq_len,
+                iterations,
+                warmup,
+                json,
+            }) => {
+                cmd_benchmark_teacher(
+                    model_path, config, model_format, tokenizer,
+                    seq_len, iterations, warmup, json,
+                )
+                .await
+            }
+            None => cmd_benchmark(hidden_dim, num_blocks, block_size, iterations).await,
+        },
         Commands::Distill {
             model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every,
             resume, model_format, tokenizer, checkpoint_every, converge, converge_patience,
@@ -1044,6 +1102,229 @@ async fn cmd_infer(
         if image_patch_count > 0 { format!(" (with {} image patches)", image_patch_count) } else { String::new() });
     println!("{}", display_output);
 
+    Ok(())
+}
+
+/// Fixed public-domain sentence used to build benchmark tokens.
+///
+/// It is the opening of *The Adventures of Sherlock Holmes* (Arthur Conan
+/// Doyle, 1892; public domain in every jurisdiction this project ships to).
+const TEACHER_BENCH_TEXT: &str = "To Sherlock Holmes she is always the woman. \
+I have seldom heard him mention her under any other name. In his eyes she \
+eclipses and predominates the whole of her sex. It was not that he felt any \
+emotion akin to love for Irene Adler. All emotions, and that one particularly, \
+were abhorrent to his cold, precise but admirably balanced mind.";
+
+/// Deterministic token ids in `[0, vocab)`. A fixed LCG, not the OS RNG, so a
+/// benchmark run can be repeated exactly.
+fn deterministic_token_ids(vocab: usize, seq_len: usize) -> Vec<u32> {
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    (0..seq_len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) % vocab.max(1) as u64) as u32
+        })
+        .collect()
+}
+
+/// Build exactly `seq_len` tokens.
+///
+/// With a tokenizer, the fixed public-domain sentence is encoded and cycled
+/// until the window is full. Ids outside the config vocabulary are dropped,
+/// because a benchmark forward must not index outside the embedding table.
+/// Without a tokenizer, the ids come from a fixed deterministic stream.
+fn build_teacher_bench_tokens(
+    vocab: usize,
+    seq_len: usize,
+    tokenizer: Option<&HfTokenizer>,
+) -> anyhow::Result<Vec<u32>> {
+    if seq_len == 0 {
+        anyhow::bail!("--seq-len must be greater than zero");
+    }
+    if vocab == 0 {
+        anyhow::bail!("model vocabulary is empty");
+    }
+    if let Some(tok) = tokenizer {
+        let ids: Vec<u32> = tok
+            .encode(TEACHER_BENCH_TEXT)
+            .into_iter()
+            .filter(|&id| (id as usize) < vocab)
+            .collect();
+        if !ids.is_empty() {
+            return Ok((0..seq_len).map(|i| ids[i % ids.len()]).collect());
+        }
+        warn!(
+            event = "teacher_bench_tokenizer_empty",
+            "Tokenizer produced no in-vocabulary ids; using deterministic ids"
+        );
+    }
+    Ok(deterministic_token_ids(vocab, seq_len))
+}
+
+/// Median of a non-empty duration list, in seconds.
+fn median_seconds(mut seconds: Vec<f64>) -> f64 {
+    seconds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = seconds.len() / 2;
+    if seconds.len() % 2 == 0 {
+        (seconds[mid - 1] + seconds[mid]) / 2.0
+    } else {
+        seconds[mid]
+    }
+}
+
+/// Run `warmup` untimed and `iterations` timed teacher-forcing forwards.
+/// Returns the median pass time in seconds and the prefill tokens/second.
+fn benchmark_teacher_forward(
+    teacher: &Gemma4Teacher,
+    tokens: &[u32],
+    warmup: usize,
+    iterations: usize,
+) -> anyhow::Result<(f64, f64)> {
+    if iterations == 0 {
+        anyhow::bail!("--iterations must be greater than zero");
+    }
+    for _ in 0..warmup {
+        let _ = teacher.forward(tokens);
+    }
+    let mut seconds = Vec::with_capacity(iterations);
+    for i in 0..iterations {
+        let start = Instant::now();
+        let logits = teacher.forward(tokens);
+        let elapsed = start.elapsed().as_secs_f64();
+        if logits.is_empty() || logits.len() % tokens.len() != 0 {
+            anyhow::bail!("teacher returned an unexpected logits length");
+        }
+        if !logits.iter().all(|v| v.is_finite()) {
+            anyhow::bail!("teacher produced non-finite logits on pass {}", i + 1);
+        }
+        seconds.push(elapsed);
+    }
+    let median = median_seconds(seconds);
+    if !(median.is_finite() && median > 0.0) {
+        anyhow::bail!("measured a non-positive or non-finite forward time");
+    }
+    Ok((median, tokens.len() as f64 / median))
+}
+
+/// Peak resident set size from `/proc/self/status` (`VmHWM`), in MiB.
+fn peak_rss_mb() -> Option<f64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmHWM:") {
+            let kb: f64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb / 1024.0);
+        }
+    }
+    None
+}
+
+/// Quantisation label when it is visible in the file name, e.g. `Q8_0` in
+/// `Qwen3-0.6B-Q8_0.gguf` or `Q4_K_M` in `model.Q4_K_M.gguf`.
+fn quant_from_filename(path: &str) -> Option<String> {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path);
+    for part in name.split(['.', '-']) {
+        let mut chars = part.chars();
+        if chars.next() == Some('Q') {
+            if chars.next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                return Some(part.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The harness gate reads this exact line from stdout.
+fn teacher_metric_line(tokens_per_second: f64) -> String {
+    format!("metric=teacher_prefill_tps value={}", tokens_per_second)
+}
+
+/// Label for the runtime. The teacher forward itself is CPU code; an adapter
+/// name is reported when one exists, otherwise `cpu`.
+async fn teacher_bench_device_label() -> String {
+    match WgpuCompute::new().await {
+        Ok(compute) => {
+            let name = compute.adapter_info().name;
+            if name.is_empty() { "cpu".to_string() } else { name }
+        }
+        Err(_) => "cpu".to_string(),
+    }
+}
+
+async fn cmd_benchmark_teacher(
+    model_path: String,
+    config_name: String,
+    model_format: String,
+    tokenizer_path: Option<String>,
+    seq_len: usize,
+    iterations: usize,
+    warmup: usize,
+    json: bool,
+) -> anyhow::Result<()> {
+    info!(
+        event = "teacher_benchmark_start",
+        "=== Teacher prefill benchmark: seq_len={} iterations={} warmup={} ===",
+        seq_len, iterations, warmup
+    );
+
+    let device = teacher_bench_device_label().await;
+
+    // Same load path as `cmd_evaluate`: resolve the spec, load the teacher,
+    // wrap it. No student and no sampler.
+    let spec = resolve_teacher_spec(&config_name, &model_path, &model_format)?;
+    let config = spec.to_gemma4_config();
+    let path = std::path::Path::new(&model_path);
+    let model = match model_format.as_str() {
+        "gguf" => load_gemma4_model_gguf(path, config.clone()),
+        "safetensors" => load_gemma4_model_mmap(path, config.clone()),
+        other => anyhow::bail!("Unknown model format: '{}'. Use 'gguf' or 'safetensors'.", other),
+    }
+    .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
+    let teacher = Gemma4Teacher::new(model);
+
+    let tokenizer = match tokenizer_path.as_deref() {
+        Some(p) => Some(
+            HfTokenizer::from_tokenizer_json(std::path::Path::new(p))
+                .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?,
+        ),
+        None => None,
+    };
+    let tokens = build_teacher_bench_tokens(config.vocab_size, seq_len, tokenizer.as_ref())?;
+
+    let (seconds, tokens_per_second) =
+        benchmark_teacher_forward(&teacher, &tokens, warmup, iterations)?;
+    let hours_per_1b_tokens = 1e9 / (tokens_per_second * 3600.0);
+    let peak_rss = peak_rss_mb();
+    let quant = quant_from_filename(&model_path);
+
+    println!("{}", teacher_metric_line(tokens_per_second));
+    println!("hours_per_1b_tokens={}", hours_per_1b_tokens);
+
+    if json {
+        let record = serde_json::json!({
+            "tokens_per_second": tokens_per_second,
+            "seq_len": seq_len,
+            "iterations": iterations,
+            "seconds": seconds,
+            "hours_per_1b_tokens": hours_per_1b_tokens,
+            "device": device,
+            "peak_rss_mb": peak_rss,
+            "model_path": model_path,
+            "config": config_name,
+            "quant": quant,
+        });
+        println!("{}", serde_json::to_string(&record)?);
+    }
+
+    info!(
+        event = "teacher_benchmark_complete",
+        "teacher prefill: {:.3} tokens/s, {:.4} s/pass, {:.2} h per 1B tokens, device={}",
+        tokens_per_second, seconds, hours_per_1b_tokens, device
+    );
     Ok(())
 }
 
@@ -3210,6 +3491,147 @@ mod cli_tests {
         let spec = TeacherSpec::from_config_name("qwen3-0.6b").unwrap();
         assert!(spec.experts.is_none());
         assert_eq!(spec.to_gemma4_config().num_experts, 1);
+    }
+
+    /// A tiny dense config: hidden 64, two layers. The benchmark path must
+    /// run a real forward on this and print a finite tokens/s.
+    fn tiny_bench_config() -> gemma_mapper::Gemma4Config {
+        gemma_mapper::Gemma4Config {
+            hidden_dim: 64,
+            num_layers: 2,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 16,
+            intermediate_dim: 128,
+            num_experts: 1,
+            top_k: 1,
+            vocab_size: 128,
+            max_position_embeddings: 256,
+            sliding_window: 64,
+            moe_layers: vec![],
+            block_boundaries: vec![],
+            use_gelu: true,
+            hidden_size_per_layer_input: None,
+            final_logit_softcapping: None,
+            layer_types: vec![],
+            global_head_dim: 16,
+            rope_theta_sliding: 10_000.0,
+            rope_theta_full: 1_000_000.0,
+            partial_rotary_factor_full: 1.0,
+            num_kv_shared_layers: 0,
+        }
+    }
+
+    fn write_tiny_bench_model(path: &std::path::Path, config: &gemma_mapper::Gemma4Config) {
+        use std::io::Write;
+        let hd = config.hidden_dim;
+        let id = config.intermediate_dim;
+        let vs = config.vocab_size;
+        let init = |n: usize| -> Vec<f32> {
+            (0..n).map(|i| 0.01 * (i as f32 * 0.1).sin()).collect()
+        };
+        let mut tensors: Vec<(String, Vec<usize>, Vec<f32>)> = vec![
+            ("model.embed_tokens.weight".into(), vec![vs, hd], init(vs * hd)),
+            ("lm_head.weight".into(), vec![vs, hd], init(vs * hd)),
+            ("model.norm.weight".into(), vec![hd], vec![1.0; hd]),
+        ];
+        for layer in 0..config.num_layers {
+            for (suffix, shape) in [
+                ("self_attn.q_proj.weight", vec![hd, hd]),
+                ("self_attn.k_proj.weight", vec![hd, hd]),
+                ("self_attn.v_proj.weight", vec![hd, hd]),
+                ("self_attn.o_proj.weight", vec![hd, hd]),
+                ("mlp.gate_proj.weight", vec![id, hd]),
+                ("mlp.up_proj.weight", vec![id, hd]),
+                ("mlp.down_proj.weight", vec![hd, id]),
+            ] {
+                let n: usize = shape.iter().product();
+                tensors.push((
+                    format!("model.layers.{}.{}", layer, suffix),
+                    shape,
+                    init(n),
+                ));
+            }
+            for norm in [
+                "input_layernorm.weight",
+                "post_attention_layernorm.weight",
+                "pre_feedforward_layernorm.weight",
+                "post_feedforward_layernorm.weight",
+            ] {
+                tensors.push((
+                    format!("model.layers.{}.{}", layer, norm),
+                    vec![hd],
+                    vec![1.0; hd],
+                ));
+            }
+        }
+
+        // Same minimal writer as the gemma_mapper smoke tests.
+        let num = |v: i64| serde_json::Value::Number(serde_json::Number::from(v));
+        let mut header = serde_json::Map::new();
+        let mut blob = Vec::new();
+        for (name, shape, data) in &tensors {
+            let start = blob.len();
+            for f in data {
+                blob.extend_from_slice(&f.to_le_bytes());
+            }
+            let end = blob.len();
+            let mut meta = serde_json::Map::new();
+            meta.insert("dtype".into(), serde_json::Value::String("F32".into()));
+            meta.insert(
+                "shape".into(),
+                serde_json::Value::Array(shape.iter().map(|&d| num(d as i64)).collect()),
+            );
+            meta.insert(
+                "data_offsets".into(),
+                serde_json::Value::Array(vec![num(start as i64), num(end as i64)]),
+            );
+            header.insert(name.clone(), serde_json::Value::Object(meta));
+        }
+        let mut header = serde_json::to_string(&header).unwrap();
+        // Safetensors pads the header to 8 bytes so tensor data stays aligned
+        // for the mmap reader.
+        while header.len() % 8 != 0 {
+            header.push(' ');
+        }
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(header.as_bytes()).unwrap();
+        file.write_all(&blob).unwrap();
+    }
+
+    #[test]
+    fn test_teacher_benchmark_tiny_config_prints_finite_metric() {
+        let dir = std::env::temp_dir().join("ferrisres_teacher_bench_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tiny_teacher_bench.safetensors");
+        let config = tiny_bench_config();
+        write_tiny_bench_model(&path, &config);
+
+        let model = gemma_mapper::load_gemma4_model_mmap(&path, config.clone())
+            .expect("load tiny teacher");
+        let teacher = Gemma4Teacher::new(model);
+
+        let tokens = build_teacher_bench_tokens(config.vocab_size, 16, None).unwrap();
+        assert_eq!(tokens.len(), 16);
+        assert!(tokens.iter().all(|&t| (t as usize) < config.vocab_size));
+        assert_eq!(tokens, build_teacher_bench_tokens(config.vocab_size, 16, None).unwrap());
+
+        let (seconds, tps) = benchmark_teacher_forward(&teacher, &tokens, 1, 2)
+            .expect("benchmark tiny teacher");
+        assert!(seconds.is_finite() && seconds > 0.0);
+        assert!(tps.is_finite() && tps > 0.0, "finite metric expected, got {}", tps);
+        assert!(
+            teacher_metric_line(tps).starts_with("metric=teacher_prefill_tps value="),
+            "metric line must match the harness contract"
+        );
+        assert!(1e9 / (tps * 3600.0) > 0.0);
+
+        assert_eq!(quant_from_filename("Qwen3-0.6B-Q8_0.gguf").as_deref(), Some("Q8_0"));
+        assert_eq!(quant_from_filename("Qwen3-0.6B.Q4_K_M.gguf").as_deref(), Some("Q4_K_M"));
+        assert_eq!(quant_from_filename("model.safetensors"), None);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
