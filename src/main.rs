@@ -94,6 +94,10 @@ enum Commands {
         /// `WGPU_ADAPTER_INDEX` selects the adapter for `gpu`.
         #[arg(long, default_value = "cpu")]
         device: String,
+        /// A HuggingFace `tokenizer.json`. Without it the built-in byte
+        /// tokenizer (259 ids) is used. The model vocabulary follows this file.
+        #[arg(long)]
+        tokenizer: Option<String>,
     },
 
     /// Export an FRTRAIN1 training checkpoint to an inference-ready model.
@@ -334,10 +338,12 @@ async fn main() -> anyhow::Result<()> {
             hidden_dim, num_blocks, block_size, epochs, batch_size,
             learning_rate, data, data_format, chat_template, seq_len, vocab,
             seed, checkpoint_every, output, resume, log_every, lora_rank, device,
+            tokenizer,
         } => cmd_train(
             hidden_dim, num_blocks, block_size, epochs, batch_size,
             learning_rate, data, data_format, chat_template, seq_len, vocab,
             seed, checkpoint_every, output, resume, log_every, lora_rank, device,
+            tokenizer,
         ).await,
         Commands::Export { checkpoint, output } => cmd_export(&checkpoint, &output).await,
         Commands::Infer {
@@ -465,6 +471,7 @@ async fn cmd_train(
     log_every: u64,
     lora_rank: Option<usize>,
     device: String,
+    tokenizer_path: Option<String>,
 ) -> anyhow::Result<()> {
     use ferrisres::training::f32_trainer::F32Config;
     use ferrisres::training::train_loop::TrainOptions;
@@ -481,7 +488,6 @@ async fn cmd_train(
         anyhow::anyhow!("--data is required: pass a text or JSONL corpus")
     })?;
 
-    let tokenizer = SimpleTokenizer::new();
     let mut text = String::new();
     let mut examples = 0usize;
     for example in load_dataset_with(
@@ -494,7 +500,31 @@ async fn cmd_train(
         text.push('\n');
         examples += 1;
     }
-    let tokens = tokenizer.encode(&text);
+    // A 32k BPE corpus cannot be trained with the 259-id byte tokenizer: the ids
+    // would be meaningless and the head would be the wrong size. A supplied
+    // tokenizer.json defines both the ids and the vocabulary.
+    let (tokens, vocab) = match tokenizer_path.as_deref() {
+        Some(path) => {
+            let hf = ferrisres::model::tokenizer::HfTokenizer::from_tokenizer_json(
+                std::path::Path::new(path),
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+            let v = hf.vocab_size();
+            anyhow::ensure!(
+                v <= 65536,
+                "tokenizer vocabulary {} exceeds the 65536 ids the model head supports",
+                v
+            );
+            info!(
+                event = "hf_tokenizer_used_for_training",
+                path = path,
+                vocab_size = v,
+                "Training ids come from the supplied tokenizer.json"
+            );
+            (hf.encode(&text), v)
+        }
+        None => (SimpleTokenizer::new().encode(&text), vocab),
+    };
 
     info!(
         event = "tokenized_dataset_examples_tokens",
