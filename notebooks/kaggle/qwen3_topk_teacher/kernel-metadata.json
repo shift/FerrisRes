@@ -8,7 +8,9 @@
   "enable_gpu": false,
   "enable_tpu": true,
   "enable_internet": true,
-  "dataset_sources": [],
+  "dataset_sources": [
+    "sectionme/ferrisres-corpus-release-slice"
+  ],
   "competition_sources": [],
   "kernel_sources": []
 }
