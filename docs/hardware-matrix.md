@@ -51,6 +51,19 @@ fact, not a broken GPU.
 | multi-GPU launcher not wired to training | only fake-adapter tests | `int/train-multi-gpu` |
 | `.deb` built only on ubuntu-22.04 | Kaggle install path | `int/train-deb` |
 
+## Generating this table
+
+The evidence section is generated, not hand-written:
+
+```
+scripts/hardware_matrix.py --selftest                     # checks the validator
+scripts/hardware_matrix.py --from records/ --out table.md  # reads *.json records
+```
+
+A record must name the **command**, the **date** and the **device**; a record
+without them is refused and listed under "Refused records". A calculated number
+is not a measurement and belongs in the prose, not in the generated table.
+
 ## Rules
 
 1. A row changes to "verified" only with a command, a date and the measured
