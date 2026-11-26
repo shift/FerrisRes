@@ -36,6 +36,29 @@ Code filtering: no secrets (scan for keys and tokens), no minified or generated
 files, no vendored dependencies, deduplicate by normalised content, keep tests
 and docs, keep the per-file licence tag in the provenance.
 
+## Documentation — user-facing, as grounding
+
+The docs are the product's vocabulary: commands, flags, error strings, ADP
+claims and leases, workflow semantics. Train the model to **retrieve and cite**
+them, not to memorise a release.
+
+| source | licence | target | notes |
+|---|---|---:|---|
+| `agentic-loop` user docs: README, quickstart, CLI, workflows, Telegram, skills, ADP | ours | 4M | user-facing only |
+| CLI `--help` text and error messages | ours | 1M | exact strings; the model suggests real commands |
+| ADP docs: status, workspace layout, claims/leases, trust, auth | ours | 2M | the ADP vocabulary; no invented operations |
+| doc-QA pairs: question → answer with the doc path/heading | CC0 | 10M | generated, verified against the docs |
+| deployment/runbook docs | ours | 2M | no secrets; redact endpoints and keys |
+
+**Excluded:** the deploy repo's endpoint/credential docs, incident logs, licence
+keys, security configuration, and anything containing a secret. A doc that
+cannot be published is not training data.
+
+The doc-QA set is what teaches the behaviour: the answer carries a citation, and
+a question whose answer is not in the retrieved docs is answered "I don't know"
+rather than guessed. Version drift is the failure mode — a memorised flag from
+last release — so retrieval, not recall, is the target.
+
 ## SFT
 
 | source | licence | target | notes |

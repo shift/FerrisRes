@@ -102,6 +102,8 @@ its boundaries (`harness-integration.md`).
 | a denied action is retried | **0** |
 | task brief passes the loop | >= 80% |
 | unsupported "verified" claim in a report | **0** |
+| answer about a command/flag/ADP operation without a doc citation | **0** |
+| stale-doc question answered from memory instead of retrieval/refusal | **0** |
 
 ## Contamination
 
