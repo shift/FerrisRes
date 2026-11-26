@@ -9,15 +9,17 @@ Measured with `intel_gpu_top` while training on the HD 530 (2026-11-26):
 
 | counter | value |
 |---|---|
-| IMC reads | up to **7800 MiB/s** (≈8.2 GB/s) |
+| IMC reads | **7800 → 10000 MiB/s** as the load grew (≈8.2–10.5 GB/s) |
 | IMC writes | 750–1900 MiB/s |
 | Render/3D engine busy | **~30%** |
 
 Two conclusions, both measured rather than assumed:
 
-1. **The 6.3 GB/s used by the tier tables is too low.** It was an estimate; the
-   controller serves at least 8.2 GB/s of reads. Decode figures computed at 6.3
-   are pessimistic by ~30%: Small becomes ~228 tok/s rather than ~163.
+1. **The 6.3 GB/s used by the tier tables is far too low.** It was an estimate;
+   the controller served **10 GB/s of reads** under sustained load, and that is
+   still a floor — the counter rose with the load rather than plateauing at 8.
+   Decode figures computed at 6.3 are pessimistic by ~65%: Small is ~291 tok/s
+   rather than ~163, Base ~78 rather than ~49.
 2. **GPU training here is memory-bound, not dispatch-bound.** Bandwidth is at the
    ceiling while the EUs sit at 30%. So more threads or wider SIMD buy almost
    nothing on this host, and cutting bytes buys up to ~3.3× before compute takes
