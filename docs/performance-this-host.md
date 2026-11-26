@@ -76,6 +76,11 @@ Measured training throughput that does exist:
 | Draft (Nano) | adds 20–50% decode overhead, recovers 2–3× | predicted |
 | Router / decision head | sub-millisecond | predicted |
 
+## How to improve prefill
+
+The levers, the roofline and the measurement plan are in
+`prefill-performance.md`.
+
 ## What to measure next
 
 1. `benchmark` on an exported Small: decode tok/s at 128, 1k, 8k.

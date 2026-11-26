@@ -67,6 +67,7 @@ Start here. The current state is `status-2026-11.md`; the decisions are
 | `corpus-manifest.md` | token targets per source family |
 | `data-plan.md` | data mix, teacher, distillation plan |
 | `data-retention.md` | data classes, deletion, hosted-provider rules |
+| `data-source-navigation.md` | where each data type lives, identifiers, licences, access |
 | `dataset-formats.md` | sample shapes and chat templates |
 | `deployment.md` | how to deploy the harness and model |
 | `design-patterns.md` | pattern vocabulary, Rust idioms, anti-ceremony gate |

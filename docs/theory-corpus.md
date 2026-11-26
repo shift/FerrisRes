@@ -46,6 +46,7 @@ principle | why it holds | when it applies | failure mode | a check or tool
 | **Reliability** | SLO/SLI/error budgets, blast radius, graceful degradation, circuit breakers, observability (logs/metrics/traces), incident command, postmortem | an incident drill |
 | **Numerical methods** | floating point, stability, conditioning, error propagation, units and dimensional analysis | a reference computation |
 | **Statistics** | sampling, confidence intervals, significance vs effect size, multiple comparisons, causal vs correlational | a reproducible analysis |
+| **Information literacy / source navigation** | which registry owns which object, identifier systems, access patterns, licence families, no invented endpoints | `data-source-navigation.md` |
 | **Licensing and privacy principles** | copyright vs licence, permissive vs copyleft, patent grant, attribution/NOTICE, CC variants, GDPR principles (minimisation, purpose, retention) — identify when to ask a human | a licence check; the provenance register |
 | **Control and supervision** | feedback loops, stability, deadbands, budgets, restart policy, one authority, precedence | the control-plane trace |
 
