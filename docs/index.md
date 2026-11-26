@@ -57,16 +57,19 @@ Start here. The current state is `status-2026-11.md`; the decisions are
 
 | doc | purpose |
 |---|---|
+| `Brief.md` | the project brief |
+| `TurboQuant_Engine_Specification.md` | the quantisation engine spec |
 | `adr-index.md` | FR-001…FR-027: decision, status, owner |
 | `api-reference.md` | the Rust module/API reference (older than the CLI surface) |
 | `architecture.md` | the engine's structure |
-| `Brief.md` | the project brief |
 | `cli-surface.md` | commands and flags by branch; release vs planned |
 | `corpus-builder.md` | sources → licensed, deduped, tokenised shards |
 | `corpus-manifest.md` | token targets per source family |
 | `data-plan.md` | data mix, teacher, distillation plan |
+| `data-retention.md` | data classes, deletion, hosted-provider rules |
 | `dataset-formats.md` | sample shapes and chat templates |
 | `deployment.md` | how to deploy the harness and model |
+| `design-patterns.md` | pattern vocabulary, Rust idioms, anti-ceremony gate |
 | `distillation.md` | the teacher→student path |
 | `embedding-head.md` | a 768→256 head for an embedding mode |
 | `eval-plan.md` | the suites, metrics and thresholds |
@@ -76,8 +79,12 @@ Start here. The current state is `status-2026-11.md`; the decisions are
 | `hardware-matrix.md` | verified vs designed devices |
 | `hardware-shapes.md` | shape levers per device bottleneck |
 | `harness-integration.md` | tool-result resistance, evidence, protocol |
+| `implementation-handoff.md` | delegate-ready task index and stop rules |
+| `kaggle-readiness.md` | GPU-only smoke vs real-run blockers |
 | `kaggle-runbook.md` | notebooks, quota, datasets |
+| `learning-theory.md` | child tutor: learning science, hint ladder, integrity |
 | `long-running.md` | compaction, handoff, recovery |
+| `loop-policy.md` | how the development loop runs |
 | `model-card-template.md` | the required release card |
 | `model-catalogue.md` | model lookup and routing, not memorisation |
 | `model-identity.md` | artefact identity vs trained purpose |
@@ -86,28 +93,33 @@ Start here. The current state is `status-2026-11.md`; the decisions are
 | `model-tiers.md` | Nano/Small/Base/Large |
 | `molt.md` | Mixture-of-Loops assessment and clean-room rule |
 | `naming.md` | ids, versions, artefacts, specialists |
+| `performance-this-host.md` | decode, prefill and training expectations |
 | `persona-and-principals.md` | souls, principals, child rules |
+| `prefill-performance.md` | prefill levers and the roofline |
+| `principal-awareness.md` | who is in the conversation, and what may never be inferred |
 | `provenance-register.md` | third-party licences and clean-room notes |
 | `quantization.md` | ternary, NF4, KV precision |
 | `quickstart.md` | the shortest path to a running instance |
 | `reasoning-and-retention.md` | recall tools, notebook, retention policy |
 | `release-runbook.md` | preconditions, artefacts, sign-off |
 | `reproducibility.md` | pinned hashes, determinism, run records |
+| `research/` | research notes |
 | `response-modes.md` | instant/balanced/deliberate |
 | `runtime-caches.md` | what to cache and how to invalidate |
+| `security-training.md` | secure development and vuln finding as theory + tools |
 | `security.md` | the harness threat model |
-| `source-index.md` | per-source licence, revision, status |
+| `self-generated-data.md` | harness-generated verified trajectories |
 | `soul-training.md` | the soul corpus and behaviour |
+| `source-index.md` | per-source licence, revision, status |
 | `subagents.md` | delegation as a granted capability |
+| `tasks/` | one task spec per open piece of work |
 | `text-aligned-kd.md` | 151k teacher → 32k student |
+| `theory-corpus.md` | which theories are trained, with checks |
 | `token-economics.md` | AST tools, tokens per verified change |
 | `tokenizer.md` | the 32k code-aware BPE |
 | `tool-generalization.md` | tool discovery and cross-harness claims |
 | `training-runbook.md` | corpus → run → resume → export → eval |
 | `troubleshooting.md` | symptom → cause → fix |
-| `TurboQuant_Engine_Specification.md` | the quantisation engine spec |
-| `tasks/` | one task spec per open piece of work |
-| `research/` | research notes |
 
 ## What is not here
 
