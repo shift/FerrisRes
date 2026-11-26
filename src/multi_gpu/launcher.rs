@@ -441,8 +441,9 @@ fn terminate_and_reap(child: &mut Child) -> Option<ExitStatus> {
 #[cfg(unix)]
 fn signal_group(pid: u32, signal: i32) {
     // No libc crate: one symbol is enough, and `kill` with a negated pid is the
-    // only way std exposes group delivery (it does not).
-    unsafe extern "C" {
+    // only way std exposes group delivery (it does not). `extern` without
+    // `unsafe` keeps the declared 1.75 MSRV; edition 2021 accepts it.
+    extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
     unsafe {
