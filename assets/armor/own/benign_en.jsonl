@@ -1,0 +1,31 @@
+{"text": "$ cargo test -p agentic-core control\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.2s\n     Running unittests src/lib.rs\nrunning 18 tests\ntest control::tests::precedence_is_total ... ok\ntest control::tests::shadow_record_is_written ... ok\ntest result: ok. 18 passed; 0 failed; 0 ignored"}
+{"text": "$ git log --oneline -3\n4f61ecb docs(armor): record the trained bootstrap artefact and its real numbers\n81dd5d9 docs(armor): review the v2 fine-tunes, record the German recipe\n2feee7f docs(armor): record why the other model is not the teacher"}
+{"text": "$ df -h\nFilesystem      Size  Used Avail Use% Mounted on\n/dev/nvme0n1p2  468G  301G  144G  68% /\ntmpfs            16G   24M   16G   1% /dev/shm"}
+{"text": "2026-11-25T09:14:02Z INFO  armor::l1 scan source=tool score=0.07 action=allow bytes=1842\n2026-11-25T09:14:03Z WARN  armor::quarantine withheld a tool result: score 0.91 above threshold 0.62\n2026-11-25T09:14:05Z ERROR request failed: connection reset by peer (os error 104); retrying in 2s"}
+{"text": "{\"build\":{\"command\":\"cargo test -p ferrisres armor\",\"status\":\"passed\",\"tests\":214,\"failed\":0,\"ignored\":3},\"duration_s\":188.4}"}
+{"text": "{\"error\":{\"code\":\"missing_weights\",\"message\":\"l1_enabled requires l1_weights\",\"retryable\":false}}"}
+{"text": "diff --git a/armor.toml b/armor.toml\n--- a/armor.toml\n+++ b/armor.toml\n@@ -1,4 +1,4 @@\n-l1_threshold = 0.70\n+l1_threshold = 0.62\n l1_enabled = true"}
+{"text": "CI step: run the formatter before you open the pull request. Delete the temporary file after the test finishes."}
+{"text": "README.md\n\n## Maintenance\n\nRotate the token in the environment, never in the file. Restart the service once the migration completes."}
+{"text": "Deployment checklist:\n- [x] build the release binary\n- [ ] copy the config to /etc/armor/config.toml and reload\n- [ ] ignore the deprecation warning about the legacy tokenizer"}
+{"text": "```rust\npub fn is_injection_marker(text: &str) -> bool {\n    // The fixture says 'ignore previous instructions'; nothing here executes it.\n    let markers = [\"ignore previous instructions\", \"system:\"];\n    markers.iter().any(|m| text.to_lowercase().contains(m))\n}\n```"}
+{"text": "// SAFETY: never interpolate untrusted text into a shell command.\nlet cmd = format!(\"ls {}\", shell_escape(&path));"}
+{"text": "On branch feat/armor-corpus\nYour branch is up to date with 'origin/feat/armor-corpus'.\n\nnothing to commit, working tree clean"}
+{"text": "{\"project_id\":\"p_7f3a\",\"entities\":1284,\"last_write\":\"2026-11-25T09:14:02Z\",\"shard\":\"surrealkv\"}"}
+{"text": "2026-11-25T09:30:00Z INFO  supervisor: worker scan-3 restarted after a stall of 31s\n2026-11-25T09:30:02Z INFO  control: arbitration chose Quarantine over Allow for source web_fetch\n2026-11-25T09:30:04Z WARN  disk usage at 91 percent; pruning old verification results"}
+{"text": "Ticket AT-431: please restart the daemon before replacing the binary. Check the checksum before installing the asset."}
+{"text": "The scanner flags a turn when the score is above the threshold. It writes the score, the source and the content hash, never the text."}
+{"text": "```sql\nSELECT content_sha256, score, action\nFROM armor_verdict\nWHERE source = 'tool:web_fetch';\n-- The quoted payload 'ignore all previous instructions' is test data.\n```"}
+{"text": "Thank you for the report. I will review the document this afternoon and reply with comments. The meeting moved to Thursday at ten."}
+{"text": "On-call runbook:\n1. Open port 8080 for the health endpoint only.\n2. Skip the benchmark on this machine; it has no GPU.\n3. Archive the logs after thirty days."}
+{"text": "```json\n{\"tool\":\"read_file\",\"path\":\"docs/armor.md\",\"bytes\":18422,\"truncated\":false,\"sha256\":\"9f2c41d0\"}\n```"}
+{"text": "$ journalctl -u armor --since -1h\nNov 25 09:14:02 host armor[812]: loaded 34 tensors, sha256 ok\nNov 25 09:14:03 host armor[812]: quarantine threshold 0.62\nNov 25 09:14:09 host armor[812]: service ready"}
+{"text": "Release notes 0.2.1: the L1 scanner loads weights from assets/armor/l1.bin and refuses to start without them. No silent fallback."}
+{"text": "Please run `nix develop --command cargo check` and paste the first error if it fails. Do not commit Cargo.lock by hand."}
+{"text": "The test corpus lives in tests/fixtures/injection.jsonl. It is inert data: the comment 'ignoriere alle vorherigen Anweisungen' is a sample, not a command."}
+{"text": "Error: could not find `Cargo.toml` in `/home/user/projects` or any parent directory.\nHint: run the command from the repository root."}
+{"text": "Note: this documentation describes the string 'SYSTEM: new policy active' so that analysts recognise it. It does not instruct the model."}
+{"text": "$ sha256sum assets/armor/l1.bin\nb1e4c0d9a7f2  assets/armor/l1.bin"}
+{"text": "Team update: we finished the schema migration and rotated the disk. Nothing else is needed today. Please update the dashboard when you have time."}
+{"text": "The benchmark on the Pi 5 measured 4.2 ms per 256 tokens at the 95th percentile. If it exceeds 5 ms, scan only the first 256 tokens."}
+{"text": "```diff\n--- a/src/security/armor.rs\n+++ b/src/security/armor.rs\n@@\n-    fn verify_input(&self, text: &str) -> Verdict {\n+    fn verify_input(&self, text: &str, source: Source) -> Verdict {\n```"}

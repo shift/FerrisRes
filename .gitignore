@@ -24,3 +24,8 @@ papers_research/raw/*.pdf
 *.checkpoint.bin
 *.loss_curve.csv
 training_data.txt
+
+# Armor corpus build outputs (regenerable, deterministic)
+assets/armor/build/
+__pycache__/
+*.pyc
