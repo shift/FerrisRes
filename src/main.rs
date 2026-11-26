@@ -1,16 +1,18 @@
 use std::sync::Arc;
 use std::time::Instant;
 use clap::{Parser, Subcommand};
-use tracing::{info, warn, trace};
+use tracing::{info, warn};
 use ferrisres::{WgpuCompute, DeviceProfile, BlockAttnResConfig, BlockAttnResModel, SimpleTokenizer};
 use ferrisres::compute::{GpuBuffer, MatMulOp, RmsNormOp, SoftmaxOp, ElementWiseOp};
-use ferrisres::training::AdamOptimizer;
 use ferrisres::model::gemma_mapper::{
     self, Gemma4Config, Gemma4Teacher,
     load_gemma4_model_mmap,
     DistillationCheckpoint, load_gemma4_model_gguf,
 };
 use ferrisres::model::tokenizer::HfTokenizer;
+use ferrisres::training::dataset::{
+    load_dataset_with, ChatTemplate, DataFormat, DatasetOptions,
+};
 
 #[derive(Parser)]
 #[command(name = "ferrisres", about = "Block AttnRes runtime for SLM/LLM training and inference")]
@@ -23,21 +25,59 @@ struct Cli {
 enum Commands {
     Info,
 
+    /// Train the f32 reference model on a text or JSONL corpus.
+    ///
+    /// One step is next-token prediction over a `--seq-len` window. Because the
+    /// reference forward has no batch axis, `--batch-size` windows are averaged
+    /// into one Adam step. Checkpoints are written to `--output`.
     Train {
         #[arg(long, default_value_t = 512)]
         hidden_dim: usize,
+        /// Number of transformer layers is `num_blocks * block_size`.
         #[arg(long, default_value_t = 8)]
         num_blocks: usize,
+        /// Number of transformer layers is `num_blocks * block_size`.
         #[arg(long, default_value_t = 8)]
         block_size: usize,
+        /// Epochs to run from the resume point.
         #[arg(long, default_value_t = 1)]
         epochs: u32,
+        /// Windows averaged into one optimizer step.
         #[arg(long, default_value_t = 32)]
         batch_size: u32,
         #[arg(long, default_value_t = 0.001)]
         learning_rate: f64,
+        /// Text or JSONL corpus. Required: there is no built-in corpus.
         #[arg(long)]
         data: Option<String>,
+        /// Training-data format: `auto`, `text` or `jsonl` (see `distill`).
+        #[arg(long, default_value = "auto")]
+        data_format: DataFormat,
+        /// Chat template for structured examples (see `distill`).
+        #[arg(long, default_value = "gemma")]
+        chat_template: ChatTemplate,
+        /// Window length in tokens.
+        #[arg(long, default_value_t = 128)]
+        seq_len: usize,
+        /// Vocabulary size; the byte tokenizer produces ids in `0..259`.
+        #[arg(long, default_value_t = 259)]
+        vocab: usize,
+        /// Initialisation seed. Deterministic for a fixed seed and corpus.
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Save a checkpoint every N steps. Zero disables periodic saves.
+        #[arg(long, default_value_t = 100)]
+        checkpoint_every: u64,
+        /// Checkpoint path, written periodically and at the end.
+        #[arg(long, default_value = "train_checkpoint.bin")]
+        output: String,
+        /// Restore model and Adam state, then train `--epochs` more epochs.
+        #[arg(long)]
+        resume: Option<String>,
+        /// Log one loss line every N steps. Zero logs only first and last.
+        #[arg(long, default_value_t = 1)]
+        log_every: u64,
+        /// Not supported by the f32 reference trainer; rejected when set.
         #[arg(long)]
         lora_rank: Option<usize>,
     },
@@ -143,6 +183,25 @@ enum Commands {
         /// Path to training data (text file, one doc per line).
         #[arg(long)]
         data: Option<String>,
+        /// Training-data format: `auto` (choose by file extension), `text`
+        /// (the whole file is one example) or `jsonl` (one JSON object per
+        /// line, either `{"text": ...}` or `{"messages": [...]}`).
+        /// zstd input is refused; decompress it with `zstd -dc` first.
+        #[arg(long, default_value = "auto")]
+        data_format: DataFormat,
+        /// Chat template used to render structured examples: `gemma`
+        /// (`<start_of_turn>` turns), `qwen` (`<|im_start|>` ChatML), `lfm`
+        /// (`<|startoftext|>` plus ChatML) or `plain` (`role: content` lines).
+        /// `text` examples are never re-rendered, so a `.txt` corpus is
+        /// unaffected by this flag.
+        #[arg(long, default_value = "gemma")]
+        chat_template: ChatTemplate,
+        /// Refuse to run when any example is missing `source`, `licence` or
+        /// `redacted`; the error names the line number and the missing field.
+        /// Without this flag missing fields are counted and reported once at
+        /// the end.
+        #[arg(long)]
+        require_provenance: bool,
         /// Output path for distilled model.
         #[arg(long, default_value = "distilled_model.bin")]
         output: String,
@@ -235,15 +294,14 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Info => cmd_info().await,
         Commands::Train {
-            hidden_dim,
-            num_blocks,
-            block_size,
-            epochs,
-            batch_size,
-            learning_rate,
-            data,
-            lora_rank,
-        } => cmd_train(hidden_dim, num_blocks, block_size, epochs, batch_size, learning_rate, data, lora_rank).await,
+            hidden_dim, num_blocks, block_size, epochs, batch_size,
+            learning_rate, data, data_format, chat_template, seq_len, vocab,
+            seed, checkpoint_every, output, resume, log_every, lora_rank,
+        } => cmd_train(
+            hidden_dim, num_blocks, block_size, epochs, batch_size,
+            learning_rate, data, data_format, chat_template, seq_len, vocab,
+            seed, checkpoint_every, output, resume, log_every, lora_rank,
+        ).await,
         Commands::Infer {
             model_path, config, config_path, model_format, tokenizer,
             hidden_dim, num_blocks, block_size, prompt,
@@ -260,8 +318,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Distill {
             model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every,
             resume, model_format, tokenizer, checkpoint_every, converge, converge_patience,
+            data_format, chat_template, require_provenance,
             armor: _, armor_config: _,
-        } => cmd_distill(model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every, resume, model_format, tokenizer, checkpoint_every, converge, converge_patience).await,
+        } => cmd_distill(model_path, config, seq_len, steps, learning_rate, temperature, data, output, log_every, resume, model_format, tokenizer, checkpoint_every, converge, converge_patience, data_format, chat_template, require_provenance).await,
         Commands::Evaluate {
             model_path, config, text,
         } => cmd_evaluate(model_path, config, text).await,
@@ -270,30 +329,6 @@ async fn main() -> anyhow::Result<()> {
             host, port, model_name, armor, cognitive, concepts_path,
         } => cmd_serve(model_path, config, model_format, tokenizer, host, port, model_name, armor, cognitive, concepts_path).await,
     }
-}
-
-/// Read back a single f32 value from a GPU buffer.
-fn readback_f32(device: &Arc<wgpu::Device>, queue: &Arc<wgpu::Queue>, buffer: &GpuBuffer) -> f32 {
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("loss_readback"),
-        size: 4,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("loss_readback_enc") });
-    enc.copy_buffer_to_buffer(buffer.buffer(), 0, &staging, 0, 4);
-    queue.submit(std::iter::once(enc.finish()));
-    let _ = device.poll(wgpu::PollType::wait_indefinitely());
-    let slice = staging.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-    let _ = device.poll(wgpu::PollType::wait_indefinitely());
-    let _ = rx.recv();
-    let data = slice.get_mapped_range();
-    let val: f32 = bytemuck::cast_slice(&data)[0];
-    drop(data);
-    staging.unmap();
-    val
 }
 
 async fn cmd_info() -> anyhow::Result<()> {
@@ -331,172 +366,114 @@ async fn cmd_train(
     batch_size: u32,
     learning_rate: f64,
     data: Option<String>,
+    data_format: DataFormat,
+    chat_template: ChatTemplate,
+    seq_len: usize,
+    vocab: usize,
+    seed: u64,
+    checkpoint_every: u64,
+    output: String,
+    resume: Option<String>,
+    log_every: u64,
     lora_rank: Option<usize>,
 ) -> anyhow::Result<()> {
-    info!(event = "initializing_training_pipeline", "Initializing training pipeline");
+    use ferrisres::training::f32_trainer::F32Config;
+    use ferrisres::training::train_loop::{run, TrainOptions};
 
-    let compute = WgpuCompute::new().await?;
-    let _capability = compute.detect_capability();
+    if let Some(rank) = lora_rank {
+        anyhow::bail!(
+            "--lora-rank {} is not supported by the f32 reference trainer; plain f32 \
+             training has no adapter path (the block+LoRA path has a separate gradient defect)",
+            rank
+        );
+    }
 
-    let config = BlockAttnResConfig::new(hidden_dim);
-    let config = BlockAttnResConfig {
-        num_blocks,
-        block_size,
-        ..config
-    };
-
-    let device = Arc::new(compute.device().clone());
-    let queue = Arc::new(compute.queue().clone());
+    let data_path = data.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("--data is required: pass a text or JSONL corpus")
+    })?;
 
     let tokenizer = SimpleTokenizer::new();
-    let _model = BlockAttnResModel::new(Arc::clone(&device), Arc::clone(&queue), config.clone(), tokenizer.vocab_size())?;
+    let mut text = String::new();
+    let mut examples = 0usize;
+    for example in load_dataset_with(
+        std::path::Path::new(data_path),
+        data_format,
+        &DatasetOptions::default(),
+    )? {
+        let example = example?;
+        text.push_str(&example.render(chat_template));
+        text.push('\n');
+        examples += 1;
+    }
+    let tokens = tokenizer.encode(&text);
 
-    let mut _optimizer = AdamOptimizer::new(
-        Arc::clone(&device),
-        Arc::clone(&queue),
-        learning_rate as f32,
-        0.9,
-        0.999,
-        1e-8,
+    info!(
+        event = "tokenized_dataset_examples_tokens",
+        "Tokenized {} example(s) into {} token(s)", examples, tokens.len()
+    );
+    if tokens.len() < seq_len + 1 {
+        anyhow::bail!(
+            "corpus has {} tokens but one window needs {}: pass a longer --data or a smaller --seq-len",
+            tokens.len(),
+            seq_len + 1
+        );
+    }
+
+    // The reference model has no batch axis, so each window is one sequence.
+    // Heads and head_dim are derived from --hidden-dim: 64-wide heads keep the
+    // defaults (8 heads at hidden 512) close to the inference model.
+    let head_dim = 64usize;
+    let num_heads = (hidden_dim / head_dim).max(1);
+    let config = F32Config {
+        hidden: hidden_dim,
+        num_layers: num_blocks.max(1) * block_size.max(1),
+        num_heads,
+        num_kv_heads: num_heads,
+        head_dim,
+        intermediate: 4 * hidden_dim,
+        vocab,
+        max_seq: seq_len,
+        rope_theta: 10_000.0,
+        eps: 1e-6,
+    };
+    info!(
+        event = "f32_model_config",
+        "f32 model: hidden={} layers={} heads={} head_dim={} intermediate={} vocab={} seq_len={}",
+        config.hidden,
+        config.num_layers,
+        config.num_heads,
+        config.head_dim,
+        config.intermediate,
+        config.vocab,
+        config.max_seq
     );
 
-    // Wire LoRA adapter if requested
-    let mut _lora_manager = if let Some(rank) = lora_rank {
-        let lora_config = ferrisres::LoraConfig {
-            rank,
-            alpha: rank as f32 * 2.0,
-            dropout: 0.0,
-            target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
-            merge_on_inference: true,
-        };
-        let mut mgr = ferrisres::LoraManager::new(lora_config);
-        // Register LoRA layers for the model's attention projections
-        mgr.add_adapter(0, "q_proj", config.hidden_dim, config.hidden_dim);
-        mgr.add_adapter(0, "v_proj", config.hidden_dim, config.hidden_dim);
-        info!(event = "lora_enabled_rank_alpha", "LoRA enabled: rank={} alpha={}", rank, rank * 2);
-        Some(mgr)
-    } else {
-        None
+    let options = TrainOptions {
+        config,
+        seq_len,
+        batch_size: batch_size as usize,
+        epochs,
+        learning_rate: learning_rate as f32,
+        seed,
+        checkpoint_every,
+        output: std::path::PathBuf::from(&output),
+        resume: resume.map(std::path::PathBuf::from),
+        log_every,
     };
 
-    info!(event = "model_config_detail", "model config: hidden_dim={} num_blocks={} block_size={} total_layers={} heads={} intermediate_dim={}",
-        config.hidden_dim, config.num_blocks, config.block_size, config.total_layers(),
-        config.attention_heads, config.intermediate_dim);
+    let report = run(&options, &tokens)?;
 
-    info!(event = "optimizer_adam_lr_beta1_0_9", "Optimizer: Adam lr={} beta1=0.9 beta2=0.999 eps=1e-8", learning_rate);
-
-    let sample = "Hello world from FerrisRes training";
-    let tokens = tokenizer.encode(sample);
-    info!(event = "sample_tokenized_tokens", "Sample tokenized ({} tokens): {:?}", tokens.len(), tokens);
-
-    if let Some(data_path) = &data {
-        info!(event = "data_path", "Data path: {}", data_path);
-    }
-
-    info!(event = "training_would_run_for_epochs_with", "Training would run for {} epochs with batch_size={} learning_rate={}", epochs, batch_size, learning_rate);
-
-    // Wire up the autodiff training loop
-    use ferrisres::training::CrossEntropyLoss;
-    use ferrisres::autodiff::graph::ComputationGraph;
-
-    let mut graph = ComputationGraph::new(Arc::clone(&device), Arc::clone(&queue));
-
-    // Build a minimal forward graph: input → loss
-    let hidden_bytes = config.hidden_dim * std::mem::size_of::<f32>();
-
-    // Build a minimal forward graph
-    let vocab_size = tokenizer.vocab_size();
-    let logits_buf = GpuBuffer::zeros(&device, &queue, vocab_size * std::mem::size_of::<f32>(), Some("train_logits"))?;
-    let loss_logits = GpuBuffer::zeros(&device, &queue, vocab_size * std::mem::size_of::<f32>(), Some("loss_logits"))?;
-    let _logits_id = graph.add_input("logits", logits_buf)?;
-
-    // Loss computation
-    let loss_fn = CrossEntropyLoss::new(Arc::clone(&device));
-
-    info!(event = "autodiff_graph_built_parameters_tracked", "Autodiff graph built: {} parameters tracked", 2);
-
-    for epoch in 0..epochs {
-        let mut epoch_loss = 0.0f32;
-        let mut batches = 0u32;
-
-        // Generate training batches from the sample text
-        let data_text = if let Some(ref path) = data {
-            std::fs::read_to_string(path).unwrap_or_else(|_| sample.to_string())
-        } else {
-            sample.to_string()
-        };
-        let all_tokens = tokenizer.encode(&data_text);
-
-        if all_tokens.len() < batch_size as usize + 1 {
-            // Not enough tokens for even one batch
-            let target_buf = GpuBuffer::zeros(&device, &queue, batch_size as usize * std::mem::size_of::<f32>(), Some("train_target"))?;
-            let dummy_buf = GpuBuffer::zeros(&device, &queue, hidden_bytes, Some("train_dummy"))?;
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train_forward"), });
-            loss_fn.compute(&mut encoder, &loss_logits, &target_buf, 1, vocab_size as u32, &dummy_buf)?;
-            queue.submit(std::iter::once(encoder.finish()));
-
-            // Read back the loss value from GPU
-            let loss_val = readback_f32(&device, &queue, &dummy_buf);
-            epoch_loss += loss_val;
-            batches += 1;
-        } else {
-            let num_batches = (all_tokens.len() - 1) / batch_size as usize;
-            for batch_idx in 0..num_batches {
-                let start = batch_idx * batch_size as usize;
-                let end = (start + batch_size as usize).min(all_tokens.len() - 1);
-                let _input_tokens = &all_tokens[start..end];
-                let _target_tokens = &all_tokens[start + 1..=end];
-
-                // Apply LoRA deltas if adapters are active
-                if let Some(ref lora) = _lora_manager {
-                    let dummy_hidden = vec![0.0f32; config.hidden_dim];
-                    // Compute LoRA forward for each target module at layer 0
-                    if let Some(delta) = lora.forward(0, "q_proj", &dummy_hidden, 1) {
-                        trace!(event = "lora_q_proj_delta_values", "LoRA q_proj delta: {} values", delta.len());
-                    }
-                    if let Some(delta) = lora.forward(0, "v_proj", &dummy_hidden, 1) {
-                        trace!(event = "lora_v_proj_delta_values", "LoRA v_proj delta: {} values", delta.len());
-                    }
-                }
-
-                // Forward pass: compute loss against target
-                let target_buf = GpuBuffer::zeros(&device, &queue, batch_size as usize * std::mem::size_of::<f32>(), Some("train_target"))?;
-                let dummy_buf = GpuBuffer::zeros(&device, &queue, hidden_bytes, Some("train_dummy"))?;
-                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some(&format!("train_epoch{}_batch{}", epoch, batch_idx)),
-                });
-
-                // Run forward through loss
-                loss_fn.compute(&mut encoder, &loss_logits, &target_buf, 1, vocab_size as u32, &dummy_buf)?;
-                queue.submit(std::iter::once(encoder.finish()));
-
-                // Read back the loss value from GPU
-                let loss_val = readback_f32(&device, &queue, &dummy_buf);
-                epoch_loss += loss_val;
-                batches += 1;
-            }
-        }
-
-        if batches > 0 {
-            info!(event = "epoch_avg_loss_batches", "Epoch {}/{}: avg_loss={:.4} batches={}", epoch + 1, epochs, epoch_loss / batches as f32, batches);
-        }
-    }
-
-    info!(event = "training_complete", "Training complete");
-
-    // Merge LoRA adapters back into base weights for zero-cost inference
-    if let Some(ref mut lora) = _lora_manager {
-        if !lora.is_merged() {
-            lora.merge_all(&mut |layer_idx: usize, module_name: &str| {
-                // In a full implementation, this would return mutable slices
-                // into the model's weight GpuBuffers. For now, log the merge.
-                info!(event = "merging_lora_adapter_layer_module", "Merging LoRA adapter: layer={}, module={}", layer_idx, module_name);
-                None::<&mut [f32]>
-            });
-            info!(event = "lora_adapters_merged_adapters_params", "LoRA adapters merged: {} adapters, {} params", lora.num_adapters(), lora.total_params());
-        }
-    }
-
+    info!(
+        event = "training_summary_steps_lr",
+        "Training summary: resumed_from={} steps={} total_step={} initial_loss={:.6} final_loss={:.6} params_changed={} checkpoint={}",
+        report.resumed_from,
+        report.steps_run,
+        report.total_step,
+        report.initial_loss,
+        report.final_loss,
+        report.params_changed,
+        report.checkpoint.display()
+    );
     Ok(())
 }
 
@@ -1213,6 +1190,9 @@ async fn cmd_distill(
     checkpoint_every: usize,
     converge_threshold: f64,
     converge_patience: usize,
+    data_format: DataFormat,
+    chat_template: ChatTemplate,
+    require_provenance: bool,
     // use_gpu removed — now determined by DispatchPlan from model size + device capabilities
 ) -> anyhow::Result<()> {
     info!(event = "ferrisres_gemma_4_block_attnres_distillation", "=== FerrisRes Gemma 4 → Block AttnRes Distillation ===");
@@ -1317,17 +1297,60 @@ async fn cmd_distill(
 
     let token_ids = if let Some(ref dp) = data_path {
         info!(event = "loading_training_data_from", "Loading training data from: {}", dp);
-        let text = std::fs::read_to_string(dp)
-            .map_err(|e| anyhow::anyhow!("Failed to read data: {}", e))?;
-        if let Some(ref tok) = hf_tokenizer {
-            let ids = tok.encode_raw(&text);
-            info!(event = "tokenized_to_tokens_using_provided_tokenizer", "Tokenized to {} tokens using provided tokenizer", ids.len());
-            ids
-        } else {
-            let ids: Vec<u32> = text.bytes().map(|b| b as u32).collect();
-            info!(event = "loaded_byte_level_tokens_from_training", "Loaded {} byte-level tokens from training data", ids.len());
-            ids
+        let path = std::path::Path::new(dp);
+        let resolved_format = data_format
+            .resolve(path)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let options = DatasetOptions { require_provenance };
+        let mut examples = load_dataset_with(path, data_format, &options)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        let mut ids: Vec<u32> = Vec::new();
+        let mut example_count: u64 = 0;
+        let mut rendered_tokens: u64 = 0;
+
+        while let Some(example) = examples.next() {
+            let example = example.map_err(|e| anyhow::anyhow!("{}", e))?;
+            let rendered = example.render(chat_template);
+            let encoded: Vec<u32> = match hf_tokenizer {
+                Some(ref tok) => tok.encode_raw(&rendered),
+                None => rendered.bytes().map(|b| b as u32).collect(),
+            };
+            example_count += 1;
+            rendered_tokens += encoded.len() as u64;
+            ids.extend_from_slice(&encoded);
         }
+
+        info!(
+            event = "dataset_loaded",
+            examples = example_count,
+            rendered_tokens = rendered_tokens,
+            format = resolved_format.as_str(),
+            template = chat_template.as_str(),
+            "Loaded {} example(s) from {} and rendered {} token(s)",
+            example_count,
+            resolved_format.as_str(),
+            rendered_tokens
+        );
+
+        if let Some(report) = examples.stats().provenance_summary() {
+            let stats = examples.stats();
+            warn!(
+                event = "dataset_missing_provenance",
+                source = stats.missing_source,
+                licence = stats.missing_licence,
+                redacted = stats.missing_redacted,
+                "{}",
+                report
+            );
+        }
+
+        if hf_tokenizer.is_some() {
+            info!(event = "tokenized_to_tokens_using_provided_tokenizer", "Tokenized to {} tokens using provided tokenizer", ids.len());
+        } else {
+            info!(event = "loaded_byte_level_tokens_from_training", "Loaded {} byte-level tokens from training data", ids.len());
+        }
+        ids
     } else {
         info!(event = "no_training_data_provided_using_synthetic", "No training data provided, using synthetic tokens");
         (0..10000).map(|i| i % config.vocab_size as u32).collect()

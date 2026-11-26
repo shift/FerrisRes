@@ -16,7 +16,7 @@ struct Params {
 @group(0) @binding(1) var<storage, read> b_transposed: array<f32>;
 @group(0) @binding(2) var<storage, read_write> grad_a: array<f32>;
 
-var<private> params: Params;
+var<immediate> params: Params;
 
 @compute @workgroup_size(64)
 fn matmul_grad_a(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -44,7 +44,7 @@ struct Params {
 @group(0) @binding(1) var<storage, read> grad_output: array<f32>;
 @group(0) @binding(2) var<storage, read_write> grad_b: array<f32>;
 
-var<private> params: Params;
+var<immediate> params: Params;
 
 @compute @workgroup_size(64)
 fn matmul_grad_b(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -71,7 +71,7 @@ struct Params {
 @group(0) @binding(1) var<storage, read> grad_output: array<f32>;
 @group(0) @binding(2) var<storage, read_write> grad_input: array<f32>;
 
-var<private> params: Params;
+var<immediate> params: Params;
 
 @compute @workgroup_size(256)
 fn softmax_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -117,7 +117,7 @@ struct Params {
 @group(0) @binding(2) var<storage, read> grad_output: array<f32>;
 @group(0) @binding(3) var<storage, read_write> grad_input: array<f32>;
 
-var<private> params: Params;
+var<immediate> params: Params;
 
 @compute @workgroup_size(256)
 fn rmsnorm_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -157,7 +157,7 @@ struct Params {
 @group(0) @binding(1) var<storage, read> targets: array<u32>;
 @group(0) @binding(2) var<storage, read_write> grad_input: array<f32>;
 
-var<private> params: Params;
+var<immediate> params: Params;
 
 @compute @workgroup_size(256)
 fn loss_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -799,7 +799,7 @@ impl BackwardPass {
                     @group(0) @binding(0) var<storage, read> token_ids: array<u32>;
                     @group(0) @binding(1) var<storage, read> grad_out: array<f32>;
                     @group(0) @binding(2) var<storage, read_write> grad_emb: array<f32>;
-                    var<private> p: EP;
+                    var<immediate> p: EP;
 
                     @compute @workgroup_size(256)
                     fn scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -1099,7 +1099,7 @@ impl BackwardPass {
             }
             @group(0) @binding(0) var<storage, read> grad_out: array<f32>;
             @group(0) @binding(1) var<storage, read_write> grad_bias: array<f32>;
-            var<private> p: BP;
+            var<immediate> p: BP;
 
             @compute @workgroup_size(256)
             fn sum_rows(@builtin(global_invocation_id) gid: vec3<u32>) {

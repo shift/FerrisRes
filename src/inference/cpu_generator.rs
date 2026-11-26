@@ -6,7 +6,10 @@
 use std::collections::HashMap;
 use crate::error::Result;
 use crate::inference::logit_processors::{LogitProcessor, LogitProcessorConfig};
-use crate::model::cpu_block_attn_res::CpuBlockAttnResModel;
+use crate::model::cpu_block_attn_res::{
+    add_layer_prefix, block_index_of_layer, embedding_prefix, prefix_means, running_means,
+    CpuBlockAttnResModel,
+};
 use crate::model::gemma_mapper::{apply_rope, apply_rope_gqa, gelu_tanh, rms_norm, matmul, per_head_rms_norm, per_head_rms_norm_no_scale};
 
 /// Per-layer CPU KV cache: stores K and V as contiguous f32 buffers.
@@ -170,11 +173,11 @@ impl CpuGenerateConfig {
 pub struct CpuTokenGenerator {
     model: CpuBlockAttnResModel,
     kv_cache: CpuModelKVCache,
-    /// Block representations accumulated during generation.
+    /// Causal running sums for inter-block attention: entry 0 is the embedding
+    /// sum, entry `i + 1` is block `i`'s layer-output sum, all over every
+    /// processed position. See `CpuBlockAttnResModel`'s module docs.
     block_reps: Vec<Vec<f32>>,
-    /// Partial sum accumulator for current block.
-    partial_sum: Vec<f32>,
-    /// Tokens in current block (for mean-pooling).
+    /// Number of positions processed (the causal prefix length).
     partial_count: usize,
     /// Shared KV: maps source_layer_idx → (K, V) computed during prefill/decode.
     shared_kv: HashMap<usize, (Vec<f32>, Vec<f32>)>,
@@ -195,7 +198,6 @@ impl CpuTokenGenerator {
             model,
             kv_cache,
             block_reps: Vec::new(),
-            partial_sum: Vec::new(),
             partial_count: 0,
             shared_kv: HashMap::new(),
         }
@@ -221,7 +223,6 @@ impl CpuTokenGenerator {
         self.kv_cache.reset_all();
         self.block_reps.clear();
         self.shared_kv.clear();
-        self.partial_sum = vec![0.0f32; self.model.hidden_dim];
         self.partial_count = 0;
 
         let mut logit_processor = LogitProcessor::new(config.to_logit_config());
@@ -265,11 +266,18 @@ impl CpuTokenGenerator {
         // 1. Embedding with Gemma scaling
         let mut hidden = self.embed_tokens(token_ids);
 
-        // 2. Initialize block reps with mean-pooled embedding
-        for t in 0..seq {
-            for d in 0..hd {
-                self.partial_sum[d] += hidden[t * hd + d];
-            }
+        // 2. Causal block state: per-position prefix sums for the prompt.
+        let boundaries = &self.model.block_config.boundary_layers;
+        let has_blocks = !boundaries.is_empty();
+        let lpb = self.model.block_config.layers_per_block.max(1);
+        let num_entries = boundaries.len() + 1;
+        let mut prefix_sums: Vec<Vec<f32>> = if has_blocks {
+            vec![vec![0.0f32; seq * hd]; num_entries]
+        } else {
+            Vec::new()
+        };
+        if has_blocks {
+            prefix_sums[0] = embedding_prefix(&hidden, seq, hd);
         }
         self.partial_count = seq;
 
@@ -333,19 +341,27 @@ impl CpuTokenGenerator {
                 }
             }
 
-            // Accumulate into partial_sum for block representation
-            for t in 0..seq {
-                for d in 0..hd {
-                    self.partial_sum[d] += hidden[t * hd + d];
+            // Causal block tracking (same rule as CpuBlockAttnResModel).
+            if has_blocks {
+                let bi = block_index_of_layer(boundaries, layer_idx);
+                add_layer_prefix(&mut prefix_sums[bi + 1], &hidden, seq, hd);
+                if self.model.is_block_boundary(layer_idx) {
+                    let means = prefix_means(&prefix_sums, bi + 1, seq, hd, lpb);
+                    let inter_out = self.model.inter_block_attention(&hidden, &means, seq);
+                    for i in 0..seq * hd { hidden[i] += inter_out[i]; }
                 }
             }
-            self.partial_count += seq;
-
-            // Block boundary: inter-block attention
-            if self.model.is_block_boundary(layer_idx) {
-                self.finalize_block_and_inter_attn(&mut hidden, seq);
-            }
         }
+
+        // Keep the full-prefix running sums for decode.
+        self.block_reps = if has_blocks {
+            prefix_sums
+                .iter()
+                .map(|entry| entry[(seq - 1) * hd..].to_vec())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // 5. Final norm + LM head
         let logits = self.compute_logits(&hidden, seq);
@@ -368,6 +384,18 @@ impl CpuTokenGenerator {
         // 1. Embed single token
         let mut hidden = self.embed_tokens(&[token_id]);
 
+        // Causal block state: extend the running sums with this position.
+        let boundaries = self.model.block_config.boundary_layers.clone();
+        let has_blocks = !boundaries.is_empty();
+        let lpb = self.model.block_config.layers_per_block.max(1);
+        if has_blocks {
+            if self.block_reps.len() < boundaries.len() + 1 {
+                self.block_reps = vec![vec![0.0f32; hd]; boundaries.len() + 1];
+            }
+            self.partial_count += 1;
+            for d in 0..hd { self.block_reps[0][d] += hidden[d]; }
+        }
+
         // 2. PLE for single token
         let ple_dim = self.model.hidden_size_per_layer_input;
         let ple_precomputed = self.model.precompute_ple(&hidden, &[token_id], 1, hd, ple_dim);
@@ -387,7 +415,7 @@ impl CpuTokenGenerator {
             .collect();
 
         for layer_idx in 0..num_layers {
-            let (kv_shared, _is_boundary) = layer_info[layer_idx];
+            let (kv_shared, is_boundary) = layer_info[layer_idx];
 
             let ple_slice = ple_precomputed.as_ref().map(|pre| {
                 let mut slice = vec![0.0f32; ple_dim];
@@ -400,9 +428,16 @@ impl CpuTokenGenerator {
                 layer_idx, &hidden, ple_slice.as_deref(), pos, kv_shared,
             );
 
-            // Block boundary inter-block attention during decode
-            if layer_info[layer_idx].1 {
-                self.finalize_block_and_inter_attn(&mut hidden, 1);
+            // Causal block tracking and inter-block attention.
+            if has_blocks {
+                let bi = block_index_of_layer(&boundaries, layer_idx);
+                let entry = bi + 1;
+                for d in 0..hd { self.block_reps[entry][d] += hidden[d]; }
+                if is_boundary {
+                    let means = running_means(&self.block_reps, entry, self.partial_count, lpb);
+                    let inter_out = self.model.inter_block_attention_single(&hidden, &means);
+                    for d in 0..hd { hidden[d] += inter_out[d]; }
+                }
             }
         }
 
@@ -497,7 +532,7 @@ impl CpuTokenGenerator {
 
         // Attention: q [1, q_dim], k [total_len, kv_dim], v [total_len, kv_dim]
         let attn_out = self.model.layers[layer_idx].cpu_attention(
-            &q, &all_k, &all_v, 1, nh, nkv, head_d, q_dim, kv_dim,
+            &q, &all_k, &all_v, 1, total_len, nh, nkv, head_d, q_dim, kv_dim,
         );
 
         // Post-attention norm
@@ -550,29 +585,6 @@ impl CpuTokenGenerator {
         }
 
         hidden
-    }
-
-    /// Finalize a block and apply inter-block attention.
-    fn finalize_block_and_inter_attn(&mut self, hidden: &mut Vec<f32>, seq: usize) {
-        let hd = self.model.hidden_dim;
-
-        // Finalize block rep: mean pool the accumulated partial sum
-        if self.partial_count > 0 {
-            for d in 0..hd {
-                self.partial_sum[d] /= self.partial_count as f32;
-            }
-        }
-        self.block_reps.push(self.partial_sum.clone());
-        self.partial_sum = vec![0.0f32; hd];
-        self.partial_count = 0;
-
-        // Inter-block attention
-        let inter_out = self.model.inter_block_attention(hidden, &self.block_reps, seq);
-        for t in 0..seq {
-            for d in 0..hd {
-                hidden[t * hd + d] += inter_out[d];
-            }
-        }
     }
 
     /// Embed tokens with Gemma scaling.
