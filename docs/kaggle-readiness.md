@@ -215,3 +215,33 @@ first `[` (`json.JSONDecoder().raw_decode(stdout, stdout.find('['))`). It cost r
 2. Build the GPU `.deb`; probe the T4 with `devices`.
 3. GPU smoke (20 steps) only if the T4 is visible.
 4. Corpus + tokenizer; then a real run; then multi-GPU.
+
+## The TPU was never allocated (measured 2026-11-27)
+
+`ferrisres-tpu-qwen` requested `enable_tpu: true` and Kaggle **stored**
+`machine_shape: TpuV5E8` — then ran it on a CPU machine:
+
+```
+/dev/accel*   absent        /dev/vfio   absent
+TPU|XRT|PJRT|LIBTPU env     empty
+CPU           Intel Xeon @ 2.20GHz, 4 cores, 31 GB
+```
+
+Two conclusions:
+
+1. **A stored shape is not an allocated accelerator.** The kernel metadata is
+   what was *asked for*; the session tells the truth. This is the same silent
+   downgrade as the "no `nvidia-smi`" T4 session, and the check that catches it is
+   a device or env probe inside the session, never the metadata.
+2. **The six earlier TPU failures were misdiagnosed.** `xm.xla_device_hw`
+   returning `CPU` was read as "libtpu is missing"; the measured explanation is
+   that no TPU was present. Installing `libtpu`, pinning `torch_xla`, and the
+   vLLM-TPU plan were all effort spent on a device the session did not have.
+
+Before any further TPU work: open the kernel in the browser, set the accelerator
+explicitly, and confirm `/dev/vfio` or the libtpu env is present. If it is not,
+stop — a CPU fallback is not a TPU result.
+
+Disk facts from the same session, worth keeping: `/kaggle/working` is **20 GB**
+(outputs only) while `/root`'s overlay had **2.5 TB** free, so model weights belong
+in the HF cache under `/root` and a 55 GB download is only feasible there.
