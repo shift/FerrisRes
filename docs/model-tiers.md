@@ -18,6 +18,13 @@ Training hours assume 2B tokens and 20 TFLOP/s effective on a T4; Kaggle's
 30 h/week quota therefore means ~0.6, 3.3 and 5.6 weeks for Small, Base and
 Large.
 
+## Other points in the space
+
+The four tiers fix one shape. The alternatives — GQA instead of MQA, a code
+tokenizer at 32k, hybrid sliding+global attention, bf16 on a T4, a larger MoE on
+a unified-memory box — are in `hardware-shapes.md`, each changing one lever at a
+time so a regression can be attributed.
+
 ## What each tier is for
 
 - **Nano** — router, tool selector, Armor-class scanner, embeddings, and the
