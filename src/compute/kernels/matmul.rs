@@ -169,8 +169,12 @@ fn matmul_double_buf(
         // Each thread reads its 2 rows from tile_a and 2 cols from tile_b
         let a_base0 = cur * TS * TS + (local_row * 2u + 0u) * TS;
         let a_base1 = cur * TS * TS + (local_row * 2u + 1u) * TS;
-        let b_base0 = cur * TS * TS + (local_col * 2u + 0u) * TS;
-        let b_base1 = cur * TS * TS + (local_col * 2u + 1u) * TS;
+        // tile_b holds B[k][n] at [k*TS + n]. The two output columns this
+        // thread owns are local_col*2 and +1, so the n offset is constant and
+        // the k stride is TS. Reading [n*TS + k] instead transposes B, which is
+        // what made A·B = [[1,2],[3,4]]·[[5,6],[7,8]] return 17 rather than 19.
+        let b_col0 = cur * TS * TS + local_col * 2u;
+        let b_col1 = b_col0 + 1u;
 
         // Unrolled inner loop: 32 iterations
         // Manually unroll by 4 for better instruction-level parallelism
@@ -186,14 +190,14 @@ fn matmul_double_buf(
             let a1_i2 = tile_a[a_base1 + i + 2u];
             let a1_i3 = tile_a[a_base1 + i + 3u];
 
-            let b0_i = tile_b[b_base0 + i];
-            let b0_i1 = tile_b[b_base0 + i + 1u];
-            let b0_i2 = tile_b[b_base0 + i + 2u];
-            let b0_i3 = tile_b[b_base0 + i + 3u];
-            let b1_i = tile_b[b_base1 + i];
-            let b1_i1 = tile_b[b_base1 + i + 1u];
-            let b1_i2 = tile_b[b_base1 + i + 2u];
-            let b1_i3 = tile_b[b_base1 + i + 3u];
+            let b0_i = tile_b[b_col0 + i * TS];
+            let b0_i1 = tile_b[b_col0 + (i + 1u) * TS];
+            let b0_i2 = tile_b[b_col0 + (i + 2u) * TS];
+            let b0_i3 = tile_b[b_col0 + (i + 3u) * TS];
+            let b1_i = tile_b[b_col1 + i * TS];
+            let b1_i1 = tile_b[b_col1 + (i + 1u) * TS];
+            let b1_i2 = tile_b[b_col1 + (i + 2u) * TS];
+            let b1_i3 = tile_b[b_col1 + (i + 3u) * TS];
 
             acc00 = acc00 + a0_i * b0_i   + a0_i1 * b0_i1 + a0_i2 * b0_i2 + a0_i3 * b0_i3;
             acc01 = acc01 + a0_i * b1_i   + a0_i1 * b1_i1 + a0_i2 * b1_i2 + a0_i3 * b1_i3;
