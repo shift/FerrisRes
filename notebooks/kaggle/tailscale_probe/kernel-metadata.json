@@ -1,13 +1,16 @@
 {
   "id": "sectionme/ferrisres-tailscale-probe",
-  "title": "FerrisRes tailscale probe",
-  "code_file": "tailscale_probe.ipynb",
+  "title": "FerrisRes train in tailnet",
+  "code_file": "train_in_tailnet.ipynb",
   "language": "python",
   "kernel_type": "notebook",
   "is_private": true,
-  "enable_gpu": false,
+  "enable_gpu": true,
   "enable_internet": true,
-  "dataset_sources": [],
+  "dataset_sources": [
+    "sectionme/ferrisres",
+    "sectionme/ferrisres-corpus-32k"
+  ],
   "competition_sources": [],
   "kernel_sources": []
 }
