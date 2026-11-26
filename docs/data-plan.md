@@ -13,8 +13,8 @@ Datasets whose licence is unclear may be used for evaluation only.
 | **Distillation** | teacher logits and hidden states on rendered text | a denser signal per token than hard labels |
 
 Distillation is the only verified path today (`distill`); `train` is being
-implemented. c-base can generate SFT text but not hidden states, so it belongs
-to SFT, not distillation.
+implemented. A hosted text generator can produce SFT text but not hidden
+states, so it belongs to SFT, not distillation.
 
 ## Candidate sources
 
@@ -26,7 +26,7 @@ the family and the intended use, not a legal opinion.
 | English web, filtered | pretrain | FineWeb-Edu, DCLM-baseline, Dolma 3, Common Pile | ODC-By / CC-BY / permissive — attribute |
 | German web | pretrain | FineWeb-2 `de`, CulturaX `de`, GermanWeb | ODC-By / gated terms — verify per card |
 | Code | pretrain + SFT | The Stack v2 permissive subset; **Rust** (crates.io, rust-lang repos, our own); **Nix** (nixpkgs, permissive flakes) | per-file licences; MIT/Apache/BSD only; no secrets, no generated/vendored files |
-| Instruction / chat | SFT | OASST1 (Apache-2.0), Dolly (CC-BY-SA), SmolTalk/Tulu, OpenHermes | prefer Apache/MIT/CC-BY; avoid NC |
+| Instruction / chat | SFT | OASST1 (Apache-2.0), SmolTalk/Tulu (per subset), OpenHermes; **Dolly excluded (CC-BY-SA)** | permissive/CC0/CC-BY only; no NC, no share-alike for an Apache-2.0 weights release |
 | German instruction | SFT | Multi-SFT (permissively licensed, DE included), translated OASST1 | verify per card |
 | Tool use | SFT | Glaive function-calling, xLAM, ToolBench, BFCL train split | verify per card; exclude the BFCL test split |
 | Math / reasoning | pretrain cooldown | OpenR1-Math, NuminaMath subsets | Apache-2.0 — verify |

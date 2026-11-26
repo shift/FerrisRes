@@ -66,7 +66,7 @@ last release — so retrieval, not recall, is the target.
 | source | licence | target | notes |
 |---|---|---:|---|
 | OASST1 | Apache-2.0 | 40M | chat |
-| Dolly | CC-BY-SA | 10M | share-alike: record, or exclude if strict |
+| Dolly | CC-BY-SA | 0 | **excluded**: share-alike reaches an Apache-2.0 weights release |
 | SmolTalk / Tulu | per card | 50M | verify each |
 | Multi-SFT (DE) | permissive | 30M | German |
 | German authored templates | CC0 | 20M | |

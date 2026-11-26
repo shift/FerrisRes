@@ -83,7 +83,7 @@ Nix training data teaches code, not the AST edit path.
 | id | source | licence | revision | access | target | filter | status |
 |---|---|---|---|---|---|---|---|
 | `sft-oasst1` | OASST1 | Apache-2.0 | pin | `hf:OpenAssistant/oasst1` | 40M | dedupe, tree flatten with provenance | planned |
-| `sft-dolly` | Dolly 15k | CC-BY-SA-3.0 | pin | `hf:databricks/databricks-dolly-15k` | 10M | **share-alike: commercial decision** | planned |
+| `sft-dolly` | Dolly 15k | CC-BY-SA-3.0 | pin | `hf:databricks/databricks-dolly-15k` | 0 | **excluded for the open-weight release** (share-alike reaches the weights) | excluded |
 | `sft-smoltalk` | SmolTalk | Apache-2.0 (verify card) | pin | `hf:HuggingFaceTB/smoltalk` | 50M | dedupe | planned |
 | `sft-tulu3` | Tulu 3 SFT mixture | mixture; verify per subset | pin | `hf:allenai/tulu-3-sft-mixture` | 30M | licence per subset; some subsets may be excluded | planned |
 | `sft-de` | German multi-SFT | per card | pin | hf | 30M | lang=de | planned |
@@ -93,7 +93,7 @@ Nix training data teaches code, not the AST edit path.
 | id | source | licence | revision | access | target | filter | status |
 |---|---|---|---|---|---|---|---|
 | `tool-bfcl` | BFCL train split | Apache-2.0 | pin | `hf:gorilla-llm/...` | 30M | dedupe against eval split | planned |
-| `tool-xlam` | xLAM function calling | **verify (NC reported)** | pin | hf | 20M | **exclude from commercial if NC** | planned |
+| `tool-xlam` | xLAM function calling | **NC reported** | pin | hf | 0 | **excluded**: an open, commercially usable model cannot be built on NC data | excluded |
 | `tool-glaive` | Glaive function calling v2 | Apache-2.0 | pin | `hf:glaiveai/...` | 20M | strip synthetic dialogues that invent tools | planned |
 | `tool-registry` | MCP catalogue + OpenAPI specs | per server/repo | pin | mixed | 5M | ids and schemas only; no secrets in examples | planned |
 | `tool-traces` | reviewed run records | internal | redacted | ours | 40M | derived, never raw; consent recorded | planned |
@@ -166,13 +166,30 @@ void.
 | `eval-interface` | interface suite | 60 |
 | `eval-gates` | the 15-gate manifest | 15 |
 
+## 13. Generated data (hosted providers and local generators)
+
+Free access is not a training licence. A generated row trains only when its
+generator is on the allowlist and the row carries provenance
+(`model-licensing.md`).
+
+| id | generator | terms | target | filter | status |
+|---|---|---|---|---|---|
+| `gen-qwen3-local` | Qwen3-0.6B/1.7B, open weights | Apache-2.0 | 40M | authored/synthetic prompts; verified by a check | planned |
+| `gen-gemma4-local` | Gemma 4 E2B/E4B, open weights | Apache-2.0 | 10M | same | planned |
+| `gen-teacher-distill` | teacher-forcing logits from the open-weight teacher | Apache-2.0 | 40M | revision-bound; no hosted API | planned |
+| `gen-hosted-open` | a hosted OpenAI-compatible provider, **open-weight models only** | per model, recorded | 20M | allowlist; no private input; verified; no eval overlap | planned |
+
+Excluded by rule: any hosted model whose terms forbid training on its outputs,
+any prompt containing a soul, a child message, a transcript, a credential or a
+customer document.
+
 ## Open licence questions
 
 | source | question | effect |
 |---|---|---|
-| xLAM | NC reported; confirm | if NC, commercial edition excludes it |
-| Dolly | CC-BY-SA-3.0 | share-alike decision for weights |
-| CulturaX | gated terms | acceptance recorded; redistribution limits |
+| xLAM | NC reported; confirm | **excluded** from the open-weight release |
+| Dolly | CC-BY-SA-3.0 | **excluded**; share-alike reaches the weights |
+| CulturaX | gated terms | **excluded** unless the terms permit weight redistribution |
 | Tulu 3 | mixture per subset | some subsets may be excluded |
 | The Stack v2 | per-file long tail | allowlist only; unknown licence dropped |
 | crates.io | per-crate long tail | allowlist only; drop vendored |
