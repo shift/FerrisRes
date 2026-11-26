@@ -1128,6 +1128,43 @@ impl Gradients {
         }
     }
 
+    /// Add `scale * other` into `self`, in place.
+    ///
+    /// The CLI trains on one window at a time (the reference forward has no
+    /// batch axis), so a batch is expressed as an average of per-window
+    /// gradients. The scale is applied here so the caller can divide once per
+    /// window instead of copying the gradient struct.
+    pub fn accumulate(&mut self, other: &Gradients, scale: f32) {
+        fn add(dst: &mut [f32], src: &[f32], scale: f32) {
+            assert_eq!(dst.len(), src.len(), "gradient length mismatch");
+            for (d, s) in dst.iter_mut().zip(src.iter()) {
+                *d += scale * *s;
+            }
+        }
+
+        add(&mut self.embed, &other.embed, scale);
+        assert_eq!(self.layers.len(), other.layers.len(), "gradient layer count mismatch");
+        for (dst, src) in self.layers.iter_mut().zip(other.layers.iter()) {
+            add(&mut dst.attn_norm_w, &src.attn_norm_w, scale);
+            add(&mut dst.q, &src.q, scale);
+            add(&mut dst.k, &src.k, scale);
+            add(&mut dst.v, &src.v, scale);
+            add(&mut dst.q_norm_w, &src.q_norm_w, scale);
+            add(&mut dst.k_norm_w, &src.k_norm_w, scale);
+            add(&mut dst.o, &src.o, scale);
+            add(&mut dst.post_attn_norm_w, &src.post_attn_norm_w, scale);
+            add(&mut dst.pre_ffn_norm_w, &src.pre_ffn_norm_w, scale);
+            add(&mut dst.gate, &src.gate, scale);
+            add(&mut dst.up, &src.up, scale);
+            add(&mut dst.down, &src.down, scale);
+            add(&mut dst.post_ffn_norm_w, &src.post_ffn_norm_w, scale);
+            dst.layer_scalar += scale * src.layer_scalar;
+        }
+        add(&mut self.final_norm_w, &other.final_norm_w, scale);
+        add(&mut self.lm_head, &other.lm_head, scale);
+        add(&mut self.attn_res_norm, &other.attn_res_norm, scale);
+    }
+
     /// Same order as [`F32Model::tensors`].
     pub fn tensors(&self) -> Vec<(String, &[f32])> {
         let mut out: Vec<(String, &[f32])> = Vec::new();
