@@ -15,6 +15,7 @@ pub mod shadow_weights;
 pub mod bit_moe;
 pub mod f32_trainer;
 pub mod armor_trainer;
+pub mod armor_jsonl;
 #[cfg(test)]
 pub mod armor_corpus;
 
