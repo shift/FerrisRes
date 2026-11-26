@@ -36,6 +36,24 @@ enum Commands {
         json: bool,
     },
 
+    /// Launch one worker process per GPU adapter.
+    ///
+    /// Refuses when fewer usable adapters exist than `--world-size`. Each child
+    /// gets `WGPU_ADAPTER_INDEX=i` and `--rank i --world-size N` appended.
+    Workers {
+        #[arg(long, default_value_t = 1)]
+        world_size: usize,
+        /// Include software (CPU) adapters; off by default.
+        #[arg(long)]
+        allow_software: bool,
+        /// Directory for per-rank evidence JSON. Defaults to a temp directory.
+        #[arg(long)]
+        evidence_dir: Option<String>,
+        /// Child command and arguments, after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+
     Train {
         #[arg(long, default_value_t = 512)]
         hidden_dim: usize,
@@ -267,6 +285,22 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Info => cmd_info().await,
         Commands::Devices { json } => cmd_devices(json).await,
+        Commands::Workers {
+            world_size,
+            allow_software,
+            evidence_dir,
+            command,
+        } => {
+            ferrisres::multi_gpu::launcher::run_workers(
+                world_size,
+                allow_software,
+                evidence_dir,
+                command,
+            )
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
+        }
         Commands::Train {
             hidden_dim,
             num_blocks,
