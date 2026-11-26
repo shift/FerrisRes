@@ -1,0 +1,15 @@
+{
+  "id": "sectionme/ferrisres-topk-vllm",
+  "title": "FerrisRes topk vllm",
+  "code_file": "qwen3_topk_vllm.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "sectionme/ferrisres-corpus-release-slice"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}
