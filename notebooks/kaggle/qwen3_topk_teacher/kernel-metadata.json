@@ -1,5 +1,5 @@
 {
-  "id": "sectionme/ferrisres-topk-teacher",
+  "id": "sectionme/ferrisres-top-k-teacher-logits",
   "title": "FerrisRes top-k teacher logits",
   "code_file": "qwen3_topk_teacher.ipynb",
   "language": "python",
