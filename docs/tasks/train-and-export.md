@@ -1,8 +1,13 @@
 # `train` and export
 
-Status: **task specification.** `train` is currently a stub; the f32 reference
-model with a verified backward exists in `src/training/f32_trainer.rs` and is
-not wired to the CLI.
+Status: **learning implemented at `d81becf` on `feat/train-cli`; export open.**
+`train` now calls `training::train_loop::run` on the f32 reference model:
+forward → shifted cross-entropy → backward → Adam, gradient accumulation over
+the batch, `FRTRAIN1` checkpoints and `--resume`. Verified by
+`tests/train_learns.rs`: 300 steps on a fixed sequence, loss 3.652375 →
+0.000944, `params_changed=true`; `cargo test -p ferrisres --lib` 1630 passed.
+Remaining: export, the BPE/32k tokenizer, corpus-scale and 12-hour resume
+behaviour, and the block+LoRA path (separate defect).
 
 ## Goal
 
