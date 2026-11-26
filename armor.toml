@@ -6,7 +6,8 @@
 enabled = true  # L0: regex + bloom filters
 
 [l1]
-enabled = true  # L1: neural scanner
+enabled = false  # L1: neural scanner. Requires trained weights; enabling it
+                 # without [armor] l1_weights refuses startup.
 threshold = 0.7  # injection score threshold
 
 [l2] 
@@ -15,6 +16,13 @@ threshold = 0.7
 
 [l3]
 enabled = true  # L3: PII redaction
+
+[armor]
+# Path to trained L1 weights (FRAL). Produced by the bootstrap trainer in
+# src/training/armor_trainer.rs. Empty keeps L1 off. The file format and the
+# enable gate are specified in docs/tasks/armor-l1-enablement.md on the
+# docs/armor-l1 branch.
+l1_weights = ""
 
 # Self-learning feedback
 [feedback]

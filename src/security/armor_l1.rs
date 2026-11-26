@@ -21,12 +21,10 @@
 //!    zero-width characters, lowercase, collapse whitespace;
 //! 2. for each word emit one bucket token in `256..256+buckets`
 //!    (FNV-1a 64 hash of the normalised word modulo `buckets`);
-//! 3. if there is budget left, append the bytes of the normalised text, so
-//!    base64 blobs, paths and JSON punctuation remain visible after the word
-//!    tokens.
-//!
-//! Word tokens come first so a truncated scan still sees the words; bytes fill
-//! the tail of the budget.
+//! 3. if the word is not plain (`len > 24` or contains punctuation other than
+//!    `_`/`-`), append up to 8 byte tokens of that word, so base64 blobs,
+//!    paths and JSON punctuation remain visible without one long word
+//!    consuming the whole budget.
 //!
 //! The normalisation is an NFKC *subset*, not full Unicode NFKC: this crate
 //! has no Unicode normalisation dependency. German umlauts and `ß` are
@@ -258,11 +256,22 @@ pub fn fnv1a_64(bytes: &[u8]) -> u64 {
     hash
 }
 
+fn word_needs_bytes(word: &str) -> bool {
+    let len = word.chars().count();
+    if len > 24 {
+        return true;
+    }
+    !word
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+}
+
 /// Tokenize `text` into at most `max_tokens` token ids using `spec`.
 ///
-/// Word bucket tokens come first, then byte tokens of the normalised text.
-/// This function is shared by the scanner and the trainer, so a trained
-/// artefact and its runtime tokenizer cannot drift apart.
+/// Plain words cost one bucket token; a long or punctuated word additionally
+/// contributes up to 8 byte tokens. This function is shared by the scanner and
+/// the trainer, so a trained artefact and its runtime tokenizer cannot drift
+/// apart.
 pub fn tokenize_text(spec: &L1TokenizerSpec, text: &str, max_tokens: usize) -> Vec<u32> {
     let normalised = normalise_text(text);
     let mut out = Vec::with_capacity(max_tokens.min(64));
@@ -274,15 +283,19 @@ pub fn tokenize_text(spec: &L1TokenizerSpec, text: &str, max_tokens: usize) -> V
             continue;
         }
         if out.len() >= max_tokens {
-            return out;
-        }
-        out.push(L1_BYTE_VOCAB as u32 + (fnv1a_64(word.as_bytes()) % spec.buckets as u64) as u32);
-    }
-    for &b in normalised.as_bytes() {
-        if out.len() >= max_tokens {
             break;
         }
-        out.push(b as u32);
+        let bucket =
+            L1_BYTE_VOCAB as u32 + (fnv1a_64(word.as_bytes()) % spec.buckets as u64) as u32;
+        out.push(bucket);
+        if word_needs_bytes(word) {
+            for &b in word.as_bytes().iter().take(8) {
+                if out.len() >= max_tokens {
+                    break;
+                }
+                out.push(b as u32);
+            }
+        }
     }
     out
 }
@@ -1215,12 +1228,11 @@ mod tests {
     fn test_l1_tokenize() {
         let scanner = L1Scanner::new_random();
         let tokens = scanner.tokenize("hello world test");
-        // Three word buckets, then the bytes of the normalised text.
-        assert_eq!(tokens.len(), 3 + "hello world test".len());
-        assert!(tokens[..3]
+        // Plain words cost one bucket token each.
+        assert_eq!(tokens.len(), 3);
+        assert!(tokens
             .iter()
             .all(|&t| (t as usize) >= L1_BYTE_VOCAB && (t as usize) < scanner.config().vocab_size));
-        assert!(tokens[3..].iter().all(|&t| (t as usize) < L1_BYTE_VOCAB));
     }
 
     #[test]

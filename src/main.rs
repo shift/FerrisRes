@@ -87,6 +87,9 @@ enum Commands {
         /// Enable FerrisRes Armor (security filtering).
         #[arg(long)]
         armor: bool,
+        /// Path to trained Armor L1 weights (FRAL). Overrides [armor] l1_weights.
+        #[arg(long)]
+        armor_weights: Option<String>,
         /// Enable cognitive pipeline (concept memory + self-evaluation + LLM-Computer).
         #[arg(long)]
         cognitive: bool,
@@ -239,6 +242,9 @@ enum Commands {
         /// Enable FerrisRes Armor (security filtering).
         #[arg(long)]
         armor: bool,
+        /// Path to trained Armor L1 weights (FRAL). Overrides [armor] l1_weights.
+        #[arg(long)]
+        armor_weights: Option<String>,
         /// Enable cognitive pipeline.
         #[arg(long)]
         cognitive: bool,
@@ -270,9 +276,9 @@ async fn main() -> anyhow::Result<()> {
             model_path, config, config_path, model_format, tokenizer,
             hidden_dim, num_blocks, block_size, prompt,
             max_tokens, temperature, template, yarn_scale, image,
-            armor, cognitive, concepts_path, persist_kv, kv_path,
+            armor, armor_weights, cognitive, concepts_path, persist_kv, kv_path,
             student, moe_experts, lora_path,
-        } => cmd_infer(model_path, config, config_path, model_format, tokenizer, hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale, image, armor, cognitive, concepts_path, persist_kv, kv_path, student, moe_experts, lora_path).await,
+        } => cmd_infer(model_path, config, config_path, model_format, tokenizer, hidden_dim, num_blocks, block_size, prompt, max_tokens, temperature, template, yarn_scale, image, armor, armor_weights, cognitive, concepts_path, persist_kv, kv_path, student, moe_experts, lora_path).await,
         Commands::Benchmark {
             hidden_dim,
             num_blocks,
@@ -290,8 +296,8 @@ async fn main() -> anyhow::Result<()> {
         } => cmd_evaluate(model_path, config, text).await,
         Commands::Serve {
             model_path, config, model_format, tokenizer,
-            host, port, model_name, armor, cognitive, concepts_path,
-        } => cmd_serve(model_path, config, model_format, tokenizer, host, port, model_name, armor, cognitive, concepts_path).await,
+            host, port, model_name, armor, armor_weights, cognitive, concepts_path,
+        } => cmd_serve(model_path, config, model_format, tokenizer, host, port, model_name, armor, armor_weights, cognitive, concepts_path).await,
     }
 }
 
@@ -523,6 +529,49 @@ async fn cmd_train(
     Ok(())
 }
 
+/// Resolve the Armor layer for a production start.
+///
+/// `--armor-weights` wins over `[armor] l1_weights` in `armor.toml`. L1 is
+/// enabled when a path is configured or when `[l1] enabled = true`. Enabled
+/// without a path is a startup error; no effective L1 path keeps L1 off and
+/// logs it.
+fn resolve_armor_layer(
+    armor: bool,
+    armor_weights: Option<String>,
+) -> anyhow::Result<Option<ferrisres::ArmorLayer>> {
+    if !armor {
+        return Ok(None);
+    }
+    info!(event = "armor_enabled", "FerrisRes Armor security enabled");
+    let file_cfg = ferrisres::ArmorFileConfig::load_if_exists(std::path::Path::new("armor.toml"))
+        .map_err(|e| anyhow::anyhow!("failed to read armor.toml: {e}"))?;
+    let weights = armor_weights
+        .map(std::path::PathBuf::from)
+        .or_else(|| file_cfg.l1_weights.clone().map(std::path::PathBuf::from));
+    let l1_enabled = file_cfg.l1_enabled.unwrap_or(false) || weights.is_some();
+    if l1_enabled && weights.is_none() {
+        anyhow::bail!(
+            "L1 is enabled in armor.toml but no weights path is configured; \
+             set --armor-weights or [armor] l1_weights \
+             (see docs/tasks/armor-l1-enablement.md)"
+        );
+    }
+    if !l1_enabled {
+        info!(
+            event = "armor_l1_disabled",
+            "Armor L1 disabled: no weights path configured; L0/L2/L3 only"
+        );
+    }
+    let config = ferrisres::ArmorConfig {
+        l1_enabled,
+        l1_threshold: file_cfg.l1_threshold.unwrap_or(0.7),
+        ..Default::default()
+    };
+    let layer = ferrisres::ArmorLayer::try_with_config(config, weights.as_deref())
+        .map_err(|e| anyhow::anyhow!("refusing to start Armor: {e}"))?;
+    Ok(Some(layer))
+}
+
 async fn cmd_infer(
     model_path: Option<String>,
     config_name: String,
@@ -539,6 +588,7 @@ async fn cmd_infer(
     yarn_scale: Option<f32>,
     image: Option<String>,
     armor: bool,
+    armor_weights: Option<String>,
     cognitive: bool,
     concepts_path: Option<String>,
     persist_kv: bool,
@@ -549,13 +599,9 @@ async fn cmd_infer(
 ) -> anyhow::Result<()> {
     info!(event = "initializing_inference_pipeline", "Initializing inference pipeline");
 
-    // Initialize Armor if enabled
-    let mut armor_layer = if armor {
-        info!(event = "armor_enabled", "FerrisRes Armor security enabled");
-        Some(ferrisres::ArmorLayer::new())
-    } else {
-        None
-    };
+    // Initialize Armor if enabled. L1 is only loaded when a weights path is
+    // configured; an enabled L1 without weights refuses to start.
+    let mut armor_layer = resolve_armor_layer(armor, armor_weights)?;
     
     // Check prompt with Armor before generation
     if let Some(ref mut layer) = armor_layer {
@@ -2457,11 +2503,16 @@ async fn cmd_serve(
     port: u16,
     model_name: String,
     armor: bool,
+    armor_weights: Option<String>,
     cognitive: bool,
     concepts_path: Option<String>,
 ) -> anyhow::Result<()> {
     info!(event = "ferrisres_serve", "=== FerrisRes API Server ===");
     info!(event = "server_config", host = %host, port = port, model = %model_name, "Starting server");
+
+    // Resolve Armor before binding: an L1 configuration that cannot load
+    // refuses to start rather than falling back to a random scanner.
+    let armor_layer = resolve_armor_layer(armor, armor_weights)?;
 
     // Load real model if provided
     let loaded_model = if let Some(ref path) = model_path {
@@ -2539,7 +2590,7 @@ async fn cmd_serve(
         model_name: model_name.clone(),
         tokenizer,
         loaded_model,
-        _armor: armor,
+        _armor: armor_layer,
     });
 
     let server_config = ferrisres::server::ApiServerConfig {
@@ -2566,7 +2617,8 @@ struct FerrisResApiHandler {
     model_name: String,
     tokenizer: Arc<dyn Send + Sync + Fn(&str) -> Vec<u32>>,
     loaded_model: Option<Gemma4Teacher>,
-    _armor: bool,
+    /// Resolved but not yet invoked: the per-request hook is future work.
+    _armor: Option<ferrisres::ArmorLayer>,
 }
 
 impl ferrisres::server::ApiHandler for FerrisResApiHandler {

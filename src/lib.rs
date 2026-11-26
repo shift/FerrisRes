@@ -26,6 +26,7 @@ pub use security::{
     armor::ArmorLayer, 
     armor::ArmorConfig, 
     armor::ArmorError,
+    armor::ArmorFileConfig,
     armor::SecurityVerdict,
     armor::ViolationRecord,
     armor::ViolationSource,

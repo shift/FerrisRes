@@ -32,6 +32,93 @@ pub enum ArmorError {
 }
 
 // ---------------------------------------------------------------------------
+// File configuration and L1 resolution
+// ---------------------------------------------------------------------------
+
+/// The subset of `armor.toml` the runtime needs.
+///
+/// `[armor] l1_weights` is the default weights path; `[armor] l1_enabled` and
+/// `[l1] enabled` say whether the operator asked for L1. The parser is
+/// deliberately tiny: no TOML dependency, scalar keys only, unknown keys
+/// ignored.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ArmorFileConfig {
+    /// `[armor] l1_weights`; `None` when absent or empty.
+    pub l1_weights: Option<String>,
+    /// `[armor] l1_enabled` or `[l1] enabled`.
+    pub l1_enabled: Option<bool>,
+    /// `[armor] l1_threshold` or `[l1] threshold`.
+    pub l1_threshold: Option<f32>,
+}
+
+impl ArmorFileConfig {
+    /// Parse the `[armor]` and `[l1]` sections of `armor.toml`.
+    pub fn parse(text: &str) -> Self {
+        let mut cfg = Self::default();
+        let mut section = String::new();
+        for raw in text.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('[') && line.ends_with(']') {
+                section = line[1..line.len() - 1].trim().to_string();
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            let value = value.trim().trim_matches('"').trim_matches('\'');
+            match (section.as_str(), key) {
+                ("armor", "l1_weights") => {
+                    if !value.is_empty() {
+                        cfg.l1_weights = Some(value.to_string());
+                    }
+                }
+                ("armor", "l1_enabled") => cfg.l1_enabled = value.parse().ok(),
+                ("armor", "l1_threshold") => cfg.l1_threshold = value.parse().ok(),
+                ("l1", "enabled") if cfg.l1_enabled.is_none() => {
+                    cfg.l1_enabled = value.parse().ok();
+                }
+                ("l1", "threshold") if cfg.l1_threshold.is_none() => {
+                    cfg.l1_threshold = value.parse().ok();
+                }
+                _ => {}
+            }
+        }
+        cfg
+    }
+
+    /// Load `path`, returning defaults when it does not exist.
+    pub fn load_if_exists(path: &Path) -> std::io::Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Ok(Self::parse(&text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Resolve L1 for a production start.
+///
+/// - `enabled == false` returns `None` and never touches the file system.
+/// - `enabled == true` with no path is [`ArmorError::MissingWeights`].
+/// - `enabled == true` with a path loads and validates the `FRAL` file.
+pub fn resolve_l1_scanner(
+    enabled: bool,
+    weights: Option<&Path>,
+) -> Result<Option<L1Scanner>, ArmorError> {
+    if !enabled {
+        return Ok(None);
+    }
+    match weights {
+        Some(path) => Ok(Some(L1Scanner::load(path)?)),
+        None => Err(ArmorError::MissingWeights),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Security verdict
 // ---------------------------------------------------------------------------
 
@@ -176,9 +263,8 @@ impl ArmorLayer {
         config: ArmorConfig,
         weights_path: Option<&Path>,
     ) -> Result<Self, ArmorError> {
-        let mut l1 = match weights_path {
-            Some(path) => L1Scanner::load(path)?,
-            None if config.l1_enabled => return Err(ArmorError::MissingWeights),
+        let mut l1 = match resolve_l1_scanner(config.l1_enabled, weights_path)? {
+            Some(scanner) => scanner,
             None => L1Scanner::placeholder(),
         };
         l1.set_threshold(config.l1_threshold);
@@ -565,6 +651,59 @@ mod tests {
             Err(ArmorError::L1Load(_)) => {}
             other => panic!("expected L1Load, got {:?}", other.err()),
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_armor_file_config_parse() {
+        let cfg = ArmorFileConfig::parse(
+            "[l1]\nenabled = false\nthreshold = 0.62\n\n[armor]\nl1_weights = \"/tmp/l1.bin\"\nl1_enabled = true\n",
+        );
+        assert_eq!(cfg.l1_weights.as_deref(), Some("/tmp/l1.bin"));
+        assert_eq!(cfg.l1_enabled, Some(true));
+        assert!((cfg.l1_threshold.unwrap() - 0.62).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_armor_file_config_empty_weights_is_none() {
+        let cfg = ArmorFileConfig::parse("[armor]\nl1_weights = \"\"\n");
+        assert_eq!(cfg.l1_weights, None);
+        // Missing file returns defaults, not an error.
+        let defaults = ArmorFileConfig::load_if_exists(std::path::Path::new(
+            "/nonexistent/ferrisres-armor.toml",
+        ))
+        .expect("missing file is not an error");
+        assert_eq!(defaults, ArmorFileConfig::default());
+    }
+
+    #[test]
+    fn test_resolve_l1_disabled_does_not_load() {
+        // The path cannot exist; Ok(None) proves the file is never opened.
+        assert!(matches!(
+            resolve_l1_scanner(false, Some(std::path::Path::new("/nonexistent/l1.bin"))),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn test_resolve_l1_enabled_without_path_errors() {
+        match resolve_l1_scanner(true, None) {
+            Err(ArmorError::MissingWeights) => {}
+            other => panic!("expected MissingWeights, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn test_resolve_l1_enabled_with_path_loads() {
+        let dir = std::env::temp_dir().join("ferrisres-armor-layer-tests");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join(format!("resolve-{}.bin", std::process::id()));
+        L1Scanner::new_random().save(&path).expect("save weights");
+        let scanner = resolve_l1_scanner(true, Some(&path))
+            .expect("load")
+            .expect("some scanner");
+        assert_eq!(scanner.config().hidden_dim, 192);
+        assert_eq!(scanner.config().num_layers, 3);
         let _ = std::fs::remove_file(&path);
     }
 

@@ -21,6 +21,12 @@
 //! * German is written by the author of this file, not reviewed by a native
 //!   speaker.
 //!
+//! Every template is followed by a fixed, benign filler document (English or
+//! German) so a 256-position scan contains real tokens at every position. The
+//! filler is identical across examples of a language, so its pooled
+//! contribution is a constant offset rather than noise; the injection or the
+//! benign template still sits in the first tokens.
+//!
 //! Split policy: 20 injection families and 20 benign families, 100 examples
 //! each (2 000 + 2 000). Fourteen families of each class go to train, three
 //! to dev and three to test, so the split is 70/15/15 **by template family**.
@@ -110,18 +116,36 @@ struct Family {
     generator: fn(usize) -> String,
 }
 
-/// Build the bootstrap corpus (2 000 injection + 2 000 benign, 70/15/15).
+/// Build the bootstrap corpus (2 000 injection + 2 000 benign, 70/15/15),
+/// with the long-form filler so every example reaches 256 tokens.
 pub fn build_bootstrap_corpus() -> Corpus {
-    let families = families();
+    build(&families(), 100, true)
+}
+
+/// Small, short-form fixture for the fast train/export/load test.
+///
+/// 128 train / 64 dev / 64 test examples, 16 per family, no filler, so the
+/// tokenizer sees at most a few dozen tokens per example. This is a plumbing
+/// fixture, not a corpus for measurement.
+pub fn build_small_fixture() -> Corpus {
+    build(&small_families(), 16, false)
+}
+
+fn build(families: &[Family], per_family: usize, filler: bool) -> Corpus {
     let mut corpus = Corpus {
         train: Vec::new(),
         dev: Vec::new(),
         test: Vec::new(),
     };
-    for family in &families {
-        for i in 0..100 {
+    for family in families {
+        for i in 0..per_family {
+            let text = (family.generator)(i);
             let example = Example {
-                text: (family.generator)(i),
+                text: if filler {
+                    with_filler(&text, family.lang)
+                } else {
+                    text
+                },
                 label: family.label,
                 lang: family.lang,
                 family: family.name,
@@ -137,6 +161,28 @@ pub fn build_bootstrap_corpus() -> Corpus {
         }
     }
     corpus
+}
+
+// ---------------------------------------------------------------------------
+// Long-form filler
+// ---------------------------------------------------------------------------
+
+/// Benign filler, no punctuation (so every word is one bucket token). Around
+/// 80 words per block; four blocks clear the 256-token budget.
+const FILLER_EN: &str = "the service writes a structured log entry for every request and stores the result in the archive each report lists the timestamp the request identifier the status code and the duration in milliseconds the operator can filter the archive by date and by service name a maintenance window is announced one week in advance the documentation describes the configuration fields and the default values tests run on the build host and publish their output to the dashboard the release notes summarise the changes and the known limitations";
+
+/// German filler, no punctuation, same purpose.
+const FILLER_DE: &str = "der dienst schreibt für jede anfrage einen eintrag ins protokoll und legt das ergebnis im archiv ab jeder bericht enthält den zeitstempel die anfragekennung den statuscode und die dauer in millisekunden der betreiber kann das archiv nach datum und nach dienstnamen filtern ein wartungsfenster wird eine woche vorher angekündigt die dokumentation beschreibt die konfigurationsfelder und die standardwerte die tests laufen auf dem build rechner und veröffentlichen ihre ausgabe im dashboard die versionshinweise fassen die änderungen und die bekannten einschränkungen zusammen";
+
+fn with_filler(text: &str, lang: &str) -> String {
+    let block = if lang == "de" { FILLER_DE } else { FILLER_EN };
+    let mut out = String::with_capacity(text.len() + block.len() * 4 + 4);
+    out.push_str(text);
+    for _ in 0..4 {
+        out.push(' ');
+        out.push_str(block);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,6 +1164,33 @@ fn families() -> Vec<Family> {
     ]
 }
 
+/// Short-form families for the fast smoke test.
+///
+/// Eight train families, four dev and four test families of 16 examples each:
+/// 128 / 64 / 64. Test families still share vocabulary with train (the
+/// override templates reuse the same action phrases), so a one-epoch model has
+/// something to learn from.
+fn small_families() -> Vec<Family> {
+    vec![
+        Family { name: "en-ignore-previous", lang: "en", label: 1, split: Split::Train, generator: en_ignore_previous },
+        Family { name: "en-you-are-now", lang: "en", label: 1, split: Split::Train, generator: en_you_are_now },
+        Family { name: "de-ignore-previous", lang: "de", label: 1, split: Split::Train, generator: de_ignore_previous },
+        Family { name: "de-du-bist-jetzt", lang: "de", label: 1, split: Split::Train, generator: de_du_bist_jetzt },
+        Family { name: "json-status", lang: "en", label: 0, split: Split::Train, generator: json_status },
+        Family { name: "log-info", lang: "en", label: 0, split: Split::Train, generator: log_info },
+        Family { name: "de-weather", lang: "de", label: 0, split: Split::Train, generator: de_weather },
+        Family { name: "en-request", lang: "en", label: 0, split: Split::Train, generator: en_request },
+        Family { name: "en-reveal-system", lang: "en", label: 1, split: Split::Dev, generator: en_reveal_system },
+        Family { name: "de-systemprompt", lang: "de", label: 1, split: Split::Dev, generator: de_systemprompt },
+        Family { name: "json-nested", lang: "en", label: 0, split: Split::Dev, generator: json_nested },
+        Family { name: "de-email", lang: "de", label: 0, split: Split::Dev, generator: de_email },
+        Family { name: "en-override", lang: "en", label: 1, split: Split::Test, generator: en_override },
+        Family { name: "de-override", lang: "de", label: 1, split: Split::Test, generator: de_override },
+        Family { name: "shell-git", lang: "en", label: 0, split: Split::Test, generator: shell_git },
+        Family { name: "de-docs", lang: "de", label: 0, split: Split::Test, generator: de_docs },
+    ]
+}
+
 /// Standard base64 with padding. Dependency-free.
 fn base64(input: &str) -> String {
     const ALPHABET: &[u8; 64] =
@@ -1168,6 +1241,30 @@ mod tests {
     use super::*;
     use crate::security::armor_l1::{normalise_text, tokenize_text, L1TokenizerSpec};
     use std::collections::HashSet;
+
+    #[test]
+    fn test_small_fixture_sizes_and_lengths() {
+        let corpus = build_small_fixture();
+        assert_eq!(corpus.train.len(), 128);
+        assert_eq!(corpus.dev.len(), 64);
+        assert_eq!(corpus.test.len(), 64);
+        assert_eq!(corpus.injection_count(), 128);
+        assert_eq!(corpus.benign_count(), 128);
+        let spec = L1TokenizerSpec::default();
+        for e in corpus.train.iter().chain(&corpus.dev).chain(&corpus.test) {
+            let tokens = tokenize_text(&spec, &e.text, 64);
+            assert!(!tokens.is_empty());
+            assert!(tokens.len() <= 64);
+            // Short-form: no filler, so the text stays far below the filler
+            // documents (about 1.5 KB each).
+            assert!(
+                e.text.len() < 600,
+                "small fixture example looks filled: {} bytes in {}",
+                e.text.len(),
+                e.family
+            );
+        }
+    }
 
     #[test]
     fn test_corpus_sizes_and_balance() {
@@ -1266,7 +1363,15 @@ mod tests {
         for e in corpus.train.iter().chain(&corpus.dev).chain(&corpus.test) {
             let tokens = tokenize_text(&spec, &e.text, 256);
             assert!(!tokens.is_empty(), "no tokens for {:?}", e.text);
-            assert!(tokens.len() <= 256);
+            // The filler guarantees 256 real tokens, so a full-length scan is
+            // not padding.
+            assert_eq!(
+                tokens.len(),
+                256,
+                "family {} produced only {} tokens",
+                e.family,
+                tokens.len()
+            );
         }
     }
 
