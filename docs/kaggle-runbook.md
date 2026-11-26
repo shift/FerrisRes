@@ -26,6 +26,15 @@ the procedure that keeps a 12-hour session from costing a week.
 4. A **resumable** training command. `distill` already has `--resume`; `train`
    does not until `tasks/train-and-export.md` is implemented.
 
+## Credentials
+
+The Kaggle API token is an **operator credential** — a `kaggle.json` with
+`username` and `key`. Use it for the run only, from the environment; never
+commit it, copy it into a worktree, or paste it into a notebook. On Kaggle
+itself, use the Secrets UI; locally, read the two values into
+`KAGGLE_USERNAME` / `KAGGLE_KEY` for the command that needs them, and do not
+echo them.
+
 ## Session procedure
 
 1. **Verify the GPU before anything else.**
