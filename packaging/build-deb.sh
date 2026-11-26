@@ -3,19 +3,20 @@ set -e
 # Build the ferrisres .deb package
 # Usage: ./build-deb.sh [output-dir]
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+OUTPUT_DIR="${2:-${ROOT_DIR}/target/deb}"
+
 # Version: explicit argument, else the crate version. The binary and the
 # package must agree; CI passes the value read from Cargo.toml.
 if [ -n "${1:-}" ]; then
   VERSION="$1"
 else
-  VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "${SCRIPT_DIR}/../Cargo.toml" | head -1)"
+  VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "${ROOT_DIR}/Cargo.toml" | head -1)"
 fi
 [ -n "$VERSION" ] || { echo "ERROR: cannot determine version" >&2; exit 1; }
 ARCH="amd64"
 PKG_NAME="ferrisres_${VERSION}_${ARCH}"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-OUTPUT_DIR="${2:-${ROOT_DIR}/target/deb}"
 
 echo "Building ferrisres ${VERSION} .deb package..."
 
