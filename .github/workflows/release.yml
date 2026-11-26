@@ -212,6 +212,15 @@ jobs:
       - name: Build release binary
         run: cargo build --release --no-default-features --features vulkan
 
+      - name: Check the tag matches the crate version
+        run: |
+          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          tag="${GITHUB_REF#refs/tags/v}"
+          if [ "$crate" != "$tag" ]; then
+            echo "tag v$tag does not match Cargo.toml $crate" >&2
+            exit 1
+          fi
+
       - name: Extract version from tag
         id: version
         run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"

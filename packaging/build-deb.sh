@@ -3,7 +3,14 @@ set -e
 # Build the ferrisres .deb package
 # Usage: ./build-deb.sh [output-dir]
 
-VERSION="${1:-0.2.1}"
+# Version: explicit argument, else the crate version. The binary and the
+# package must agree; CI passes the value read from Cargo.toml.
+if [ -n "${1:-}" ]; then
+  VERSION="$1"
+else
+  VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "${SCRIPT_DIR}/../Cargo.toml" | head -1)"
+fi
+[ -n "$VERSION" ] || { echo "ERROR: cannot determine version" >&2; exit 1; }
 ARCH="amd64"
 PKG_NAME="ferrisres_${VERSION}_${ARCH}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -27,6 +34,20 @@ fi
 cp "${ROOT_DIR}/target/release/ferrisres" "${OUTPUT_DIR}/${PKG_NAME}/usr/bin/ferrisres"
 strip "${OUTPUT_DIR}/${PKG_NAME}/usr/bin/ferrisres" 2>/dev/null || true
 chmod 755 "${OUTPUT_DIR}/${PKG_NAME}/usr/bin/ferrisres"
+
+# Portability guard. Colab and Kaggle run Ubuntu 22.04 (GLIBC 2.35). A binary
+# linked against a newer glibc builds here and fails there at the loader.
+# Build the package on ubuntu-22.04 (CI); a NixOS build is not shippable.
+GLIBC_MAX="$(objdump -T "${OUTPUT_DIR}/${PKG_NAME}/usr/bin/ferrisres" 2>/dev/null \
+  | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -V | tail -1)"
+if [ -n "$GLIBC_MAX" ] && [ "$(printf '%s\n2.35\n' "$GLIBC_MAX" | sort -V | tail -1)" != "2.35" ]; then
+  echo "ERROR: the binary requires GLIBC_${GLIBC_MAX}; Colab/Kaggle need <= 2.35." >&2
+  echo "Build the .deb on ubuntu-22.04 (CI), not on this host." >&2
+  if [ "${FERRISRES_DEB_ALLOW_GLIBC:-0}" != "1" ]; then
+    exit 1
+  fi
+  echo "WARNING: continuing because FERRISRES_DEB_ALLOW_GLIBC=1; this package will not run on Kaggle." >&2
+fi
 
 # NVIDIA Vulkan ICD — makes GPU visible on Colab/AWS/GCP cloud instances
 # where driver libs exist but ICD JSON is missing

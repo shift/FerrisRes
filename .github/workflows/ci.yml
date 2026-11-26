@@ -70,12 +70,16 @@ jobs:
       - name: Build release binary
         run: cargo build --release --no-default-features --features vulkan
 
+      - name: Read crate version
+        id: crate
+        run: echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+
       - name: Build .deb package
-        run: ./packaging/build-deb.sh 0.2.1
+        run: ./packaging/build-deb.sh ${{ steps.crate.outputs.version }}
 
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
         with:
           name: ferrisres-colab-amd64
-          path: target/deb/ferrisres_0.2.1_amd64.deb
+          path: target/deb/ferrisres_${{ steps.crate.outputs.version }}_amd64.deb
           retention-days: 30
