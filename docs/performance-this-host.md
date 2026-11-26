@@ -134,3 +134,26 @@ wired to `infer` yet.
 Until those exist, the honest summary is: **Nano ~170, Small ~65, Base/Large ~20
 tok/s decode if the 2.5× gap holds; first-token latency is dominated by prefill
 and needs the prefix cache; training on this host is not viable.**
+
+## Achieved efficiency on the HD 530 (measured 2026-11-26)
+
+One shape, timed end to end with the release build, `--device gpu`, batch 4:
+
+| hidden | seq | steps | seconds | s/step | tok/s (train) |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 128 | 40 | 187 | **4.676** | **109.5** |
+
+`intel_gpu_top` during the same load: **Render/3D ~97–100%**, IMC reads 1.8–2.8
+GB/s, writes 0.76 GB/s.
+
+Working out what that means: a hidden-64, 8-layer window of 128 tokens is roughly
+`6 × 0.5M params × 128 ≈ 4.0e8` FLOP forward+backward, and one window takes
+~1.17 s (4.676 s per step ÷ 4 windows). That is **≈0.34 GFLOP/s**, against a
+fp32 peak of ~0.4 TFLOPS for 24 EUs — **about 0.09% of peak**, with the EUs
+reported fully busy.
+
+So the GPU is not idle and not waiting on memory: it is issuing roughly a
+thousand instructions per useful multiply-add. Every earlier "tok/s" estimate in
+these docs assumed a kernel that converts instructions into MACs at a normal
+rate; this engine's does not, and that gap — not bandwidth, not dispatch — is the
+single largest number in the performance budget.
