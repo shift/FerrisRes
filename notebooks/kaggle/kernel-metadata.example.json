@@ -1,0 +1,16 @@
+{
+  "id": "YOUR_USERNAME/ferrisres-teacher-benchmark",
+  "title": "FerrisRes teacher benchmark",
+  "code_file": "teacher_benchmark.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4x2",
+  "dataset_sources": [
+    "YOUR_USERNAME/ferrisres-deb"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}
