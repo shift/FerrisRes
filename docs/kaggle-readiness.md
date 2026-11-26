@@ -11,7 +11,7 @@ about the target. The smoke must run `--device gpu` and show the T4.
 | 1 | **GPU training loop** — wgpu forward, backward, Adam, `train --device gpu`, FRTRAIN1 read-back | **critical path**, branch not pushed (`feat/gpu-train-loop`) | agent |
 | 2 | parity and learning gates: logits/gradients vs f32, loss falls, parameters change | the agent's Phase B/C | agent |
 | 3 | **Vulkan on the Kaggle T4** — `ferrisres devices` must list the T4, not llvmpipe | **unverified**; the `.deb` ships an NVIDIA ICD, the image must expose the driver | first session |
-| 4 | `.deb` with the GPU loop, built on ubuntu:22.04 with `--features vulkan` | after 1 | agent |
+| 4 | `.deb` with the GPU loop, built on ubuntu:22.04 with `--features vulkan` | **0.2.4 exists** (`int/kaggle-deb` `efdde0b`, 5.7 MiB, sha `a87a81a9…`) with train + export + devices, but **no GPU loop**; it is the integration base, not the Kaggle artefact | agent |
 | 5 | GPU smoke notebook: `nvidia-smi`, `devices` shows T4, `train --device gpu` 20 steps, loss falls, tokens/s recorded | updated, not runnable until 1 | — |
 | 6 | checkpoint read-back, export, infer from the GPU-trained checkpoint | after 1 | agent |
 | 7 | resume from a GPU checkpoint across a 12-hour session | after 1 | agent |

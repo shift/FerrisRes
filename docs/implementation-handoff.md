@@ -47,7 +47,7 @@ up one task at a time without making design decisions. If a task needs a decisio
 | branch | work | state |
 |---|---|---|
 | `feat/corpus-builder` | corpus builder v1 | **landed** at `b3a9a89`, 6/6 tests; the source adapters task is unblocked |
-| `int/kaggle-deb` | 0.2.4 `.deb` (train + export) | agent running |
+| `int/kaggle-deb` | 0.2.4 `.deb` (train + export) | **landed** at `efdde0b`, 15/15 gate; CPU only |
 | `feat/gpu-train-loop` | wgpu training loop | agent running, not pushed |
 | `int/train-multi-gpu` | multi-process local SGD | **landed (CPU only)** at `11fb681`; GPU wiring still needs the wgpu loop |
 | `feat/prefix-kv-cache` | prefix KV cache | agent running, not pushed |

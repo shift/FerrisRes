@@ -69,7 +69,7 @@ released when it is in a tagged `.deb`. The Rust API reference is separate
 
 | command | owner |
 |---|---|
-| `ferrisres export --checkpoint … --output …` | `feat/train-export` (`44a9409`) | writes `.safetensors` + `.json`; `infer --model-format safetensors` loads it |
+| `ferrisres export --checkpoint … --output …` | in 0.2.4 (`int/kaggle-deb` `efdde0b`) | writes `.safetensors` + `.json`; `infer --model-format safetensors` loads it |
 | `ferrisres corpus build/verify/stats/sample` | `corpus-builder.md` |
 | `ferrisres eval --suite …` | `eval-runner.md` |
 | `ferrisres tokenizer train/inspect/fertility` | `tokenizer.md` |
