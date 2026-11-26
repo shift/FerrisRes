@@ -177,7 +177,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) row
     let cc = c_shared;
     for (var i = c; i < p.dim; i = i + 256u) {
         let idx = row.x * p.dim + i;
-        dx[idx] = inv * dy[idx] - cc * x[idx];
+        dx[idx] = dx[idx] + inv * dy[idx] - cc * x[idx];
     }
 }
 "#;
@@ -206,7 +206,7 @@ struct P { numel: u32, cols: u32, rows: u32, _pad: u32 }
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= p.numel) { return; }
-    da[i] = dout[i] * w[i % p.cols];
+    da[i] = da[i] + dout[i] * w[i % p.cols];
 }
 "#;
 
@@ -224,7 +224,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var r = 0u; r < p.rows; r = r + 1u) {
         s = s + dout[r * p.cols + c] * a[r * p.cols + c];
     }
-    dw[c] = s;
+    dw[c] = dw[c] + s;
 }
 "#;
 
@@ -259,8 +259,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let s = 1.0 / (1.0 + exp(-g));
     let silu = g * s;
     // silu'(g) = s * (1 + g * (1 - s))
-    dgate[i] = dout[i] * up[i] * s * (1.0 + g * (1.0 - s));
-    dup[i] = dout[i] * silu;
+    dgate[i] = dgate[i] + dout[i] * up[i] * s * (1.0 + g * (1.0 - s));
+    dup[i] = dup[i] + dout[i] * silu;
 }
 "#;
 
@@ -313,8 +313,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let s = sin(angle);
     let da = dx[base + d];
     let db = dx[base + d + half];
-    dout[base + d] = da * c + db * s;
-    dout[base + d + half] = -da * s + db * c;
+    dout[base + d] = dout[base + d] + da * c + db * s;
+    dout[base + d + half] = dout[base + d + half] - da * s + db * c;
 }
 "#;
 
@@ -358,7 +358,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let h = kvh * group + g;
         s = s + dout[(t * p.heads + h) * p.head_dim + d];
     }
-    dkv[i] = s;
+    dkv[i] = dkv[i] + s;
 }
 "#;
 
@@ -480,7 +480,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let kb = (s * p.heads + h) * p.head_dim;
             acc = acc + ds[row + s] * p.scale * k[kb + d];
         }
-        dq[base + d] = acc;
+        dq[base + d] = dq[base + d] + acc;
     }
 }
 "#;
@@ -509,8 +509,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             dk_acc = dk_acc + ds[row + s] * p.scale * q[tb + d];
             dv_acc = dv_acc + probs[row + s] * dout[tb + d];
         }
-        dk[base + d] = dk_acc;
-        dv[base + d] = dv_acc;
+        dk[base + d] = dk[base + d] + dk_acc;
+        dv[base + d] = dv[base + d] + dv_acc;
     }
 }
 "#;
@@ -549,7 +549,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var t = 0u; t < p.seq; t = t + 1u) {
         if (ids[t] == v) { s = s + dout[t * p.hidden + d]; }
     }
-    dtable[i] = s;
+    dtable[i] = dtable[i] + s;
 }
 "#;
 
@@ -577,46 +577,28 @@ struct P { numel: u32, _a: u32, _b: u32, _c: u32 }
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= p.numel) { return; }
-    dx[i] = dout[i] * scalar[0];
+    dx[i] = dx[i] + dout[i] * scalar[0];
 }
 "#;
 
-const LAYER_SCALE_BWD_S_PARTIAL: &str = r#"
+const LAYER_SCALE_BWD_S: &str = r#"
 struct P { numel: u32, _a: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<storage, read> dout: array<f32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
-@group(0) @binding(2) var<storage, read_write> partials: array<f32>;
+@group(0) @binding(2) var<storage, read_write> dscalar: array<f32>;
 @group(0) @binding(3) var<uniform> p: P;
-var<workgroup> sh: array<f32, 256>;
-@compute @workgroup_size(256)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>) {
-    let c = lid.x;
-    var s = 0.0;
-    for (var i = wg.x * 256u + c; i < p.numel; i = i + 256u) {
-        s = s + dout[i] * x[i];
-    }
-    sh[c] = s;
-    workgroupBarrier();
-    var stride = 128u;
-    while (stride > 0u) {
-        if (c < stride) { sh[c] = sh[c] + sh[c + stride]; }
-        workgroupBarrier();
-        stride = stride / 2u;
-    }
-    if (c == 0u) { partials[wg.x] = sh[0]; }
-}
-"#;
-
-const LAYER_SCALE_BWD_S_FINAL: &str = r#"
-struct P { n: u32, _a: u32, _b: u32, _c: u32 }
-@group(0) @binding(0) var<storage, read> partials: array<f32>;
-@group(0) @binding(1) var<storage, read_write> dscalar: array<f32>;
-@group(0) @binding(2) var<uniform> p: P;
 @compute @workgroup_size(1)
 fn main() {
+    // Deliberately sequential and in ascending index order. The CPU oracle
+    // sums this gradient the same way; a tree reduction changes the low bits,
+    // and Adam divides by |g| + eps, so with |g| ~ 1e-7 the parameter moved
+    // 1.5e-3 differently when the order changed. Exact order costs one thread
+    // over `seq * hidden` per layer and removes that noise.
     var s = 0.0;
-    for (var i = 0u; i < p.n; i = i + 1u) { s = s + partials[i]; }
-    dscalar[0] = s;
+    for (var i = 0u; i < p.numel; i = i + 1u) {
+        s = s + dout[i] * x[i];
+    }
+    dscalar[0] = dscalar[0] + s;
 }
 "#;
 
@@ -647,8 +629,7 @@ pub struct TrainOps {
     embedding_bwd: Kernel,
     layer_scale_fwd: Kernel,
     layer_scale_bwd_x: Kernel,
-    layer_scale_bwd_s_partial: Kernel,
-    layer_scale_bwd_s_final: Kernel,
+    layer_scale_bwd_s: Kernel,
 }
 
 impl TrainOps {
@@ -673,8 +654,7 @@ impl TrainOps {
             embedding_bwd: kernel(d, "embedding_bwd", EMBEDDING_BWD, "main", &[true, true, false], true),
             layer_scale_fwd: kernel(d, "layer_scale_fwd", LAYER_SCALE_FWD, "main", &[true, true, false], true),
             layer_scale_bwd_x: kernel(d, "layer_scale_bwd_x", LAYER_SCALE_BWD_X, "main", &[true, true, false], true),
-            layer_scale_bwd_s_partial: kernel(d, "layer_scale_bwd_s_partial", LAYER_SCALE_BWD_S_PARTIAL, "main", &[true, true, false], true),
-            layer_scale_bwd_s_final: kernel(d, "layer_scale_bwd_s_final", LAYER_SCALE_BWD_S_FINAL, "main", &[true, false], true),
+            layer_scale_bwd_s: kernel(d, "layer_scale_bwd_s", LAYER_SCALE_BWD_S, "main", &[true, true, false], true),
             device,
             queue,
         }
@@ -980,27 +960,7 @@ impl TrainOps {
     ) -> Result<()> {
         let p = params_n(numel);
         self.dispatch(&self.layer_scale_bwd_x, enc, &[dout, scalar, dx], &p, (groups(numel, 256), 1, 1))?;
-        let n = groups(numel, 256);
-        let partials = GpuBuffer::zeros(
-            self.device.as_ref(),
-            self.queue.as_ref(),
-            n as usize * std::mem::size_of::<f32>(),
-            Some("layer_scale_partials"),
-        )?;
-        self.dispatch(
-            &self.layer_scale_bwd_s_partial,
-            enc,
-            &[dout, x, &partials],
-            &p,
-            (n, 1, 1),
-        )?;
-        self.dispatch(
-            &self.layer_scale_bwd_s_final,
-            enc,
-            &[&partials, dscalar],
-            &params_n(n),
-            (1, 1, 1),
-        )
+        self.dispatch(&self.layer_scale_bwd_s, enc, &[dout, x, dscalar], &p, (1, 1, 1))
     }
 }
 

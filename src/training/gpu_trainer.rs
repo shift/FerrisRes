@@ -51,6 +51,9 @@ pub struct GpuModel {
     param_order: Vec<String>,
     /// Gradient accumulation across `batch_size` windows.
     grad_acc: BTreeMap<String, GpuBuffer>,
+    /// Node ids from the most recent forward pass, keyed by a stable name.
+    /// Tests read them back to localise a parity failure to one op.
+    trace: BTreeMap<String, NodeId>,
     pub adam: AdamOptimizer,
 }
 
@@ -123,6 +126,7 @@ impl GpuModel {
             param_nodes,
             param_order,
             grad_acc: BTreeMap::new(),
+            trace: BTreeMap::new(),
             adam,
         })
     }
@@ -300,6 +304,7 @@ impl GpuModel {
         let eps = cfg.eps;
 
         self.graph.clear_activations();
+        self.trace.clear();
 
         let mut enc = self
             .device
@@ -338,11 +343,14 @@ impl GpuModel {
         self.elementwise
             .dispatch_scale(&mut enc, &self.node_buf(emb), &scaled, sqrt_h, (seq * h) as u32)?;
         let mut x = self.graph.record_scale(emb, scaled, sqrt_h, (seq * h) as u32)?;
+        self.trace.insert("embed_scaled".to_string(), x);
 
         for layer in 0..cfg.num_layers {
             let n = |suffix: &str| format!("layer{}.{}", layer, suffix);
             let attn_norm = self.rmsnorm_weighted(&mut enc, x, seq, h, &n("attn_norm"), "h_attn")?;
+            self.trace.insert(format!("L{layer}.h_attn"), attn_norm);
             let q_proj = self.matmul(&mut enc, attn_norm, &n("q"), seq, h, q_dim, "q_proj")?;
+            self.trace.insert(format!("L{layer}.q_proj"), q_proj);
             let k_proj = self.matmul(&mut enc, attn_norm, &n("k"), seq, h, kv_dim, "k_proj")?;
             let v_raw = self.matmul(&mut enc, attn_norm, &n("v"), seq, h, kv_dim, "v_raw")?;
 
@@ -363,6 +371,7 @@ impl GpuModel {
                 head_dim as u32,
                 eps,
             )?;
+            self.trace.insert(format!("L{layer}.v_norm"), v);
 
             let q_normed = self.rmsnorm_weighted(
                 &mut enc,
@@ -401,6 +410,7 @@ impl GpuModel {
                 cfg.rope_theta,
                 0,
             )?;
+            self.trace.insert(format!("L{layer}.q_rope"), q);
 
             let k_rope = self.alloc(seq * kv_dim, "k_rope")?;
             self.ops.rope_forward(
@@ -422,6 +432,7 @@ impl GpuModel {
                 cfg.rope_theta,
                 0,
             )?;
+            self.trace.insert(format!("L{layer}.k_rope"), k);
 
             // GQA: expand each KV head for its query group, then run one
             // causal attention op over the expanded layout.
@@ -486,12 +497,17 @@ impl GpuModel {
                 1.0,
             )?;
 
+            self.trace.insert(format!("L{layer}.attn"), attn);
             let attn_out = self.matmul(&mut enc, attn, &n("o"), seq, q_dim, h, "attn_out")?;
+            self.trace.insert(format!("L{layer}.attn_out"), attn_out);
             let post_attn =
                 self.rmsnorm_weighted(&mut enc, attn_out, seq, h, &n("post_attn_norm"), "post_attn")?;
+            self.trace.insert(format!("L{layer}.post_attn"), post_attn);
             let x_mid = self.add(&mut enc, x, post_attn, seq * h, "x_mid")?;
+            self.trace.insert(format!("L{layer}.x_mid"), x_mid);
 
             let h_ffn = self.rmsnorm_weighted(&mut enc, x_mid, seq, h, &n("pre_ffn_norm"), "h_ffn")?;
+            self.trace.insert(format!("L{layer}.h_ffn"), h_ffn);
             let gate = self.matmul(&mut enc, h_ffn, &n("gate"), seq, h, inter, "gate")?;
             let up = self.matmul(&mut enc, h_ffn, &n("up"), seq, h, inter, "up")?;
             let act = self.alloc(seq * inter, "act")?;
@@ -503,7 +519,10 @@ impl GpuModel {
                 (seq * inter) as u32,
             )?;
             let act = self.graph.record_silu_mul(gate, up, act, (seq * inter) as u32)?;
+            self.trace.insert(format!("L{layer}.gate"), gate);
+            self.trace.insert(format!("L{layer}.act"), act);
             let ffn_out = self.matmul(&mut enc, act, &n("down"), seq, inter, h, "ffn_out")?;
+            self.trace.insert(format!("L{layer}.ffn_out"), ffn_out);
             let post_ffn =
                 self.rmsnorm_weighted(&mut enc, ffn_out, seq, h, &n("post_ffn_norm"), "post_ffn")?;
             let summed = self.add(&mut enc, x_mid, post_ffn, seq * h, "x_sum")?;
@@ -523,9 +542,11 @@ impl GpuModel {
                 scaled,
                 (seq * h) as u32,
             )?;
+            self.trace.insert(format!("L{layer}.x_out"), x);
         }
 
         let h_final = self.rmsnorm_weighted(&mut enc, x, seq, h, "final_norm", "h_final")?;
+        self.trace.insert("h_final".to_string(), h_final);
         let logits = self.matmul(&mut enc, h_final, "lm_head", seq, h, cfg.vocab, "logits")?;
 
         // Next-token targets: row t predicts tokens[t + 1]. The loss op divides
@@ -550,6 +571,10 @@ impl GpuModel {
         self.queue.submit(std::iter::once(enc.finish()));
         self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
         Ok((logits, loss))
+    }
+
+    pub fn node_id(&self, name: &str) -> Option<NodeId> {
+        self.trace.get(name).copied()
     }
 
     pub fn read_logits(&self, logits: NodeId, len: usize) -> Result<Vec<f32>> {

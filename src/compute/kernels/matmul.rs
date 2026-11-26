@@ -493,7 +493,10 @@ impl MatMulOp {
         k: u32,
         n: u32,
     ) -> Result<()> {
-        let tile_size = 32u32;  // 32x32 output tile (16x16 WG × 2x2 register blocking)
+        // This dispatches the naive 16x16 shader (`SHADER`), whose workgroup is
+        // 16x16 threads and whose `tile_size` is 16. A 32 here launched half the
+        // workgroups, so output columns past the first 16 were left at zero.
+        let tile_size = 16u32;
         let workgroup_count_x = (m + tile_size - 1) / tile_size;
         let workgroup_count_y = (n + tile_size - 1) / tile_size;
 
@@ -566,7 +569,7 @@ impl MatMulOp {
         k: u32,
         n: u32,
     ) -> Result<()> {
-        let tile_size = 32u32;  // 32x32 output tile
+        let tile_size = 16u32; // same 16x16 `SHADER` as `dispatch`
         let workgroup_count_x = (m + tile_size - 1) / tile_size;
         let workgroup_count_y = (n + tile_size - 1) / tile_size;
 

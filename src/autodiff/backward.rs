@@ -19,7 +19,7 @@ struct Params {
 
 var<immediate> params: Params;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(8, 8)
 fn matmul_grad_a(@builtin(global_invocation_id) gid: vec3<u32>) {
     let row = gid.x;
     let col = gid.y;
@@ -30,7 +30,9 @@ fn matmul_grad_a(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var i: u32 = 0u; i < params.N; i = i + 1u) {
         acc = acc + grad_output[row * params.N + i] * b_transposed[col * params.N + i];
     }
-    grad_a[row * params.K + col] = acc;
+    // Accumulate: an activation can feed several consumers (h_attn feeds Q,
+    // K and V; x feeds the attention residual and the MLP residual).
+    grad_a[row * params.K + col] = grad_a[row * params.K + col] + acc;
 }
 "#;
 
@@ -47,7 +49,7 @@ struct Params {
 
 var<immediate> params: Params;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(8, 8)
 fn matmul_grad_b(@builtin(global_invocation_id) gid: vec3<u32>) {
     let row = gid.x;
     let col = gid.y;
@@ -61,7 +63,7 @@ fn matmul_grad_b(@builtin(global_invocation_id) gid: vec3<u32>) {
         // wrong until the parity test caught it.
         acc = acc + a_transposed[i * params.K + row] * grad_output[i * params.N + col];
     }
-    grad_b[row * params.N + col] = acc;
+    grad_b[row * params.N + col] = grad_b[row * params.N + col] + acc;
 }
 "#;
 
@@ -381,7 +383,20 @@ impl BackwardPass {
             entries: &[
                 read_entry.clone(),
                 read_entry_b.clone(),
-                rw_entry.clone(),
+                // `grad_output` is read-only in RMSNORM_GRAD_WGSL; only the
+                // fourth binding (grad_input) is written. Using the shared
+                // read-write entry here fails pipeline validation, which is
+                // why this pipeline had never been created by a test.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
                 rmsnorm_read_c,
             ],
         });
@@ -515,8 +530,10 @@ impl BackwardPass {
                 let (b_buf, _) = Self::node_buf_info(graph, b_id)?;
                 let (b_grad, _) = Self::node_grad_info(graph, b_id)?;
 
-                let wg_x = (*m + 63) / 64;
-                let wg_y = (*k + 63) / 64;
+                // 8x8 workgroup: `gid.y` is the column, so a 1-D 64-thread
+                // group left every column but 0 unwritten.
+                let wg_x = (*m + 7) / 8;
+                let wg_y = (*k + 7) / 8;
 
                 let bg_a = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("MatMul Grad A Bind Group"),
@@ -538,8 +555,8 @@ impl BackwardPass {
                 pass.dispatch_workgroups(wg_x, wg_y, 1);
                 drop(pass);
 
-                let wg_x_b = (*k + 63) / 64;
-                let wg_y_b = (*n + 63) / 64;
+                let wg_x_b = (*k + 7) / 8;
+                let wg_y_b = (*n + 7) / 8;
 
                 let bg_b = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("MatMul Grad B Bind Group"),
@@ -1187,8 +1204,8 @@ impl BackwardPass {
         n: u32,
         k: u32,
     ) -> Result<()> {
-        let wg_x = (m + 63) / 64;
-        let wg_y = (k + 63) / 64;
+        let wg_x = (m + 7) / 8;
+        let wg_y = (k + 7) / 8;
 
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("MatMul Grad A Bind Group"),
@@ -1223,8 +1240,8 @@ impl BackwardPass {
         k: u32,
         n: u32,
     ) -> Result<()> {
-        let wg_x = (k + 63) / 64;
-        let wg_y = (n + 63) / 64;
+        let wg_x = (k + 7) / 8;
+        let wg_y = (n + 7) / 8;
 
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("MatMul Grad B Bind Group"),
