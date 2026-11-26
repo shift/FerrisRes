@@ -1,7 +1,31 @@
 # Performance on this host
 
-Host: i5-6500, 4 cores, 6 MB L3, DDR4 (~6.3 GB/s effective), Intel HD 530
-(shared memory, Vulkan), 32 GB RAM. Every number is labelled **measured**,
+Host: i5-6500, 4 cores, 6 MB L3, DDR4 (see the measured bus below), Intel HD 530
+(shared memory, Vulkan), 32 GB RAM.
+
+## The measured bus, and what it says about the GPU path
+
+Measured with `intel_gpu_top` while training on the HD 530 (2026-11-26):
+
+| counter | value |
+|---|---|
+| IMC reads | up to **7800 MiB/s** (≈8.2 GB/s) |
+| IMC writes | 750–1900 MiB/s |
+| Render/3D engine busy | **~30%** |
+
+Two conclusions, both measured rather than assumed:
+
+1. **The 6.3 GB/s used by the tier tables is too low.** It was an estimate; the
+   controller serves at least 8.2 GB/s of reads. Decode figures computed at 6.3
+   are pessimistic by ~30%: Small becomes ~228 tok/s rather than ~163.
+2. **GPU training here is memory-bound, not dispatch-bound.** Bandwidth is at the
+   ceiling while the EUs sit at 30%. So more threads or wider SIMD buy almost
+   nothing on this host, and cutting bytes buys up to ~3.3× before compute takes
+   over: f16 activations ≈ 2×, f16 plus fused elementwise ops ≈ 3×.
+
+This is also why the T4 result (326 tok/s, dispatch-bound) and this host cannot be
+compared directly: the two are limited by different things.
+ Every number is labelled **measured**,
 **calculated** or **unknown**; a calculated number is not a promise.
 
 ## Decode (generation)
