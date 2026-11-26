@@ -12,9 +12,9 @@ about the target. The smoke must run `--device gpu` and show the T4.
 | 2 | parity and learning gates: logits/gradients vs f32, loss falls, parameters change | **passed**: logits 1.892e-4, grads ~1e-4, post-step 5e-5, loss 3.557→0.0026 | done |
 | 3 | **Vulkan on the Kaggle T4** — `ferrisres devices` must list the T4, not llvmpipe | **unverified**; the `.deb` ships an NVIDIA ICD, the image must expose the driver | first session |
 | 4 | `.deb` with the GPU loop, built on ubuntu:22.04 with `--features vulkan` | **0.2.5 building** (`int/gpu-deb`: `int/kaggle-deb` + `feat/gpu-train-loop`); 0.2.4 lacks the GPU loop | agent |
-| 5 | GPU smoke notebook: `nvidia-smi`, `devices` shows T4, `train --device gpu` 20 steps, loss falls, tokens/s recorded | updated, not runnable until 1 | — |
-| 6 | checkpoint read-back, export, infer from the GPU-trained checkpoint | after 1 | agent |
-| 7 | resume from a GPU checkpoint across a 12-hour session | after 1 | agent |
+| 5 | GPU smoke notebook: `nvidia-smi`, `devices` shows T4, `train --device gpu` 20 steps, loss falls, tokens/s recorded | updated; runnable when 0.2.5 is uploaded | — |
+| 6 | checkpoint read-back, export, infer from the GPU-trained checkpoint | **done in the loop branch**; the packaged path is after 0.2.5 | agent |
+| 7 | resume from a GPU checkpoint across a 12-hour session | **resume tested** (`total_step=42`); the HF round-trip is in the notebook | operator |
 | 8 | upload the `.deb` as a private Kaggle dataset | operator | you |
 | 9 | Kaggle account with GPU T4 + internet | operator | you |
 

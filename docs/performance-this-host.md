@@ -62,6 +62,9 @@ days**, not hours. This host is for correctness and smoke tests, not training.
 
 Measured training throughput that does exist:
 
+- **GPU loop, Intel HD 530**: tiny config, 200 steps, loss 3.557 → 0.0026 in
+  **32.8 s** on the wgpu path (`73a6902`). No T4 measurement yet; attention is
+  one invocation per head per token, so the T4 number is the next thing to record.
 - Armor L1 (2.2M, 128 tokens): full corpus, ~10k examples, **3,997 s**
   (~2.5 examples/s) on this host.
 - `train` learns and resumes (loss 3.65 → 0.0009 on the overfit test), but no
