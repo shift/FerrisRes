@@ -2,14 +2,13 @@
 
 FerrisRes Armor is a 4-layer defensive security proxy that sits in front of LLM workloads. It uses distilled neural scanners, regex pattern matching, and representation engineering to detect and block malicious inputs, sanitize outputs, and self-improve over time.
 
-> **Status: L0 and L3 are implemented and deterministic. L1 and L2 are
-> scaffolded and disabled by default.** Their weights are not trained or
-> loaded today — `L1Scanner::new()` and `ProbeHead::new()` initialise from a
-> deterministic hash, so their scores are noise. Do not enable them until
-> the training and evaluation gate in
-> [`tasks/armor-l1-enablement.md`](tasks/armor-l1-enablement.md) passes.
-> The CLI `--armor` flag is off by default; `ArmorLayer::new()` defaults all
-> four layers on, which is a mismatch this document should not hide.
+> **Status: L0 and L3 are implemented and deterministic. L1 has a synthetic
+> bootstrap artefact and a versioned loader; L2 is scaffolded. Neither L1 nor
+> L2 is enabled by default, and the L1 artefact is not a real scanner — dev
+> FNR 25% at 0.33% FPR on synthetic data. Do not enable them until the gate in
+> [`tasks/armor-l1-enablement.md`](tasks/armor-l1-enablement.md) passes. The
+> CLI `--armor` flag is off by default; `ArmorLayer::new()` now leaves L1 off,
+> and `try_with_config` is the production path.
 
 ## Architecture
 
@@ -32,24 +31,36 @@ Instant blocking of known malicious strings and PII patterns. 31 regex recognize
 
 Bloom filter provides O(1) lookup for custom blocklist entries. Default 1MB (~8M bits, ~0.01% FPR for 1M entries).
 
-### L1: Neural Scanner (~3.5M params, not yet trained)
+### L1: Neural Scanner (2.2M params, synthetic bootstrap only)
 
-ArmorGuardTiny is the intended architecture: a 4-layer BERT-style encoder for
-binary SAFE/INJECTION classification.
+ArmorGuardTiny is a bidirectional encoder classifier: 3 layers, hidden 192,
+4 heads, FFN 768, max_seq 256, no causal mask, mean pool over non-pad
+positions, linear `192→1`, sigmoid.
 
-- Token embedding (vocab=1000, hidden=256) + position embedding
-- 4 encoder layers with multi-head self-attention (4 heads) + FFN (256→1024→256)
-- [CLS] pooling → linear classifier → sigmoid
-- CPU-only with `Vec<f32>` weights
+- **2,214,337 parameters**; artefact `FRAL` v1, 8.86 MB, sha256 trailer.
+- Tokenizer id 1: NFKC subset, lowercase, zero-width removal, whitespace
+  collapse, one FNV-1a bucket per word into 256..4352, byte tokens for the
+  rest.
+- CPU training and inference.
 
-**Current state: the weights are hash-initialised, not trained and not loaded.**
-The code shape is real; the classifier is not. The distillation source
-(`protectai/deberta-v3-base-prompt-injection-v2`, Apache-2.0, 184M params) is
-the *candidate* teacher, not a completed distillation. Its published
-post-training numbers on 20k unseen prompts are 99.74% recall at 91.59%
-precision. It is English-only, does not detect jailbreak attacks, and
-false-positives on system prompts. The threshold (0.7) is a default, not a
-measured operating point.
+**Current state: trained on a synthetic bootstrap, not on a real corpus.**
+2,800 train / 600 dev / 600 test, author-written EN/DE templates. Dev is
+**25% FNR at 0.33% FPR**; the held-out test reads 0.67% FNR, but it is easier
+because its zero-width families normalise onto phrases present in train. The
+dev number is the generalisation signal, and it says the fixture is too easy —
+not that the scanner works.
+
+Also: only the first 12 positions of `pos_embed` were trained; positions
+12..256 keep their initialisation, so scans longer than 12 tokens are not
+supported by this artefact despite `max_seq = 256`.
+
+The loader rejects bad magic, version, shape, hash, truncation and tokenizer id
+with named errors. `L1Scanner::new_random()` is test-only; `ArmorLayer::new()`
+leaves L1 off; `try_with_config` is the production path and is not yet wired
+into the CLI.
+
+The corpus, the real FNR/FPR gate, German review and the quarantine policy are
+specified in [`tasks/armor-l1-enablement.md`](tasks/armor-l1-enablement.md).
 
 The training corpus, the model changes (3 layers, hidden 192, byte-level plus
 hashed word buckets), the FNR/FPR gate, the versioned weight format and the
@@ -160,7 +171,8 @@ println!("Checks: {}, Blocked: {}, Rate: {:.1}%",
 ## Performance
 
 > The L1 and L2 rows are the **target** for a trained scanner on this hardware.
-> They are not measurements of the current hash-initialised code.
+> They are not measurements. L1 is now 2.2M params (3×192), not the 4×256 shape
+> this table was written for; its latency is unmeasured.
 
 | Layer | Latency | Notes |
 |-------|---------|-------|

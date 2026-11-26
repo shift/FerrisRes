@@ -1,9 +1,10 @@
 # Armor L1: train the scanner and enable it
 
-Status: **task specification, not implemented.** L1 and L2 are currently
-hash-initialised placeholders (`L1Scanner::new`, `ProbeHead::new`); only L0
-(regex PII) and L3 (output redaction) are real. This document is the plan for
-making L1 real and turning it on.
+Status: **partially implemented.** A bidirectional encoder trainer, the `FRAL`
+weight loader and a synthetic-bootstrap artefact exist (commit `32ef901`:
+2.2M params, gradient check green, dev FNR 25% at 0.33% FPR). The real corpus,
+the measured gate, German review, calibration, the runtime hook and the
+quarantine/evidence path do not.
 
 ## 1. Scope
 
