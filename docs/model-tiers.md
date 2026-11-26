@@ -45,7 +45,9 @@ time so a regression can be attributed.
    Pi 5's 2 MB; Small's two 768-wide layers (~4.6 MB) fit the i5's 6 MB but not
    the Pi; Base's two 1024-wide layers (~5.9 MB) fit the i5 only. A core that
    does not fit re-reads RAM every pass.
-3. **Top-1 experts trade storage for capacity, not speed.** This is why Large
+3. **The tokenizer is the largest tensor.** A 151k head cannot fit a 111M
+   model; the 32k design and its distillation consequences are in
+   `tokenizer.md`. **Top-1 experts trade storage for capacity, not speed.** This is why Large
    exists at the same tok/s as Base, and why the family is defined by width and
    depth first, experts second.
 
