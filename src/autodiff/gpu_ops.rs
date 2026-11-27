@@ -413,18 +413,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         sum = sum + exp(dot * p.scale - mx);
     }
+    // The dot product is loop-invariant in `d`. Computing it inside the
+    // output-dimension loop made this pass O(seq * head_dim^2) instead of
+    // O(seq * head_dim); at head_dim 64 that is 64x the work and was ~8 of the
+    // 10 seconds in a forward step. Accumulate into a per-lane array (the
+    // largest head_dim in the models is 256) so the `s` reduction order is
+    // unchanged.
+    var acc: array<f32, 256>;
     for (var d = 0u; d < p.head_dim; d = d + 1u) {
-        var acc = 0.0;
-        for (var s = 0u; s <= t; s = s + 1u) {
-            let kb = (s * p.heads + h) * p.head_dim;
-            var dot = 0.0;
-            for (var i = 0u; i < p.head_dim; i = i + 1u) {
-                dot = dot + q[base + i] * k[kb + i];
-            }
-            let prob = exp(dot * p.scale - mx) / sum;
-            acc = acc + prob * v[kb + d];
+        acc[d] = 0.0;
+    }
+    for (var s = 0u; s <= t; s = s + 1u) {
+        let kb = (s * p.heads + h) * p.head_dim;
+        var dot = 0.0;
+        for (var i = 0u; i < p.head_dim; i = i + 1u) {
+            dot = dot + q[base + i] * k[kb + i];
         }
-        out[base + d] = acc;
+        let prob = exp(dot * p.scale - mx) / sum;
+        for (var d = 0u; d < p.head_dim; d = d + 1u) {
+            acc[d] = acc[d] + prob * v[kb + d];
+        }
+    }
+    for (var d = 0u; d < p.head_dim; d = d + 1u) {
+        out[base + d] = acc[d];
     }
 }
 "#;
@@ -931,6 +942,11 @@ impl TrainOps {
         head_dim: u32,
         scale: f32,
     ) -> Result<()> {
+        if head_dim > 256 {
+            return Err(crate::error::FerrisResError::Device(format!(
+                "attention head_dim {head_dim} exceeds the 256 accumulator slots"
+            )));
+        }
         let p = params_attn(seq, heads, head_dim, scale);
         let elements = seq * heads * head_dim;
         self.dispatch(&self.attention_fwd, enc, &[q, k, v, out], &p, elements, (seq, heads, 1))

@@ -10,14 +10,20 @@
 //! `skipped: no adapter` and returns. A silent pass would hide the regression
 //! on CI, so the skip is always printed.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ferrisres::compute::pipeline::WgpuCompute;
 use ferrisres::training::f32_trainer::F32Config;
 use ferrisres::training::gpu_trainer::GpuModel;
 
+/// Both tests build a full GPU model. Running them in parallel in one binary
+/// exhausts a small adapter's memory and loses the device, not because either
+/// dispatch is wrong. They share the adapter, so they run one at a time.
+static GPU_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn no_dispatch_exceeds_the_spec_limit() {
+    let _gpu = GPU_LOCK.lock().unwrap();
     let compute = match pollster::block_on(WgpuCompute::new()) {
         Ok(compute) => compute,
         Err(e) => {
@@ -72,10 +78,12 @@ fn no_dispatch_exceeds_the_spec_limit() {
 /// `max_seq: 8` cannot overflow: `8 x 32_768 / 256` is 1,024 groups. The head
 /// gradient was already covered, but the loss gradient is dispatched from
 /// `BackwardPass` with its own flat count — the path that the original 2D fix
-/// missed. `batch = seq - 1`, so 1,024 tokens is the smallest realistic window
-/// whose loss gradient exceeds 65,535 workgroups (130,944).
+/// missed. `batch = seq - 1`, so 513 tokens gives 512 x 32_768 / 256 = 65,536
+/// groups, the smallest window that crosses the 65,535 cap. (1,024 tokens also
+/// overflows but needs ~1.5 GB and loses the device on a small adapter.)
 #[test]
 fn the_loss_gradient_at_a_real_sequence_fits_the_dispatch_limit() {
+    let _gpu = GPU_LOCK.lock().unwrap();
     let compute = match pollster::block_on(WgpuCompute::new()) {
         Ok(compute) => compute,
         Err(e) => {
@@ -94,13 +102,13 @@ fn the_loss_gradient_at_a_real_sequence_fits_the_dispatch_limit() {
         head_dim: 64,
         intermediate: 2048,
         vocab: 32_768,
-        max_seq: 1_024,
+        max_seq: 513,
         rope_theta: 10_000.0,
         eps: 1e-6,
     };
     let mut model = GpuModel::new(Arc::clone(&device), Arc::clone(&queue), config, 7)
         .expect("upload model");
-    let tokens: Vec<u32> = (0..1_024).map(|i| 100 + (i as u32 % 1_000)).collect();
+    let tokens: Vec<u32> = (0..513).map(|i| 100 + (i as u32 % 1_000)).collect();
 
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let (_logits, loss) = model.forward(&tokens).expect("forward");

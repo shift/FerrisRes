@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "ferrisres"
-version = "0.2.7"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "ash",

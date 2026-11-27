@@ -8,7 +8,7 @@
 //!
 //! # Usage
 //! ```rust
-//! use ferrisres::compute::turboquant_kernels::TURBOQUANT_WGSL;
+//! use ferrisres::compute::kernels::TURBOQUANT_WGSL;
 //! ```
 
 /// The complete TurboQuant WGSL shader source code
