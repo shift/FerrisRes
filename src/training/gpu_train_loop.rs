@@ -98,7 +98,6 @@ pub async fn run(options: &TrainOptions, tokens: &[u32]) -> Result<TrainReport> 
             let window = (first_window + b) % windows_per_epoch;
             let begin = window * options.seq_len;
             let input = &tokens[begin..begin + options.seq_len];
-            let target = &tokens[begin + 1..begin + options.seq_len + 1];
 
             let t = std::time::Instant::now();
             let (logits_node, loss_node) = model.forward(input)?;
@@ -111,7 +110,10 @@ pub async fn run(options: &TrainOptions, tokens: &[u32]) -> Result<TrainReport> 
             ms_read_logits += t.elapsed().as_secs_f64() * 1e3;
 
             let t = std::time::Instant::now();
-            let (loss, _) = F32Model::cross_entropy(&logits, target, cfg.vocab);
+            // `cross_entropy` shifts internally: logits[t] predicts tokens[t+1].
+            // Passing an already-shifted slice scored t+2 and made the logged
+            // loss measure an objective the model was not trained on.
+            let (loss, _) = F32Model::cross_entropy(&logits, input, cfg.vocab);
             ms_cross_entropy += t.elapsed().as_secs_f64() * 1e3;
             if !loss.is_finite() {
                 return Err(FerrisResError::Shape(format!(

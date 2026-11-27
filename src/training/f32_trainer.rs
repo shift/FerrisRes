@@ -2627,4 +2627,19 @@ mod tests {
             assert_eq!(adam.v.len(), model.param_count());
         }
     }
+
+    #[test]
+    fn cross_entropy_uses_the_unshifted_window() {
+        let vocab = 4usize;
+        let tokens = vec![0u32, 1, 2, 3];
+        let mut logits = vec![0.0f32; tokens.len() * vocab];
+        for t in 0..tokens.len() - 1 {
+            logits[t * vocab + tokens[t + 1] as usize] = 10.0;
+        }
+        let (loss, _) = F32Model::cross_entropy(&logits, &tokens, vocab);
+        assert!(loss < 0.01, "unshifted window must be nearly free, got {loss}");
+        let shifted_logits = &logits[..(tokens.len() - 1) * vocab];
+        let (wrong, _) = F32Model::cross_entropy(shifted_logits, &tokens[1..], vocab);
+        assert!(wrong > 1.0, "a pre-shifted window double-shifts, got {wrong}");
+    }
 }

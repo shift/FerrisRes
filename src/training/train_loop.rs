@@ -135,13 +135,14 @@ pub fn run(options: &TrainOptions, tokens: &[u32]) -> Result<TrainReport> {
             let window = (window + b) % windows_per_epoch;
             let begin = window * options.seq_len;
             let input = &tokens[begin..begin + options.seq_len];
-            let target = &tokens[begin + 1..begin + options.seq_len + 1];
 
             let t = std::time::Instant::now();
             let (logits, cache) = model.forward(input);
             ms_forward += t.elapsed().as_secs_f64() * 1e3;
             let t = std::time::Instant::now();
-            let (loss, d_logits) = F32Model::cross_entropy(&logits, target, cfg.vocab);
+            // `cross_entropy` shifts internally; a pre-shifted slice made the
+            // gradient and the logged loss predict two tokens ahead.
+            let (loss, d_logits) = F32Model::cross_entropy(&logits, input, cfg.vocab);
             ms_cross_entropy += t.elapsed().as_secs_f64() * 1e3;
             if !loss.is_finite() {
                 return Err(FerrisResError::Shape(format!(
