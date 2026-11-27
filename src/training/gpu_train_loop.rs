@@ -83,6 +83,14 @@ pub async fn run(options: &TrainOptions, tokens: &[u32]) -> Result<TrainReport> 
     let mut final_loss = f32::NAN;
 
     for step in (start_step + 1)..=total_step {
+        let step_started = std::time::Instant::now();
+        let mut ms_forward = 0.0f64;
+        let mut ms_read_logits = 0.0f64;
+        let mut ms_cross_entropy = 0.0f64;
+        let mut ms_backward = 0.0f64;
+        let mut ms_accumulate = 0.0f64;
+        let mut ms_optimizer = 0.0f64;
+        let mut ms_checkpoint = 0.0f64;
         let first_window = ((step - 1) % windows_per_epoch as u64) as usize;
         let mut step_loss = 0.0f32;
 
@@ -92,9 +100,19 @@ pub async fn run(options: &TrainOptions, tokens: &[u32]) -> Result<TrainReport> 
             let input = &tokens[begin..begin + options.seq_len];
             let target = &tokens[begin + 1..begin + options.seq_len + 1];
 
+            let t = std::time::Instant::now();
             let (logits_node, loss_node) = model.forward(input)?;
+            ms_forward += t.elapsed().as_secs_f64() * 1e3;
+
+            // The logits readback is the phase that makes a GPU step cost like
+            // a CPU one: seq * vocab * 4 bytes per window, then a CPU softmax.
+            let t = std::time::Instant::now();
             let logits = model.read_logits(logits_node, options.seq_len * cfg.vocab)?;
+            ms_read_logits += t.elapsed().as_secs_f64() * 1e3;
+
+            let t = std::time::Instant::now();
             let (loss, _) = F32Model::cross_entropy(&logits, target, cfg.vocab);
+            ms_cross_entropy += t.elapsed().as_secs_f64() * 1e3;
             if !loss.is_finite() {
                 return Err(FerrisResError::Shape(format!(
                     "non-finite loss at step {}: {}",
@@ -102,8 +120,14 @@ pub async fn run(options: &TrainOptions, tokens: &[u32]) -> Result<TrainReport> 
                 )));
             }
             step_loss += loss;
+
+            let t = std::time::Instant::now();
             model.backward(loss_node)?;
+            ms_backward += t.elapsed().as_secs_f64() * 1e3;
+
+            let t = std::time::Instant::now();
             model.accumulate_grads()?;
+            ms_accumulate += t.elapsed().as_secs_f64() * 1e3;
         }
 
         let mean_loss = step_loss / options.batch_size as f32;
@@ -112,9 +136,19 @@ pub async fn run(options: &TrainOptions, tokens: &[u32]) -> Result<TrainReport> 
         }
         final_loss = mean_loss;
 
+        let t = std::time::Instant::now();
         model.step_accumulated(options.learning_rate, options.batch_size as u32)?;
         model.reset_accumulators()?;
+        ms_optimizer += t.elapsed().as_secs_f64() * 1e3;
 
+        if options.checkpoint_every > 0 && step % options.checkpoint_every == 0 {
+            let t = std::time::Instant::now();
+            save_gpu_checkpoint(&options.output, &model, step)?;
+            ms_checkpoint += t.elapsed().as_secs_f64() * 1e3;
+        }
+
+        let total_ms = step_started.elapsed().as_secs_f64() * 1e3;
+        let tokens = (options.batch_size as u64) * (options.seq_len as u64);
         if options.log_every > 0 && (step % options.log_every == 0 || step == total_step) {
             tracing::info!(
                 event = "train_step_loss",
@@ -123,10 +157,28 @@ pub async fn run(options: &TrainOptions, tokens: &[u32]) -> Result<TrainReport> 
                 total_step,
                 mean_loss
             );
-        }
-
-        if options.checkpoint_every > 0 && step % options.checkpoint_every == 0 {
-            save_gpu_checkpoint(&options.output, &model, step)?;
+            tracing::info!(
+                event = "train_step_timing",
+                step,
+                total_ms,
+                forward_ms = ms_forward,
+                read_logits_ms = ms_read_logits,
+                cross_entropy_ms = ms_cross_entropy,
+                backward_ms = ms_backward,
+                accumulate_ms = ms_accumulate,
+                optimizer_ms = ms_optimizer,
+                checkpoint_ms = ms_checkpoint,
+                tokens_per_s = tokens as f64 / (total_ms / 1e3),
+                "step timing: total={:.1}ms fwd={:.1} readback={:.1} ce={:.1} bwd={:.1} acc={:.1} opt={:.1} ckpt={:.1}",
+                total_ms,
+                ms_forward,
+                ms_read_logits,
+                ms_cross_entropy,
+                ms_backward,
+                ms_accumulate,
+                ms_optimizer,
+                ms_checkpoint
+            );
         }
     }
 
