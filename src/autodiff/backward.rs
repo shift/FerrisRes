@@ -6,6 +6,24 @@ use crate::autodiff::graph::{ComputationGraph, NodeId, NodeKind};
 use crate::autodiff::gpu_ops::TrainOps;
 use crate::error::{FerrisResError, Result};
 
+
+/// The WebGPU spec caps each dispatch dimension at 65,535 workgroups. The loss
+/// gradient is `batch x vocab` elements; at 32k vocab that exceeds the fast
+/// dimension alone, which made the "2D grid so a 32k vocabulary trains" fix
+/// incomplete for the one tensor the head produces. These shaders read
+/// `num_workgroups` and flatten the 2D grid themselves, so no params change is
+/// needed and the host and shader cannot disagree about `grid_x`.
+const MAX_WORKGROUPS: u32 = 65_535;
+
+fn grid(groups: u32) -> (u32, u32) {
+    if groups == 0 {
+        return (0, 0);
+    }
+    let gx = groups.min(MAX_WORKGROUPS);
+    let gy = (groups + MAX_WORKGROUPS - 1) / MAX_WORKGROUPS;
+    (gx, gy)
+}
+
 const MATMUL_GRAD_A_WGSL: &str = r#"
 struct Params {
     M: u32,
@@ -80,8 +98,12 @@ struct Params {
 var<immediate> params: Params;
 
 @compute @workgroup_size(256)
-fn softmax_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn softmax_grad(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let idx = (wid.y * nwg.x + wid.x) * 256u + lid.x;
     let row = idx / params.cols;
     let col = idx % params.cols;
     if (row >= params.rows) {
@@ -166,8 +188,12 @@ struct Params {
 var<immediate> params: Params;
 
 @compute @workgroup_size(256)
-fn loss_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn loss_grad(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let idx = (wid.y * nwg.x + wid.x) * 256u + lid.x;
     let row = idx / params.vocab_size;
     let col = idx % params.vocab_size;
     if (row >= params.batch_size) {
@@ -658,7 +684,7 @@ impl BackwardPass {
                 let (input_grad, input_grad_size) = Self::node_grad_info(graph, input_id)?;
 
                 let total = rows * cols;
-                let wg = (total + 255) / 256;
+                let (gx, gy) = grid((total + 255) / 256);
 
                 let output_ref = GpuBuffer::from_existing(output_buf, output_size);
                 let grad_ref = GpuBuffer::from_existing(grad_buf, grad_size);
@@ -681,7 +707,7 @@ impl BackwardPass {
                 pass.set_pipeline(&self.softmax_grad_pipeline);
                 pass.set_bind_group(0, &bg, &[]);
                 pass.set_immediates(0, &[rows.to_le_bytes(), cols.to_le_bytes()].concat());
-                pass.dispatch_workgroups(wg, 1, 1);
+                pass.dispatch_workgroups(gx, gy, 1);
                 drop(pass);
 
                 tracing::debug!(event = "backward_softmax_grad_rows_cols", "Backward: softmax grad rows={} cols={}", rows, cols);
@@ -772,7 +798,7 @@ impl BackwardPass {
                 let (logits_grad, logits_grad_size) = Self::node_grad_info(graph, logits_id)?;
 
                 let total = batch_size * vocab_size;
-                let wg = (total + 255) / 256;
+                let (gx, gy) = grid((total + 255) / 256);
 
                 let logits_ref = GpuBuffer::from_existing(logits_buf, logits_size);
                 let targets_ref = GpuBuffer::from_existing(targets_buf, targets_size);
@@ -800,7 +826,7 @@ impl BackwardPass {
                     0u32.to_le_bytes(),
                     0u32.to_le_bytes(),
                 ].concat());
-                pass.dispatch_workgroups(wg, 1, 1);
+                pass.dispatch_workgroups(gx, gy, 1);
                 drop(pass);
 
                 tracing::debug!(event = "backward_loss_grad_batch_vocab", "Backward: loss grad batch={} vocab={}", batch_size, vocab_size);
@@ -1372,4 +1398,34 @@ fn input_size(graph: &ComputationGraph, id: NodeId) -> Result<usize> {
         FerrisResError::Device(format!("node {:?} not found", id))
     })?;
     Ok(node.buf.size())
+}
+
+#[cfg(test)]
+mod grid_tests {
+    use super::*;
+
+    /// The seq-1024, 32k-vocab case: 33,521,664 elements needs 130,944 groups,
+    /// which the 1D dispatch could not express. The old code would have been
+    /// rejected by WebGPU validation; this asserts the fold covers the tensor.
+    #[test]
+    fn a_32k_vocabulary_loss_gradient_fits_a_2d_grid() {
+        let total = 1023u32 * 32_768;
+        let groups = (total + 255) / 256;
+        assert!(groups > MAX_WORKGROUPS, "the case must actually overflow");
+        let (gx, gy) = grid(groups);
+        assert!(gx <= MAX_WORKGROUPS);
+        assert!(gy <= MAX_WORKGROUPS);
+        assert!(gx * gy * 256 >= total, "the grid must cover every element");
+    }
+
+    /// Catches a future revert of the shader to `global_invocation_id`, which
+    /// would silently reintroduce the 1D limit while the host still dispatches
+    /// a 2D grid.
+    #[test]
+    fn the_loss_and_softmax_shaders_read_the_grid_width() {
+        assert!(LOSS_GRAD_WGSL.contains("num_workgroups"));
+        assert!(LOSS_GRAD_WGSL.contains("workgroup_id"));
+        assert!(SOFTMAX_GRAD_WGSL.contains("num_workgroups"));
+        assert!(SOFTMAX_GRAD_WGSL.contains("workgroup_id"));
+    }
 }

@@ -66,3 +66,48 @@ fn no_dispatch_exceeds_the_spec_limit() {
         "a dispatch exceeded the WebGPU 65,535-workgroup limit: {error:?}"
     );
 }
+
+/// The loss gradient at a realistic training shape.
+///
+/// `max_seq: 8` cannot overflow: `8 x 32_768 / 256` is 1,024 groups. The head
+/// gradient was already covered, but the loss gradient is dispatched from
+/// `BackwardPass` with its own flat count — the path that the original 2D fix
+/// missed. `batch = seq - 1`, so 1,024 tokens is the smallest realistic window
+/// whose loss gradient exceeds 65,535 workgroups (130,944).
+#[test]
+fn the_loss_gradient_at_a_real_sequence_fits_the_dispatch_limit() {
+    let compute = match pollster::block_on(WgpuCompute::new()) {
+        Ok(compute) => compute,
+        Err(e) => {
+            eprintln!("skipped: no adapter ({e})");
+            return;
+        }
+    };
+    let device = Arc::new(compute.device().clone());
+    let queue = Arc::new(compute.queue().clone());
+
+    let config = F32Config {
+        hidden: 768,
+        num_layers: 1,
+        num_heads: 12,
+        num_kv_heads: 4,
+        head_dim: 64,
+        intermediate: 2048,
+        vocab: 32_768,
+        max_seq: 1_024,
+        rope_theta: 10_000.0,
+        eps: 1e-6,
+    };
+    let mut model = GpuModel::new(Arc::clone(&device), Arc::clone(&queue), config, 7)
+        .expect("upload model");
+    let tokens: Vec<u32> = (0..1_024).map(|i| 100 + (i as u32 % 1_000)).collect();
+
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let (_logits, loss) = model.forward(&tokens).expect("forward");
+    model.backward(loss).expect("backward");
+    let error = pollster::block_on(scope.pop());
+    assert!(
+        error.is_none(),
+        "the loss-gradient dispatch exceeded the WebGPU 65,535-workgroup limit: {error:?}"
+    );
+}
