@@ -75,14 +75,15 @@ fn matmul(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocati
 //
 // Task: f4c0a839 — see papers_research/flashattn3_async_wgsl_research.md
 // ---------------------------------------------------------------------------
-// Optimized matmul: 32x32 tiles, vec4 loads, 2x2 register blocking, double-buffered.
+// Optimized matmul: 32x32 tiles, 2x2 register blocking, double-buffered.
 //
 // Each 16x16 workgroup computes a 32x32 output tile.
 // Each thread computes a 2x2 block (4 outputs).
-// A/B tiles loaded via vec4<f32> = 4x fewer load instructions.
 // Double-buffered prefetch hides global memory latency.
 //
-// T4 performance: ~8-12 TFLOPS (vs ~3 TFLOPS for 16x16 naive).
+// Task f4c0a839 reported ~8-12 TFLOPS on a T4 (vs ~3 TFLOPS for the 16x16
+// naive kernel). That was not re-measured when this kernel was wired into
+// `dispatch`; only numerical equivalence was.
 const SHADER_DOUBLE_BUF: &str = r#"
 struct Params {
     M: u32,
@@ -367,8 +368,24 @@ fn matmul_ta(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invoc
 }
 "#;
 
+/// Output-tile edge used by [`MatMulOp::dispatch`] for an `m x n` result.
+///
+/// The double-buffered kernel computes one 32x32 tile per 16x16 workgroup.
+/// When either output dimension is smaller than a full tile most lanes work on
+/// padded rows or columns, so the 16x16 kernel does the same job with fewer
+/// idle lanes and is used instead.
+fn forward_tile_edge(m: u32, n: u32) -> u32 {
+    if m >= 32 && n >= 32 {
+        32
+    } else {
+        16
+    }
+}
+
 pub struct MatMulOp {
     pipeline: wgpu::ComputePipeline,
+    /// 32x32-tile, double-buffered forward pipeline (`SHADER_DOUBLE_BUF`).
+    double_buf_pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     /// Pipeline for dL/dA = dC × B^T (transpose-B matmul)
     backward_b_pipeline: wgpu::ComputePipeline,
@@ -450,6 +467,21 @@ impl MatMulOp {
 
         tracing::debug!(event = "matmulop_pipeline_created_successfully", "MatMulOp pipeline created successfully");
 
+        // The double-buffered kernel uses the same bind group layout (three
+        // storage buffers and one uniform), so it shares `pipeline_layout`.
+        let double_buf_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("MatMul Double-Buffer Shader"),
+            source: wgpu::ShaderSource::Wgsl(SHADER_DOUBLE_BUF.into()),
+        });
+        let double_buf_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("MatMul Double-Buffer Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &double_buf_shader_module,
+            entry_point: Some("matmul_double_buf"),
+            cache: None,
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+
         // === Backward pipelines ===
         let tb_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("MatMul TransposeB Shader"),
@@ -479,6 +511,7 @@ impl MatMulOp {
 
         Self {
             pipeline,
+            double_buf_pipeline,
             bind_group_layout,
             backward_b_pipeline,
             backward_a_pipeline,
@@ -487,39 +520,48 @@ impl MatMulOp {
         }
     }
 
-    pub fn dispatch(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        a: &GpuBuffer,
-        b: &GpuBuffer,
-        c: &GpuBuffer,
-        m: u32,
-        k: u32,
-        n: u32,
-    ) -> Result<()> {
-        // This dispatches the naive 16x16 shader (`SHADER`), whose workgroup is
-        // 16x16 threads and whose `tile_size` is 16. A 32 here launched half the
-        // workgroups, so output columns past the first 16 were left at zero.
-        let tile_size = 16u32;
-        let workgroup_count_x = (m + tile_size - 1) / tile_size;
-        let workgroup_count_y = (n + tile_size - 1) / tile_size;
-
-        tracing::debug!(
-            "MatMulOp dispatch: M={} K={} N={} workgroups=({},{},1)",
-            m, k, n, workgroup_count_x, workgroup_count_y
-        );
-
+    /// Create and write the uniform buffer shared by every forward dispatch.
+    fn write_params(&self, label: &str, m: u32, k: u32, n: u32) -> wgpu::Buffer {
         let params_data: [u32; 3] = [m, k, n];
         let params_buffer = self.device.create_buffer(&BufferDescriptor {
-            label: Some("MatMul Params"),
+            label: Some(label),
             size: 12,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.queue.write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params_data));
+        self.queue
+            .write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params_data));
+        params_buffer
+    }
+
+    /// Encode one forward matmul pass with an explicit pipeline and tile edge.
+    fn encode_forward(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        a: &GpuBuffer,
+        b: &GpuBuffer,
+        c_binding: wgpu::BindingResource<'_>,
+        label: &str,
+        m: u32,
+        k: u32,
+        n: u32,
+        pipeline: &wgpu::ComputePipeline,
+        tile: u32,
+    ) -> Result<()> {
+        let params_buffer = self.write_params(&format!("{label} Params"), m, k, n);
+
+        tracing::debug!(
+            "MatMulOp dispatch: M={} K={} N={} tile={} workgroups=({},{},1)",
+            m,
+            k,
+            n,
+            tile,
+            (m + tile - 1) / tile,
+            (n + tile - 1) / tile
+        );
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MatMul Bind Group"),
+            label: Some(label),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -532,7 +574,7 @@ impl MatMulOp {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: c.buffer().as_entire_binding(),
+                    resource: c_binding,
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -541,18 +583,87 @@ impl MatMulOp {
             ],
         });
 
+        let workgroup_count_x = (m + tile - 1) / tile;
+        let workgroup_count_y = (n + tile - 1) / tile;
+
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("MatMul Compute Pass"),
+            label: Some(label),
             timestamp_writes: None,
         });
-
-        pass.set_pipeline(&self.pipeline);
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1);
-
         drop(pass);
 
         Ok(())
+    }
+
+    pub fn dispatch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        a: &GpuBuffer,
+        b: &GpuBuffer,
+        c: &GpuBuffer,
+        m: u32,
+        k: u32,
+        n: u32,
+    ) -> Result<()> {
+        // Use the 32x32 double-buffered kernel whenever both output dimensions
+        // span a full tile; otherwise fall back to the 16x16 kernel. Both
+        // kernels compute the same product; see `forward_tile_edge`.
+        let tile = forward_tile_edge(m, n);
+        let pipeline = if tile == 32 {
+            &self.double_buf_pipeline
+        } else {
+            &self.pipeline
+        };
+        self.encode_forward(
+            encoder,
+            a,
+            b,
+            c.buffer().as_entire_binding(),
+            "MatMul Compute Pass",
+            m,
+            k,
+            n,
+            pipeline,
+            tile,
+        )
+    }
+
+    /// Dispatch the naive 16x16 kernel explicitly.
+    ///
+    /// This is the reference path for numerical-equivalence tests; production
+    /// callers use [`dispatch`](Self::dispatch), which selects the faster
+    /// kernel. It is also the fallback for output tiles smaller than 32.
+    pub fn dispatch_naive(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        a: &GpuBuffer,
+        b: &GpuBuffer,
+        c: &GpuBuffer,
+        m: u32,
+        k: u32,
+        n: u32,
+    ) -> Result<()> {
+        self.encode_forward(
+            encoder,
+            a,
+            b,
+            c.buffer().as_entire_binding(),
+            "MatMul Naive Compute Pass",
+            m,
+            k,
+            n,
+            &self.pipeline,
+            16,
+        )
+    }
+
+    /// The output-tile edge [`dispatch`](Self::dispatch) uses for an `m x n`
+    /// result: 32 for the double-buffered kernel, 16 for the naive fallback.
+    pub fn selected_tile_edge(&self, m: u32, n: u32) -> u32 {
+        forward_tile_edge(m, n)
     }
 
     /// Dispatch matmul with the output (C) buffer bound at a byte offset.
@@ -573,58 +684,33 @@ impl MatMulOp {
         k: u32,
         n: u32,
     ) -> Result<()> {
-        let tile_size = 16u32; // same 16x16 `SHADER` as `dispatch`
-        let workgroup_count_x = (m + tile_size - 1) / tile_size;
-        let workgroup_count_y = (n + tile_size - 1) / tile_size;
-
-        let params_data: [u32; 3] = [m, k, n];
-        let params_buffer = self.device.create_buffer(&BufferDescriptor {
-            label: Some("MatMul Offset Params"),
-            size: 12,
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue.write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params_data));
-
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MatMul Offset Bind Group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: a.buffer().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: b.buffer().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: c_buffer,
-                        offset: c_offset,
-                        size: Some(std::num::NonZeroU64::new(c_size).unwrap_or(std::num::NonZeroU64::new(1).unwrap())),
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: params_buffer.as_entire_binding(),
-                },
-            ],
+        let tile = forward_tile_edge(m, n);
+        let pipeline = if tile == 32 {
+            &self.double_buf_pipeline
+        } else {
+            &self.pipeline
+        };
+        let c_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: c_buffer,
+            offset: c_offset,
+            size: Some(
+                std::num::NonZeroU64::new(c_size)
+                    .unwrap_or(std::num::NonZeroU64::new(1).unwrap()),
+            ),
         });
 
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("MatMul Offset Compute Pass"),
-            timestamp_writes: None,
-        });
-
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1);
-
-        drop(pass);
-
-        Ok(())
+        self.encode_forward(
+            encoder,
+            a,
+            b,
+            c_binding,
+            "MatMul Offset Compute Pass",
+            m,
+            k,
+            n,
+            pipeline,
+            tile,
+        )
     }
 
     /// Backward pass: compute dL/dA = dC × B^T
@@ -849,8 +935,12 @@ impl MatMulDoubleBufferOp {
         self.queue
             .write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params_data));
 
-        let wg_x = (m + 15) / 16;
-        let wg_y = (n + 15) / 16;
+        // Each workgroup computes a 32x32 output tile from 16x16 threads, and
+        // `gid.x * 2` is the global row. The count must therefore be
+        // ceil(m/32), not ceil(m/16): the latter launched twice the needed
+        // workgroups and relied on the shader's bounds guards to discard them.
+        let wg_x = (m + 31) / 32;
+        let wg_y = (n + 31) / 32;
 
         tracing::debug!(
             "MatMulDoubleBufferOp dispatch: M={} K={} N={} workgroups=({},{},1)",
@@ -929,6 +1019,20 @@ mod tests {
             }
         }
         db
+    }
+
+    #[test]
+    fn test_forward_tile_edge_selects_double_buffer_only_for_full_tiles() {
+        // Production shapes (seq x hidden / intermediate) take the 32x32 path.
+        assert_eq!(forward_tile_edge(512, 3072), 32);
+        assert_eq!(forward_tile_edge(512, 768), 32);
+        // Exactly one tile is enough.
+        assert_eq!(forward_tile_edge(32, 32), 32);
+        // A dimension below one 32-wide tile keeps the 16x16 kernel.
+        assert_eq!(forward_tile_edge(16, 768), 16);
+        assert_eq!(forward_tile_edge(768, 31), 16);
+        assert_eq!(forward_tile_edge(2, 2), 16);
+        assert_eq!(forward_tile_edge(1, 16384), 16);
     }
 
     #[test]

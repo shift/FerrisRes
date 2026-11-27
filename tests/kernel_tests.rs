@@ -965,7 +965,9 @@ async fn test_matmul_double_buf_matches_single_buf_32x64x32() {
     let mut enc = device.create_command_encoder(
         &wgpu::CommandEncoderDescriptor { label: Some("mm_compare") }
     );
-    single.dispatch(&mut enc, &a_buf, &b_buf, &c1_buf, m as u32, k as u32, n as u32).unwrap();
+    // Explicit naive path: `MatMulOp::dispatch` now selects the 32x32 kernel
+    // for this shape, which would make this a double-vs-double comparison.
+    single.dispatch_naive(&mut enc, &a_buf, &b_buf, &c1_buf, m as u32, k as u32, n as u32).unwrap();
     double.dispatch(&mut enc, &a_buf, &b_buf, &c2_buf, m as u32, k as u32, n as u32).unwrap();
     queue.submit(std::iter::once(enc.finish()));
 
@@ -977,6 +979,83 @@ async fn test_matmul_double_buf_matches_single_buf_32x64x32() {
             (a - b).abs() < 1e-3,
             "mm_double_buf vs single_buf mismatch at [{}]: {} vs {}", i, a, b
         );
+    }
+}
+
+/// Deterministic values in `[-1, 1)`; no RNG dependency.
+fn test_values(n: usize, seed: u32) -> Vec<f32> {
+    let mut state = seed;
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+        })
+        .collect()
+}
+
+/// The kernel `dispatch` selects must produce the same result as the explicit
+/// naive kernel, and both must match the CPU reference.
+///
+/// Shapes are deliberately non-square and `k` is not a multiple of either tile
+/// (16 or 32), so a partial K-tile is exercised. The last shape is below one
+/// 32-wide output tile in both dimensions and therefore selects the naive
+/// fallback.
+#[tokio::test]
+async fn test_matmul_selected_kernel_matches_naive_and_cpu() {
+    let (_compute, device, queue) = create_test_compute().await;
+    let op = MatMulOp::new(&device, &queue);
+
+    let shapes = [
+        (37usize, 45usize, 53usize), // non-square, K % 32 != 0, K % 16 != 0
+        (64, 100, 48),               // full tiles in M/N, K % 32 != 0
+        (33, 17, 32),                // smallest selected shape, K < tile
+        (17, 45, 31),                // fallback: N < 32
+    ];
+
+    for (case, &(m, k, n)) in shapes.iter().enumerate() {
+        let a = test_values(m * k, 17 + case as u32);
+        let b = test_values(k * n, 41 + case as u32);
+        let expected = matmul_ref(&a, &b, m, k, n);
+
+        let a_buf = create_filled_buffer(&device, &a);
+        let b_buf = create_filled_buffer(&device, &b);
+        let selected_buf = create_output_buffer(&device, m * n * 4);
+        let naive_buf = create_output_buffer(&device, m * n * 4);
+
+        let mut enc = device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("mm_selected_vs_naive") },
+        );
+        op.dispatch(&mut enc, &a_buf, &b_buf, &selected_buf, m as u32, k as u32, n as u32)
+            .unwrap();
+        op.dispatch_naive(&mut enc, &a_buf, &b_buf, &naive_buf, m as u32, k as u32, n as u32)
+            .unwrap();
+        queue.submit(std::iter::once(enc.finish()));
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+
+        let selected = read_buffer(&device, &queue, &selected_buf);
+        let naive = read_buffer(&device, &queue, &naive_buf);
+
+        let want_tile = if m >= 32 && n >= 32 { 32 } else { 16 };
+        assert_eq!(
+            op.selected_tile_edge(m as u32, n as u32),
+            want_tile,
+            "case {case}: selection for {m}x{k}x{n}"
+        );
+
+        for i in 0..m * n {
+            assert!(
+                (selected[i] - naive[i]).abs() < 1e-4,
+                "case {case} ({m}x{k}x{n}) selected vs naive at [{i}]: {} vs {}",
+                selected[i],
+                naive[i]
+            );
+            assert!(
+                (selected[i] - expected[i]).abs() < 1e-4,
+                "case {case} ({m}x{k}x{n}) selected vs CPU at [{i}]: {} vs {}",
+                selected[i],
+                expected[i]
+            );
+        }
     }
 }
 
