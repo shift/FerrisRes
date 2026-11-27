@@ -251,6 +251,18 @@ impl CpuMoELayer {
 /// This is the key component that enables O(n) scaling. At initialization,
 /// it is an identity transform (pass-through). During distillation, it learns
 /// to compress block information into a compact summary.
+/// WebGPU caps each dispatch dimension at 65,535 workgroups.
+const MAX_WORKGROUPS: u32 = 65_535;
+
+fn grid(groups: u32) -> (u32, u32) {
+    if groups == 0 {
+        return (0, 0);
+    }
+    let gx = groups.min(MAX_WORKGROUPS);
+    let gy = (groups + MAX_WORKGROUPS - 1) / MAX_WORKGROUPS;
+    (gx, gy)
+}
+
 pub struct BlockSummaryLayer {
     /// Learnable summary queries: [num_queries × hidden_dim].
     /// Initialized as identity rows: query[i] = one_hot(i).
@@ -4476,8 +4488,12 @@ struct Params {
 /// Forward was: for each query q, attn = softmax(Q_q · K_t / √d) · V
 /// We compute: d_queries and d_tokens given d_output.
 @compute @workgroup_size(64)
-fn block_summary_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn block_summary_backward(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let idx = (wid.y * nwg.x + wid.x) * 64u + lid.x;
     let nq = params.num_queries;
     let hd = params.hidden_dim;
     let bs = params.block_size;
@@ -4782,10 +4798,15 @@ impl BlockSummaryGpuOp {
         });
         pass.set_pipeline(&self.backward_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        // One workgroup per query for d_queries, plus enough for d_tokens
+        // The shader covers `(nq + bs) * hd` elements, not one per query/token:
+        // it was dispatched with `nq + bs` threads, so only 1/hd of every
+        // gradient row was ever written. Fold the element count over the grid,
+        // because the head-sized case exceeds the 65,535-workgroup cap.
         let wg = 64u32;
-        let total_elements = (self.num_queries + self.block_size).max(1) as u32;
-        pass.dispatch_workgroups((total_elements + wg - 1) / wg, 1, 1);
+        let total_elements =
+            ((self.num_queries + self.block_size).max(1) as u32) * self.hidden_dim as u32;
+        let (gx, gy) = grid((total_elements + wg - 1) / wg);
+        pass.dispatch_workgroups(gx, gy, 1);
         drop(pass);
 
         tracing::debug!(
@@ -6204,5 +6225,33 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod dispatch_grid_tests {
+    use super::*;
+
+    #[test]
+    fn block_summary_backward_covers_every_gradient_element() {
+        // The bug: `nq + bs` threads for a `(nq + bs) * hd` shader. At the
+        // training shape (1024 queries, hidden 768, block 16) that wrote 1/768
+        // of each row.
+        let (nq, bs, hd) = (1_024u32, 16u32, 768u32);
+        let total = (nq + bs) * hd;
+        let groups = (total + 63) / 64;
+        let (gx, gy) = grid(groups);
+        assert!(gx <= MAX_WORKGROUPS && gy <= MAX_WORKGROUPS);
+        assert!(
+            gx * gy * 64 >= total,
+            "the old dispatch covered {} elements, the shader needs {total}",
+            nq + bs
+        );
+    }
+
+    #[test]
+    fn the_backward_shader_reads_the_grid_width() {
+        assert!(BLOCK_SUMMARY_BACKWARD_WGSL.contains("num_workgroups"));
+        assert!(BLOCK_SUMMARY_BACKWARD_WGSL.contains("workgroup_id"));
     }
 }

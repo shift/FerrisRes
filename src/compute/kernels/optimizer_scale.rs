@@ -60,8 +60,12 @@ const SCALE_UPDATE_WGSL: &str = r#"
     @group(0) @binding(3) var<uniform> params: Params;
 
     @compute @workgroup_size(256)
-    fn scale_update_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-        let idx = gid.x;
+    fn scale_update_main(
+        @builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>,
+    ) {
+        let idx = (wid.y * nwg.x + wid.x) * 256u + lid.x;
         let total = params.rows * params.cols;
         if (idx >= total) {
             return;
@@ -91,8 +95,12 @@ const SCALE_MOMENTUM_WGSL: &str = r#"
     @group(0) @binding(2) var<uniform> params: Params;
 
     @compute @workgroup_size(256)
-    fn scale_momentum_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-        let idx = gid.x;
+    fn scale_momentum_main(
+        @builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>,
+    ) {
+        let idx = (wid.y * nwg.x + wid.x) * 256u + lid.x;
         if (idx >= params.total) {
             return;
         }
@@ -101,6 +109,20 @@ const SCALE_MOMENTUM_WGSL: &str = r#"
         momentum[idx] = beta1 * momentum[idx] + gradient[idx];
     }
 "#;
+
+/// WebGPU caps each dispatch dimension at 65,535 workgroups. A 32k x 768
+/// parameter is 25.2M elements, i.e. 98,304 groups in one dimension, so the
+/// SCALE optimiser needs the same fold the Adam kernel already has.
+const MAX_WORKGROUPS: u32 = 65_535;
+
+fn dispatch_grid(groups: u32) -> (u32, u32) {
+    if groups == 0 {
+        return (0, 0);
+    }
+    let gx = groups.min(MAX_WORKGROUPS);
+    let gy = (groups + MAX_WORKGROUPS - 1) / MAX_WORKGROUPS;
+    (gx, gy)
+}
 
 pub struct ScaleGpuOps {
     column_norms_pipeline: wgpu::ComputePipeline,
@@ -308,7 +330,8 @@ impl ScaleGpuOps {
         });
         pass.set_pipeline(&self.scale_update_pipeline);
         pass.set_bind_group(0, &bg, &[]);
-        pass.dispatch_workgroups((total + 255) / 256, 1, 1);
+        let (gx, gy) = dispatch_grid((total + 255) / 256);
+        pass.dispatch_workgroups(gx, gy, 1);
         drop(pass);
 
         Ok(())
@@ -349,7 +372,8 @@ impl ScaleGpuOps {
         });
         pass.set_pipeline(&self.momentum_pipeline);
         pass.set_bind_group(0, &bg, &[]);
-        pass.dispatch_workgroups((total + 255) / 256, 1, 1);
+        let (gx, gy) = dispatch_grid((total + 255) / 256);
+        pass.dispatch_workgroups(gx, gy, 1);
         drop(pass);
 
         Ok(())
@@ -471,5 +495,21 @@ mod tests {
             momentum_ref(&mut momentum, &gradient, 0.9);
         }
         assert!(momentum[0].abs() < 1e-2);
+    }
+}
+
+#[cfg(test)]
+mod scale_grid_tests {
+    use super::*;
+
+    #[test]
+    fn the_scale_optimiser_folds_a_head_sized_parameter() {
+        // 32k x 768 = 25,165,824 elements = 98,304 groups in one dimension.
+        let total = 32_768u32 * 768;
+        let groups = (total + 255) / 256;
+        assert!(groups > MAX_WORKGROUPS, "the case must actually overflow");
+        let (gx, gy) = dispatch_grid(groups);
+        assert!(gx <= MAX_WORKGROUPS && gy <= MAX_WORKGROUPS);
+        assert!(gx * gy * 256 >= total);
     }
 }
