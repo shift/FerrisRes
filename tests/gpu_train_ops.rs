@@ -487,3 +487,94 @@ fn attention_causal_mask_and_gradients_match_cpu() {
 
     assert!(e1 < TOL && e2 < TOL && e3 < TOL && e4 < TOL);
 }
+
+/// The 64-lane backward shaders at shapes that exercise both branches of the
+/// head-dimension stride: one warp per head (64), and the two chunked cases
+/// (128, 256). Sequence lengths 1, 2, 17 and 64 cover an empty `s` range, a
+/// single visible key, an odd length and a full warp-row. The CPU oracle is
+/// the same `attention_ref` the original single-invocation kernel used, so a
+/// failure here is a wrong result, not just a different summation order.
+#[test]
+#[ignore = "needs a Vulkan/WGPU device; run with VK_ICD_FILENAMES set"]
+fn attention_backward_64_lane_grid_matches_cpu() {
+    let (device, queue) = setup();
+    let ops = TrainOps::new(Arc::clone(&device), Arc::clone(&queue));
+    let cases = [
+        (1usize, 2usize, 64usize),
+        (2, 2, 64),
+        (17, 2, 64),
+        (64, 2, 64),
+        (17, 2, 128),
+        (4, 2, 256),
+    ];
+    for (case_index, (seq, heads, head_dim)) in cases.into_iter().enumerate() {
+        let dim = seq * heads * head_dim;
+        let seed = 70 + case_index as u32 * 4;
+        let q = values(dim, seed);
+        let k = values(dim, seed + 1);
+        let v = values(dim, seed + 2);
+        let dout = values(dim, seed + 3);
+        let scale = 0.5f32;
+
+        let qb = buf(&device, &queue, &q);
+        let kb = buf(&device, &queue, &k);
+        let vb = buf(&device, &queue, &v);
+        let outb = GpuBuffer::zeros(&device, &queue, dim * 4, Some("out")).unwrap();
+        let doutb = buf(&device, &queue, &dout);
+        let dqb = GpuBuffer::zeros(&device, &queue, dim * 4, Some("dq")).unwrap();
+        let dkb = GpuBuffer::zeros(&device, &queue, dim * 4, Some("dk")).unwrap();
+        let dvb = GpuBuffer::zeros(&device, &queue, dim * 4, Some("dv")).unwrap();
+        let scratch = heads * seq * seq * 4;
+        let probsb = GpuBuffer::zeros(&device, &queue, scratch, Some("p")).unwrap();
+        let dsb = GpuBuffer::zeros(&device, &queue, scratch, Some("ds")).unwrap();
+
+        let mut enc =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        ops.attention_forward(
+            &mut enc,
+            &qb,
+            &kb,
+            &vb,
+            &outb,
+            seq as u32,
+            heads as u32,
+            head_dim as u32,
+            scale,
+        )
+        .unwrap();
+        ops.attention_backward(
+            &mut enc,
+            &doutb,
+            &qb,
+            &kb,
+            &vb,
+            &dqb,
+            &dkb,
+            &dvb,
+            &probsb,
+            &dsb,
+            seq as u32,
+            heads as u32,
+            head_dim as u32,
+            scale,
+        )
+        .unwrap();
+        queue.submit([enc.finish()]);
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+
+        let (eout, edq, edk, edv) = attention_ref(&q, &k, &v, &dout, seq, heads, head_dim, scale);
+        let e1 = max_abs(&read(&device, &queue, &outb, dim), &eout);
+        let e2 = max_abs(&read(&device, &queue, &dqb, dim), &edq);
+        let e3 = max_abs(&read(&device, &queue, &dkb, dim), &edk);
+        let e4 = max_abs(&read(&device, &queue, &dvb, dim), &edv);
+        eprintln!(
+            "attention seq={seq} heads={heads} head_dim={head_dim} \
+             fwd={e1:.3e} dq={e2:.3e} dk={e3:.3e} dv={e4:.3e}"
+        );
+        assert!(
+            e1 < TOL && e2 < TOL && e3 < TOL && e4 < TOL,
+            "seq={seq} heads={heads} head_dim={head_dim}: \
+             fwd={e1:.3e} dq={e2:.3e} dk={e3:.3e} dv={e4:.3e}"
+        );
+    }
+}

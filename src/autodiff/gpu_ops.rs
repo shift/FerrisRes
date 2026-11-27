@@ -450,62 +450,73 @@ struct P { seq: u32, heads: u32, head_dim: u32, scale: f32 }
 @group(0) @binding(5) var<storage, read_write> probs: array<f32>;
 @group(0) @binding(6) var<storage, read_write> ds: array<f32>;
 @group(0) @binding(7) var<uniform> p: P;
-@compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let t = gid.x;
-    let h = gid.y;
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let t = wid.x;
+    let h = wid.y;
+    let lane = lid.x;
     if (t >= p.seq || h >= p.heads) { return; }
     let base = (t * p.heads + h) * p.head_dim;
     let row = (h * p.seq + t) * p.seq;
-    var mx = -1.0e30;
-    for (var s = 0u; s <= t; s = s + 1u) {
-        let kb = (s * p.heads + h) * p.head_dim;
-        var dot = 0.0;
-        for (var d = 0u; d < p.head_dim; d = d + 1u) {
-            dot = dot + q[base + d] * k[kb + d];
+    // `probs` and `ds` are shared by the whole row, and computing them needs
+    // the QK and DO*V dots (reductions over d), so one lane computes them
+    // exactly as the previous single-invocation kernel did: the s order and
+    // the d order are unchanged. The other lanes wait at the barrier.
+    if (lane == 0u) {
+        var mx = -1.0e30;
+        for (var s = 0u; s <= t; s = s + 1u) {
+            let kb = (s * p.heads + h) * p.head_dim;
+            var dot = 0.0;
+            for (var d = 0u; d < p.head_dim; d = d + 1u) {
+                dot = dot + q[base + d] * k[kb + d];
+            }
+            mx = max(mx, dot * p.scale);
         }
-        mx = max(mx, dot * p.scale);
-    }
-    var sum = 0.0;
-    for (var s = 0u; s <= t; s = s + 1u) {
-        let kb = (s * p.heads + h) * p.head_dim;
-        var dot = 0.0;
-        for (var d = 0u; d < p.head_dim; d = d + 1u) {
-            dot = dot + q[base + d] * k[kb + d];
+        // Keep the unnormalised exp values in `probs` so the next pass does
+        // not recompute the QK dot. Dividing `e` by `sum` gives the same f32
+        // value as the old `exp(dot * scale - mx) / sum`.
+        var sum = 0.0;
+        for (var s = 0u; s <= t; s = s + 1u) {
+            let kb = (s * p.heads + h) * p.head_dim;
+            var dot = 0.0;
+            for (var d = 0u; d < p.head_dim; d = d + 1u) {
+                dot = dot + q[base + d] * k[kb + d];
+            }
+            let e = exp(dot * p.scale - mx);
+            probs[row + s] = e;
+            sum = sum + e;
         }
-        sum = sum + exp(dot * p.scale - mx);
-    }
-    // First pass: write p and dp, and accumulate sum_s(p * dp) for the
-    // softmax Jacobian. dp is recomputed in the second pass, so no per-row
-    // scratch array is needed and the kernel has no sequence-length ceiling.
-    var weighted = 0.0;
-    for (var s = 0u; s <= t; s = s + 1u) {
-        let kb = (s * p.heads + h) * p.head_dim;
-        var dot = 0.0;
-        for (var d = 0u; d < p.head_dim; d = d + 1u) {
-            dot = dot + q[base + d] * k[kb + d];
+        // First pass: normalise p, and accumulate sum_s(p * dp) for the
+        // softmax Jacobian. `ds` temporarily holds dp, so the second pass does
+        // not recompute the DO*V dot either. Both keep the same s order and
+        // therefore the same f32 result as before.
+        var weighted = 0.0;
+        for (var s = 0u; s <= t; s = s + 1u) {
+            let kb = (s * p.heads + h) * p.head_dim;
+            let prob = probs[row + s] / sum;
+            probs[row + s] = prob;
+            var dpv = 0.0;
+            for (var d = 0u; d < p.head_dim; d = d + 1u) {
+                dpv = dpv + dout[base + d] * v[kb + d];
+            }
+            ds[row + s] = dpv;
+            weighted = weighted + prob * dpv;
         }
-        let prob = exp(dot * p.scale - mx) / sum;
-        probs[row + s] = prob;
-        var dpv = 0.0;
-        for (var d = 0u; d < p.head_dim; d = d + 1u) {
-            dpv = dpv + dout[base + d] * v[kb + d];
+        for (var s = 0u; s <= t; s = s + 1u) {
+            ds[row + s] = probs[row + s] * (ds[row + s] - weighted);
         }
-        weighted = weighted + prob * dpv;
-    }
-    for (var s = 0u; s <= t; s = s + 1u) {
-        let kb = (s * p.heads + h) * p.head_dim;
-        var dpv = 0.0;
-        for (var d = 0u; d < p.head_dim; d = d + 1u) {
-            dpv = dpv + dout[base + d] * v[kb + d];
+        for (var s = t + 1u; s < p.seq; s = s + 1u) {
+            probs[row + s] = 0.0;
+            ds[row + s] = 0.0;
         }
-        ds[row + s] = probs[row + s] * (dpv - weighted);
     }
-    for (var s = t + 1u; s < p.seq; s = s + 1u) {
-        probs[row + s] = 0.0;
-        ds[row + s] = 0.0;
-    }
-    for (var d = 0u; d < p.head_dim; d = d + 1u) {
+    workgroupBarrier();
+    storageBarrier();
+    // dq[t,h,d] only sums over s, so every lane owns a distinct d. Chunking
+    // by 64 keeps head_dim 128/256 correct without truncating any dimension.
+    // The s order is the same as the old per-lane loop, so each output element
+    // is bit-comparable with the previous kernel.
+    for (var d = lane; d < p.head_dim; d = d + 64u) {
         var acc = 0.0;
         for (var s = 0u; s <= t; s = s + 1u) {
             let kb = (s * p.heads + h) * p.head_dim;
@@ -525,13 +536,17 @@ struct P { seq: u32, heads: u32, head_dim: u32, scale: f32 }
 @group(0) @binding(4) var<storage, read_write> dk: array<f32>;
 @group(0) @binding(5) var<storage, read_write> dv: array<f32>;
 @group(0) @binding(6) var<uniform> p: P;
-@compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let s = gid.x;
-    let h = gid.y;
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let s = wid.x;
+    let h = wid.y;
+    let lane = lid.x;
     if (s >= p.seq || h >= p.heads) { return; }
     let base = (s * p.heads + h) * p.head_dim;
-    for (var d = 0u; d < p.head_dim; d = d + 1u) {
+    // dk[s,h,d] and dv[s,h,d] only sum over t, so every lane owns a distinct
+    // d. Chunking by 64 covers head_dim 128/256; the t order is unchanged and
+    // each lane still writes its own element, so no atomics are involved.
+    for (var d = lane; d < p.head_dim; d = d + 64u) {
         var dk_acc = 0.0;
         var dv_acc = 0.0;
         for (var t = s; t < p.seq; t = t + 1u) {
@@ -954,6 +969,12 @@ impl TrainOps {
 
     /// Backward over pre-expanded K/V. `probs` and `ds` are scratch buffers of
     /// `heads * seq * seq` floats; the caller owns them.
+    ///
+    /// Both entry points use 64 lanes per `(position, head)` and stride the
+    /// head dimension by 64, so `head_dim` 128/256 is covered in several
+    /// iterations instead of being truncated. One lane still computes the
+    /// shared softmax rows in `bwd_a`; every lane computes its own `dq`, `dk`
+    /// or `dv` element.
     pub fn attention_backward(
         &self,
         enc: &mut wgpu::CommandEncoder,
@@ -971,6 +992,11 @@ impl TrainOps {
         head_dim: u32,
         scale: f32,
     ) -> Result<()> {
+        if head_dim == 0 {
+            return Err(crate::error::FerrisResError::Device(
+                "attention head_dim must be non-zero".into(),
+            ));
+        }
         let p = params_attn(seq, heads, head_dim, scale);
         let elements = seq * heads * head_dim;
         self.dispatch(&self.attention_bwd_a, enc, &[dout, q, k, v, dq, probs, ds], &p, elements, (seq, heads, 1))?;
