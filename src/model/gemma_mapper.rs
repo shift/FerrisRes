@@ -246,11 +246,6 @@ impl CpuMoELayer {
 // Block Summary Layer — the bridge between dense and hierarchical attention
 // ---------------------------------------------------------------------------
 
-/// Block Summary Layer: compresses a block of tokens into a single state.
-///
-/// This is the key component that enables O(n) scaling. At initialization,
-/// it is an identity transform (pass-through). During distillation, it learns
-/// to compress block information into a compact summary.
 /// WebGPU caps each dispatch dimension at 65,535 workgroups.
 const MAX_WORKGROUPS: u32 = 65_535;
 
@@ -263,6 +258,11 @@ fn grid(groups: u32) -> (u32, u32) {
     (gx, gy)
 }
 
+/// Block Summary Layer: compresses a block of tokens into a single state.
+///
+/// This is the key component that enables O(n) scaling. At initialization,
+/// it is an identity transform (pass-through). During distillation, it learns
+/// to compress block information into a compact summary.
 pub struct BlockSummaryLayer {
     /// Learnable summary queries: [num_queries × hidden_dim].
     /// Initialized as identity rows: query[i] = one_hot(i).

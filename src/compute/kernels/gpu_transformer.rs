@@ -223,21 +223,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         sum_val = sum_val + exp(dot * scale - max_val);
     }
 
-    // Third pass: weighted sum of V.
+    // Third pass: weighted sum of V. The QK dot is computed once per key
+    // position and accumulated into every output dimension; computing it in
+    // the inner `d` loop instead makes this pass O(seq·hd²) rather than
+    // O(seq·hd). `acc` replaces the removed score array and is bounded by the
+    // largest head_dim the models use (256).
+    var acc: array<f32, 256>;
     for (var d = 0u; d < hd; d = d + 1u) {
-        var val = 0.0;
-        for (var s = 0u; s <= t; s = s + 1u) {
-            let k_offset = s * nkv * hd + kv_h * hd;
-            var dot = 0.0;
-            for (var dd = 0u; dd < hd; dd = dd + 1u) {
-                dot = dot + q[q_offset + dd] * k[k_offset + dd];
-            }
-            let weight = exp(dot * scale - max_val) / sum_val;
-            let v_offset = s * nkv * hd + kv_h * hd;
-            val = val + weight * v[v_offset + d];
+        acc[d] = 0.0;
+    }
+    for (var s = 0u; s <= t; s = s + 1u) {
+        let k_offset = s * nkv * hd + kv_h * hd;
+        var dot = 0.0;
+        for (var dd = 0u; dd < hd; dd = dd + 1u) {
+            dot = dot + q[q_offset + dd] * k[k_offset + dd];
         }
-        let out_offset = t * nh * hd + h * hd;
-        output[out_offset + d] = val;
+        let weight = exp(dot * scale - max_val) / sum_val;
+        let v_offset = s * nkv * hd + kv_h * hd;
+        for (var d = 0u; d < hd; d = d + 1u) {
+            acc[d] = acc[d] + weight * v[v_offset + d];
+        }
+    }
+    let out_offset = t * nh * hd + h * hd;
+    for (var d = 0u; d < hd; d = d + 1u) {
+        output[out_offset + d] = acc[d];
     }
 }
 "#;
@@ -721,6 +730,12 @@ impl GpuTransformerPipeline {
         num_kv_heads: u32,
         head_dim: u32,
     ) -> Result<()> {
+        if head_dim > 256 {
+            return Err(crate::error::FerrisResError::Device(format!(
+                "attention head_dim {head_dim} exceeds the 256 accumulator slots"
+            )));
+        }
+
         let kv_group_size = num_heads / num_kv_heads;
         let params_data: [u32; 5] = [seq_len, num_heads, num_kv_heads, head_dim, kv_group_size];
         let params_buf = device.create_buffer(&BufferDescriptor {
