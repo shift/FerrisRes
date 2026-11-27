@@ -190,40 +190,49 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let q_offset = t * nh * hd + h * hd;
     let scale = 1.0 / sqrt(f32(hd));
 
-    // Online softmax: track max and sum
+    // Online softmax: track max and sum.
+    //
+    // This used a fixed `array<f32, 256>` to keep the scores between passes,
+    // with a comment claiming 256 was the maximum sequence length. The model is
+    // configured with `max_seq = 1024`, so every position past 255 indexed the
+    // array out of bounds. Recomputing the dot product is stateless, costs no
+    // memory, and is correct at any length.
     var max_val = -1e30;
     var sum_val = 0.0;
 
-    // First pass: compute max for numerical stability
-    var scores: array<f32, 256>;  // max seq_len = 256
-    for (var s = 0u; s < seq; s = s + 1u) {
-        if (s > t) {
-            scores[s] = -1e30;
-            continue;
-        }
-        // Dot product Q[t,h,:] · K[s,kv_h,:]
-        var dot = 0.0;
+    // First pass: maximum, for numerical stability.
+    for (var s = 0u; s <= t; s = s + 1u) {
         let k_offset = s * nkv * hd + kv_h * hd;
+        var dot = 0.0;
         for (var d = 0u; d < hd; d = d + 1u) {
             dot = dot + q[q_offset + d] * k[k_offset + d];
         }
         let score = dot * scale;
-        scores[s] = score;
         if (score > max_val) {
             max_val = score;
         }
     }
 
-    // Second pass: compute sum of exp(score - max)
+    // Second pass: sum of exp(score - max).
     for (var s = 0u; s <= t; s = s + 1u) {
-        sum_val = sum_val + exp(scores[s] - max_val);
+        let k_offset = s * nkv * hd + kv_h * hd;
+        var dot = 0.0;
+        for (var d = 0u; d < hd; d = d + 1u) {
+            dot = dot + q[q_offset + d] * k[k_offset + d];
+        }
+        sum_val = sum_val + exp(dot * scale - max_val);
     }
 
-    // Third pass: weighted sum of V
+    // Third pass: weighted sum of V.
     for (var d = 0u; d < hd; d = d + 1u) {
         var val = 0.0;
         for (var s = 0u; s <= t; s = s + 1u) {
-            let weight = exp(scores[s] - max_val) / sum_val;
+            let k_offset = s * nkv * hd + kv_h * hd;
+            var dot = 0.0;
+            for (var dd = 0u; dd < hd; dd = dd + 1u) {
+                dot = dot + q[q_offset + dd] * k[k_offset + dd];
+            }
+            let weight = exp(dot * scale - max_val) / sum_val;
             let v_offset = s * nkv * hd + kv_h * hd;
             val = val + weight * v[v_offset + d];
         }
@@ -826,5 +835,20 @@ mod tests {
                 eprintln!("No GPU adapter, skipping shader compilation test");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod attention_bounds_tests {
+    use super::*;
+
+    /// The model runs with `max_seq = 1024`; the shader kept scores in a
+    /// 256-element array, so every position past 255 was out of bounds.
+    #[test]
+    fn attention_does_not_keep_scores_in_a_fixed_256_slot_array() {
+        assert!(
+            !CAUSAL_ATTENTION_GQA_WGSL.contains("array<f32, 256>;  // max seq_len"),
+            "the fixed score buffer is back; it cannot hold max_seq=1024"
+        );
     }
 }

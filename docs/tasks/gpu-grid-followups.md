@@ -25,6 +25,19 @@ The arithmetic test runs anywhere; the GPU test prints `skipped: no adapter`
 and returns on a host without one, so a green run there proves nothing unless
 the skip line is absent.
 
+## Also fixed (commit `7d8ede0`, and the attention change beside it)
+
+- `gemma_mapper::dispatch_backward` dispatched `nq + bs` threads for a shader
+  covering `(nq + bs) * hd` elements — **1/768 of every gradient row** was
+  written. Now folded over a 2D grid.
+- `optimizer_scale` dispatched 98,304 groups in one dimension at 32k × 768, over
+  the cap. Both kernels already had `idx >= total` guards; host and index fold.
+- `gpu_transformer` causal attention kept scores in `array<f32, 256>` while the
+  model runs `max_seq = 1024`. Scores are now recomputed per pass; stateless and
+  correct at any length, at the cost of two extra QK dot products per position.
+
+None of these has been executed on a GPU host.
+
 ## Open, ranked
 
 1. **Elementwise over-dispatch without a guard** (`src/compute/kernels/elementwise.rs`).
