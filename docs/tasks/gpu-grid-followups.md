@@ -58,3 +58,34 @@ None of these has been executed on a GPU host.
 4. **`TrainOps::dispatch` asserts dimensions but not coverage**
    (`src/autodiff/gpu_ops.rs`). Add `gx * gy * WG >= elements` and, where the
    shader takes `grid_x`, `gx == grid_x`.
+
+## Measured on a Kaggle T4, 0.2.9 (2026-11-27)
+
+The per-step timing build ran the real shape (hidden 768, 8 layers, heads 12,
+head_dim 64, intermediate 3072, vocab 16384, seq 512, batch 1) on a hardware T4
+(Vulkan adapter, not llvmpipe). One optimizer step:
+
+| phase | ms |
+|---|---|
+| forward | ~10 000 |
+| backward | ~4 850 |
+| CPU cross-entropy | ~100 |
+| logits readback | ~58 |
+| optimizer | ~170 |
+| checkpoint (every 50) | 3 900 |
+| **total** | **~15 200** |
+
+Conclusion: the readback and CPU loss are **not** the bottleneck (2 % combined).
+Forward and backward are 98 %, so the next work is in the GPU graph/kernels —
+dispatch count, per-token/per-layer submissions, encoder reuse — not in moving
+cross-entropy to the GPU.
+
+Two environment facts that cost runs:
+
+- Kaggle kernels must have `enable_internet: true`. Without it, apt fails at
+  DNS (`Temporary failure resolving archive.ubuntu.com`) and the Vulkan ICD has
+  no `libGLX_nvidia`; the failure is silent if apt's exit is piped through
+  `tail`. The 0.2.9 notebook prints the real exit code.
+- The `.deb` ships `usr/share/vulkan/icd.d/nvidia_icd.x86_64.json`; with the GL
+  userspace installed and `VK_DRIVER_FILES`/`VK_ICD_FILENAMES` set,
+  `ferrisres devices --json` lists the T4 as hardware.
