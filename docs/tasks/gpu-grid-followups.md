@@ -89,3 +89,20 @@ Two environment facts that cost runs:
 - The `.deb` ships `usr/share/vulkan/icd.d/nvidia_icd.x86_64.json`; with the GL
   userspace installed and `VK_DRIVER_FILES`/`VK_ICD_FILENAMES` set,
   `ferrisres devices --json` lists the T4 as hardware.
+
+## The attention fix is now measured (0.2.10, 2026-11-27)
+
+Resumed the step-700 `FRTRAIN1` checkpoint on a T4 and ran to the 1200 s budget:
+
+| phase | 0.2.9 | 0.2.10 |
+|---|---|---|
+| forward | ~10 000 ms | **2 550 ms** |
+| backward | ~4 850 ms | ~4 875 ms |
+| total step | ~15 200 ms | **8 011 ms** |
+
+148 steps logged (701 → 848), checkpoint written at **825**, `resumed_from=700`.
+Backward is unchanged, as expected: it never had the redundant QK dot. The
+training step is now roughly halved and backward is the largest phase.
+
+0.2.11 selects the 32x32 double-buffered matmul for M,N >= 32; its equivalence is
+tested at non-square and non-multiple K, but its speed gain is not yet measured.
