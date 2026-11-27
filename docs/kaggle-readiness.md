@@ -10,7 +10,7 @@ about the target. The smoke must run `--device gpu` and show the T4.
 |---|---|---|---|
 | 1 | **GPU training loop** — wgpu forward, backward, Adam, `train --device gpu`, FRTRAIN1 read-back | **landed** at `73a6902`: parity, learning, CLI and resume; 1634 lib + 8 GPU tests | done |
 | 2 | parity and learning gates: logits/gradients vs f32, loss falls, parameters change | **passed**: logits 1.892e-4, grads ~1e-4, post-step 5e-5, loss 3.557→0.0026 | done |
-| 3 | **Vulkan on the Kaggle T4** — `ferrisres devices` must list the T4, not llvmpipe | **closed: Kaggle cannot do Vulkan.** `NVIDIA_DRIVER_CAPABILITIES=compute,utility`, so no `libGLX_nvidia.so` is mounted; installing `libnvidia-gl-580` in-session leaves the library absent and `-server` conflicts with `libnvidia-egl-gbm1`. `devices` reports only `llvmpipe` on `gl`. The T4 is unreachable by a wgpu/Vulkan engine on Kaggle | answered |
+| 3 | **Vulkan on the Kaggle T4** — `ferrisres devices` must list the T4, not llvmpipe | **verified working (2026-11-27).** `libnvidia-gl-580-server` installs when dpkg is given `--force-overwrite --force-confold` (the conflict was with `libnvidia-egl-gbm1`), the ICD manifest is supplied, and `ferrisres info` then reports **`adapter 0 Tesla T4`** — observed in the `ferrisres-train-16k` kernel log after the .deb install. The earlier “cannot” was two fixable packaging problems, not the container | answered |
 | 4 | `.deb` with the GPU loop, built on ubuntu:22.04 with `--features vulkan` | **done**: 0.2.5 at `int/gpu-deb` `21aed9c`, 5.7 MiB, sha `db443ac2…`; gate PASS (version, devices, `--device`, CPU smoke, export, infer, glibc 2.34) | agent |
 | 5 | GPU smoke notebook: `nvidia-smi`, `devices` shows T4, `train --device gpu` 20 steps, loss falls, tokens/s recorded | **kernel `sectionme/ferrisres-gpu-probe`** pushed; v1 confirmed the T4 and the missing ICD, then stopped | agent |
 | 6 | checkpoint read-back, export, infer from the GPU-trained checkpoint | **done in the loop branch**; the packaged path is after 0.2.5 | agent |
@@ -112,10 +112,14 @@ not graphics. Measured on run 3:
   `/usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json`, owned by
   `libnvidia-egl-gbm1`.
 
-Consequence: **a wgpu/Vulkan engine cannot use a Kaggle T4.** This is not
-fixable from a notebook. The GPU trainer needs a host that mounts the graphics
-capabilities (most rented pods do), or the engine needs a CUDA backend. Until
-one of those exists, Kaggle is a data-preparation host, not the compute host.
+Consequence: **these failures are fixable from the notebook, and were fixed.**
+The two blockers were the dpkg conflict (solved by `--force-overwrite
+--force-confold`) and a missing ICD manifest (supplied at run time, with
+`VK_DRIVER_FILES` and `VK_ICD_FILENAMES` exported before the first wgpu call).
+With both, `ferrisres info` reports `adapter 0 Tesla T4`, as captured in the
+`ferrisres-train-16k` log. The walkthrough above is kept as history: it records
+what run 3 measured *without* those two steps, not what the container is capable
+of.
 
 ## Risks
 
